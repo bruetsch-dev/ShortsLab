@@ -1052,8 +1052,11 @@ def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scen
     if not os.environ.get("WAVESPEED_API_KEY"):
         return []
     prompt = (
-        "Before generating media, create a Micro-Beat Plan for a vertical YouTube Short.\n"
+        "Before generating media, create a Micro-Beat Plan for a vertical YouTube Short engineered for maximum retention.\n"
         "The voice script is not background narration. It is the edit map. Every visual decision must be justified by the exact spoken words at that timestamp.\n"
+        "Captions are burned in word-by-word, frame-synced to the voice, and cuts land on the beat - so make beats tight and punchy.\n"
+        "Beat 1 is the hook: it must be the strongest, most curiosity-provoking visual in the whole video and read instantly. "
+        "Across adjacent beats, vary visual_hook_type and shot scale so it never feels repetitive (pattern interrupt), and let tension escalate toward a payoff.\n"
         "Split the voice script into micro-beats, usually 0.8 to 2.2 seconds, but keep timing coherent with the provided timed base scenes. "
         "Each micro-beat must visually answer the current voice line. If the viewer watched without audio, they should roughly understand the same idea.\n"
         "Voice-Script = content and timing. Visual Script = image ideas, mood, and shot suggestions. Auto Director decides what fits. "
@@ -1075,7 +1078,7 @@ def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scen
     payload = {
         "model": reasoning_model or GPT55_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a precise short-form editor. Build fast, clear micro-beat edit maps from voice scripts."},
+            {"role": "system", "content": "You are an elite short-form editor obsessed with hooks and retention. Build fast, clear, pattern-interrupting micro-beat edit maps from voice scripts. Return compact valid JSON only."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.16,
@@ -1401,6 +1404,7 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
         "caption_max_words": 3,
         "caption_uppercase": True,
         "caption_center_y": 0.72,
+        "export_caption_pngs": True,
         "dynamic_zoom": True,
         "cut_punch_amount": 0.06,
         "cut_punch_seconds": 0.34,
@@ -1715,14 +1719,15 @@ def llm_search_plan(title, scenes, reasoning_model=None, status_cb=None):
         "Do not create queries from vague visual words such as dark room, courtroom, dramatic, blueprint, cinematic, silhouette, scary, or close-up unless those exact entities are part of the spoken topic.\n"
         "Avoid generic keywords like 'war', 'battle', 'farm', or words copied blindly from the script.\n"
         "Avoid book covers, title pages, library catalog scans, scanned book pages, archive.org/open-library scans, and text-only pages unless the scene explicitly asks for a book or manuscript.\n"
-        "Create queries for general web image search, not only Wikimedia. Prefer specific entity/place/object/event phrases that can find real photos, maps, archives, news images, museums, official pages, or documentary references.\n\n"
+        "Create queries for general web image search, not only Wikimedia. Prefer specific entity/place/object/event phrases that can find real photos, maps, archives, news images, museums, official pages, or documentary references.\n"
+        "Among correct options, bias queries toward the most visually striking, dramatic, and instantly readable images (strong subject, high contrast, emotion, scale) - this is a scroll-stopping Short, not an encyclopedia.\n\n"
         f"Title: {humanize_title(title)}\n"
         f"Scenes JSON: {json.dumps(scene_lines, ensure_ascii=False)}"
     )
     payload = {
         "model": reasoning_model or GPT55_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a careful research assistant for public-domain documentary image search."},
+            {"role": "system", "content": "You are a careful research assistant for documentary image search who also has a viral editor's eye for striking, scroll-stopping visuals. Return compact valid JSON only."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.15,
@@ -4068,13 +4073,19 @@ def run_project(form, status_cb=None):
         config["visual_script"] = visual_script
     if audio_path:
         config["timing_audio_path"] = str(audio_path)
-        config["audio_path"] = None
-        config["speech_audio_in_final"] = False
+        mix_voice = str(form.get("mix_voice_in_final", "on")).lower() == "on"
+        if mix_voice:
+            config["audio_path"] = str(audio_path)
+            config["speech_audio_in_final"] = True
+            log(status_cb, "Uploaded voice is the primary audio; music and SFX are ducked under it.")
+        else:
+            config["audio_path"] = None
+            config["speech_audio_in_final"] = False
+            log(status_cb, "Uploaded speech audio is used for timing only; it will not be mixed into the final video.")
         config["audio_model"] = GEMINI_AUDIO_MODEL if audio_analysis else None
         config["audio_duration_seconds"] = audio_duration
         config["audio_timing_source"] = audio_timing_source
         config["audio_sync_locked"] = bool(audio_duration and audio_timing_source and audio_timing_source != "fallback")
-        log(status_cb, "Uploaded speech audio is used for timing only; it will not be mixed into the final video.")
 
     # Frame-accurate word timing: align the known script to the actual voice so
     # word-by-word captions and scene cuts land exactly on the spoken beats.

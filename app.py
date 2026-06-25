@@ -34,6 +34,7 @@ UI_TEXT_DEFAULTS = {
 UI_CHECKBOX_DEFAULTS = {
     "autonomous_director": True,
     "use_audio_timing": True,
+    "mix_voice_in_final": True,
     "use_llm_search": True,
     "use_llm_video_review": True,
     "enable_speaker_hook": False,
@@ -1095,7 +1096,10 @@ def form_page():
         <div class="panel">
           <label>Speech audio</label>
           <input type="file" name="audio_file" accept="audio/*,video/mp4,video/webm">
-          <div class="hint">Optional. Gemini 3.5 Flash transcribes and creates timed visual beats. The uploaded speech audio is timing reference only and is not mixed into the final video.</div>
+          <div class="checks">
+            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use the uploaded voice as the final narration (music/SFX ducked under it)</label>
+          </div>
+          <div class="hint">Optional. The voice is force-aligned to your script for frame-accurate word-by-word captions and beat-synced cuts. With the box checked it is also the primary audio of the final video.</div>
         </div>
         <div class="panel">
           <label>Speaker hook image</label>

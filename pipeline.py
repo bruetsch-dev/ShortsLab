@@ -440,6 +440,77 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
 
+def render_caption_overlay(chunk, width, height, config, is_hook=False):
+    """Render one caption chunk as a full-frame transparent RGBA overlay (neutral white)."""
+    base_size = int(config.get("caption_size") or max(54, min(110, int(width * 0.076))))
+    if is_hook:
+        base_size = int(base_size * 1.12)
+    font = get_font(base_size, True)
+    stroke = max(5, base_size // 9)
+    line_h = int(base_size * 1.16)
+    max_text_width = width * 0.86
+    center_rel = float(config.get("caption_center_y", 0.50 if is_hook else 0.72))
+    center_y = int(height * center_rel)
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    space_w = draw.textlength(" ", font=font)
+    lines, current, current_w = [], [], 0.0
+    for word in chunk["words"]:
+        ww = draw.textlength(word["text"], font=font)
+        add = ww if not current else ww + space_w
+        if current and current_w + add > max_text_width:
+            lines.append(current)
+            current, current_w = [word], ww
+        else:
+            current.append(word)
+            current_w += add
+    if current:
+        lines.append(current)
+
+    top = center_y - (len(lines) * line_h) // 2
+    for li, line in enumerate(lines):
+        widths = [draw.textlength(w["text"], font=font) for w in line]
+        line_w = sum(widths) + space_w * (len(line) - 1)
+        x = (width - line_w) / 2.0
+        cy = top + li * line_h + line_h // 2
+        for word, ww in zip(line, widths):
+            _draw_caption_word(draw, word["text"], int(x + ww / 2.0), int(cy), font, CAPTION_BODY, 255, stroke)
+            x += ww + space_w
+    return overlay
+
+
+def export_caption_pngs(config, caption_chunks_by_scene, scenes, first_scene_id, width, height, out_dir):
+    """Save each on-screen caption as its own transparent PNG plus a timing manifest."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    idx = 0
+    for i, scene in enumerate(scenes, 1):
+        sid = scene.get("id", str(i))
+        s0 = float(scene["start"])
+        for chunk in caption_chunks_by_scene.get(sid, []):
+            text = " ".join(w["text"] for w in chunk["words"]).strip()
+            if not text:
+                continue
+            idx += 1
+            abs_start = round(s0 + float(chunk["start"]), 3)
+            abs_end = round(s0 + float(chunk["end"]), 3)
+            image = render_caption_overlay(chunk, width, height, config, is_hook=(sid == first_scene_id))
+            fname = f"caption_{idx:03d}_{abs_start:07.2f}s.png"
+            image.save(out_dir / fname)
+            manifest.append({
+                "file": fname, "index": idx, "start": abs_start, "end": abs_end, "text": text,
+                "words": [{"word": w["text"], "start": round(s0 + float(w["start"]), 3),
+                           "end": round(s0 + float(w["end"]), 3)} for w in chunk["words"]],
+            })
+    (out_dir / "captions.json").write_text(
+        json.dumps({"width": width, "height": height, "count": len(manifest), "captions": manifest}, indent=2),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def pulse_at(p, center, width):
     if width <= 0:
         return 0.0
@@ -1701,6 +1772,15 @@ def render_video(config, basename=None):
                 ctext, sdur, caption_max_words, caption_uppercase,
                 word_times=scene.get("word_timings"),
             )
+        if bool(config.get("export_caption_pngs", True)):
+            try:
+                count = len(export_caption_pngs(
+                    config, caption_chunks_by_scene, config["scenes"],
+                    first_scene_id, width, height, render_dir.parent / "captions",
+                ))
+                status_log(status_cb, f"Saved {count} individual transparent caption PNG(s) to captions/.")
+            except Exception as exc:
+                status_log(status_cb, f"Caption PNG export skipped: {exc}")
 
     assets = {
         scene.get("id", str(i)): scene_image(config, scene, asset_dir, width, height)

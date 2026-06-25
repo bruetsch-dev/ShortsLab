@@ -131,6 +131,14 @@ for every word. That word timeline then drives the edit:
 - **Scene cuts** snap onto the nearest spoken word onset, so the picture changes on the beat.
 - **Sound effects** (the SFX pass) line up emphasis with the spoken words.
 
+When you upload a voiceover, "Use the uploaded voice as the final narration" (on by default) mixes it
+in as the primary audio with music and SFX ducked underneath. Uncheck it to keep the voice as a
+timing reference only.
+
+Every on-screen caption is also exported as its own full-frame transparent PNG into the project's
+`captions/` folder, with a `captions.json` manifest (file, start, end, text, per-word times) so you
+can drop the caption overlays straight onto the footage in any editor.
+
 ASR errors are corrected back to the script text (e.g. a misheard "Sellers" becomes the script's
 "Cellars") while keeping the accurate spoken timing. If `faster-whisper` is not installed or no voice
 is uploaded, captions fall back to length-weighted estimated timing. Install with
