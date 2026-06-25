@@ -47,7 +47,10 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".webm", ".mp4", 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WAVESPEED_LLM_API = "https://llm.wavespeed.ai/v1/chat/completions"
-WEB_IMAGE_SEARCH_PROVIDERS = ("duckduckgo", "bing", "wikimedia")
+# DuckDuckGo's unofficial image endpoint constantly returns 403 / times out (bot
+# blocking), which stalled every search. Bing + Wikimedia are reliable, so DDG is
+# dropped from the active providers (the duckduckgo_* helpers are kept but unused).
+WEB_IMAGE_SEARCH_PROVIDERS = ("bing", "wikimedia")
 GPT55_MODEL = "openai/gpt-5.5"
 GEMINI_AUDIO_MODEL = "google/gemini-3.5-flash"
 SEEDANCE_VIDEO_MODELS = {
