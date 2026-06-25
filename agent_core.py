@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import math
 import base64
@@ -7,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -67,6 +69,33 @@ SPEAKER_HOOK_REFERENCE_STYLE = (
     "It should feel like a punchy TikTok/Shorts hook before B-roll starts, but without copying any specific person, watermark, caption style, or on-screen text."
 )
 LAST_WEB_REQUEST_AT = 0.0
+
+# Per-host politeness throttle so parallel web searches across different hosts
+# (Bing, Wikimedia, image CDNs) overlap instead of serialising on one global lock.
+_HOST_THROTTLE_LOCK = threading.Lock()
+_HOST_LOCKS = {}
+_HOST_LAST = {}
+
+
+def host_throttle(url, min_interval):
+    """Serialise requests to the same host with `min_interval` spacing; different
+    hosts run concurrently. Returns immediately for unknown/empty hosts."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        host = ""
+    if not host:
+        return
+    with _HOST_THROTTLE_LOCK:
+        lock = _HOST_LOCKS.get(host)
+        if lock is None:
+            lock = _HOST_LOCKS[host] = threading.Lock()
+    with lock:
+        last = _HOST_LAST.get(host, 0.0)
+        wait = min_interval - (time.monotonic() - last)
+        if wait > 0:
+            time.sleep(wait)
+        _HOST_LAST[host] = time.monotonic()
 ACTION_WORDS = {
     "chase", "chased", "run", "running", "escape", "escaping", "scatter", "scattered",
     "attack", "fight", "truck", "drive", "moving", "collapse", "failed", "failure",
@@ -1637,23 +1666,14 @@ def topic_query_candidates(title, script, canonical=""):
 
 
 def request_json_url(url, timeout=45, min_interval=1.1):
-    global LAST_WEB_REQUEST_AT
-    elapsed = time.monotonic() - LAST_WEB_REQUEST_AT
-    if elapsed < min_interval:
-        time.sleep(min_interval - elapsed)
+    host_throttle(url, min_interval)
     req = urllib.request.Request(url, headers={"User-Agent": "autonomous-shorts-agent/1.1"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    finally:
-        LAST_WEB_REQUEST_AT = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def request_text_url(url, timeout=45, min_interval=1.1, referer=""):
-    global LAST_WEB_REQUEST_AT
-    elapsed = time.monotonic() - LAST_WEB_REQUEST_AT
-    if elapsed < min_interval:
-        time.sleep(min_interval - elapsed)
+    host_throttle(url, min_interval)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
@@ -1662,12 +1682,9 @@ def request_text_url(url, timeout=45, min_interval=1.1, referer=""):
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
-    finally:
-        LAST_WEB_REQUEST_AT = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
 
 
 def post_json_url(url, payload, timeout=75):
@@ -2189,7 +2206,7 @@ def commons_search_images(query, limit=6):
     }
     url = f"{COMMONS_API}?{urllib.parse.urlencode(params)}"
     try:
-        data = request_json_url(url, min_interval=1.25)
+        data = request_json_url(url, min_interval=0.6)
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
             time.sleep(8)
@@ -2296,7 +2313,7 @@ def bing_search_images(query, limit=12):
         "qft": "+filterui:photo-photo",
     }
     url = "https://www.bing.com/images/search?" + urllib.parse.urlencode(params)
-    text = request_text_url(url, min_interval=1.3)
+    text = request_text_url(url, min_interval=0.5)
     results = []
     seen = set()
     for match in re.finditer(r'<a[^>]+class="[^"]*\biusc\b[^"]*"[^>]+m="([^"]+)"', text):
@@ -3619,32 +3636,47 @@ def gather_web_images_for_script(
         use_llm_search = bool(use_glm)
     profile = build_topic_profile(title, script, scenes, use_gpt55=use_llm_search, reasoning_model=reasoning_model, status_cb=status_cb)
     log(status_cb, f"Searching general web images for topic: {profile.get('canonical', title)} using {', '.join(WEB_IMAGE_SEARCH_PROVIDERS)}.")
+    # Pass 1: search every scene's queries in parallel (network-bound, the slow part).
+    query_tasks = []
+    for scene_index, scene in enumerate(scenes, 1):
+        for query in web_queries_for_scene(title, scene, scene_index=scene_index, profile=profile):
+            ql = query.lower()
+            if ql in searched_queries:
+                continue
+            searched_queries.add(ql)
+            query_tasks.append((scene_index, query))
+
+    def _run_query(task):
+        scene_index, query = task
+        log(status_cb, f"Scene {scene_index}: general web image query '{query}'")
+        try:
+            return scene_index, general_search_images(query, limit=18, status_cb=status_cb)
+        except Exception as exc:
+            log(status_cb, f"Search failed for '{query}': {exc}")
+            return scene_index, []
+
+    results_by_scene = {}
+    if query_tasks:
+        workers = min(8, len(query_tasks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for scene_index, results in pool.map(_run_query, query_tasks):
+                results_by_scene.setdefault(scene_index, []).extend(results)
+
+    # Pass 2: ground/score/download per scene (sequential; preserves dedup + targets).
     for scene_index, scene in enumerate(scenes, 1):
         if len(downloaded) >= target_count:
             break
         scene_downloads = 0
         candidates = []
-        for query in web_queries_for_scene(title, scene, scene_index=scene_index, profile=profile):
-            if query.lower() in searched_queries:
+        for result in results_by_scene.get(scene_index, []):
+            if result["url"] in seen_urls:
                 continue
-            searched_queries.add(query.lower())
-            if len(downloaded) + scene_downloads >= target_count:
-                break
-            log(status_cb, f"Scene {scene_index}: general web image query '{query}'")
-            try:
-                results = general_search_images(query, limit=18, status_cb=status_cb)
-            except Exception as exc:
-                log(status_cb, f"Search failed for '{query}': {exc}")
+            grounded, ground_reason = web_candidate_topic_grounded(result, profile, scene)
+            if not grounded:
+                log(status_cb, f"Rejected off-topic general web candidate before download: {result.get('title', '')} ({ground_reason})")
                 continue
-            for result in results:
-                if result["url"] in seen_urls:
-                    continue
-                grounded, ground_reason = web_candidate_topic_grounded(result, profile, scene)
-                if not grounded:
-                    log(status_cb, f"Rejected off-topic general web candidate before download: {result.get('title', '')} ({ground_reason})")
-                    continue
-                result["score"] = web_candidate_score(result, profile, scene)
-                candidates.append(result)
+            result["score"] = web_candidate_score(result, profile, scene)
+            candidates.append(result)
         candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
         for result in candidates:
             if scene_downloads >= images_per_scene or len(downloaded) >= target_count:
