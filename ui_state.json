@@ -1,0 +1,22 @@
+{
+  "script": "This man killed over 500 soldiers in 100 days.\r\nThey called him the White Death.\r\nFinland. The Winter War. Minus forty degrees.\r\nThe Soviet Union attacks with everything \u2014 tanks, artillery, thousands of men.\r\nAnd somewhere in the snow\u2026 lies one man.\r\nSimo H\u00e4yh\u00e4.\r\nNo scope. No modern gear.\r\nJust a rifle, white camo, and total silence.\r\nHe packs snow in his mouth so his breath won't give him away.\r\nHe doesn't move. He waits.\r\nAnd every time a Soviet soldier spots him \u2014 it's already too late.\r\nThe Red Army wants him dead.\r\nThey shell entire forests. They send counter-snipers.\r\nBut H\u00e4yh\u00e4 just vanishes into the white.\r\nThen a round hits him in the face and tears it open.\r\nHe survives.\r\nWhen he finally wakes from the coma \u2014 the war is over.\r\nAnd his name is already a legend.\r\nThe White Death.",
+  "visual_script": "",
+  "title": "The Great Emu War",
+  "slug": "",
+  "web_image_count": "14",
+  "web_images_per_scene": "2",
+  "static_gpt_image_count": "0",
+  "seedance_clip_count": "4",
+  "seedance_model": "seedance-2.0",
+  "reasoning_model": "anthropic/claude-opus-4.8",
+  "loaded_project_mode": "normal",
+  "autonomous_director": true,
+  "use_audio_timing": true,
+  "use_llm_search": true,
+  "use_llm_video_review": true,
+  "enable_speaker_hook": true,
+  "auto_web_images": true,
+  "background_music_enabled": true,
+  "allow_gpt": true,
+  "allow_seedance": true
+}

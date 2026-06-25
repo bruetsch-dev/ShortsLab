@@ -1,0 +1,37 @@
+# --- Secrets ---
+.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Generated output & user data (large, not source) ---
+projects/
+uploads/
+renders/
+
+# --- Runtime / asset folders (large binaries, keep on disk only) ---
+browser-profile/
+browser-profile-*/
+background music/
+soundeffects/
+speaker/
+
+# --- Logs ---
+*.log
+launch_app.log
+manual_app.log
+app_server.log
+app_server_error.log
+server.out.log
+server.err.log
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp
