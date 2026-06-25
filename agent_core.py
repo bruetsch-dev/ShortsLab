@@ -2904,9 +2904,13 @@ def review_and_correct_web_images(
     final_paths = paths[:target_count]
     minimum_required = min(10, target_count) if target_count >= 10 else target_count
     if use_gpt55 and os.environ.get("WAVESPEED_API_KEY") and len(final_paths) < minimum_required:
-        raise RuntimeError(
-            f"Reasoning Agent accepted only {len(final_paths)} web image(s), below the required {minimum_required}. "
-            "Render stopped so the app does not cut with off-topic web media. Try a more specific title/script or rerun web search."
+        # Obscure topics genuinely lack enough on-topic stock imagery. Rather than
+        # aborting the whole render, proceed with the approved images and let the
+        # director fill the remaining scenes with GPT-source/Seedance reconstructions.
+        log(
+            status_cb,
+            f"Only {len(final_paths)} of {minimum_required} target web image(s) passed review for this topic; "
+            "proceeding and covering the remaining scenes with GPT-source/Seedance reconstructions.",
         )
     final_sheet = create_media_contact_sheet(
         final_paths,
