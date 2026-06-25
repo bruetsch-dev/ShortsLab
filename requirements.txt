@@ -6,3 +6,6 @@ Pillow
 # Frame-accurate word-level voice alignment (captions/cuts/SFX timing)
 # Runs on GPU (CUDA) when available, else CPU. Downloads a Whisper model on first use.
 faster-whisper
+
+# Robust JSON parsing for LLM agent outputs (Opus/GPT can emit malformed JSON)
+json-repair

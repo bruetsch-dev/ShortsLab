@@ -1602,10 +1602,24 @@ def extract_json_object(text):
     try:
         return json.loads(text)
     except Exception:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    candidate = match.group(0) if match else text
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+    # LLMs (incl. Opus via WaveSpeed) sometimes emit malformed JSON - missing
+    # commas, unclosed braces, trailing junk. Repair it instead of discarding the
+    # whole plan and silently falling back to heuristics.
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(candidate, return_objects=True)
+        if isinstance(repaired, (dict, list)):
+            return repaired
+    except Exception:
+        pass
+    return json.loads(candidate)
 
 
 def extract_phrases(text, limit=8):
@@ -1852,7 +1866,7 @@ def llm_auto_director_plan(title, script, scenes, target_duration, media_counts,
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2400,
+        "max_tokens": 3600,
         "response_format": {"type": "json_object"},
     }
     try:
