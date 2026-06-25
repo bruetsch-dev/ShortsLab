@@ -1137,7 +1137,7 @@ def generate_assets(config, force=False, status_cb=None):
         }
 
     if pending_jobs:
-        workers = wavespeed_parallelism(config, "image_concurrency", default=2, maximum=8)
+        workers = wavespeed_parallelism(config, "image_concurrency", default=4, maximum=8)
         status_log(status_cb, f"Submitting {len(pending_jobs)} GPT image job(s) with concurrency {workers}...")
         if workers == 1 or len(pending_jobs) == 1:
             for job in pending_jobs:
@@ -1262,7 +1262,7 @@ def generate_clips(config, force=False, status_cb=None):
         }
 
     if pending_jobs:
-        workers = wavespeed_parallelism(config, "video_concurrency", default=2, maximum=4)
+        workers = wavespeed_parallelism(config, "video_concurrency", default=3, maximum=5)
         status_log(status_cb, f"Submitting {len(pending_jobs)} Seedance job(s) with concurrency {workers}...")
         if workers == 1 or len(pending_jobs) == 1:
             for job in pending_jobs:
