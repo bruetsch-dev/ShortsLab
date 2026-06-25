@@ -121,6 +121,23 @@ The agent:
 - removes ordinary MP4 container metadata and chapters from the final output as a privacy cleanup step
 - saves the autonomous decision plan in `input/director_plan.json`
 
+## Viral Captions
+
+The render burns in **word-by-word animated captions** ("karaoke" style) sourced from each scene's
+spoken line, synced across the scene window. The currently spoken word is highlighted in a punchy
+accent color with a subtle pop; already-spoken words stay white, upcoming words are slightly dimmed.
+Each chunk slides up and fades in, with a heavy stroke + drop shadow so text stays readable over any
+footage. This is on by default for every render.
+
+Tunable keys in the project config:
+
+- `animated_captions` (default `true`): master switch for the burned-in captions.
+- `caption_max_words` (default `3`): words shown on screen at once.
+- `caption_uppercase` (default `true`): all-caps caption styling.
+- `caption_center_y` (default `0.72`): vertical center as a fraction of height (the hook scene is
+  raised automatically).
+- `caption_size`: optional fixed font size; auto-scales from width when unset.
+
 ## Notes
 
 When speech audio is uploaded, the final MP4 keeps that audio primary. Background music and SFX are mixed quietly underneath. The app does not generate voiceover by itself.

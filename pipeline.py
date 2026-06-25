@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -270,6 +271,159 @@ def draw_caption(img, text, y, width, height, font_size=None):
         (0, 0, 0, 255),
         max(4, font_size // 15),
     )
+
+
+# ---------------------------------------------------------------------------
+# Viral word-by-word ("karaoke") caption system
+# ---------------------------------------------------------------------------
+
+CAPTION_ACCENT = (255, 219, 26)      # punchy yellow for the currently spoken word
+CAPTION_BODY = (255, 255, 255)       # already-spoken / idle words
+CAPTION_UPCOMING = (216, 220, 226)   # words not reached yet (slightly dimmed)
+
+
+def _caption_word_weight(word):
+    """Relative on-screen time for a word, blending length and syllable count."""
+    bare = re.sub(r"[^a-z]", "", word.lower())
+    if not bare:
+        return 0.7
+    vowel_groups = re.findall(r"[aeiouy]+", bare)
+    syllables = max(1, len(vowel_groups))
+    weight = 0.55 + 0.45 * syllables + 0.045 * len(bare)
+    # Trailing sentence punctuation earns a small extra beat (natural pause).
+    if word.strip()[-1:] in ".!?:":
+        weight += 0.45
+    return weight
+
+
+def build_caption_chunks(text, duration, max_words=3, uppercase=True):
+    """Turn a spoken line into timed caption chunks (1-`max_words` words each).
+
+    Each word gets a [start, end] window inside the scene so the active word can
+    be highlighted in sync with the voice even without word-level ASR timing.
+    """
+    text = (text or "").strip()
+    if not text or duration <= 0:
+        return []
+    raw_words = [w for w in re.split(r"\s+", text) if w.strip()]
+    if not raw_words:
+        return []
+    words = [w.upper() if uppercase else w for w in raw_words]
+    weights = [_caption_word_weight(w) for w in raw_words]
+    total = sum(weights) or 1.0
+    lead = min(0.10, duration * 0.05)
+    tail = min(0.12, duration * 0.05)
+    usable = max(0.10, duration - lead - tail)
+    spans = []
+    cursor = lead
+    for word, weight in zip(words, weights):
+        span_d = usable * weight / total
+        spans.append({"text": word, "start": cursor, "end": cursor + span_d})
+        cursor += span_d
+    chunks = []
+    for i in range(0, len(spans), max(1, max_words)):
+        group = spans[i:i + max_words]
+        chunks.append({"start": group[0]["start"], "end": group[-1]["end"], "words": group})
+    if not chunks:
+        return []
+    # First chunk visible from the very start; no gaps between chunks; last lingers.
+    chunks[0]["start"] = 0.0
+    for i in range(len(chunks) - 1):
+        chunks[i]["end"] = chunks[i + 1]["start"]
+    chunks[-1]["end"] = duration
+    return chunks
+
+
+def _caption_color_for(word, local):
+    if local >= word["end"]:
+        return CAPTION_BODY        # already spoken
+    if local >= word["start"]:
+        return CAPTION_ACCENT      # active word
+    return CAPTION_UPCOMING        # not reached yet
+
+
+def _draw_caption_word(draw, text, cx, cy, font, color, alpha, stroke):
+    """Draw one centered word with a heavy stroke + drop shadow for readability."""
+    shadow_a = int(alpha * 0.5)
+    draw.text((cx + 4, cy + 5), text, font=font, anchor="mm",
+              fill=(0, 0, 0, shadow_a), stroke_width=stroke, stroke_fill=(0, 0, 0, shadow_a))
+    draw.text((cx, cy), text, font=font, anchor="mm",
+              fill=(color[0], color[1], color[2], alpha),
+              stroke_width=stroke, stroke_fill=(0, 0, 0, alpha))
+
+
+def draw_animated_caption(base, chunks, local, width, height, config, is_hook=False):
+    """Render the active caption chunk with word-by-word karaoke highlighting."""
+    if not chunks:
+        return base
+    chunk = next((c for c in chunks if c["start"] <= local < c["end"]), None)
+    if chunk is None:
+        if local >= chunks[-1]["end"]:
+            chunk = chunks[-1]
+        else:
+            return base
+
+    base_size = int(config.get("caption_size") or max(54, min(110, int(width * 0.076))))
+    if is_hook:
+        base_size = int(base_size * 1.12)
+    font = get_font(base_size, True)
+    stroke = max(5, base_size // 9)
+    line_h = int(base_size * 1.16)
+    max_text_width = width * 0.86
+    center_rel = float(config.get("caption_center_y", 0.50 if is_hook else 0.72))
+    center_y = int(height * center_rel)
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    space_w = draw.textlength(" ", font=font)
+
+    # Wrap chunk words to fit the safe width.
+    lines = []
+    current = []
+    current_w = 0.0
+    for word in chunk["words"]:
+        ww = draw.textlength(word["text"], font=font)
+        add = ww if not current else ww + space_w
+        if current and current_w + add > max_text_width:
+            lines.append(current)
+            current = [word]
+            current_w = ww
+        else:
+            current.append(word)
+            current_w += add
+    if current:
+        lines.append(current)
+
+    # Entrance (slide-up + fade) and gentle exit fade.
+    chunk_age = local - chunk["start"]
+    enter = clamp(chunk_age / 0.14, 0.0, 1.0)
+    exit_fade = clamp((chunk["end"] - local) / 0.10, 0.0, 1.0)
+    block_alpha = enter * exit_fade
+    y_slide = int((1.0 - ease_in_out(enter)) * 26)
+
+    total_h = len(lines) * line_h
+    top = center_y - total_h // 2 + y_slide
+
+    for li, line in enumerate(lines):
+        widths = [draw.textlength(w["text"], font=font) for w in line]
+        line_w = sum(widths) + space_w * (len(line) - 1)
+        x = (width - line_w) / 2.0
+        cy = top + li * line_h + line_h // 2
+        for word, ww in zip(line, widths):
+            cx = x + ww / 2.0
+            color = _caption_color_for(word, local)
+            word_font = font
+            # Active word "pop": briefly larger right after it becomes spoken.
+            if color is CAPTION_ACCENT:
+                pop_age = local - word["start"]
+                pop = 1.0 + 0.16 * max(0.0, 1.0 - pop_age / 0.18)
+                if pop > 1.01:
+                    word_font = get_font(int(base_size * pop), True)
+            a = int(255 * block_alpha * (1.0 if color is not CAPTION_UPCOMING else 0.82))
+            _draw_caption_word(draw, word["text"], int(cx), int(cy), word_font, color, a, stroke)
+            x += ww + space_w
+
+    return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
 
 def pulse_at(p, center, width):
@@ -1495,6 +1649,21 @@ def render_video(config, basename=None):
     output = render_dir / f"{basename}.mp4"
     vignette = make_vignette(width, height)
 
+    # Precompute viral word-by-word caption timelines (sourced from spoken script).
+    captions_enabled = bool(config.get("animated_captions", config.get("captions_enabled", True)))
+    caption_max_words = int(config.get("caption_max_words", 3))
+    caption_uppercase = bool(config.get("caption_uppercase", True))
+    caption_chunks_by_scene = {}
+    first_scene_id = config["scenes"][0].get("id", "1") if config.get("scenes") else None
+    if captions_enabled:
+        for i, scene in enumerate(config["scenes"], 1):
+            sid = scene.get("id", str(i))
+            ctext = (scene.get("caption") or scene.get("script") or "").strip()
+            sdur = max(0.1, float(scene["end"]) - float(scene["start"]))
+            caption_chunks_by_scene[sid] = build_caption_chunks(
+                ctext, sdur, caption_max_words, caption_uppercase
+            )
+
     assets = {
         scene.get("id", str(i)): scene_image(config, scene, asset_dir, width, height)
         for i, scene in enumerate(config["scenes"], 1)
@@ -1597,6 +1766,16 @@ def render_video(config, basename=None):
                 )
             base = ImageEnhance.Contrast(base).enhance(float(scene.get("contrast", 1.06)))
             base = add_grain(base, frame_no, strength=int(scene.get("grain", config.get("grain", 18))))
+            if captions_enabled:
+                base = draw_animated_caption(
+                    base,
+                    caption_chunks_by_scene.get(scene_id, []),
+                    local,
+                    width,
+                    height,
+                    config,
+                    is_hook=(scene_id == first_scene_id),
+                )
             writer.write(cv2.cvtColor(np.array(base), cv2.COLOR_RGB2BGR))
     finally:
         clip_paths = {scene_id: clip.path for scene_id, clip in clips.items()}
