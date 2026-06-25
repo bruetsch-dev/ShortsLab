@@ -3799,31 +3799,47 @@ def run_project(form, status_cb=None):
     audio_path = safe_copy_audio(form.get("audio_path", ""), project_dir)
     speaker_image_path = form.get("speaker_image_path", "")
     audio_analysis = None
+    word_timeline_cache = None
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
-    
+
     if audio_path and form.get("use_audio_timing", "on") == "on":
         if audio_duration:
             log(status_cb, f"Measured speech audio duration: {audio_duration:.2f}s")
-        else:
-            log(status_cb, "Could not measure audio duration locally; Gemini duration will be used.")
-        log(status_cb, f"Analyzing audio with Gemini 3.5 Flash: {audio_path.name}")
+        # Primary timing source: local frame-accurate forced alignment (faster-whisper).
         try:
-            audio_analysis = analyze_audio_with_gemini(
-                audio_path,
-                title,
-                script,
-                status_cb=status_cb,
-                audio_duration=audio_duration,
-            )
-            analysis_path = project_dir / "input" / "audio_analysis.json"
-            analysis_path.write_text(json.dumps(audio_analysis, indent=2), encoding="utf-8")
-            transcript = clean_text(audio_analysis.get("transcript", ""))
-            if transcript and not script:
-                script = transcript
+            import voice_align
+            if voice_align.available():
+                log(status_cb, "Aligning script to voice (faster-whisper) for frame-accurate timing...")
+                audio_analysis, word_timeline_cache = voice_align.analysis_from_audio(
+                    audio_path, script_text=script, duration=audio_duration, status_cb=status_cb,
+                )
+                if audio_analysis:
+                    if not script:
+                        script = clean_text(audio_analysis.get("transcript", ""))
+                    log(status_cb, f"Voice timing locked from forced alignment ({len(word_timeline_cache)} words).")
+            else:
+                log(status_cb, "faster-whisper not installed; falling back to Gemini for audio timing.")
         except Exception as exc:
-            if not script:
-                raise RuntimeError(f"Gemini audio analysis failed and no text script was provided: {exc}") from exc
-            log(status_cb, f"Gemini audio analysis failed; falling back to text timing: {exc}")
+            log(status_cb, f"Local alignment failed ({exc}); trying Gemini fallback.")
+            audio_analysis = None
+        # Fallback only if the local aligner is unavailable or produced nothing.
+        if not audio_analysis:
+            try:
+                log(status_cb, f"Analyzing audio with Gemini 3.5 Flash: {audio_path.name}")
+                audio_analysis = analyze_audio_with_gemini(
+                    audio_path, title, script, status_cb=status_cb, audio_duration=audio_duration,
+                )
+                transcript = clean_text(audio_analysis.get("transcript", ""))
+                if transcript and not script:
+                    script = transcript
+            except Exception as exc:
+                if not script:
+                    raise RuntimeError(f"Audio analysis failed and no text script was provided: {exc}") from exc
+                log(status_cb, f"Audio timing fell back to estimated text timing: {exc}")
+                audio_analysis = None
+        if audio_analysis:
+            (project_dir / "input" / "audio_analysis.json").write_text(
+                json.dumps(audio_analysis, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if not script:
         raise RuntimeError("Paste a text script or upload a speech audio file.")
@@ -4092,25 +4108,25 @@ def run_project(form, status_cb=None):
 
     # Frame-accurate word timing: align the known script to the actual voice so
     # word-by-word captions and scene cuts land exactly on the spoken beats.
+    # Reuse the timeline already computed for the primary timing source when available.
     if audio_path and config.get("scenes"):
         try:
             import voice_align
-            if voice_align.available():
+            timeline = word_timeline_cache
+            if not timeline and voice_align.available():
                 log(status_cb, "Aligning script to voice for frame-accurate word timing...")
                 timeline = voice_align.word_timeline(str(audio_path), script_text=script, status_cb=status_cb)
-                if timeline:
-                    voice_align.snap_scene_boundaries(
-                        config["scenes"], timeline, float(config.get("duration") or 0.0)
+            if timeline:
+                voice_align.snap_scene_boundaries(
+                    config["scenes"], timeline, float(config.get("duration") or 0.0)
+                )
+                for scene in config["scenes"]:
+                    scene["word_timings"] = voice_align.words_in_window(
+                        timeline, float(scene["start"]), float(scene["end"])
                     )
-                    for scene in config["scenes"]:
-                        scene["word_timings"] = voice_align.words_in_window(
-                            timeline, float(scene["start"]), float(scene["end"])
-                        )
-                    config["word_timing_source"] = "forced_alignment"
-                    log(status_cb, f"Frame-accurate word timing applied to captions and cuts ({len(timeline)} words).")
-                else:
-                    log(status_cb, "Word alignment returned no words; captions use estimated timing.")
-            else:
+                config["word_timing_source"] = "forced_alignment"
+                log(status_cb, f"Frame-accurate word timing applied to captions and cuts ({len(timeline)} words).")
+            elif not voice_align.available():
                 log(status_cb, "faster-whisper not installed; captions use estimated word timing.")
         except Exception as exc:
             log(status_cb, f"Word alignment skipped ({exc}); captions use estimated timing.")

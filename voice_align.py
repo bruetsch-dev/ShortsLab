@@ -138,6 +138,46 @@ def word_timeline(audio_path, script_text=None, model_name=DEFAULT_MODEL,
     return aligned if ratio >= 0.5 else asr_words
 
 
+def sentences_from_words(words, max_gap=0.7, max_words=14):
+    """Group the word timeline into sentence-level [{start,end,text}] segments."""
+    sentences, cur = [], []
+    for w in words:
+        cur.append(w)
+        end_sentence = (w["word"][-1:] in ".!?"
+                        or len(cur) >= max_words
+                        or (cur and len(cur) > 1 and w is not cur[0]
+                            and w["start"] - cur[-2]["end"] > max_gap))
+        if end_sentence:
+            sentences.append({"start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3),
+                              "text": " ".join(x["word"] for x in cur)})
+            cur = []
+    if cur:
+        sentences.append({"start": round(cur[0]["start"], 3), "end": round(cur[-1]["end"], 3),
+                          "text": " ".join(x["word"] for x in cur)})
+    return sentences
+
+
+def analysis_from_audio(audio_path, script_text=None, duration=None, status_cb=None):
+    """Build a Gemini-shaped timing analysis from local forced alignment.
+
+    Returns (analysis_dict, word_timeline). The analysis mimics the audio-analysis
+    schema the rest of the pipeline already consumes (transcript, duration_seconds,
+    sentence_timestamps) so faster-whisper can replace Gemini as the timing source.
+    """
+    timeline = word_timeline(audio_path, script_text=script_text, status_cb=status_cb)
+    if not timeline:
+        return None, []
+    sentences = sentences_from_words(timeline)
+    transcript = " ".join(w["word"] for w in timeline)
+    analysis = {
+        "transcript": transcript,
+        "duration_seconds": round(float(duration) if duration else timeline[-1]["end"], 3),
+        "sentence_timestamps": sentences,
+        "timing_source": "forced_alignment",
+    }
+    return analysis, timeline
+
+
 def snap_scene_boundaries(scenes, timeline, total_duration=0.0, tolerance=0.28):
     """Nudge each scene cut onto the nearest spoken word onset (so cuts hit the beat).
 
