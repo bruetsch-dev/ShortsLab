@@ -1397,12 +1397,12 @@ def progress_state(status, logs):
         ("Reasoning Agent pre-render edit audit starting", 78),
         ("Reasoning Agent pre-render audit", 79),
         ("Rendering final 9:16 MP4", 80),
-        ("Rendering frames", 84),
-        ("Mixing audio", 86),
-        ("Encoding final MP4", 87),
-        ("Creating review sheets", 88),
-        ("Scene review sheet", 90),
-        ("Shot review sheet", 92),
+        ("Rendering frames", 80),
+        ("Mixing audio", 93),
+        ("Encoding final MP4", 94),
+        ("Creating review sheets", 94),
+        ("Scene review sheet", 95),
+        ("Shot review sheet", 96),
         ("Reasoning Agent review pass 1/2 starting", 93),
         ("Reviewing video with Reasoning Agent", 94),
         ("Reasoning Agent requested correction", 96),
@@ -1430,6 +1430,14 @@ def progress_state(status, logs):
         if text and not text.startswith("PREVIEW_IMAGE|"):
             activity = text
             break
+    # Frame rendering is the longest phase; let the bar climb with the real
+    # frame percentage (80 -> 92) instead of sitting on a single fixed value.
+    if progress < 93:
+        for line in reversed(logs):
+            match = re.search(r"Rendering frames:\s*(\d+)\s*%", str(line))
+            if match:
+                progress = max(progress, min(92, 80 + round(int(match.group(1)) * 0.12)))
+                break
     activity = re.sub(r"\s+", " ", activity).strip()
     if len(activity) > 150:
         activity = activity[:147].rstrip() + "..."
