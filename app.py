@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import agent_core
+import sfx_agent
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1052,6 +1053,7 @@ def form_page():
       </div>
       <div class="nav-actions">
         <button type="button" class="button secondary" onclick="document.getElementById('load-modal').classList.add('active')">Load Project</button>
+        <a class="button secondary" href="/sfx">Add SFX</a>
         <a class="button secondary" href="/assets">Assets</a>
       </div>
     </div>
@@ -1168,6 +1170,56 @@ def form_page():
     return page("Autonomous Shorts Agent", body)
 
 
+def sfx_page():
+    body = """
+    <div class="top">
+      <div class="brand">
+        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
+        <div>
+          <h1>AI Sound-Effect Pass</h1>
+          <p class="sub">Upload a finished Short and an Opus&nbsp;4.8 agent adds fitting sound effects &mdash; whooshes on image changes, impacts and stingers to punch key spoken moments &mdash; mixed quietly under your existing audio. The video stream stays untouched (lossless).</p>
+        </div>
+      </div>
+      <div class="nav-actions">
+        <a class="button secondary" href="/">New project</a>
+        <a class="button secondary" href="/assets">Assets</a>
+      </div>
+    </div>
+    <form method="post" action="/sfx-run" enctype="multipart/form-data">
+      <section class="stack">
+        <div class="panel accent">
+          <label>Finished Short (video)</label>
+          <input type="file" name="video_file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required>
+          <div class="hint">Rendered vertical MP4 / MOV / WebM. The video is copied losslessly; only the audio gets the new sound effects mixed in.</div>
+        </div>
+        <div class="panel">
+          <label>Planning agent</label>
+          <select name="reasoning_model">
+            <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
+            <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
+          </select>
+          <div class="hint">The agent detects scene changes, reads the timed transcript, and chooses sound effects from your local <code>soundeffects/</code> library.</div>
+        </div>
+        <button type="submit">Add sound effects</button>
+      </section>
+
+      <section class="stack">
+        <div class="loaded-media-panel">
+          <h2 style="margin-bottom: 12px;">How the agent works</h2>
+          <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
+            <li><strong>Scene detection</strong> &mdash; ffmpeg finds every hard image/scene change.</li>
+            <li><strong>Transcription</strong> &mdash; Gemini&nbsp;3.5 Flash transcribes the speech with timing.</li>
+            <li><strong>Opus&nbsp;4.8 planning</strong> &mdash; the agent places whooshes on cuts and impacts/stingers to emphasise key spoken words and reveals.</li>
+            <li><strong>Lossless mix</strong> &mdash; the chosen effects are mixed quietly under your audio; the picture is copied bit-for-bit.</li>
+          </ol>
+          <div class="hint" style="margin-top: 16px;">You get the enhanced video plus the original and a JSON plan of every effect and why it was placed.</div>
+        </div>
+      </section>
+    </form>
+    """
+    return page("AI Sound-Effect Pass", body)
+
+
 def save_upload(file_info, job_id):
     if not file_info or not file_info.get("data") or not file_info.get("filename"):
         return ""
@@ -1282,6 +1334,64 @@ def start_job(fields, files):
     return job_id
 
 
+def start_sfx_job(fields, files):
+    job_id = str(int(time.time() * 1000))
+    fields = dict(fields)
+    video_path = save_upload(files.get("video_file"), job_id)
+    reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued."],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "sfx",
+        }
+    if not video_path:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "No video uploaded."
+            JOBS[job_id]["logs"].append("Error: no video uploaded.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+
+    def worker():
+        try:
+            status_cb("Started.")
+            result = sfx_agent.enhance_video_with_sfx(
+                video_path, reasoning_model=reasoning_model, status_cb=status_cb
+            )
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
 def cancel_job(job_id):
     with JOB_LOCK:
         job = JOBS.get(job_id)
@@ -1372,6 +1482,15 @@ def progress_state(status, logs):
     steps = [
         ("Queued.", 2),
         ("Started.", 5),
+        # SFX post-production pass (uploaded video -> Opus-planned sound effects)
+        ("Loaded video:", 8),
+        ("Detecting scene changes", 16),
+        ("Transcribing speech with Gemini", 34),
+        ("planning sound effects", 52),
+        ("sound-effect event", 64),
+        ("after spacing/dedup", 72),
+        ("under the original audio", 84),
+        ("SFX enhancement complete", 99),
         ("Estimated speaking time", 8),
         ("Analyzing audio", 10),
         ("Gemini audio timing", 14),
@@ -1760,6 +1879,7 @@ def render_outputs(result, job_id):
         return ""
     items = [
         ("Final video", "video", True),
+        ("SFX plan", "sfx_plan", False),
         ("No audio render", "video_no_audio", False),
         ("No SFX render", "video_no_sfx", False),
         ("Seedance audio only render", "video_seedance_audio_only", False),
@@ -1908,6 +2028,7 @@ def assets_page():
         <div class="sub">Previous runs, renders, review sheets, generated images, Seedance clips, and downloaded web media.</div>
       </div>
       <div class="nav-actions">
+        <a class="button secondary" href="/sfx">Add SFX</a>
         <a class="button secondary" href="/">New project</a>
       </div>
     </div>
@@ -2113,6 +2234,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_static_asset(Path(parsed.path).name)
         elif parsed.path == "/assets":
             self.send_bytes(assets_page())
+        elif parsed.path == "/sfx":
+            self.send_bytes(sfx_page())
         elif parsed.path == "/ui-state":
             self.send_bytes(json.dumps(load_ui_state()).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/project-preset":
@@ -2205,6 +2328,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(303)
             self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
+            self.end_headers()
+            return
+        if parsed.path == "/sfx-run":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                fields, files = parse_multipart(content_type, body)
+            else:
+                fields, files = {}, {}
+            job_id = start_sfx_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()
             return
         if parsed.path != "/run":

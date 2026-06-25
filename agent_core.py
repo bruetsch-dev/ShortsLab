@@ -1169,16 +1169,24 @@ def analyze_audio_with_gemini(audio_path, title, script_hint, status_cb=None, au
         "max_tokens": 3600,
         "response_format": {"type": "json_object"},
     }
+
+    def _attempt(timeout):
+        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=timeout)
+        content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+        if not content:
+            raise RuntimeError("Gemini returned empty content.")
+        analysis = extract_json_object(content)
+        if not isinstance(analysis, dict):
+            raise RuntimeError("Gemini audio analysis did not return a JSON object.")
+        return analysis
+
     try:
-        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
+        analysis = _attempt(180)
     except Exception as url_exc:
-        log(status_cb, f"Gemini audio URL mode failed, trying inline audio: {url_exc}")
+        # URL mode can return an empty / non-JSON body; retry with inline base64 audio.
+        log(status_cb, f"Gemini audio URL mode failed ({url_exc}); trying inline audio...")
         payload["messages"] = gemini_audio_messages_with_base64(title, script_hint, audio_path, audio_duration=audio_duration)
-        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=240)
-    content = data["choices"][0]["message"]["content"]
-    analysis = extract_json_object(content)
-    if not isinstance(analysis, dict):
-        raise RuntimeError("Gemini audio analysis did not return a JSON object.")
+        analysis = _attempt(240)
     analysis["uploaded_audio_url"] = audio_url
     return analysis
 

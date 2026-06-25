@@ -153,6 +153,26 @@ Tunable keys:
 - `hook_hold_seconds` (default `0.6`) / `hook_punch_amount` (default `0.12`): opening hook
   intensity and duration.
 
+## AI Sound-Effect Pass
+
+Open **Add SFX** in the top bar (or go to `/sfx`) to enhance an already-finished Short. Upload a
+rendered vertical video and an Opus 4.8 agent adds fitting sound effects, then mixes them quietly
+under the existing audio. The pipeline:
+
+1. **Scene detection** — ffmpeg finds every hard image/scene change.
+2. **Transcription** — Gemini 3.5 Flash transcribes the speech with timing (URL mode with an inline
+   base64 fallback).
+3. **Opus 4.8 planning** — the agent places whooshes/transitions on cuts and impacts, booms, or
+   stingers to emphasise key spoken words and reveals, choosing categories from the local
+   `soundeffects/shorts_ready/` library.
+4. **Lossless mix** — the chosen effects are mixed under the original audio with a limiter while the
+   video stream is copied bit-for-bit (`-c:v copy`), so the picture quality is untouched.
+
+If no API key is set or the LLM fails, a deterministic fallback still places transition whooshes on
+the detected cuts. The job outputs the enhanced video, the original, and a JSON plan listing every
+effect, its time, the file used, and why it was placed. Enhanced videos are written to
+`projects/_sfx_enhanced/`.
+
 ## Notes
 
 When speech audio is uploaded, the final MP4 keeps that audio primary. Background music and SFX are mixed quietly underneath. The app does not generate voiceover by itself.
