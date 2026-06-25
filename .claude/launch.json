@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "shorts-app",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["app.py", "--host", "127.0.0.1", "--port", "7866"],
+      "port": 7866
+    }
+  ]
+}

@@ -231,11 +231,21 @@ def app_style():
         background-size: 36px 36px, 36px 36px, auto;
         color: var(--text);
       }
-      main { max-width: 95vw; margin: 0 auto; padding: 30px; }
-      h1 { font-size: 31px; margin: 0; letter-spacing: 0; text-shadow: 0 1px 0 #000; }
+      main { max-width: 1480px; margin: 0 auto; padding: 30px clamp(20px, 4vw, 48px); }
+      h1 {
+        font-size: 30px; margin: 0; letter-spacing: -.4px; font-weight: 900; line-height: 1.05;
+        background: linear-gradient(96deg, #fff8eb 0%, var(--accent) 58%, var(--accent-2) 100%);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+      }
       h2 { font-size: 18px; margin: 0 0 12px; color: #fff8eb; }
-      .top { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 22px; }
-      .sub { color: var(--muted); margin-top: 7px; max-width: 780px; line-height: 1.45; }
+      .top { display: flex; justify-content: space-between; gap: 24px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 26px; }
+      .brand { display: flex; gap: 16px; align-items: center; min-width: 0; }
+      .brand-mark {
+        width: 56px; height: 56px; flex: 0 0 auto; border-radius: 14px; object-fit: cover;
+        border: 1px solid var(--line-strong);
+        box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.08);
+      }
+      .sub { color: var(--muted); margin-top: 7px; max-width: 760px; line-height: 1.5; font-size: 14px; }
       .nav-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; min-width: 170px; }
       .nav-actions .button { width: auto; min-width: 132px; }
       form { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; align-items: start; }
@@ -378,10 +388,8 @@ def app_style():
         transition: width .35s ease;
         animation: progress-stripes 1.2s linear infinite;
       }
-      .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); gap: 16px; align-items: stretch; margin-top: 16px; }
-      .job-layout > .panel, .job-layout > aside { min-height: min(76vh, 860px); }
-      .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; }
-      .job-layout > .panel, .job-layout > aside { min-width: 0; }
+      .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; margin-top: 16px; }
+      .job-layout > .panel, .job-layout > aside { min-height: min(76vh, 860px); min-width: 0; }
       .log-box { height: calc(min(78vh, 900px) - 70px); max-height: none; overflow: auto; font-size: 13px; }
       .preview-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
       .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: #06080a; border: 1px solid #253036; border-radius: 5px; transition: transform .18s ease, filter .18s ease; }
@@ -478,6 +486,33 @@ def app_style():
       .modal-content h2 { margin-top: 0; }
       .modal-close { float: right; cursor: pointer; color: var(--muted); border: none; background: none; font-size: 20px; }
       .modal-close:hover { color: #fff; }
+      /* --- Form-page polish --- */
+      .mode-selector { background: linear-gradient(180deg, #15191d, #11151a); }
+      .mode-selector > label { font-size: 16px; letter-spacing: .2px; }
+      .run-mode-btn { min-width: 168px; }
+      .button.primary { border-color: var(--accent-2); background: #2c1d0a; color: #fff7e9; box-shadow: inset 0 -3px 0 rgba(240,180,95,.95), 0 12px 28px rgba(0,0,0,.34); }
+      .loaded-media-panel {
+        background: linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
+        border: 1px solid var(--line) !important; border-radius: 10px !important;
+        box-shadow: 0 18px 50px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.045);
+      }
+      #project-media-hint {
+        text-align: center; min-height: 220px; padding: 64px 24px;
+        border: 1px dashed #303c42; border-radius: 10px; color: var(--muted);
+        background: repeating-linear-gradient(45deg, rgba(255,255,255,.014) 0 12px, transparent 12px 24px);
+      }
+      body { overflow-x: hidden; }
+      @media (max-width: 820px) {
+        .top { display: flex; flex-direction: column; align-items: stretch; gap: 14px; }
+        .brand { gap: 10px; flex-direction: column; align-items: flex-start; min-width: 0; }
+        .brand > div { min-width: 0; width: 100%; }
+        .brand-mark { width: 46px; height: 46px; }
+        h1 { font-size: 23px; }
+        .sub { font-size: 13px; max-width: 100%; overflow-wrap: anywhere; }
+        .nav-actions { justify-content: stretch; min-width: 0; }
+        .nav-actions .button { flex: 1; min-width: 0; }
+        .run-mode-btn { min-width: 0; }
+      }
     </style>
     """
 
@@ -494,7 +529,6 @@ def app_script():
             form.querySelector("[name='use_llm_search']").checked = true;
             form.querySelector("[name='use_llm_video_review']").checked = true;
             form.querySelector("[name='allow_seedance']").checked = true;
-            form.querySelector("[name='allow_gpt']").checked = true;
             form.querySelector("[name='allow_gpt']").checked = true;
           } else if (mode === "repair_recut") {
             document.getElementById("load-modal").classList.add("active");
@@ -1009,9 +1043,12 @@ def form_page():
 
     body = f"""
     <div class="top">
-      <div>
-        
-        
+      <div class="brand">
+        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
+        <div>
+          <h1>Autonomous Shorts Agent</h1>
+          <p class="sub">Paste a script, optionally drop in voice audio, and the Auto Director builds a viral 9:16 Short end to end &mdash; sourcing footage, writing word-by-word captions, and rendering with cinematic motion.</p>
+        </div>
       </div>
       <div class="nav-actions">
         <button type="button" class="button secondary" onclick="document.getElementById('load-modal').classList.add('active')">Load Project</button>
