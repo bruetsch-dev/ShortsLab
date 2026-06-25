@@ -121,6 +121,21 @@ The agent:
 - removes ordinary MP4 container metadata and chapters from the final output as a privacy cleanup step
 - saves the autonomous decision plan in `input/director_plan.json`
 
+## Frame-Accurate Voice Timing
+
+When you upload a voiceover, the agent runs **forced alignment** of the known script against the
+actual voice (`voice_align.py`, faster-whisper, GPU when available) to get frame-accurate start/end
+for every word. That word timeline then drives the edit:
+
+- **Captions** highlight each word exactly when it is spoken (no estimation).
+- **Scene cuts** snap onto the nearest spoken word onset, so the picture changes on the beat.
+- **Sound effects** (the SFX pass) line up emphasis with the spoken words.
+
+ASR errors are corrected back to the script text (e.g. a misheard "Sellers" becomes the script's
+"Cellars") while keeping the accurate spoken timing. If `faster-whisper` is not installed or no voice
+is uploaded, captions fall back to length-weighted estimated timing. Install with
+`pip install faster-whisper` (see `requirements.txt`); a Whisper model downloads on first use.
+
 ## Viral Captions
 
 The render burns in **word-by-word animated captions** ("karaoke" style) sourced from each scene's

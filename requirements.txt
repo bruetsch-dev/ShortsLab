@@ -1,0 +1,8 @@
+# Core render pipeline
+opencv-python
+numpy
+Pillow
+
+# Frame-accurate word-level voice alignment (captions/cuts/SFX timing)
+# Runs on GPU (CUDA) when available, else CPU. Downloads a Whisper model on first use.
+faster-whisper

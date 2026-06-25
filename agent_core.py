@@ -4067,6 +4067,32 @@ def run_project(form, status_cb=None):
         config["audio_timing_source"] = audio_timing_source
         config["audio_sync_locked"] = bool(audio_duration and audio_timing_source and audio_timing_source != "fallback")
         log(status_cb, "Uploaded speech audio is used for timing only; it will not be mixed into the final video.")
+
+    # Frame-accurate word timing: align the known script to the actual voice so
+    # word-by-word captions and scene cuts land exactly on the spoken beats.
+    if audio_path and config.get("scenes"):
+        try:
+            import voice_align
+            if voice_align.available():
+                log(status_cb, "Aligning script to voice for frame-accurate word timing...")
+                timeline = voice_align.word_timeline(str(audio_path), script_text=script, status_cb=status_cb)
+                if timeline:
+                    voice_align.snap_scene_boundaries(
+                        config["scenes"], timeline, float(config.get("duration") or 0.0)
+                    )
+                    for scene in config["scenes"]:
+                        scene["word_timings"] = voice_align.words_in_window(
+                            timeline, float(scene["start"]), float(scene["end"])
+                        )
+                    config["word_timing_source"] = "forced_alignment"
+                    log(status_cb, f"Frame-accurate word timing applied to captions and cuts ({len(timeline)} words).")
+                else:
+                    log(status_cb, "Word alignment returned no words; captions use estimated timing.")
+            else:
+                log(status_cb, "faster-whisper not installed; captions use estimated word timing.")
+        except Exception as exc:
+            log(status_cb, f"Word alignment skipped ({exc}); captions use estimated timing.")
+
     config_path = project_dir / "config" / "project.json"
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     config["_config_path"] = str(config_path.resolve())

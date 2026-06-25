@@ -98,10 +98,36 @@ def detect_scene_cuts(video_path, ffmpeg, threshold=0.30, min_gap=0.45):
     return spaced
 
 
+def _phrases_from_words(words, max_gap=0.6, max_words=12):
+    """Group frame-accurate ASR words into short timed phrases for the LLM prompt."""
+    phrases, cur = [], []
+    for w in words:
+        if cur and (w["start"] - cur[-1]["end"] > max_gap
+                    or len(cur) >= max_words
+                    or cur[-1]["word"][-1:] in ".!?"):
+            phrases.append({"start": round(cur[0]["start"], 2), "end": round(cur[-1]["end"], 2),
+                            "text": " ".join(x["word"] for x in cur)})
+            cur = []
+        cur.append(w)
+    if cur:
+        phrases.append({"start": round(cur[0]["start"], 2), "end": round(cur[-1]["end"], 2),
+                        "text": " ".join(x["word"] for x in cur)})
+    return phrases
+
+
 def transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=None):
-    """Extract audio and return timed phrases [{start,end,text}] via Gemini."""
-    if not os.environ.get("WAVESPEED_API_KEY"):
-        log(status_cb, "No WAVESPEED_API_KEY; skipping transcription (cuts-only mode).")
+    """Extract audio and return timed phrases [{start,end,text}].
+
+    Prefers the local frame-accurate word aligner (faster-whisper); falls back to
+    Gemini if the aligner is unavailable and an API key is set.
+    """
+    try:
+        import voice_align
+        local_ok = voice_align.available()
+    except Exception:
+        local_ok = False
+    if not local_ok and not os.environ.get("WAVESPEED_API_KEY"):
+        log(status_cb, "No local aligner and no WAVESPEED_API_KEY; cuts-only mode.")
         return []
     audio_path = video_path.with_suffix(".sfx_audio.mp3")
     try:
@@ -110,6 +136,16 @@ def transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=None
               str(audio_path)], timeout=180)
         if not audio_path.exists():
             return []
+        # Prefer the local frame-accurate word aligner (no hallucination on real speech).
+        try:
+            import voice_align
+            if voice_align.available():
+                log(status_cb, "Transcribing speech with local word aligner...")
+                asr_words = voice_align.transcribe_words(str(audio_path), status_cb=status_cb)
+                if asr_words:
+                    return _phrases_from_words(asr_words)
+        except Exception as exc:
+            log(status_cb, f"Local transcription failed ({exc}); trying Gemini...")
         log(status_cb, "Transcribing speech with Gemini 3.5 Flash...")
         analysis = agent_core.analyze_audio_with_gemini(
             audio_path, title="Uploaded Short", script_hint="", status_cb=status_cb,

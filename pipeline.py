@@ -296,30 +296,44 @@ def _caption_word_weight(word):
     return weight
 
 
-def build_caption_chunks(text, duration, max_words=3, uppercase=True):
+def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None):
     """Turn a spoken line into timed caption chunks (1-`max_words` words each).
 
-    Each word gets a [start, end] window inside the scene so the active word can
-    be highlighted in sync with the voice even without word-level ASR timing.
+    When `word_times` (frame-accurate [{word,start,end}] in scene-local seconds) is
+    given, the words land exactly on the voice like a real edit. Otherwise each
+    word's window is estimated inside the scene by length/syllable weight.
     """
-    text = (text or "").strip()
-    if not text or duration <= 0:
+    if duration <= 0:
         return []
-    raw_words = [w for w in re.split(r"\s+", text) if w.strip()]
-    if not raw_words:
-        return []
-    words = [w.upper() if uppercase else w for w in raw_words]
-    weights = [_caption_word_weight(w) for w in raw_words]
-    total = sum(weights) or 1.0
-    lead = min(0.10, duration * 0.05)
-    tail = min(0.12, duration * 0.05)
-    usable = max(0.10, duration - lead - tail)
     spans = []
-    cursor = lead
-    for word, weight in zip(words, weights):
-        span_d = usable * weight / total
-        spans.append({"text": word, "start": cursor, "end": cursor + span_d})
-        cursor += span_d
+    if word_times:
+        for wt in word_times:
+            word = (wt.get("word") or "").strip()
+            if not word:
+                continue
+            start = max(0.0, float(wt.get("start", 0.0)))
+            spans.append({
+                "text": word.upper() if uppercase else word,
+                "start": start,
+                "end": max(start + 0.05, float(wt.get("end", start))),
+            })
+    else:
+        text = (text or "").strip()
+        raw_words = [w for w in re.split(r"\s+", text) if w.strip()] if text else []
+        if raw_words:
+            words = [w.upper() if uppercase else w for w in raw_words]
+            weights = [_caption_word_weight(w) for w in raw_words]
+            total = sum(weights) or 1.0
+            lead = min(0.10, duration * 0.05)
+            tail = min(0.12, duration * 0.05)
+            usable = max(0.10, duration - lead - tail)
+            cursor = lead
+            for word, weight in zip(words, weights):
+                span_d = usable * weight / total
+                spans.append({"text": word, "start": cursor, "end": cursor + span_d})
+                cursor += span_d
+    if not spans:
+        return []
     chunks = []
     for i in range(0, len(spans), max(1, max_words)):
         group = spans[i:i + max_words]
@@ -1684,7 +1698,8 @@ def render_video(config, basename=None):
             ctext = (scene.get("caption") or scene.get("script") or "").strip()
             sdur = max(0.1, float(scene["end"]) - float(scene["start"]))
             caption_chunks_by_scene[sid] = build_caption_chunks(
-                ctext, sdur, caption_max_words, caption_uppercase
+                ctext, sdur, caption_max_words, caption_uppercase,
+                word_times=scene.get("word_timings"),
             )
 
     assets = {
