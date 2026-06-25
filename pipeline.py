@@ -445,6 +445,29 @@ def scene_punch_zoom(config, scene, p):
     return amount * max(pulse_at(p, float(center), 0.075) for center in centers)
 
 
+def opening_punch_zoom(config, t, local, is_first_scene):
+    """Additive zoom that snaps in at each cut (harder on the opening hook), then settles.
+
+    Always-on pacing energy: every scene start gets a quick punch-in; the first scene also
+    gets a stronger hook hold so the opening frame stops the scroll. Returns a zoom amount >= 0
+    that is added on top of the normal Ken Burns / clip zoom. Stays >= 0 so `cover` framing
+    never reveals edges.
+    """
+    if not bool(config.get("dynamic_zoom", True)):
+        return 0.0
+    extra = 0.0
+    settle = float(config.get("cut_punch_seconds", 0.34))
+    cut_amount = float(config.get("cut_punch_amount", 0.06))
+    if cut_amount > 0 and settle > 0 and local < settle:
+        extra += cut_amount * (1.0 - ease_in_out(clamp(local / settle, 0.0, 1.0)))
+    if is_first_scene:
+        hold = float(config.get("hook_hold_seconds", 0.6))
+        hook_amount = float(config.get("hook_punch_amount", 0.12))
+        if hook_amount > 0 and hold > 0 and t < hold:
+            extra += hook_amount * (1.0 - ease_in_out(clamp(t / hold, 0.0, 1.0)))
+    return extra
+
+
 def draw_arrow(draw, start, end, fill, width=8):
     sx, sy = start
     ex, ey = end
@@ -1718,9 +1741,10 @@ def render_video(config, basename=None):
                     shot_index = scene.get("shots", []).index(shot) + 1
                 except ValueError:
                     shot_index = None
+            extra_zoom = opening_punch_zoom(config, t, local, scene_id == first_scene_id)
             use_clip_frame = scene_id in clips and (shot is None or bool(shot.get("use_clip", True)))
             if use_clip_frame:
-                img = image_fit_cover(clips[scene_id].frame_trimmed(local, seedance_clip_start_trim(config, scene)), (width, height), zoom=1.0, offset=(0, 0))
+                img = image_fit_cover(clips[scene_id].frame_trimmed(local, seedance_clip_start_trim(config, scene)), (width, height), zoom=1.0 + extra_zoom, offset=(0, 0))
             else:
                 motion = dict(scene.get("motion", {}))
                 if shot and shot.get("motion"):
@@ -1737,6 +1761,7 @@ def render_video(config, basename=None):
                 pan_y *= motion_scale
                 zoom = zoom_start + (zoom_end - zoom_start) * ease_in_out(shot_p)
                 zoom += scene_punch_zoom(config, scene, p)
+                zoom += extra_zoom
                 offset = (int((shot_p - 0.5) * pan_x), int((shot_p - 0.5) * pan_y))
                 base_asset = assets[scene_id]
                 if shot_index is not None and (scene_id, shot_index) in shot_assets:

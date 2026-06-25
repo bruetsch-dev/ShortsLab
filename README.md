@@ -138,6 +138,21 @@ Tunable keys in the project config:
   raised automatically).
 - `caption_size`: optional fixed font size; auto-scales from width when unset.
 
+## Pacing & Hook
+
+Every render adds **always-on motion energy**: each scene start snaps in with a quick punch-in
+zoom that settles over ~0.34s, and the first scene gets a stronger **hook hold** so the opening
+frame stops the scroll. The zoom is additive on top of the normal Ken Burns / clip motion and
+stays `>= 1.0`, so `cover` framing never reveals edges.
+
+Tunable keys:
+
+- `dynamic_zoom` (default `true`): master switch for the punch-in/hook motion.
+- `cut_punch_amount` (default `0.06`) / `cut_punch_seconds` (default `0.34`): per-cut snap size
+  and settle time.
+- `hook_hold_seconds` (default `0.6`) / `hook_punch_amount` (default `0.12`): opening hook
+  intensity and duration.
+
 ## Notes
 
 When speech audio is uploaded, the final MP4 keeps that audio primary. Background music and SFX are mixed quietly underneath. The app does not generate voiceover by itself.
