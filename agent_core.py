@@ -1024,29 +1024,29 @@ def normalize_micro_beat_plan(raw_beats, title, script, target_duration):
 def llm_generate_project_title(script, reasoning_model=None, status_cb=None):
     if not os.environ.get("WAVESPEED_API_KEY") or not script.strip():
         return ""
-    log(status_cb, "Auto-generating project title from Voice Script using Reasoning Agent...")
+    log(status_cb, "Auto-generating project title from Voice Script...")
+    payload = {
+        "model": reasoning_model or GPT55_MODEL,
+        "messages": [
+            {"role": "system", "content": "You name short-form videos. Reply with the title only - no quotes, no punctuation marks, no explanation."},
+            {"role": "user", "content": (
+                "Read this voice script and write a short, punchy, curiosity-driven title for a vertical Short "
+                "(2-5 words, Title Case). Hint at the payoff without spoiling it; make someone want to watch.\n\n"
+                f"Script:\n{script}"
+            )},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 24,
+    }
     try:
-        reply = call_wavespeed_chat(
-            [
-                {
-                    "role": "user",
-                    "content": (
-                        "Read the following voice script and generate a short, punchy, "
-                        "cinematic title for a YouTube Short (maximum 4 words). "
-                        "Return ONLY the title as plain text, no quotes or JSON.\n\n"
-                        f"Script:\n{script}"
-                    ),
-                }
-            ],
-            model="gpt-5.5-turbo",
-            temperature=0.7,
-        )
-        title = reply.strip().strip('"').strip("'")
-        if title and len(title) < 50:
+        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=60)
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+        title = content.splitlines()[0].strip().strip('"').strip("'") if content else ""
+        if title and len(title) < 60:
             log(status_cb, f"Auto-generated title: {title}")
             return title
     except Exception as exc:
-        log(status_cb, f"Failed to generate title via GPT: {exc}")
+        log(status_cb, f"Failed to generate title: {exc}")
     return ""
 def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=None, status_cb=None):
     if not os.environ.get("WAVESPEED_API_KEY"):
@@ -1779,16 +1779,24 @@ def llm_auto_director_plan(title, script, scenes, target_duration, media_counts,
         for index, scene in enumerate(scenes, 1)
     ]
     prompt = (
-        "You are the autonomous director for a vertical documentary YouTube Short generator.\n"
-        "Make practical production decisions. The app can use these WaveSpeed APIs: Reasoning Agent for reasoning/search/review, "
-        "Gemini 3.5 Flash for audio timing, GPT Image 2 only for Seedance I2V source images, Seedance image-to-video for selected motion clips, "
+        "You are an elite short-form video editor and autonomous director for vertical 9:16 documentary-style Shorts built to go viral on TikTok, Reels, and YouTube Shorts.\n"
+        "Your job is not to make a slideshow - it is to cut an edit that stops the scroll in the first second, holds attention to the very end, and ideally loops. Make practical production decisions plus a per-scene plan.\n"
+        "Available APIs: Reasoning Agent for reasoning/search/review, Gemini 3.5 Flash for audio timing, GPT Image 2 ONLY for Seedance I2V source images, Seedance image-to-video for selected motion clips, "
         "general web image search/download from DuckDuckGo/Bing plus Wikimedia/Wikipedia as an additional source.\n"
+        "Captions are burned in word-by-word and frame-synced to the voice, and cuts land on the spoken beat - so design a tight, intentional edit where every visual change is motivated by the words.\n"
         "Return strict JSON only with these keys:\n"
         "summary, use_web_images, use_gpt_source_images, use_seedance, use_llm_search, use_llm_video_review,\n"
         "web_image_count, web_images_per_scene, seedance_clip_count,\n"
         "visual_style, pacing, selected_apis, scene_plan.\n"
         "scene_plan must be an array with one item per scene: {scene:number, use_seedance:boolean, needs_gpt_image:boolean, preferred_media:'web|gpt|seedance|local', fit:'cover|contain', motion:'calm|normal|dynamic', visual_intent:string, reason:string, voice_match_score:number, visual_clarity_score:number, motion_score:number, shorts_retention_score:number, historical_or_factual_accuracy_score:number}.\n"
-        "Rules: Seedance is expensive and should be used only when motion really helps: transformation, action, reveal, camera travel, dramatic reconstruction, non-speaking human reaction, object movement, or a machine/action starting. "
+        "RETENTION & HOOK DOCTRINE (optimise the edit, not just the facts):\n"
+        "- Scene 1 is the hook. In the first ~1.5s show the single most striking, shocking, or curiosity-provoking image that matches the opening line. Front-load your strongest visual; never open on a slow establishing shot. Aim shorts_retention_score >= 90 on scene 1.\n"
+        "- Build a retention curve: escalate stakes scene by scene, make every scene earn the next, open a curiosity gap early and pay it off at the end. Cut filler and any shot that does not add new information or tension.\n"
+        "- Pattern-interrupt: vary subject, framing, scale, and motion between neighbouring scenes so it never feels repetitive. No two adjacent scenes should look or move the same way.\n"
+        "- Pace for the platform: punchy beats on key words, the tightest cut on the climax, and where possible an ending image that loops cleanly back to the hook.\n"
+        "- visual_intent must be a concrete cinematic shot (subject, framing, action, emotion) a viewer would understand on mute. Prefer one strong subject over busy collages.\n"
+        "MEDIA RULES:\n"
+        "Seedance is expensive and should be used only when motion really helps: transformation, action, reveal, camera travel, dramatic reconstruction, non-speaking human reaction, object movement, or a machine/action starting. "
         "Use web images for factual proof, historical people, real buildings, real maps, articles/archive material, and quick references under 1.5 seconds. "
         "Use GPT-source-image + Seedance when the scene does not exist as real media, needs reconstruction, is surreal/epic, or needs a consistent visual look. "
         "Priority rule: the voice/text script is the authoritative source for topic, facts, timing, scene meaning, and what must be shown. "
@@ -1815,7 +1823,7 @@ def llm_auto_director_plan(title, script, scenes, target_duration, media_counts,
     payload = {
         "model": reasoning_model or GPT55_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a pragmatic video producer and autonomous media-planning agent. Return compact valid JSON only."},
+            {"role": "system", "content": "You are a world-class short-form video editor and viral director who thinks in hooks, retention curves, and pattern interrupts. You make decisive, taste-driven cuts and return compact valid JSON only."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
@@ -3283,7 +3291,7 @@ def llm_video_review(title, script, visual_script, config, video_path, scene_she
     payload = {
         "model": reasoning_model or GPT55_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a precise short-form video QA agent. Be critical but only recommend changes visible from the provided images."},
+            {"role": "system", "content": "You are an elite short-form video editor and retention analyst doing QA. Judge whether this feels like a deliberately cut edit that stops the scroll and holds attention, not a slideshow - apply the first-second hook test and watch for dead air, repetition, and weak pacing. Be critical, but only recommend changes that are both visible in the provided images and achievable with the listed render-only correction actions."},
             {"role": "user", "content": content},
         ],
         "temperature": 0.1,
