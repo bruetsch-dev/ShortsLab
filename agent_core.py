@@ -694,41 +694,50 @@ def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent
     environment_motion = scene.get("environment_motion") or "natural ambient motion"
     emotional_action = scene.get("emotional_action") or scene.get("emotion") or infer_emotion(script_beat)
     model = str(video_model or "").lower()
+    is_hook = scene_index == 1  # the opener must stop the scroll in the first ~1.3s
+    # Per the video-prompting skill: the prompt TEXT carries narrative + motion only;
+    # model name, aspect ratio and resolution stay out (they are API parameters).
 
     if "ltx" in model:
-        # LTX prompting: ONE flowing paragraph (no lists/line breaks), explicit
-        # motion verbs, sequential phases, and GENTLE physically-plausible motion
-        # (chaotic/fast-twisting motion -> artifacts). The image already sets the look.
+        # LTX-2.3 (official guide): scope motion to clip length -- for a short clip use
+        # ONE main action beat + ONE camera move; do NOT stack subject + camera +
+        # environment at once. Direct layout like blocking, keep texture, use motion
+        # verbs, and keep motion gentle/plausible (chaotic motion -> artifacts).
         idea = f" Use this idea only if it fits the line: {visual_direction}." if visual_direction else ""
+        if is_hook:
+            beat_phrase = (f"Open on immediate, bold motion in the very first frame: {subject_motion}, "
+                           f"while a {camera_motion} drives in.")
+        else:
+            beat_phrase = f"{subject_motion} as a single slow, deliberate {camera_motion} unfolds."
         return (
-            f"Animate this still image as one continuous, cinematic vertical 9:16 documentary shot. {position}"
-            f"It shows: {script_beat}. {objective}.{idea} "
-            f"Initially the camera holds steady on the subject; after a moment a slow, deliberate {camera_motion} begins, "
-            f"while {subject_motion} and {environment_motion} unfold naturally and the mood reads {emotional_action}. "
-            f"{_CLIP_PRESERVE} "
-            "Keep all motion gentle and physically plausible -- no jumping, juggling, fast twisting, morphing or chaotic action. "
-            "Slightly desaturated, realistic, one flowing continuous shot, not a montage. "
+            f"Animate this still as one continuous, cinematic documentary shot. It shows: {script_beat}. {objective}.{idea} "
+            f"{beat_phrase} "
+            "Direct the layout like blocking (clear foreground and background, who faces where) and keep fine texture -- "
+            "fabric, surfaces, environmental wear, edge light. "
+            "One main action beat plus one clear camera move only; keep motion gentle and physically plausible -- "
+            "no jumping, juggling, fast twisting, morphing or chaotic action, and no still-photo stillness. "
+            f"{_CLIP_PRESERVE} Slightly desaturated and realistic, one flowing shot, not a montage. "
             f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT}"
         )[:1200]
 
-    # Seedance 2.0 / 2.0-fast / Happy Horse: lead with the beat + core action (first
-    # words carry the most weight), describe MOTION and CAMERA rather than the subject
-    # (the source image provides it), ~60-160 words, preserve composition.
+    # Seedance 2.0 / 2.0-fast / Happy Horse (official guide): director-style shot
+    # breakdown with literal section labels, chronological action beats, and concrete
+    # VISIBLE physical outcomes (splashes, debris, fabric drag) -- not mood words.
+    hook_lead = "Opening hook shot -- start on bold, immediate motion that grabs attention in the first frame. " if is_hook else ""
+    idea = f"Reference idea (use only if it fits the beat): {visual_direction}. " if visual_direction else ""
+    intent = f"Director intent: {visual_intent}. " if visual_intent else ""
     prompt = (
-        f"Animate this still image for image-to-video. {position}"
-        f"Spoken beat: \"{script_beat}\". Core action: {objective}. "
+        f"Single continuous documentary shot, silent. {position}{hook_lead}"
+        f"Action: {script_beat}; {objective}. {subject_motion}, then {environment_motion}, "
+        "with concrete visible physical detail -- splashes, debris, dust, fabric and surfaces reacting. "
+        f"{idea}{intent}"
+        f"Camera: {camera_motion}. "
+        f"Style: realistic and slightly desaturated, serious; concrete visible behaviour, no abstract mood words. "
+        f"Motion focus: {seedance_motion_focus(scene)} "
         f"{_CLIP_PRESERVE} "
-    )
-    if visual_direction:
-        prompt += f"Motion idea (use only if it fits the beat): {visual_direction}. "
-    if visual_intent:
-        prompt += f"Director intent: {visual_intent}. "
-    prompt += (
-        f"Camera: {camera_motion}. Subject: {subject_motion}. Environment: {environment_motion}. "
-        f"Mood: {emotional_action}. Motion focus: {seedance_motion_focus(scene)} "
-        "Deliver real physical motion with a clear start, action change, and end pose -- not a static frame with only a zoom. "
+        "Keep a clear start, action change and end pose -- not a static frame with only a zoom. "
         f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT} "
-        "Realistic, serious, vertical 9:16, one continuous shot, not a montage."
+        "Realistic, serious, one continuous shot, not a montage."
     )
     return prompt[:1200]
 
