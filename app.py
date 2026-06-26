@@ -874,7 +874,7 @@ def app_script():
           };
           window.applyTier = function (tier) {
             var TIERS = {
-              cheap:  { video_model: "ltx-2.3",           image_model: "google/nano-banana-2/text-to-image", reasoning_model: "z-ai/glm-5.2",              tts_model: "flash" },
+              cheap:  { video_model: "ltx-2.3",           image_model: "google/nano-banana-2/text-to-image", reasoning_model: "google/gemini-3.1-pro-preview", tts_model: "flash" },
               medium: { video_model: "seedance-2.0-fast", image_model: "google/nano-banana-2/text-to-image", reasoning_model: "openai/gpt-5.5",            tts_model: "pro" },
               best:   { video_model: "seedance-2.0",      image_model: "openai/gpt-image-2/text-to-image",   reasoning_model: "anthropic/claude-opus-4.8", tts_model: "pro" }
             };
@@ -1293,8 +1293,8 @@ def form_page():
             <label>Reasoning model</label>
             <select name="reasoning_model">
               <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
+              <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
-              <option value="z-ai/glm-5.2"{' selected' if state.get("reasoning_model") == "z-ai/glm-5.2" else ""}>GLM-5.2 (cheap)</option>
             </select>
           </div>
         </div>

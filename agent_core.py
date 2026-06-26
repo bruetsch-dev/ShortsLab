@@ -53,7 +53,10 @@ WAVESPEED_LLM_API = "https://llm.wavespeed.ai/v1/chat/completions"
 # DuckDuckGo's unofficial image endpoint constantly returns 403 / times out (bot
 # blocking), which stalled every search. Bing + Wikimedia are reliable, so DDG is
 # dropped from the active providers (the duckduckgo_* helpers are kept but unused).
-WEB_IMAGE_SEARCH_PROVIDERS = ("wikimedia", "bing")
+# Bing's scraped image results return trending/SEO/NSFW junk (its HTML no longer
+# honors the query without a real browser session), so it's dropped. Wikimedia/
+# Commons gives relevant, licensed archival images; generation covers the gaps.
+WEB_IMAGE_SEARCH_PROVIDERS = ("wikimedia",)
 
 # Web image candidates whose TITLE matches this are junk/NSFW SEO noise (Bing's
 # scraped results often inject unrelated trending/shopping/adult tiles). They get
@@ -1927,6 +1930,19 @@ def request_text_url(url, timeout=45, min_interval=1.1, referer=""):
 
 
 def post_json_url(url, payload, timeout=75):
+    # Thinking models (Gemini 2.x/3.x, GLM, Qwen, DeepSeek...) spend output tokens
+    # on internal reasoning; a low max_tokens then yields EMPTY content
+    # (finish_reason=length). Give those a generous ceiling so the actual JSON
+    # answer survives after the thinking. GPT/Opus are left untouched.
+    if isinstance(payload, dict) and payload.get("max_tokens"):
+        model = str(payload.get("model", "")).lower()
+        if any(token in model for token in ("gemini", "glm", "qwen", "deepseek", "thinking")):
+            try:
+                if int(payload["max_tokens"]) < 8000:
+                    payload = dict(payload)
+                    payload["max_tokens"] = 8000
+            except (TypeError, ValueError):
+                pass
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -2887,7 +2903,9 @@ def clamp_web_image_target(count):
         value = int(count)
     except (TypeError, ValueError):
         value = 12
-    return max(10, min(15, value))
+    # Floor of 3 (not 10): a short 2-scene script shouldn't chase a 10-image pool
+    # of mostly junk -- that wasted minutes re-searching. Generation fills gaps.
+    return max(3, min(20, value))
 
 
 def web_candidate_pool_target(final_target):
@@ -3173,7 +3191,7 @@ def review_and_correct_web_images(
     review_dir = project_dir / "review"
     last_reviewed_paths = []
     zero_accept_streak = 0
-    for pass_no in range(1, 6):
+    for pass_no in range(1, 4):  # 3 passes max (was 5); each re-search costs ~1 min
         if not paths:
             break
         sheet = create_media_contact_sheet(
@@ -4357,8 +4375,10 @@ def run_project(form, status_cb=None):
     log(status_cb, f"Using {len(scenes_override)} micro-beat(s) as the edit map.")
     if visual_script:
         log(status_cb, "Visual Ablauf prompt applied to scene planning, image prompts, Seedance prompts, and review.")
-    web_image_count = 12
     web_images_per_scene = 2
+    # Scale the web-image pool to the scene count: a 2-scene short needs ~4, not 12.
+    _scene_n = len(scenes_override) if scenes_override else 6
+    web_image_count = max(3, min(16, _scene_n * web_images_per_scene))
     static_gpt_image_count = 0
     seedance_clip_count = 5
     seedance_model_choice = form.get("video_model", "seedance-2.0")
