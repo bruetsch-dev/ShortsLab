@@ -584,43 +584,64 @@ def choose_seedance_scenes(scenes, max_clips=4, preferred_indexes=None, exclude_
     return selected
 
 
-def scene_prompt(title, scene):
+# Image source-frame must also be text-free, or the I2V model inherits/echoes it.
+_IMAGE_NO_TEXT = ("Do not render any text, captions, subtitles, letters, words, numbers, signs, "
+                  "labels, UI, watermark or logo anywhere in the image.")
+
+
+def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
     visual_direction = scene.get("visual_script", "")
     voice_line = scene.get("exact_voice_text") or scene.get("voice_line") or scene["script"]
     objective = scene.get("scene_objective") or scene.get("beat_purpose") or f"Visually answer this voice line: {voice_line}"
     visual_meaning = scene.get("visual_meaning") or scene.get("required_visual_information") or voice_line
-    hook_type = scene.get("visual_hook_type") or infer_visual_hook_type(voice_line)
     must_show = scene.get("must_show") or important_terms(voice_line, 5, SEARCH_NOISE)
-    must_not_show = scene.get("must_not_show") or ["generic cinematic filler", "off-topic symbols", "random book cover", "caption text"]
-    crop_plan = scene.get("crop_plan") or default_crop_plan(hook_type)
+    must_not_show = scene.get("must_not_show") or ["off-topic symbols", "random book cover", "caption text"]
+    topic = humanize_title(title)
+    show_phrase = ", ".join(str(item) for item in must_show[:6])
+    avoid_phrase = ", ".join(str(item) for item in must_not_show[:5])
+    model = str(image_model or "").lower()
+
+    if "nano-banana" in model or "gemini" in model:
+        # Nano-Banana 2 is a reasoning image model: it reads a flowing creative brief,
+        # and comma-separated keyword soup actively hurts it. Use natural sentences and
+        # put the aspect ratio at the very end.
+        parts = [
+            f'Act as an art director and create ONE realistic documentary still for a vertical short about "{topic}".',
+            f'The frame must clearly illustrate this exact spoken line: "{voice_line}". {objective}.',
+            f"Make sure the viewer understands: {visual_meaning}.",
+        ]
+        if show_phrase:
+            parts.append(f"Clearly show {show_phrase}.")
+        if visual_direction:
+            parts.append(f"Use this direction only if it genuinely fits the spoken line, otherwise ignore it: {visual_direction}.")
+        parts.append(
+            "Stage it as a believable, period-accurate mini-documentary reconstruction with cinematic, slightly "
+            "desaturated lighting, clear foreground/midground/background depth, and the main subject frozen at the "
+            "start of a visible action so it can be animated afterwards."
+        )
+        parts.append("Keep it a single coherent scene -- no collage, split-screen, grid or inset images. Every person is fully clothed in period attire; no nudity, no gore.")
+        parts.append(_IMAGE_NO_TEXT)
+        parts.append("Photorealistic and serious in tone, not meme-like. Vertical 9:16 aspect ratio, composition readable on a phone.")
+        return " ".join(part for part in parts if part)
+
+    # GPT-Image-2 (default): structured, skimmable sections with measurable visual
+    # facts (it follows an art-director brief better than dense keyword stacks).
     prompt = (
-        "Use case: historical-scene\n"
-        "Asset type: vertical YouTube Short scene plate\n"
-        f"Short topic: {title}\n"
-        f"Topic lock: every visible subject, object, place, era, and action must clearly support this Short topic: {humanize_title(title)}.\n"
-        f"Exact voice line: {voice_line}\n"
-        f"Scene objective: {objective}\n"
-        f"Visual meaning that must be understood: {visual_meaning}\n"
-        f"Visual hook type: {hook_type}\n"
-        f"Must show: {json.dumps(must_show, ensure_ascii=False)}\n"
-        f"Must not show: {json.dumps(must_not_show, ensure_ascii=False)}\n"
-        f"9:16 crop plan: {json.dumps(crop_plan, ensure_ascii=False)}\n"
-        f"Primary request: create one realistic documentary visual that directly answers this exact voice-script beat: {voice_line}\n"
+        f'Scene: a period-accurate, realistic documentary reconstruction for the short "{topic}"; '
+        "every visible subject, object, place and era must support this topic.\n"
+        f'Subject: one clear main subject that visually answers the spoken line "{voice_line}". '
+        f"Clearly show: {show_phrase}.\n"
+        "Important details: cinematic mini-documentary look, slightly desaturated period palette, soft realistic "
+        "lighting, clear foreground/midground/background depth, 35-50mm feel, the subject frozen at the start of a "
+        f"visible action with room to move. The image must make this understood: {visual_meaning}.\n"
     )
     if visual_direction:
-        prompt += (
-            "Voice/text script priority: the script beat above is authoritative. "
-            "First judge whether the visual direction actually fits this spoken line. "
-            "Use it only if it makes the voice script clearer or more cinematic; adapt weak ideas, and ignore/replace anything that feels mismatched, too literal, off-topic, or less understandable than a better script-matched shot. "
-            f"Visual direction: {visual_direction}\n"
-        )
+        prompt += f"Optional direction (use only if it fits the spoken line, otherwise ignore): {visual_direction}\n"
     prompt += (
-        "Composition/framing: vertical 9:16, readable on phone, main subject clear, no embedded captions.\n"
-        "Seedance I2V readiness: stage the scene with clear foreground/midground/background depth, a subject frozen at the start of a visible action, environmental elements that can move naturally, and camera parallax potential.\n"
-        "Quality rule: the image must answer the voice line, not just create mood. If it would look good but not explain or intensify the spoken sentence, it is wrong.\n"
-        "Style/medium: realistic cinematic mini-documentary reconstruction, serious, not meme-like.\n"
-        "Constraints: one coherent scene or subject, no collage, no split-screen, no grid, no scrapbook, no many inset images, "
-        "no watermark, no logo, no gore, no generated text unless the scene clearly requires a document."
+        "Use case: a vertical 9:16 YouTube Short scene plate and image-to-video source frame that intensifies the "
+        "spoken beat, not just sets a mood.\n"
+        f"Constraints: one coherent scene (no collage, split-screen, grid, scrapbook or inset images); avoid {avoid_phrase}; "
+        f"every figure fully clothed in period attire; no nudity; no gore. {_IMAGE_NO_TEXT}"
     )
     return prompt
 
@@ -654,26 +675,49 @@ def seedance_motion_focus(scene):
     return "beat-specific motion: one unique movement that only visualizes this exact script beat, not a generic repeated action."
 
 
-def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent="", title=""):
+# Shared clip guardrails (model-agnostic): no speech, no on-screen text, keep the
+# source image intact. Reused by every image-to-video model prompt.
+_CLIP_NO_SPEECH = "Silent clip: no speech, voices, dialogue, narration, singing or vocalizations of any kind."
+_CLIP_NO_TEXT = ("ABSOLUTELY NO on-screen text anywhere in the frame: no captions, subtitles, titles, "
+                 "lyrics, letters, words, numbers, signs, labels, UI, watermark or logo.")
+_CLIP_PRESERVE = ("Preserve the source image's composition, colors, subject and clothing exactly; "
+                  "do not add, remove or redraw any people or objects, and keep every figure fully clothed.")
+
+
+def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent="", title="", video_model="seedance-2.0"):
     visual_direction = scene.get("visual_script", "")
     script_beat = str(scene.get("exact_voice_text") or scene.get("voice_line") or scene.get("script", "")).strip().rstrip(".!?")
     position = f"Scene {scene_index}/{total_scenes}. " if scene_index and total_scenes else ""
     objective = scene.get("scene_objective") or scene.get("beat_purpose") or f"Visually answer this voice line: {script_beat}"
-    hook_type = scene.get("visual_hook_type") or infer_visual_hook_type(script_beat)
     camera_motion = scene.get("camera_motion") or "purposeful handheld/parallax camera motion"
     subject_motion = scene.get("subject_motion") or "script-specific visible subject action"
     environment_motion = scene.get("environment_motion") or "natural ambient motion"
     emotional_action = scene.get("emotional_action") or scene.get("emotion") or infer_emotion(script_beat)
-    # Seedance I2V prompting: lead with the beat + core action (first words carry
-    # the most weight), describe MOTION and CAMERA rather than re-describing the
-    # subject (the source image already provides it), and stay ~60-160 words.
-    # "Preserve the source image's composition/colors" is both a consistency win
-    # and the strongest guard against the model inventing new bodies/objects.
+    model = str(video_model or "").lower()
+
+    if "ltx" in model:
+        # LTX prompting: ONE flowing paragraph (no lists/line breaks), explicit
+        # motion verbs, sequential phases, and GENTLE physically-plausible motion
+        # (chaotic/fast-twisting motion -> artifacts). The image already sets the look.
+        idea = f" Use this idea only if it fits the line: {visual_direction}." if visual_direction else ""
+        return (
+            f"Animate this still image as one continuous, cinematic vertical 9:16 documentary shot. {position}"
+            f"It shows: {script_beat}. {objective}.{idea} "
+            f"Initially the camera holds steady on the subject; after a moment a slow, deliberate {camera_motion} begins, "
+            f"while {subject_motion} and {environment_motion} unfold naturally and the mood reads {emotional_action}. "
+            f"{_CLIP_PRESERVE} "
+            "Keep all motion gentle and physically plausible -- no jumping, juggling, fast twisting, morphing or chaotic action. "
+            "Slightly desaturated, realistic, one flowing continuous shot, not a montage. "
+            f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT}"
+        )[:1200]
+
+    # Seedance 2.0 / 2.0-fast / Happy Horse: lead with the beat + core action (first
+    # words carry the most weight), describe MOTION and CAMERA rather than the subject
+    # (the source image provides it), ~60-160 words, preserve composition.
     prompt = (
-        f"Animate this still image for Seedance image-to-video. {position}"
+        f"Animate this still image for image-to-video. {position}"
         f"Spoken beat: \"{script_beat}\". Core action: {objective}. "
-        "Preserve the source image's composition, colors, subject and clothing exactly; "
-        "do not add, remove, or redraw any people or objects, and keep every figure fully clothed. "
+        f"{_CLIP_PRESERVE} "
     )
     if visual_direction:
         prompt += f"Motion idea (use only if it fits the beat): {visual_direction}. "
@@ -683,8 +727,7 @@ def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent
         f"Camera: {camera_motion}. Subject: {subject_motion}. Environment: {environment_motion}. "
         f"Mood: {emotional_action}. Motion focus: {seedance_motion_focus(scene)} "
         "Deliver real physical motion with a clear start, action change, and end pose -- not a static frame with only a zoom. "
-        "Silent clip: no speech, voices, dialogue, narration, singing or vocalizations of any kind. "
-        "ABSOLUTELY NO on-screen text anywhere in the frame: no captions, subtitles, titles, lyrics, letters, words, numbers, signs, labels, UI, watermark or logo. "
+        f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT} "
         "Realistic, serious, vertical 9:16, one continuous shot, not a montage."
     )
     return prompt[:1200]
@@ -1469,7 +1512,7 @@ def motion_from_director(style):
     return {"zoom_start": 1.0, "zoom_end": 1.05, "pan_x": 14, "pan_y": 0}
 
 
-def plan_config(project_dir, title, script, target_duration, allow_seedance=True, max_seedance=3, static_gpt_image_count=4, scenes_override=None, director_plan=None, visual_sections=None, speaker_hook_enabled=False):
+def plan_config(project_dir, title, script, target_duration, allow_seedance=True, max_seedance=3, static_gpt_image_count=4, scenes_override=None, director_plan=None, visual_sections=None, speaker_hook_enabled=False, image_model="openai/gpt-image-2/text-to-image", video_model="seedance-2.0"):
     scenes = scenes_override or parse_timed_script(script, target_duration)
     images, _ = list_media(project_dir)
     try:
@@ -1554,8 +1597,8 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
             },
             "director_reason": directive.get("reason", ""),
             "visual_direction": visual_direction,
-            "prompt": scene_prompt(title, scene) + (f"\nDirector visual intent: {visual_intent}" if visual_intent else ""),
-            "video_prompt": scene_video_prompt(scene, index, len(scenes), visual_intent=visual_intent, title=title),
+            "prompt": scene_prompt(title, scene, image_model=image_model) + (f"\nDirector visual intent: {visual_intent}" if visual_intent else ""),
+            "video_prompt": scene_video_prompt(scene, index, len(scenes), visual_intent=visual_intent, title=title, video_model=video_model),
             "motion": scene_motion,
             "needs_gpt_asset": wants_gpt_asset,
         }
@@ -4532,6 +4575,7 @@ def run_project(form, status_cb=None):
 
     check_cancel(form)
     log(status_cb, "Planning scenes and media...")
+    image_model_choice = (form.get("image_model") or "openai/gpt-image-2/text-to-image").strip()
     config = plan_config(
         project_dir,
         title,
@@ -4544,6 +4588,8 @@ def run_project(form, status_cb=None):
         director_plan=director_plan,
         visual_sections=visual_sections,
         speaker_hook_enabled=speaker_hook_enabled,
+        image_model=image_model_choice,
+        video_model=seedance_model_choice,
     )
     config["project_slug"] = slug
     config["loaded_project_mode"] = recut_mode
@@ -4553,9 +4599,7 @@ def run_project(form, status_cb=None):
     config["wavespeed"]["video_model"] = SEEDANCE_VIDEO_MODELS.get(seedance_model_choice)
     config["wavespeed"]["video_resolution"] = "720p" if seedance_model_choice == "happyhorse-1.1" else "480p"
     config["wavespeed"]["video_enable_web_search"] = seedance_model_choice in ("seedance-2.0", "seedance-2.0-fast")
-    image_model_choice = (form.get("image_model") or "").strip()
-    if image_model_choice:
-        config["wavespeed"]["image_model"] = image_model_choice
+    config["wavespeed"]["image_model"] = image_model_choice  # resolved before plan_config
     config["wavespeed"]["reasoning_model"] = form.get("reasoning_model", "openai/gpt-5.5")
     config["background_music_enabled"] = background_music_enabled
     config["background_music_user_enabled"] = background_music_enabled
