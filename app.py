@@ -575,13 +575,21 @@ def app_style():
       }
       .modal-overlay.active { opacity: 1; pointer-events: auto; }
       .modal-content {
-        background: #111; padding: 30px; border-radius: 8px;
+        position: relative;
+        background: #111; padding: 26px 28px; border-radius: 10px;
         border: 1px solid var(--line); width: 100%; max-width: 600px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        box-shadow: 0 18px 50px rgba(0,0,0,0.5);
       }
-      .modal-content h2 { margin-top: 0; }
-      .modal-close { float: right; cursor: pointer; color: var(--muted); border: none; background: none; font-size: 20px; }
-      .modal-close:hover { color: #fff; }
+      .modal-content h2 { margin-top: 0; padding-right: 36px; }
+      /* high-specificity so it beats the global button rule (no full-width box) */
+      .modal-content .modal-close {
+        position: absolute; top: 10px; right: 12px;
+        width: auto; min-width: 0; margin: 0; padding: 0 6px;
+        border: none; background: none; box-shadow: none;
+        color: var(--muted); font-size: 24px; line-height: 1; font-weight: 400; cursor: pointer;
+      }
+      .modal-content .modal-close::after { display: none; }
+      .modal-content .modal-close:hover { color: #fff; background: none; box-shadow: none; transform: none; }
       /* --- Form-page polish --- */
       .mode-selector { background: linear-gradient(180deg, #15191d, #11151a); }
       .mode-selector > label { font-size: 16px; letter-spacing: .2px; }
@@ -1395,7 +1403,7 @@ def form_page():
         <button class="modal-close" onclick="document.getElementById('load-modal').classList.remove('active')">&times;</button>
         <h2 style="margin-bottom: 15px;">Load previous project (Repair / Recut)</h2>
         <div>
-          <div class="project-load-controls" style="display: flex; flex-direction: column; gap: 8px; max-height: 50vh; overflow-y: auto;">
+          <div class="project-load-controls" style="display: flex; flex-direction: column; align-items: stretch; gap: 8px; max-height: 50vh; overflow-y: auto;">
             {previous_project_options}
           </div>
           <div id="project-load-status" class="hint" style="margin-top: 15px;">Click a project above to load its script, visual direction, audio, and available settings. Web images will appear in the Media Preview.</div>
