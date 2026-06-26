@@ -322,6 +322,21 @@ def form_choice(form, key, allowed, default):
     return value if value in set(allowed) else default
 
 
+_TRUTHY = {"on", "true", "1", "yes", "checked"}
+
+
+def form_flag(form, key, default=True):
+    """Tolerant checkbox/hidden-flag reader.
+
+    The UI sends "on" for an enabled flag, but a loaded project's saved config
+    (or stale client state) may store a boolean serialized as "true"/"True".
+    Accept any common truthy spelling; fall back to ``default`` when absent.
+    """
+    if key not in form:
+        return default
+    return str(form.get(key, "")).strip().lower() in _TRUTHY
+
+
 def recut_mode_label(mode):
     return {
         "recut_existing_only": "recut existing media only",
@@ -4203,25 +4218,34 @@ def load_project_config(slug):
     return config
 
 
-def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
-    """Re-render a project from the timeline editor's edits.
-
-    edits = {scenes:[{id,duration}], removed:[id...], order:[id...],
-             volumes:{voice,seedance,sfx,music}}. Scene timing is recomputed
-    contiguously from the (edited) durations, volumes are mapped onto the config,
-    then pipeline.render_video produces the final MP4.
-    """
-    config = load_project_config(slug)
-    project_dir = PROJECTS_DIR / slug
-    if cancel_event is not None:
-        config["_cancel_event"] = cancel_event
+def apply_timeline_edits_to_config(config, edits, slug):
+    """Apply the timeline editor's edits onto a loaded config IN PLACE so that a
+    render of this config reproduces exactly what the editor shows. Shared by the
+    live render, the Save button and Agent rework."""
     edits = edits or {}
     scenes = config.get("scenes", [])
+    # newly added clips dragged in from the library
+    added_by_id = {}
+    for a in (edits.get("added") or []):
+        aid = str(a.get("id") or "")
+        if not aid:
+            continue
+        asset = a.get("path") or ""
+        added_by_id[aid] = {
+            "id": aid,
+            "name": a.get("label") or "Added clip",
+            "caption": "",
+            "asset": asset,
+            "clip": Path(a["clip"]).name if a.get("clip") else None,
+            "seedance": bool(a.get("kind") == "clip"),
+            "added": True,
+        }
     removed = {str(x) for x in (edits.get("removed") or [])}
     dur_by_id = {str(d.get("id")): d.get("duration") for d in (edits.get("scenes") or []) if d.get("duration") is not None}
     order = edits.get("order")
+    idmap = {str(s.get("id", i)): s for i, s in enumerate(scenes)}
+    idmap.update(added_by_id)
     if order:
-        idmap = {str(s.get("id", i)): s for i, s in enumerate(scenes)}
         scenes = [idmap[str(i)] for i in order if str(i) in idmap] or scenes
 
     new_scenes, t = [], 0.0
@@ -4267,10 +4291,20 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
         config["render_captions"] = bool(edits["captions"])
 
     # Per-event SFX edits (each transition and content effect tuned individually).
-    overrides = {}
+    overrides = dict(config.get("sfx_overrides") or {})
+    custom_sfx = []
     for item in (edits.get("transitions") or []) + (edits.get("sfx") or []):
         eid = str(item.get("id") or "")
         if not eid:
+            continue
+        if item.get("added"):
+            custom_sfx.append({
+                "id": eid, "scene_id": str(item.get("scene_id") or ""),
+                "path": item.get("path") or "", "offset": float(item.get("offset") or 0.0),
+                "volume": max(0.0, min(0.6, float(item.get("volume") or 0.25))),
+                "enabled": item.get("enabled") is not False,
+                "label": item.get("label") or "Sound",
+            })
             continue
         entry = {}
         if item.get("volume") is not None:
@@ -4285,6 +4319,29 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     if overrides:
         config["sfx_overrides"] = overrides
         config["sfx_enabled"] = True
+    if custom_sfx:
+        config["custom_sfx"] = custom_sfx
+    return config
+
+
+def save_timeline_edits(slug, edits):
+    """Persist timeline-editor edits into the project's main config so the editor
+    reloads identically and the next render reproduces the saved state."""
+    config = load_project_config(slug)
+    apply_timeline_edits_to_config(config, edits, slug)
+    project_dir = PROJECTS_DIR / slug
+    out_path = project_dir / "config" / "project.json"
+    out_path.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
+    return {"ok": True, "scenes": len(config.get("scenes", []))}
+
+
+def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
+    """Re-render a project from the timeline editor's edits."""
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    if cancel_event is not None:
+        config["_cancel_event"] = cancel_event
+    apply_timeline_edits_to_config(config, edits, slug)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     config["output_basename"] = f"{slug}_timeline_{stamp}"
@@ -4292,7 +4349,7 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     out_config_path.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
     config["_config_path"] = str(out_config_path)
 
-    log(status_cb, f"Rendering timeline edit: {len(new_scenes)} scenes, {config['duration']:.1f}s...")
+    log(status_cb, f"Rendering timeline edit: {len(config.get('scenes', []))} scenes, {config['duration']:.1f}s...")
     output = pipeline.render_video(config)
     log(status_cb, f"Timeline render complete: {Path(output).name}")
     return {"title": config.get("title", slug), "project_dir": str(project_dir), "video": str(output)}
@@ -4324,18 +4381,41 @@ def run_project(form, status_cb=None):
         consolidate_project_folders(slug, status_cb=status_cb)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
 
+    # A scrape run pulls real TikTok footage, which requires a logged-in connection.
+    # Enforce it up front so we don't burn voiceover/director work on a run that can't
+    # source any clips.
+    if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
+        _scrape_cookies = (str(form.get("scrape_cookies_file", "") or "").strip()
+                           or str(form.get("scrape_cookies", "") or "").strip())
+        if not _scrape_cookies:
+            raise RuntimeError(
+                "Scrape runs require a TikTok connection. Open Clip source → Scrape clips, "
+                "connect TikTok (pick the browser you're signed in to), click Test, then run again."
+            )
+
     visual_script = clean_text(form.get("visual_script", ""))
+    # "Use visual direction" toggle: when off, ignore the visual-direction text entirely.
+    # (UI submits ui_form=1, so an unchecked toggle => off; programmatic runs keep it on.)
+    _vd_default = False if str(form.get("ui_form", "")).strip() else True
+    if not form_flag(form, "use_visual_direction", _vd_default):
+        visual_script = ""
     audio_path = safe_copy_audio(form.get("audio_path", ""), project_dir)
     speaker_image_path = form.get("speaker_image_path", "")
     # Default audio path: synthesize the narration from the script with Gemini TTS
     # (the user picks speaker + voice). An uploaded file, if any, still wins.
-    if not audio_path and form.get("generate_voice", "on") == "on":
+    if not audio_path and form_flag(form, "generate_voice", True):
         audio_path = generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
+        # "Halt after generating speech": pause here until the user approves (or
+        # replaces) the voiceover on the run page. The gate blocks the worker thread.
+        if audio_path and form_flag(form, "halt_after_speech", False):
+            gate = form.get("_speech_gate")
+            if callable(gate):
+                gate(audio_path)
     audio_analysis = None
     word_timeline_cache = None
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
 
-    if audio_path and form.get("use_audio_timing", "on") == "on":
+    if audio_path and form_flag(form, "use_audio_timing", True):
         if audio_duration:
             log(status_cb, f"Measured speech audio duration: {audio_duration:.2f}s")
         # Primary timing source: local frame-accurate forced alignment (faster-whisper).
@@ -4428,14 +4508,15 @@ def run_project(form, status_cb=None):
     static_gpt_image_count = 0
     seedance_clip_count = 5
     seedance_model_choice = form.get("video_model", "seedance-2.0")
-    auto_web_images = form.get("auto_web_images", "on") == "on"
+    auto_web_images = form_flag(form, "auto_web_images", True)
     manual_auto_web_images = auto_web_images
-    allow_gpt = form.get("allow_gpt", "on") == "on"
-    allow_seedance = form.get("allow_seedance", "on") == "on"
-    use_llm_search = form.get("use_llm_search", form.get("use_glm_search", "on")) == "on"
-    use_llm_video_review = form.get("use_llm_video_review", "on") == "on"
-    background_music_enabled = form.get("background_music_enabled", "") == "on"
-    autonomous_director = form.get("autonomous_director", "on") == "on"
+    allow_gpt = form_flag(form, "allow_gpt", True)
+    allow_seedance = form_flag(form, "allow_seedance", True)
+    use_llm_search = form_flag(form, "use_llm_search", form_flag(form, "use_glm_search", True))
+    use_llm_video_review = form_flag(form, "use_llm_video_review", True)
+    background_music_enabled = form_flag(form, "background_music_enabled", False)
+    autonomous_director = form_flag(form, "autonomous_director", True)
+    run_type = form_choice(form, "run_type", {"normal", "audit"}, "normal")
     loaded_project_mode = form_choice(
         form,
         "loaded_project_mode",
@@ -4443,7 +4524,7 @@ def run_project(form, status_cb=None):
         "normal",
     )
     recut_mode = loaded_project_mode if loaded_project_mode != "normal" and requested_slug else "normal"
-    speaker_hook_enabled = form.get("enable_speaker_hook", "") == "on" or recut_mode == "recut_recreate_speaker_clip"
+    speaker_hook_enabled = form_flag(form, "enable_speaker_hook", False) or recut_mode == "recut_recreate_speaker_clip"
     speaker_hook_recreate = recut_mode == "recut_recreate_speaker_clip"
     if speaker_hook_enabled and not allow_seedance:
         allow_seedance = True
@@ -4483,9 +4564,95 @@ def run_project(form, status_cb=None):
             )
     else:
         log(status_cb, "Auto Director disabled; using manual target settings.")
+    # "Smart" run type: inspect what media already exists in the project folder and
+    # only generate the categories that are still empty (keep good media, fill the gaps).
+    audit_existing_media = run_type == "audit"
+    if audit_existing_media:
+        counts = project_media_counts(project_dir)
+        have_web = counts.get("web_images_existing", 0)
+        have_gpt = counts.get("gpt_images_existing", 0)
+        have_seedance = counts.get("seedance_clips_existing", 0)
+        log(status_cb, f"Smart run: existing media — web={have_web}, gpt={have_gpt}, seedance={have_seedance}.")
+        if have_web >= max(1, web_image_count):
+            auto_web_images = False
+            manual_auto_web_images = False
+            log(status_cb, f"Smart run: {have_web} web image(s) already present — skipping new web search.")
+        else:
+            log(status_cb, "Smart run: web image pool is short — will fetch more.")
+        if have_gpt > 0:
+            allow_gpt = False
+            static_gpt_image_count = 0
+            log(status_cb, f"Smart run: {have_gpt} GPT image(s) already present — skipping GPT generation.")
+        if have_seedance > 0:
+            allow_seedance = False
+            seedance_clip_count = min(seedance_clip_count, have_seedance)
+            log(status_cb, f"Smart run: {have_seedance} Seedance clip(s) already present — reusing them, no new clips.")
     if manual_auto_web_images and not auto_web_images:
         auto_web_images = True
         log(status_cb, "Web image search kept enabled by UI setting; every automatic run keeps a 10-15 web-image pool.")
+    # ===== Per-output on/off toggles (the final word; even Smart can't re-enable) =====
+    # A real UI submission includes ui_form=1; an unchecked checkbox then means OFF.
+    # Programmatic runs (recut/replace) omit ui_form, so we keep everything ON.
+    _ui = bool(str(form.get("ui_form", "")).strip())
+    _td = False if _ui else True   # default for an absent toggle
+    out_web = form_flag(form, "out_web_images", _td)
+    out_wiki = form_flag(form, "out_wikimedia", _td)
+    out_gpt = form_flag(form, "out_gpt_images", _td)
+    out_clips = form_flag(form, "out_video_clips", _td)
+    out_sfx = form_flag(form, "out_sfx", _td)
+    out_tr_sfx = form_flag(form, "out_transition_sfx", _td)
+    out_bg = form_flag(form, "out_background_music", False)
+    out_caps = form_flag(form, "out_captions", _td)
+    # wikimedia is currently the only web-image source, so either toggle off kills web images
+    if not (out_web and out_wiki):
+        auto_web_images = False
+        manual_auto_web_images = False
+        log(status_cb, "Output toggle: web/Wikimedia images OFF.")
+    if not out_gpt:
+        allow_gpt = False
+        static_gpt_image_count = 0
+        log(status_cb, "Output toggle: generated images OFF.")
+    if not out_clips:
+        allow_seedance = False
+        seedance_clip_count = 0
+        log(status_cb, "Output toggle: video clips OFF.")
+    background_music_enabled = out_bg
+    # ===== Clip source: generate (AI) vs scrape (real TikTok/Instagram footage) =====
+    clip_source = str(form.get("clip_source", "generate") or "generate").strip().lower()
+    if clip_source not in ("generate", "scrape"):
+        clip_source = "generate"
+    scrape_platforms = [
+        p.strip() for p in str(form.get("scrape_platforms", "tiktok,instagram") or "").replace("\n", ",").split(",")
+        if p.strip()
+    ] or ["tiktok", "instagram"]
+    scrape_terms = str(form.get("scrape_terms", "") or "").strip()
+    try:
+        script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 70)))))
+    except (TypeError, ValueError):
+        script_relevancy = 70
+    if clip_source == "scrape":
+        # Scraped real footage becomes the moving-video layer: it is dropped into the
+        # project's "seedance 2.0" folder so the planner/renderer treat it exactly like
+        # generated clips (captions, SFX, music and the speaker hook are unchanged).
+        # All AI *image* sources are disabled; the video slot stays on but is sourced
+        # from scraping rather than generation.
+        auto_web_images = False
+        manual_auto_web_images = False
+        allow_gpt = False
+        static_gpt_image_count = 0
+        out_web = out_wiki = out_gpt = False
+        allow_seedance = True
+        out_clips = True
+        if not seedance_clip_count or seedance_clip_count < 1:
+            seedance_clip_count = 4
+        log(status_cb, f"Clip source: SCRAPE — pulling real clips from {', '.join(scrape_platforms)} "
+                       f"(style terms: {scrape_terms or 'from script'}; script relevancy {script_relevancy}%). "
+                       "AI image generation is disabled; scraped footage fills the video layer.")
+    output_toggles = {
+        "web_images": out_web, "wikimedia": out_wiki, "gpt_images": out_gpt,
+        "video_clips": out_clips, "sfx": out_sfx, "transition_sfx": out_tr_sfx,
+        "background_music": out_bg, "captions": out_caps,
+    }
     force_new_web_images = False
     if recut_mode != "normal":
         existing_seedance_count = len(existing_seedance_clips(project_dir))
@@ -4572,6 +4739,76 @@ def run_project(form, status_cb=None):
             use_gpt55=use_llm_search,
             reasoning_model=reasoning_model, status_cb=status_cb,
         )
+    # ===== Scrape real clips into the seedance folder (clip_source == "scrape") =====
+    if clip_source == "scrape":
+        try:
+            import clip_scraper
+        except Exception as exc:  # noqa: BLE001
+            clip_scraper = None
+            log(status_cb, f"Scrape: clip_scraper unavailable ({exc.__class__.__name__}); skipping scrape.")
+        if clip_scraper is not None:
+            # Found-footage style = EVERY scene is a real clip, not just a few. Scrape a
+            # pool sized to the whole edit (capped to bound cost), then loop-fill any
+            # shortfall so no scene falls back to a blank card.
+            scene_total = len(scenes_override) if scenes_override else max(1, seedance_clip_count)
+            SCRAPE_CAP = 12
+            want = max(1, min(scene_total, SCRAPE_CAP))
+            # cover long beats without freezing: clips as long as the longest scene
+            try:
+                per_clip = min(8.0, max(4.0, max(float(s["end"]) - float(s["start"]) for s in scenes_override)))
+            except Exception:
+                per_clip = 5.0
+            seedance_target_dir = project_dir / "seedance 2.0"
+            # Hook = a woman when the style is women-forward (the reference channels
+            # always open on an attractive subject as the scroll-stop).
+            lead_query = None
+            if re.search(r"wom(a|e)n|girl|lad(y|ies)|female", scrape_terms or "", re.I):
+                lead_query = getattr(clip_scraper, "DEFAULT_WOMAN_LEAD", None)
+            already = existing_seedance_clips(project_dir)
+            if already and recut_mode == "normal":
+                log(status_cb, f"Scrape: reusing {len(already)} clip(s) already in seedance 2.0.")
+                scraped = list(already)
+            else:
+                with step_watchdog(form, "Clip scrape", limit_s=1200, status_cb=status_cb):
+                    scraped = clip_scraper.scrape_clips(
+                        seedance_target_dir,
+                        scrape_platforms,
+                        scrape_terms,
+                        want,
+                        script_text=script,
+                        script_relevancy=script_relevancy,
+                        per_clip_seconds=per_clip,
+                        lead_query=lead_query,
+                        cookies=(str(form.get("scrape_cookies_file", "") or "").strip()
+                                 or str(form.get("scrape_cookies", "") or "").strip()),
+                        status_cb=status_cb,
+                        cancel_check=lambda: bool(cancellation_event(form) and cancellation_event(form).is_set()),
+                    )
+            if scraped:
+                # Loop-fill: duplicate the downloaded pool (cycling through the unique
+                # clips) until there is one clip file per scene, so the planner can back
+                # every scene with footage instead of falling back to a blank card.
+                if len(scraped) < scene_total:
+                    import shutil as _shutil
+                    pool = list(scraped)
+                    fill_from = len(scraped)
+                    while len(scraped) < scene_total:
+                        src = pool[(len(scraped) - fill_from) % len(pool)]
+                        dst = seedance_target_dir / f"scraped_{len(scraped):02d}.mp4"
+                        try:
+                            _shutil.copyfile(src, dst)
+                            scraped.append(dst)
+                        except Exception:
+                            break
+                    log(status_cb, f"Scrape: looped {len(pool)} unique clip(s) to cover all {scene_total} scenes.")
+                seedance_clip_count = len(scraped)
+                allow_seedance = True
+                log(status_cb, f"Scrape: {len(scraped)} clip(s) ready; backing all {scene_total} scene(s) with footage.")
+            else:
+                allow_seedance = False
+                seedance_clip_count = 0
+                log(status_cb, "Scrape: no clips obtained — this run will use still media only "
+                               "(captions/SFX/voice still apply). Add 'youtube' as a platform or paste clip URLs.")
     max_seedance = seedance_clip_count
     wavespeed_key = os.environ.get("WAVESPEED_API_KEY", "")
 
@@ -4605,7 +4842,20 @@ def run_project(form, status_cb=None):
     config["wavespeed"]["reasoning_model"] = form.get("reasoning_model", "openai/gpt-5.5")
     config["background_music_enabled"] = background_music_enabled
     config["background_music_user_enabled"] = background_music_enabled
-    config["sfx_generation_enabled"] = form.get("generate_missing_sfx", "on") == "on"
+    config["sfx_generation_enabled"] = form_flag(form, "generate_missing_sfx", True)
+    # apply the remaining output toggles onto the render config
+    config["output_toggles"] = output_toggles
+    config["sfx_enabled"] = bool(out_sfx or out_tr_sfx)
+    config["sfx_content_enabled"] = bool(out_sfx)
+    config["transition_sfx_enabled"] = bool(out_tr_sfx)
+    config["use_seedance_clips"] = bool(out_clips) and config.get("use_seedance_clips", True)
+    config["render_captions"] = bool(out_caps)
+    config["use_wikimedia"] = bool(out_wiki)
+    config["halt_after_speech"] = form_flag(form, "halt_after_speech", False)
+    config["clip_source"] = clip_source
+    config["scrape_platforms"] = scrape_platforms
+    config["scrape_terms"] = scrape_terms
+    config["script_relevancy"] = script_relevancy
     log(status_cb, f"Seedance model selected: {seedance_model_choice}.")
     log(status_cb, f"Background music: {'enabled' if background_music_enabled else 'disabled'}.")
     log(status_cb, f"SFX generation fallback: {'enabled' if config['sfx_generation_enabled'] else 'disabled'}.")
@@ -4635,7 +4885,7 @@ def run_project(form, status_cb=None):
         config["visual_script"] = visual_script
     if audio_path:
         config["timing_audio_path"] = str(audio_path)
-        mix_voice = str(form.get("mix_voice_in_final", "on")).lower() == "on"
+        mix_voice = form_flag(form, "mix_voice_in_final", True)
         if mix_voice:
             config["audio_path"] = str(audio_path)
             config["speech_audio_in_final"] = True

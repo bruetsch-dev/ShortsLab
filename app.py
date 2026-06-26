@@ -35,6 +35,7 @@ UI_TEXT_DEFAULTS = {
     "seedance_model": "seedance-2.0",
     "reasoning_model": "openai/gpt-5.5",
     "loaded_project_mode": "normal",
+    "run_type": "normal",
     "speaker_name": "Narrator",
     "tts_voice": "Achernar",
     "tts_model": "flash",
@@ -42,6 +43,12 @@ UI_TEXT_DEFAULTS = {
     "hook_text": "",
     "hook_pause_s": "0.45",
     "speaker_image_path": "",
+    "clip_source": "generate",
+    "scrape_platforms": "tiktok",
+    "scrape_terms": "",
+    "script_relevancy": "70",
+    "scrape_cookies": "",
+    "scrape_cookies_file": "",
 }
 UI_CHECKBOX_DEFAULTS = {
     "autonomous_director": True,
@@ -55,6 +62,17 @@ UI_CHECKBOX_DEFAULTS = {
     "generate_missing_sfx": True,
     "allow_gpt": True,
     "allow_seedance": True,
+    "use_visual_direction": True,
+    "halt_after_speech": False,
+    # per-output on/off toggles (default everything ON)
+    "out_web_images": True,
+    "out_wikimedia": True,
+    "out_gpt_images": True,
+    "out_video_clips": True,
+    "out_sfx": True,
+    "out_transition_sfx": True,
+    "out_background_music": False,
+    "out_captions": True,
 }
 UI_PERSIST_SKIP_FIELDS = {"slug", "loaded_project_mode"}
 
@@ -65,6 +83,213 @@ class RunCancelled(RuntimeError):
 
 def esc(value):
     return html.escape(str(value or ""), quote=True)
+
+
+def _svg(path, size=18):
+    return (f'<svg class="ico" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+            f'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+            f'aria-hidden="true">{path}</svg>')
+
+
+ICON_NEW = _svg('<path d="M12 5v14"/><path d="M5 12h14"/>')
+ICON_FOLDER = _svg('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>')
+ICON_SFX = _svg('<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M19 6.5a8 8 0 0 1 0 11"/>')
+ICON_GRID = _svg('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>')
+ICON_SCRIPT = _svg('<path d="M8 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-5-5z"/><path d="M14 3v5h5"/><path d="M8 13h8"/><path d="M8 17h6"/>')
+ICON_CHILL = _svg('<path d="M4 8h13v4a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5z"/><path d="M17 9h2a2 2 0 0 1 0 4h-2"/><path d="M8 2.5c0 1-1 1.5-1 2.5"/><path d="M12 2.5c0 1-1 1.5-1 2.5"/>')
+ICON_UPLOAD = _svg('<path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M5 20h14"/>')
+ICON_ARROW = _svg('<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>', 15)
+ICON_BACK = _svg('<path d="M19 12H5"/><path d="m11 18-6-6 6-6"/>')
+
+
+def top_nav():
+    """One consistent top nav, identical on every page."""
+    return (
+        '<nav class="nav-actions">'
+        f'<a class="button" href="/?new=1">{ICON_NEW}<span>New project</span></a>'
+        f'<a class="button secondary" href="/assets">{ICON_GRID}<span>Assets</span></a>'
+        '<span class="nav-sep" aria-hidden="true"></span>'
+        f'<a class="button secondary nav-sfx" href="/sfx">{ICON_SFX}<span>SFX master</span></a>'
+        '</nav>'
+    )
+
+
+STEPS_HTML = (
+    '<div class="steps" aria-label="script then chill then upload">'
+    f'<span class="step">{ICON_SCRIPT}<span>script</span></span>'
+    f'<span class="arrow">{ICON_ARROW}</span>'
+    f'<span class="step">{ICON_CHILL}<span>chill</span></span>'
+    f'<span class="arrow">{ICON_ARROW}</span>'
+    f'<span class="step">{ICON_UPLOAD}<span>upload</span></span>'
+    '</div>'
+)
+
+
+def brand_header(back=False):
+    """The one shared top header — identical Shortslab brand on every page.
+
+    `back=True` adds a subtle arrow-only back control on the far left (timeline).
+    """
+    back_html = (
+        '<button type="button" class="back-arrow" aria-label="Back" title="Back" '
+        'onclick="(history.length&gt;1)?history.back():(location.href=\'/assets\')">' + ICON_BACK + '</button>'
+    ) if back else ""
+    return (
+        '<div class="top">'
+        '<div class="top-left">'
+        f'{back_html}'
+        '<div class="brand">'
+        '<img class="brand-mark" src="/static/app_icon.png" alt="" width="52" height="52">'
+        f'<div><h1>Shortslab</h1>{STEPS_HTML}</div>'
+        '</div>'
+        '</div>'
+        f'{top_nav()}'
+        '</div>'
+    )
+
+
+ICON_HELP = _svg('<circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2-3 4"/><path d="M12 17h.01"/>', 15)
+ICON_CLOSE = _svg('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>', 14)
+
+
+def help_tip(text):
+    """A small question-mark whose explanation only shows on hover/focus."""
+    return f'<span class="help" tabindex="0" data-tip="{esc(text)}" aria-label="{esc(text)}">{ICON_HELP}</span>'
+
+
+PRESETS_PATH = ROOT / "presets.json"
+CUSTOM_PRESET_PATH = ROOT / "custom_preset.json"   # legacy single file (migrated in)
+
+# Read-only built-in preset: "found-footage" style like the Japan dark-facts short —
+# ALL AI generation off, clips come from a TikTok/Instagram scrape, loose relevancy.
+BUILTIN_PRESETS = {
+    "\U0001F1EF\U0001F1F5 Japanese Dark Facts": {
+        "speaker_name": "Narrator", "tts_voice": "Charon", "tts_model": "pro",
+        "video_model": "seedance-2.0", "image_model": "openai/gpt-image-2/text-to-image",
+        "reasoning_model": "openai/gpt-5.5",
+        "speaker_image_path": "", "visual_script": "",
+        "use_visual_direction": False, "enable_speaker_hook": False,
+        # no generated images — the video layer is filled by scraped real clips
+        "out_web_images": False, "out_wikimedia": False, "out_gpt_images": False,
+        "out_video_clips": True, "out_sfx": True, "out_transition_sfx": True,
+        "out_background_music": True, "out_captions": True, "halt_after_speech": False,
+        "clip_source": "scrape", "scrape_platforms": "tiktok",
+        "scrape_terms": "japan, japanese women, tokyo street style, salaryman commute, japan daily life, kimono",
+        "script_relevancy": "30",
+    },
+}
+
+
+def load_presets():
+    """User-saved presets as {name: data}. Migrates the legacy single file once."""
+    out = {}
+    try:
+        if PRESETS_PATH.exists():
+            data = json.loads(PRESETS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                out = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        out = {}
+    if not out and CUSTOM_PRESET_PATH.exists():
+        try:
+            legacy = json.loads(CUSTOM_PRESET_PATH.read_text(encoding="utf-8"))
+            if isinstance(legacy, dict) and legacy:
+                out = {"My preset": legacy}
+                _write_presets(out)
+        except Exception:
+            pass
+    return out
+
+
+def _write_presets(presets):
+    tmp = PRESETS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(presets, indent=2), encoding="utf-8")
+    tmp.replace(PRESETS_PATH)
+
+
+def save_named_preset(name, data):
+    name = str(name or "").strip()[:60]
+    if not name or not isinstance(data, dict) or name in BUILTIN_PRESETS:
+        return False
+    try:
+        presets = load_presets()
+        presets[name] = data
+        _write_presets(presets)
+        return True
+    except Exception:
+        return False
+
+
+def delete_named_preset(name):
+    name = str(name or "").strip()
+    try:
+        presets = load_presets()
+        if name in presets:
+            del presets[name]
+            _write_presets(presets)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def test_scrape_connection(cookies):
+    """Probe TikTok/Instagram with the given connection (browser name or cookies.txt
+    path) and report whether real clips are reachable. Returns {ok, message}."""
+    if not cookies:
+        return {"ok": False, "message": "Pick a browser you're signed in to, or give a cookies.txt path."}
+    try:
+        import clip_scraper
+        import yt_dlp
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Scraper unavailable ({exc.__class__.__name__})."}
+    clip_scraper.set_cookies(cookies)
+    try:
+        opts = clip_scraper._ydl_opts({"playlistend": 3, "socket_timeout": 12})
+        targets = [
+            ("TikTok", "https://www.tiktok.com/tag/tokyofashion"),
+            ("TikTok", "https://www.tiktok.com/tag/japan"),
+        ]
+        found, errors = [], []
+        for name, url in targets:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                ents = clip_scraper._entries(info)
+                if ents:
+                    found.append(f"{name} ({len(ents)} clips)")
+                else:
+                    errors.append(f"{name}: no clips")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {exc.__class__.__name__}")
+    finally:
+        clip_scraper.set_cookies(None)
+    if found:
+        return {"ok": True, "message": "Connected — reachable: " + ", ".join(found) + "."}
+    detail = "; ".join(errors) if errors else "nothing returned"
+    return {"ok": False, "message": "Couldn't reach TikTok clips (" + detail + "). Sign in to TikTok "
+                                    "in that browser first; for Chrome/Edge, fully close the browser so its "
+                                    "cookie file can be read."}
+
+
+# These were the old "Advanced options" toggles. They are always on in practice,
+# so the panel is gone and the values ride along as hidden inputs (behaviour kept).
+ADVANCED_ALWAYS_ON = (
+    "autonomous_director", "use_audio_timing", "use_llm_search",
+    "use_llm_video_review", "auto_web_images", "generate_missing_sfx",
+    "allow_gpt", "allow_seedance",
+)
+
+
+def advanced_hidden_inputs(state):
+    parts = []
+    for key in ADVANCED_ALWAYS_ON:
+        on = "on" if state.get(key, True) else ""
+        parts.append(f'<input type="hidden" name="{key}" value="{on}">')
+    # background music keeps its persisted value (off by default)
+    bg = "on" if state.get("background_music_enabled") else ""
+    parts.append(f'<input type="hidden" name="background_music_enabled" value="{bg}">')
+    return "".join(parts)
 
 
 def normalize_ui_state(raw):
@@ -169,7 +394,7 @@ def project_options_html():
         created = time.strftime("%Y-%m-%d %H:%M", time.localtime(project_dir.stat().st_mtime))
         title = project_title_from_files(project_dir)
         slug = project_dir.name
-        items.append(f'<div class="project-list-item" style="padding: 12px; border: 1px solid #334247; border-radius: 5px; cursor: pointer; background: #0f1518; transition: background 0.2s;" onmouseover="this.style.background=\'#1a2429\'" onmouseout="this.style.background=\'#0f1518\'" onclick="window.loadProject(\'{esc(slug)}\')"><div style="font-weight: bold; margin-bottom: 4px;">{esc(title)}</div><div style="font-size: 12px; color: #a8aaa3;">{esc(slug)} &bull; {esc(created)}</div></div>')
+        items.append(f'<div class="project-list-item" style="padding: 13px 15px; border: 1px solid var(--line); border-radius: var(--r-md); cursor: pointer; background: var(--bg-input); color: var(--text); transition: background .16s, border-color .16s;" onmouseover="this.style.background=\'var(--bg-overlay)\';this.style.borderColor=\'var(--accent)\'" onmouseout="this.style.background=\'var(--bg-input)\';this.style.borderColor=\'var(--line)\'" onclick="window.loadProject(\'{esc(slug)}\')"><div style="font-weight: 600; margin-bottom: 4px;">{esc(title)}</div><div style="font-size: 12px; color: var(--faint);">{esc(slug)} &bull; {esc(created)}</div></div>')
     return "".join(items)
 
 
@@ -225,218 +450,409 @@ def project_form_state(project_dir):
 def app_style():
     return """
     <style>
+      /* ===== OVERWORLD — pixel-art neo-brutalist editorial on warm parchment ===== */
       :root {
-        color-scheme: dark;
-        font-family: Inter, Segoe UI, Arial, sans-serif;
-        --bg: #090b0d;
-        --bg-panel: #12161a;
-        --bg-panel-2: #171d21;
-        --line: #2a3438;
-        --line-strong: #536066;
-        --text: #f4f0e7;
-        --muted: #a8aaa3;
-        --accent: #7bd6c5;
-        --accent-2: #f0b45f;
-        --accent-3: #d96b59;
+        color-scheme: light;
+        font-family: "Space Mono", ui-monospace, "Courier New", monospace;
+        --display: "Press Start 2P", "Space Mono", monospace;   /* chunky pixel titles */
+        --pixel: "Silkscreen", "Space Mono", monospace;          /* UI chrome / labels / buttons */
+        --mono: "Space Mono", ui-monospace, monospace;            /* body + code */
+        /* ink + paper */
+        --ink: #17150f;
+        --bg-base: #efe7d6;        /* warm parchment */
+        --bg-raised: #f6f0e3;      /* lighter card */
+        --bg-overlay: #e7ddc8;
+        --bg-input: #fbf7ee;       /* near-white field */
+        --text: #17150f;
+        --muted: #4f4a3c;
+        --faint: #837c68;
+        /* borders — bold ink for the brutalist frames, soft for dividers */
+        --line: #d8cdb4;
+        --line-strong: #17150f;
+        /* accent: editorial blue, with red/green/yellow semantics */
+        --accent: #2f6fd6;
+        --accent-hover: #2660c2;
+        --accent-active: #1f54ad;
+        --accent-subtle: #dbe6fa;
+        --accent-fg: #ffffff;
+        --accent-2: #e8472b;       /* signal red */
+        --success: #2f8a52;
+        --warning: #e0951a;
+        --danger: #e8472b;
+        /* legacy aliases so older rules still resolve */
+        --bg: var(--bg-base); --bg-panel: var(--bg-raised); --bg-panel-2: var(--bg-overlay);
+        --accent-ink: #ffffff; --accent-3: var(--danger); --go: var(--accent);
+        /* radius — small/square brutalist */
+        --r-sm: 2px; --r-md: 4px; --r-lg: 6px; --r-full: 4px;
+        --radius: var(--r-lg); --radius-sm: var(--r-md);
+        /* HARD offset shadows (no blur) — the brutalist signature */
+        --sh-1: 3px 3px 0 var(--ink);
+        --sh-2: 5px 5px 0 var(--ink);
+        --sh-3: 8px 8px 0 var(--ink);
+        --shadow: var(--sh-1);
+        --dur: 120ms; --ease: cubic-bezier(.2,.8,.2,1);
+        --blur: blur(0);
       }
-      * { scrollbar-color: #3c4a4f #0d1012; }
+      * { scrollbar-color: var(--ink) transparent; }
+      *::-webkit-scrollbar { width: 12px; height: 12px; }
+      *::-webkit-scrollbar-thumb { background: var(--ink); border-radius: 0; border: 3px solid var(--bg-base); background-clip: padding-box; }
+      *::-webkit-scrollbar-track { background: transparent; }
       body {
-        margin: 0;
-        min-height: 100vh;
+        margin: 0; min-height: 100vh;
         background:
-          linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
-          linear-gradient(0deg, rgba(255,255,255,.025) 1px, transparent 1px),
-          linear-gradient(180deg, #101418 0%, var(--bg) 58%, #070809 100%);
-        background-size: 36px 36px, 36px 36px, auto;
+          radial-gradient(800px 800px at 92% 4%, rgba(47,111,214,.06), transparent 60%),
+          radial-gradient(620px 620px at 3% 96%, rgba(232,71,43,.05), transparent 60%),
+          var(--bg-base);
         color: var(--text);
+        position: relative; overflow-x: hidden;
       }
-      main { max-width: 1480px; margin: 0 auto; padding: 30px clamp(20px, 4vw, 48px); }
+      main { max-width: 1320px; margin: 0 auto; padding: 26px clamp(18px, 3.5vw, 44px) 60px; position: relative; z-index: 1; }
       h1 {
-        font-size: 30px; margin: 0; letter-spacing: -.4px; font-weight: 900; line-height: 1.05;
-        background: linear-gradient(96deg, #fff8eb 0%, var(--accent) 58%, var(--accent-2) 100%);
-        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+        font-family: var(--display);
+        font-size: 19px; margin: 0; letter-spacing: 0; font-weight: 400; line-height: 1.15;
+        color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.28);
       }
-      h2 { font-size: 18px; margin: 0 0 12px; color: #fff8eb; }
-      .top { display: flex; justify-content: space-between; gap: 24px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 26px; }
-      .brand { display: flex; gap: 16px; align-items: center; min-width: 0; }
-      .brand-mark {
-        width: 56px; height: 56px; flex: 0 0 auto; border-radius: 14px; object-fit: cover;
-        border: 1px solid var(--line-strong);
-        box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.08);
-      }
+      h2 { font-family: var(--pixel); font-size: 15px; margin: 0 0 13px; color: var(--ink); font-weight: 400; letter-spacing: .3px; text-transform: uppercase; }
+      ::selection { background: var(--accent-2); color: #fff; }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .top { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding-bottom: 16px; margin-bottom: 24px; border-bottom: 3px solid var(--ink); }
+      .brand { display: flex; gap: 13px; align-items: center; min-width: 0; }
+      .brand-mark { display: none; }
       .sub { color: var(--muted); margin-top: 7px; max-width: 760px; line-height: 1.5; font-size: 14px; }
-      .nav-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; min-width: 170px; }
-      .nav-actions .button { width: auto; min-width: 132px; }
-      .tagline { font-weight: 800; letter-spacing: .3px; color: #ffe6ad; text-transform: lowercase; }
-      .tagline .dot { color: var(--accent-2); padding: 0 5px; }
+      .ico { flex: 0 0 auto; vertical-align: middle; }
+      /* wordmark logo lockup: a violet glyph block before the title */
+      /* pixel asterisk logo glyph before the wordmark */
+      .brand > div { position: relative; padding-left: 42px; }
+      .brand > div::before {
+        content: "\\002731"; position: absolute; left: 0; top: -2px; width: 30px; height: 30px;
+        display: grid; place-items: center; font-size: 22px; color: var(--accent);
+        text-shadow: 2px 2px 0 var(--ink);
+      }
+      .nav-actions { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+      .nav-actions .button {
+        width: auto; min-width: 0; display: inline-flex; align-items: center; gap: 8px;
+        padding: 9px 14px; font-size: 11px; font-weight: 400; white-space: nowrap;
+        font-family: var(--pixel); text-transform: uppercase; letter-spacing: .3px;
+      }
+      .nav-actions .button .ico { opacity: 1; width: 15px; height: 15px; }
+      .nav-sep { display: none; }
+      .nav-sfx { background: var(--accent-2); color: #fff; border-color: var(--ink); }
+      .nav-sfx:hover { background: #d63d22; }
+      .nav-sfx .ico { color: #fff; }
+      .top-left { display: flex; align-items: center; gap: 0; min-width: 0; }
+      .top-left .back-arrow {
+        flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+        width: 40px; height: 40px; min-width: 0; padding: 0; margin-right: 14px; border-radius: var(--r-md);
+        color: var(--ink); background: var(--bg-raised); border: 2px solid var(--ink); text-decoration: none;
+        box-shadow: var(--sh-1); cursor: pointer;
+        transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+      }
+      .top-left .back-arrow:hover { transform: translate(-2px,-2px); box-shadow: 5px 5px 0 var(--ink); background: var(--bg-raised); }
+      .top-left .back-arrow:active { transform: translate(0,0); box-shadow: 1px 1px 0 var(--ink); }
+      /* breadcrumb pipeline indicator: script // chill // upload */
+      .steps { display: inline-flex; align-items: center; gap: 0; margin-top: 10px; font-family: var(--pixel); }
+      .steps .step {
+        display: inline-flex; align-items: center; gap: 7px;
+        font-size: 11px; font-weight: 400; letter-spacing: .4px; color: var(--faint); text-transform: uppercase;
+        padding: 4px 9px; border-radius: 0;
+      }
+      .steps .step .ico { width: 14px; height: 14px; color: var(--faint); }
+      .steps .step:first-child { color: var(--accent-2); }
+      .steps .step:first-child .ico { color: var(--accent-2); }
+      .steps .arrow { display: inline-flex; color: var(--faint); padding: 0 2px; font-weight: 700; }
+      .steps .arrow .ico { display: none; }
+      .steps .arrow::before { content: "//"; font-family: var(--mono); font-size: 12px; }
       .create-bar {
         grid-column: 1 / -1;
         position: sticky; top: 10px; z-index: 30;
-        display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap;
-        margin-bottom: 22px; border: 1px solid var(--line-strong);
-        background: linear-gradient(180deg, rgba(34,25,11,.95), rgba(18,18,20,.95));
-        box-shadow: 0 14px 34px rgba(0,0,0,.4);
+        display: flex; flex-direction: column; gap: 15px;
+        padding: 17px 19px; border-radius: var(--r-lg);
+        margin-bottom: 22px; border: 3px solid var(--ink);
+        background: var(--bg-raised);
+        box-shadow: var(--sh-2);
       }
-      .create-bar-models { display: flex; gap: 14px; flex: 1; flex-wrap: wrap; min-width: 0; }
-      .create-bar .field { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 190px; }
-      .create-bar .field label { margin: 0; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
-      .create-short-btn { width: auto; min-width: 200px; font-size: 16px; font-weight: 800; padding: 14px 26px; align-self: stretch; }
-      @media (max-width: 720px) { .create-short-btn { width: 100%; } }
-      .tier-row { flex-basis: 100%; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-      .tier-label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 700; }
-      .tier-btns { display: flex; gap: 10px; flex: 1; min-width: 280px; }
-      .create-bar .tier-btns .tier-btn { flex: 1 1 0; }
-      .tier-btn {
-        width: auto; min-width: 104px; display: flex; flex-direction: column; align-items: center; gap: 1px;
-        padding: 8px 16px; line-height: 1.15; font-weight: 800; cursor: pointer;
-        border: 1px solid var(--line-strong); border-radius: 10px; background: #161a1d; color: #f3efe6;
-        transition: transform .12s ease, border-color .12s ease, background .12s ease;
+      .cbar-row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-end; }
+      .cbar-cell { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+      .cbar-cell.tiers, .cbar-cell.runtype { flex: 1 1 300px; }
+      .cbar-models .cbar-cell { flex: 1 1 200px; }
+      .cbar-cap { font-family: var(--pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 400; display: inline-flex; align-items: center; gap: 6px; }
+      .cbar-cap::before { content: "\\025A0"; color: var(--accent-2); font-size: 9px; }
+      .cbar-cap .cbar-save-btn { width: auto; min-width: 0; padding: 0; margin: 0; line-height: 1; font-size: 14px; background: transparent; color: var(--muted); border: 0; border-radius: 0; box-shadow: none; cursor: pointer; }
+      .cbar-cap .cbar-save-btn:hover { background: transparent; box-shadow: none; transform: none; color: var(--accent); }
+      .cbar-cell select { padding: 10px 12px; font-size: 13px; }
+      .cbar-divider { align-self: stretch; width: 3px; background: var(--ink); margin: 2px 2px; flex: 0 0 auto; }
+      @media (max-width: 760px) { .cbar-divider { display: none; } }
+      /* segmented control — chunky pixel cards */
+      .tier-btns { display: flex; gap: 7px; }
+      .tier-btns .tier-btn {
+        flex: 1 1 0; width: auto; min-width: 0;
+        display: flex; flex-direction: column; align-items: center; gap: 2px;
+        padding: 8px 8px 7px; line-height: 1.15; font-weight: 700; font-size: 12px; cursor: pointer;
+        border: 2px solid var(--ink); border-radius: var(--r-md);
+        background: var(--bg-input); color: var(--muted); box-shadow: var(--sh-1);
+        transition: transform var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
       }
-      .tier-btn small { font-weight: 600; font-size: 11px; color: var(--muted); }
-      .tier-btn:hover { transform: translateY(-1px); border-color: var(--accent-2); background: #1d2226; }
-      .tier-btn.tier-active { border-color: var(--accent); background: #2c1d0a; color: #fff7e9; box-shadow: inset 0 -2px 0 rgba(240,180,95,.8); }
-      .tier-btn.tier-active small { color: #f6dcae; }
-      .tier-hint { flex: 1; min-width: 180px; margin: 0; }
-      .action-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+      .tier-btns .tier-btn::after { display: none; }
+      .tier-btns .tier-btn b { display: block; font-family: var(--pixel); font-weight: 400; font-size: 11px; line-height: 1.2; text-transform: uppercase; }
+      .tier-btns .tier-btn small { display: block; font-weight: 700; font-size: 11px; color: var(--faint); line-height: 1.1; margin-top: 2px; }
+      .tier-btns .tier-btn:hover { color: var(--ink); transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
+      .tier-btn.tier-active, .runtype-btns .tier-btn.run-active {
+        background: var(--accent); color: #fff; border-color: var(--ink);
+        box-shadow: var(--sh-1); transform: none;
+      }
+      .tier-btn.tier-active small, .runtype-btns .tier-btn.run-active small { color: #fff !important; }
+      /* cheap -> best price ramp (preset only) */
+      .cbar-cell.tiers .tier-btn:nth-child(1) small { color: var(--success); }
+      .cbar-cell.tiers .tier-btn:nth-child(2) small { color: var(--warning); }
+      .cbar-cell.tiers .tier-btn:nth-child(3) small { color: var(--accent-2); }
+      .create-bar .create-short-btn {
+        flex: 0 0 auto; align-self: flex-end; width: auto; min-width: 0;
+        padding: 13px 26px; font-size: 12px; font-weight: 400; letter-spacing: .4px;
+        font-family: var(--pixel); text-transform: uppercase;
+        border-radius: var(--r-md); color: #fff; border: 2px solid var(--ink);
+        background: var(--accent); box-shadow: var(--sh-2);
+      }
+      .create-bar .create-short-btn::after { display: none; }
+      .create-bar .create-short-btn:hover {
+        transform: translate(-2px,-2px); background: var(--accent-hover);
+        box-shadow: 7px 7px 0 var(--ink);
+      }
+      .create-bar .create-short-btn:active { transform: translate(0,0); box-shadow: 2px 2px 0 var(--ink); }
+      @media (max-width: 720px) { .create-bar .create-short-btn { width: 100%; align-self: stretch; } }
+      .help { display: inline-flex; align-items: center; justify-content: center; color: var(--faint); cursor: help; vertical-align: middle; position: relative; }
+      .help:hover, .help:focus { color: var(--accent); outline: none; }
+      .help::after {
+        content: attr(data-tip);
+        position: absolute; left: 50%; top: calc(100% + 8px); transform: translateX(-50%) translateY(-4px);
+        width: max-content; max-width: 260px; padding: 10px 13px; z-index: 80;
+        background: var(--ink);
+        color: var(--bg-base); border: 2px solid var(--ink); border-radius: var(--r-md);
+        font-family: var(--mono); font-size: 12px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; text-align: left;
+        box-shadow: var(--sh-2); white-space: normal;
+        opacity: 0; pointer-events: none; transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+      }
+      .help:hover::after, .help:focus::after { opacity: 1; transform: translateX(-50%) translateY(0); }
+      .script-wrap { position: relative; }
+      /* highlight overlay + textarea MUST share identical metrics (font/size/padding)
+         so the colored hook lines up with the textarea's caret and wrapping. */
+      .script-wrap textarea, .script-highlight {
+        font-family: var(--mono);
+        font-size: 13.5px; line-height: 1.6; letter-spacing: 0;
+      }
+      .script-wrap textarea { position: relative; background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--accent); }
+      /* the textarea text is transparent (the highlight layer renders it) so we must
+         re-show the placeholder explicitly, otherwise -webkit-text-fill-color hides it. */
+      .script-wrap textarea::placeholder { color: var(--faint); -webkit-text-fill-color: var(--faint); }
+      .script-wrap textarea::selection { background: var(--accent-subtle); -webkit-text-fill-color: var(--text); }
+      .script-highlight {
+        position: absolute; inset: 0; margin: 0; pointer-events: none; overflow: hidden;
+        box-sizing: border-box; border: 1px solid transparent; border-radius: var(--r-md);
+        padding: 11px 13px; min-height: 360px;
+        white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word; color: var(--text);
+      }
+      .script-highlight .hook-mark { color: #fff; -webkit-text-fill-color: #fff; font-weight: 700; background: var(--accent-2); border-radius: 2px; box-shadow: 0 0 0 1px var(--ink); }
+      .hook-controls { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+      .hook-controls .hook-btn { width: auto; min-width: 0; flex: 0 0 auto; padding: 8px 13px; font-size: 10px; }
+      @media (max-width: 820px) { .script-highlight { min-height: 300px; } }
+      .action-btns { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; }
       .action-btns .action-btn {
-        width: auto; flex: 1 1 150px; min-width: 140px;
+        width: auto; min-width: 0;
         display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
-        padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px;
-        background: #12181b; color: #d7d2c6; font-weight: 800; cursor: pointer; line-height: 1.2;
-        transition: transform .12s ease, border-color .12s ease, background .12s ease;
+        padding: 9px 13px; border: 2px solid var(--ink); border-radius: var(--r-md);
+        background: var(--bg-input); color: var(--ink); font-weight: 700; cursor: pointer; line-height: 1.25; box-shadow: var(--sh-1);
+        transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease);
       }
-      .action-btns .action-btn small { font-weight: 600; font-size: 11px; color: var(--muted); }
-      .action-btns .action-btn:hover { transform: translateY(-1px); border-color: var(--accent-2); }
-      .action-btns .action-btn.active { border-color: var(--accent); background: #2c1d0a; color: #fff7e9; }
-      .action-btns .action-btn.active small { color: #f6dcae; }
+      .action-btns .action-btn small { font-weight: 700; font-size: 11px; color: var(--faint); }
+      .action-btns .action-btn:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
+      .action-btns .action-btn.active { border-color: var(--ink); background: var(--accent); color: #fff; }
+      .action-btns .action-btn.active small { color: #fff; }
       .speaker-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-bottom: 10px; max-height: 232px; overflow-y: auto; padding: 2px; }
-      .speaker-tile { width: 100%; padding: 0; border: 2px solid var(--line); border-radius: 8px; overflow: hidden; background: #06080a; cursor: pointer; aspect-ratio: 3 / 4; transition: border-color .12s ease, transform .12s ease; }
+      .speaker-tile { width: 100%; padding: 0; border: 2px solid var(--ink); border-radius: var(--r-md); overflow: hidden; background: var(--bg-input); cursor: pointer; aspect-ratio: 3 / 4; box-shadow: var(--sh-1); transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
       .speaker-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
-      .speaker-tile:hover { border-color: var(--accent-2); transform: translateY(-1px); }
-      .speaker-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(240,180,95,.4); }
+      .speaker-tile:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); }
+      .speaker-tile.selected { box-shadow: 0 0 0 3px var(--accent), var(--sh-1); }
       .speaker-upload { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 8px; }
       .speaker-upload .hint { margin: 0; }
-      form { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; align-items: start; }
-      label { display: block; font-weight: 850; margin-bottom: 7px; color: #fff8eb; }
+      /* "+" upload tile inside the speaker gallery */
+      .speaker-tile.speaker-add { display: grid; place-items: center; background: transparent; border: 2px dashed var(--ink); box-shadow: none; }
+      .speaker-tile.speaker-add:hover { background: var(--bg-input); transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); }
+      .speaker-tile.speaker-add.dragover { background: var(--accent-subtle); border-color: var(--accent); }
+      .speaker-add-plus { font-family: var(--mono); font-size: 34px; font-weight: 700; color: var(--ink); line-height: 1; }
+      /* panel header with a top-right on/off switch */
+      .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+      .panel-head label { margin: 0; }
+      .toggle-panel.off .panel-body { opacity: .42; pointer-events: none; filter: grayscale(.4); }
+      /* a label-wrapped checkbox is just the toggle switch (no box around it) */
+      label.switch { display: inline-flex; padding: 0; margin: 0; cursor: pointer; }
+      label.switch input[type="checkbox"] { margin: 0; }
+      .otoggles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 11px 22px; }
+      .otoggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; font-family: var(--mono); text-transform: none; letter-spacing: 0; font-size: 13.5px; font-weight: 700; color: var(--ink); }
+      .otoggle input[type="checkbox"] { margin: 0; }
+      @media (max-width: 560px){ .otoggles { grid-template-columns: 1fr; } }
+      /* --- Clip source --- */
+      .csrc-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .csrc-btn {
+        width: auto; min-width: 0; margin: 0; padding: 11px 12px; text-align: left;
+        background: var(--bg-input); color: var(--ink);
+        border: 1px solid var(--line-strong); border-radius: var(--r-md); box-shadow: var(--sh-1); cursor: pointer;
+      }
+      .csrc-btn::after { display: none; }
+      .csrc-btn b { display: block; font-family: var(--pixel); font-weight: 400; font-size: 11px; text-transform: uppercase; line-height: 1.2; }
+      .csrc-btn small { display: block; font-weight: 700; font-size: 11px; color: var(--faint); margin-top: 3px; }
+      .csrc-btn:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
+      .csrc-btn.csrc-active { background: var(--accent); border-color: var(--accent-active); color: #fff; box-shadow: var(--sh-2); }
+      .csrc-btn.csrc-active small { color: rgba(255,255,255,.82); }
+      .scrape-settings { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line-strong); }
+      .scrape-lbl { margin-top: 12px; }
+      .scrape-lbl:first-child { margin-top: 0; }
+      .scrape-terms { min-height: 64px; resize: vertical; }
+      .relv-val { color: var(--accent); font-weight: 700; }
+      .connect-row { display: flex; gap: 8px; align-items: stretch; }
+      .connect-row select { flex: 1; min-width: 0; margin: 0; }
+      .connect-row .button { width: auto; min-width: 0; margin: 0; padding: 8px 14px; white-space: nowrap; }
+      #connect-status.ok { color: var(--success); }
+      #connect-status.bad { color: var(--accent-2); }
+      .req-tag { display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; color: #fff; background: var(--accent-2); border-radius: var(--r-sm); padding: 1px 5px; vertical-align: middle; }
+      input[type="range"] {
+        -webkit-appearance: none; appearance: none; width: 100%; height: 8px; padding: 0; margin: 6px 0 2px;
+        background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: 999px; box-shadow: none; cursor: pointer;
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none; width: 20px; height: 20px; border-radius: 50%;
+        background: var(--accent); border: 2px solid var(--ink); box-shadow: var(--sh-1); cursor: pointer; margin-top: -1px;
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 18px; height: 18px; border-radius: 50%; background: var(--accent); border: 2px solid var(--ink); cursor: pointer;
+      }
+      .cbar-halt { display: flex; align-items: center; gap: 9px; font-family: var(--pixel); font-size: 10px; text-transform: uppercase; color: var(--muted); margin: 0; cursor: pointer; }
+      .cbar-halt input[type="checkbox"] { margin: 0; }
+      form { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+      label { display: block; font-family: var(--pixel); font-weight: 400; margin-bottom: 9px; color: var(--ink); font-size: 12px; text-transform: uppercase; letter-spacing: .3px; }
       input, textarea, select {
         width: 100%;
         box-sizing: border-box;
-        border: 1px solid var(--line);
-        border-bottom-color: var(--line-strong);
-        border-radius: 4px;
-        padding: 12px 12px;
+        border: 2px solid var(--ink);
+        border-radius: var(--r-md);
+        padding: 11px 13px;
         font-size: 14px;
-        background: #0d1114;
+        font-family: var(--mono);
+        background: var(--bg-input);
         color: var(--text);
         outline: none;
-        transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+        transition: box-shadow var(--dur) var(--ease);
       }
+      select { appearance: none; -webkit-appearance: none; cursor: pointer;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2317150f' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+        background-repeat: no-repeat; background-position: right 12px center; padding-right: 34px; }
+      select option { color: var(--text); background: var(--bg-input); }
+      input::placeholder, textarea::placeholder { color: var(--faint); }
       input:focus, textarea:focus, select:focus {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px rgba(123, 214, 197, .14), inset 0 0 0 1px rgba(123, 214, 197, .2);
-        background: #10171a;
+        border-color: var(--ink);
+        box-shadow: 3px 3px 0 var(--accent);
       }
-      input[type="checkbox"] { accent-color: var(--accent); }
       input[type="file"]::file-selector-button {
-        border: 1px solid #496360;
-        border-radius: 4px;
-        background: #172a2b;
-        color: #e9fff9;
-        padding: 8px 10px;
+        border: 2px solid var(--ink);
+        border-radius: var(--r-md);
+        background: var(--accent); color: #fff;
+        padding: 8px 14px;
         margin-right: 10px;
-        font-weight: 850;
+        font-family: var(--pixel); font-size: 10px; text-transform: uppercase;
+        cursor: pointer;
       }
-      textarea { min-height: 360px; resize: vertical; line-height: 1.45; }
+      /* English custom file picker (the native button text is browser/locale-controlled) */
+      .filepick-input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; padding: 0; margin: -1px; border: 0; }
+      .filepick { display: inline-flex; align-items: center; gap: 12px; cursor: pointer; margin: 0; padding: 0; text-transform: none; }
+      .filepick .filepick-btn { display: inline-flex; align-items: center; gap: 7px; border: 2px solid var(--ink); border-radius: var(--r-md); background: var(--accent); color: #fff; padding: 9px 15px; font-family: var(--pixel); font-size: 10px; text-transform: uppercase; box-shadow: var(--sh-1); }
+      .filepick:hover .filepick-btn { transform: translate(-2px,-2px); box-shadow: 5px 5px 0 var(--ink); }
+      .filepick .filepick-name { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      textarea { min-height: 360px; resize: vertical; line-height: 1.55; }
       textarea.visual-textarea { min-height: 210px; }
       .wide { grid-column: 1 / -1; }
       .panel {
-        background: linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        padding: 16px;
-        box-shadow: 0 18px 50px rgba(0, 0, 0, .34), inset 0 1px 0 rgba(255,255,255,.045);
-        transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+        background: var(--bg-raised);
+        border: 3px solid var(--ink);
+        border-radius: var(--r-lg);
+        padding: 18px;
+        box-shadow: var(--sh-1);
+        transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
       }
-      .panel:hover { border-color: #3e4b50; box-shadow: 0 22px 54px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.055); }
-      .panel.accent { border-left: 4px solid var(--accent); border-top-color: #38595c; }
-      .stack { display: grid; gap: 14px; }
+      .panel.accent { box-shadow: var(--sh-1); border-left: 7px solid var(--accent-2); }
+      .stack { display: grid; gap: 16px; }
       .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .project-load-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }
       .project-load-controls .button { width: auto; min-width: 112px; padding: 12px 14px; }
-      .checks { display: grid; gap: 10px; }
-      .checks label { font-weight: 400; display: flex; gap: 7px; align-items: center; }
+      .checks { display: grid; gap: 11px; }
+      .checks label { font-weight: 500; font-size: 13.5px; color: var(--muted); display: flex; gap: 9px; align-items: center; }
       .checks input { width: auto; }
       button:not(.preview-button), .button {
         position: relative;
-        overflow: hidden;
-        border: 1px solid #b68245;
-        border-radius: 4px;
-        background: #1b1711;
-        color: #fff2df;
-        padding: 13px 18px;
-        font-weight: 950;
+        border: 2px solid var(--ink);
+        border-radius: var(--r-md);
+        background: var(--bg-input);
+        color: var(--ink);
+        padding: 11px 17px;
+        font-family: var(--pixel); font-weight: 400;
+        font-size: 11px; text-transform: uppercase; letter-spacing: .3px;
         cursor: pointer;
         width: 100%;
         text-decoration: none;
         display: inline-block;
         text-align: center;
         box-sizing: border-box;
-        box-shadow: inset 0 -3px 0 rgba(240, 180, 95, .78), 0 10px 24px rgba(0,0,0,.28);
-        transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease;
-      }
-      button:not(.preview-button)::after, .button::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        transform: translateX(-120%) skewX(-18deg);
-        background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent);
-        transition: transform .4s ease;
+        box-shadow: var(--sh-1);
+        transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
       }
       button:not(.preview-button):hover, .button:hover {
-        transform: translateY(-1px);
-        border-color: var(--accent-2);
-        background: #21190f;
-        box-shadow: inset 0 -3px 0 rgba(240, 180, 95, .95), 0 14px 30px rgba(0,0,0,.36);
+        transform: translate(-2px,-2px);
+        box-shadow: 5px 5px 0 var(--ink);
       }
-      button:not(.preview-button):hover::after, .button:hover::after { transform: translateX(120%) skewX(-18deg); }
-      button:not(.preview-button):active, .button:active, .tier-btn:active, .action-btn:active { transform: translateY(1px) scale(.992); box-shadow: inset 0 2px 7px rgba(0,0,0,.45); }
+      button:not(.preview-button):active, .button:active, .tier-btn:active, .action-btn:active { transform: translate(0,0); box-shadow: 1px 1px 0 var(--ink); }
+      button:disabled, .button:disabled { opacity: .45; cursor: not-allowed; transform: none; box-shadow: var(--sh-1); }
       @keyframes page-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-      main { animation: page-fade .34s ease both; }
-      @media (prefers-reduced-motion: reduce) { main { animation: none; } }
-      button[type="submit"] { background: #281908; border-color: var(--accent-2); color: #fff7e9; }
-      .button.secondary {
-        background: #101619;
-        border: 1px solid #37454b;
-        color: #dff8f2;
-        box-shadow: inset 0 -3px 0 rgba(123, 214, 197, .34), 0 10px 24px rgba(0,0,0,.24);
+      main { animation: page-fade .22s var(--ease) both; }
+      @media (prefers-reduced-motion: reduce) { main, * { animation: none !important; } }
+      button[type="submit"] { background: var(--accent); color: #fff; }
+      button[type="submit"]:hover { background: var(--accent-hover); }
+      .button.secondary { background: var(--bg-raised); color: var(--ink); }
+      .button.secondary:hover { background: var(--bg-input); }
+      button.danger, .button.danger { background: var(--accent-2); border-color: var(--ink); color: #fff; }
+      button.danger:hover, .button.danger:hover { background: #d63d22; }
+      /* ===== Apple-style on/off toggle: ALL checkboxes render as switches ===== */
+      input[type="checkbox"] {
+        appearance: none; -webkit-appearance: none; -moz-appearance: none;
+        flex: 0 0 auto; width: 40px; height: 22px; min-width: 40px; padding: 0; margin: 0;
+        border: 2px solid var(--ink); border-radius: 999px; background: var(--bg-overlay);
+        position: relative; cursor: pointer; box-shadow: none;
+        transition: background var(--dur) var(--ease);
       }
-      .button.secondary:hover { background: #142023; border-color: var(--accent); }
-      button.danger, .button.danger {
-        background: #2a1111;
-        border-color: #a84b45;
-        color: #ffe1dc;
-        box-shadow: inset 0 -3px 0 rgba(217, 107, 89, .55), 0 10px 24px rgba(0,0,0,.26);
+      input[type="checkbox"]::before {
+        content: ""; position: absolute; top: 1px; left: 1px; width: 16px; height: 16px;
+        border-radius: 999px; background: var(--ink);
+        transition: transform var(--dur) var(--ease);
       }
-      button.danger:hover, .button.danger:hover { background: #351515; border-color: #d96b59; }
+      input[type="checkbox"]:checked { background: var(--success); }
+      input[type="checkbox"]:checked::before { transform: translateX(18px); background: #fff; }
+      input[type="checkbox"]:hover { box-shadow: 2px 2px 0 var(--ink); }
       pre {
         white-space: pre-wrap;
-        background: #06080a;
-        color: #e9e6db;
+        background: var(--bg-input);
+        color: var(--muted);
+        font-family: var(--mono);
         padding: 14px;
-        border: 1px solid #1c2529;
-        border-radius: 5px;
+        border: 2px solid var(--ink);
+        border-radius: var(--r-md);
         max-height: 480px;
         overflow: auto;
-        line-height: 1.35;
+        line-height: 1.5; font-size: 12.5px;
       }
       a { color: var(--accent); }
       .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
-      .status { display: inline-block; border-radius: 3px; padding: 5px 10px; font-weight: 950; background: #172024; color: #dbe6dc; border: 1px solid #32434a; }
-      .done { background: #10281f; border-color: #2f7258; color: #c8f1df; }
-      .error { background: #341714; border-color: #80392f; color: #ffd9d3; }
-      .cancelled { background: #2a2113; border-color: #8d6a31; color: #ffe0a9; }
-      .cancelling { background: #2a2113; border-color: #8d6a31; color: #ffe0a9; }
-      .hint { color: var(--muted); font-size: 13px; margin-top: 6px; line-height: 1.35; }
+      .status { display: inline-block; border-radius: var(--r-md); padding: 4px 12px; font-family: var(--pixel); font-weight: 400; font-size: 10px; text-transform: uppercase; background: var(--bg-overlay); color: var(--ink); border: 2px solid var(--ink); }
+      .done { background: var(--success); border-color: var(--ink); color: #fff; }
+      .error { background: var(--accent-2); border-color: var(--ink); color: #fff; }
+      .cancelled { background: var(--warning); border-color: var(--ink); color: var(--ink); }
+      .cancelling { background: var(--warning); border-color: var(--ink); color: var(--ink); }
+      .hint { color: var(--faint); font-size: 12.5px; margin-top: 6px; line-height: 1.5; }
       .job-head { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 16px; }
       .job-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
       .job-actions .button { width: auto; min-width: 132px; }
@@ -446,10 +862,10 @@ def app_style():
       .panel-head h2 { margin: 0; }
       .panel-head .button { width: auto; min-width: 94px; padding: 8px 11px; }
       .progress-wrap { margin: 16px 0 18px; }
-      .elapsed-line { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: #9aa4a1; font-size: 13px; font-weight: 800; }
+      .elapsed-line { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: var(--muted); font-size: 13px; font-weight: 600; }
       .progress-label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: #cbc7ba; font-weight: 800; }
       .progress-label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .progress-track { height: 14px; border-radius: 3px; overflow: hidden; background: #0d1114; border: 1px solid var(--line); box-shadow: inset 0 1px 8px rgba(0,0,0,.65); }
+      .progress-track { height: 12px; border-radius: 999px; overflow: hidden; background: var(--bg-base); border: 1px solid var(--line); }
       .progress-fill {
         height: 100%;
         width: 0;
@@ -464,30 +880,30 @@ def app_style():
       .step-chip {
         position: relative; overflow: hidden; flex: 1 1 96px; min-width: 96px;
         display: flex; flex-direction: column; gap: 2px; justify-content: center;
-        padding: 9px 12px; border-radius: 9px; border: 1px solid var(--line);
-        background: #0e1316; color: #8b938f; font-weight: 800; font-size: 12.5px;
-        transition: color .25s ease, border-color .25s ease, background .25s ease;
+        padding: 10px 13px; border-radius: var(--r-md); border: 1px solid var(--line);
+        background: var(--bg-input); color: var(--faint); font-weight: 600; font-size: 12.5px;
+        transition: color .25s var(--ease), border-color .25s var(--ease), background .25s var(--ease);
       }
       .step-chip .step-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; z-index: 0;
-        background: linear-gradient(90deg, rgba(240,180,95,.32), rgba(240,180,95,.08)); }
+        background: linear-gradient(90deg, var(--accent-subtle), rgba(124,92,255,.04)); }
       .step-chip .step-name, .step-chip .step-time { position: relative; z-index: 1; }
       .step-chip .step-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .step-chip .step-time { font-size: 11px; font-weight: 700; color: #c9c3b6; font-variant-numeric: tabular-nums; }
+      .step-chip .step-time { font-size: 11px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
       .step-chip.pending { opacity: .5; }
-      .step-chip.active { color: #fff7e9; border-color: var(--accent); background: #1a1407; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+      .step-chip.active { color: var(--text); border-color: var(--accent); background: var(--bg-overlay); }
       .step-chip.active .step-fill { animation: stepfill 45s linear forwards; animation-delay: calc(-1 * var(--el)); }
-      .step-chip.done { color: #d8ffe2; border-color: #2f7d49; background: #102316; }
-      .step-chip.done .step-fill { width: 100%; background: linear-gradient(90deg, #1f6b3a, #2f9b54); }
-      .step-chip.done .step-time { color: #9fe6b6; }
-      .step-chip.stopped { color: #ffd9d3; border-color: #7d3030; background: #221010; }
-      .step-chip.stopped .step-fill { width: 100%; background: linear-gradient(90deg, #6b1f1f, #9b2f2f); }
+      .step-chip.done { color: var(--text); border-color: rgba(56,211,154,.45); background: rgba(56,211,154,.1); }
+      .step-chip.done .step-fill { width: 100%; background: linear-gradient(90deg, rgba(56,211,154,.3), rgba(56,211,154,.08)); }
+      .step-chip.done .step-time { color: var(--success); }
+      .step-chip.stopped { color: var(--text); border-color: rgba(240,104,115,.5); background: rgba(240,104,115,.1); }
+      .step-chip.stopped .step-fill { width: 100%; background: linear-gradient(90deg, rgba(240,104,115,.3), rgba(240,104,115,.08)); }
       @keyframes stepfill { from { width: 6%; } to { width: 94%; } }
-      .progress-current { color: #cbc7ba; font-weight: 700; font-size: 13px; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .progress-current { color: rgba(255,255,255,.78); font-weight: 600; font-size: 13px; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; margin-top: 16px; }
       .job-layout > .panel, .job-layout > aside { min-height: min(76vh, 860px); min-width: 0; }
       .log-box { height: calc(min(78vh, 900px) - 70px); max-height: none; overflow: auto; font-size: 13px; }
       .preview-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
-      .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: #06080a; border: 1px solid #253036; border-radius: 5px; transition: transform .18s ease, filter .18s ease; }
+      .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); transition: transform .18s ease, filter .18s ease; }
       .preview:hover img { transform: scale(1.012); filter: contrast(1.04) saturate(1.02); }
       .preview strong { display: block; margin-bottom: 8px; }
       .preview-button { width: 100%; padding: 0; background: transparent; border: 0; color: inherit; text-align: left; }
@@ -500,57 +916,86 @@ def app_style():
       .media-tiny-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
       .media-tile {
         position: relative;
-        border: 1px solid #263238;
-        background: #0a0f12;
-        border-radius: 5px;
+        border: 1px solid var(--line);
+        background: var(--bg-input);
+        border-radius: var(--r-md);
         padding: 6px;
         min-width: 0;
       }
-      .media-tile.queued { border-color: #d7b35d; box-shadow: inset 0 0 0 1px rgba(215,179,93,.25); }
-      .media-tile img { display: block; width: 100%; aspect-ratio: 9 / 14; object-fit: cover; border-radius: 3px; background: #050709; }
-      .media-tile video { display: block; width: 100%; aspect-ratio: 9 / 14; object-fit: cover; border-radius: 3px; background: #050709; }
-      .media-audio-tile { display: grid; place-items: center; width: 100%; aspect-ratio: 9 / 14; border-radius: 3px; background: #050709; color: #a8aaa3; border: 1px solid #26343a; font-weight: 900; }
-      .media-tile label { display: flex; gap: 6px; align-items: center; margin-top: 6px; color: #d8dbd2; font-size: 12px; font-weight: 850; }
-      .media-tile input { width: auto; margin: 0; accent-color: var(--accent); }
-      .media-tile small { display: block; color: #8d9895; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
-      .media-kind { position: absolute; top: 10px; left: 10px; padding: 3px 5px; border-radius: 3px; background: rgba(4,7,8,.82); border: 1px solid rgba(210,217,206,.18); color: #e7e4db; font-size: 10px; font-weight: 950; text-transform: uppercase; }
-      .preview-section { grid-column: 1 / -1; }
-      .loaded-media-panel .media-tiny-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+      .media-tile.queued { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-subtle); }
+      .media-tile img { display: block; width: 100%; aspect-ratio: 9 / 14; object-fit: cover; border-radius: 9px; background: var(--bg-base); }
+      .media-tile video { display: block; width: 100%; aspect-ratio: 9 / 14; object-fit: cover; border-radius: 9px; background: var(--bg-base); }
+      .media-audio-tile { display: grid; place-items: center; width: 100%; aspect-ratio: 9 / 14; border-radius: 9px; background: var(--bg-base); color: var(--faint); border: 1px solid var(--line); font-weight: 700; }
+      .media-tile label { display: flex; gap: 6px; align-items: center; margin-top: 6px; color: var(--text); font-size: 12px; font-weight: 600; }
+      .media-tile input { margin: 0; }
+      .media-tile small { display: block; color: var(--faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+      .media-kind { position: absolute; top: 10px; left: 10px; padding: 3px 6px; border-radius: 5px; background: rgba(8,9,12,.82); border: 1px solid var(--line); color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; z-index: 2; }
+      /* .media-tile .media-del: extra specificity beats the global button rule
+         (which would otherwise force a full-width, filled, centered box). */
+      .media-tile .media-del {
+        position: absolute; top: 5px; right: 5px; z-index: 4;
+        width: 20px; height: 20px; min-width: 0; padding: 0; border-radius: 6px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 15px; line-height: 1; font-weight: 700; cursor: pointer;
+        background: transparent; color: #fff; border: 0;
+        box-shadow: none; text-shadow: 0 1px 4px rgba(0,0,0,.95); opacity: .6;
+        transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease), background var(--dur) var(--ease);
+      }
+      .media-tile .media-del::after { display: none; }
+      .media-tile .media-del:hover { opacity: 1; color: #fff; background: rgba(240,104,115,.85); border: 0; transform: none; box-shadow: none; }
+      /* no sticky: a sticky right column scrolls out of step with the left column. */
+      .preview-section { grid-column: 2; align-self: start; }
+      /* fixed 3 columns so tiles stay the SAME size on every tab (was auto-fit, which
+         resized tiles when a tab like "web images" had a different item count). */
+      .loaded-media-panel .media-tiny-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
       .loaded-media-panel .media-tab-panel { max-height: none; }
       .media-tabs { display: flex; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; gap: 6px; margin: 10px 0; }
       .media-tab {
-        border: 1px solid #334247; background: #0f1518; color: #d8dbd2; padding: 7px 9px;
-        border-radius: 3px; font-size: 12px; font-weight: 900; cursor: pointer;
+        border: 1px solid var(--line); background: var(--bg-input); color: var(--muted); padding: 7px 13px;
+        border-radius: var(--r-full); font-size: 12px; font-weight: 600; cursor: pointer;
       }
-      .media-tab.active { border-color: rgba(123,214,197,.75); background: rgba(123,214,197,.14); color: #f6fff9; }
+      .media-tab.active { border-color: var(--accent); background: var(--accent-subtle); color: var(--text); }
       .media-tab-panel[hidden] { display: none; }
       .output-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 16px; }
-      .output-card { display: grid; gap: 10px; align-content: start; border-top: 1px solid #45545a; }
+      .output-card { display: grid; gap: 10px; align-content: start; border-top: 1px solid var(--line); }
       .output-card strong { font-size: 15px; }
-      .output-card small { color: #9a9d95; word-break: break-all; line-height: 1.35; }
+      .output-card small { color: var(--faint); word-break: break-all; line-height: 1.35; }
       .output-actions { display: flex; gap: 8px; }
       .output-actions .button { width: auto; flex: 1; padding: 10px 12px; }
-      .media-inline { width: 100%; max-height: 260px; border-radius: 5px; background: #06080a; border: 1px solid #253036; object-fit: contain; }
-      .asset-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
-      .asset-card { display: grid; gap: 12px; align-content: start; }
-      .asset-card h2 { margin-bottom: 0; }
-      .asset-thumb { width: 100%; aspect-ratio: 16 / 10; object-fit: cover; background: #06080a; border: 1px solid #253036; border-radius: 5px; }
-      .asset-meta { display: flex; gap: 8px; flex-wrap: wrap; color: #c7cbc3; font-size: 12px; }
-      .asset-pill { border: 1px solid #334247; background: #0f1518; padding: 5px 8px; border-radius: 3px; }
-      .asset-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-      .asset-actions .button { width: 100%; padding: 10px 12px; }
-      .media-page img, .media-page video { width: 100%; max-height: 78vh; object-fit: contain; background: #06080a; border: 1px solid #253036; border-radius: 6px; }
+      .media-inline { width: 100%; max-height: 260px; border-radius: var(--r-md); background: var(--bg-base); border: 1px solid var(--line); object-fit: contain; }
+      .asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+      .asset-card { display: grid; gap: 12px; align-content: start; padding: 14px; }
+      .asset-card .asset-figure { display: block; padding: 0; margin: 0; border: 0; background: none; box-shadow: none; width: 100%; border-radius: var(--r-md); overflow: hidden; cursor: zoom-in; }
+      .asset-card .asset-figure::after { display: none; }
+      .asset-thumb { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); }
+      .asset-body { display: grid; gap: 6px; }
+      .asset-body h2 { margin: 0; font-size: 17px; line-height: 1.2; }
+      .asset-sub { color: var(--faint); font-size: 12px; }
+      .asset-meta { display: flex; gap: 6px; flex-wrap: wrap; }
+      .asset-pill { border: 1px solid var(--line); background: var(--bg-input); padding: 4px 11px; border-radius: var(--r-full); font-size: 11px; font-weight: 600; color: var(--muted); }
+      .asset-primary { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .asset-primary .button { width: 100%; padding: 10px 12px; font-size: 13px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+      .asset-primary .asset-go {
+        color: #fff; border: 1px solid var(--accent-active);
+        background: linear-gradient(180deg, var(--accent-hover), var(--accent));
+        box-shadow: 0 6px 16px rgba(124,92,255,.32);
+      }
+      .asset-primary .asset-go:hover { background: linear-gradient(180deg, #a18dff, var(--accent-hover)); border-color: var(--accent-hover); }
+      .asset-timeline { width: 100%; padding: 9px 12px; font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: var(--bg-input); border: 1px solid var(--line); color: var(--muted); box-shadow: none; }
+      .asset-timeline:hover { border-color: var(--accent); background: var(--bg-overlay); color: var(--text); box-shadow: none; }
+      .asset-timeline-locked { text-align: center; padding: 9px 12px; font-size: 12px; color: var(--faint); border: 1px dashed var(--line); border-radius: var(--r-md); }
+      .media-page img, .media-page video { width: 100%; max-height: 78vh; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); }
       .media-page audio { width: 100%; }
       .file-list { display: grid; gap: 8px; padding-left: 0; list-style: none; }
-      .file-list a { display: block; padding: 10px 12px; border-radius: 4px; background: #11171a; border: 1px solid var(--line); text-decoration: none; }
-      .file-list a:hover { border-color: var(--accent); background: #152024; }
-      .lightbox { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; background: rgba(4, 6, 7, .9); backdrop-filter: blur(8px); z-index: 50; }
+      .file-list a { display: block; padding: 10px 14px; border-radius: var(--r-md); background: var(--bg-input); border: 1px solid var(--line); text-decoration: none; color: var(--text); }
+      .file-list a:hover { border-color: var(--accent); background: var(--bg-overlay); }
+      .lightbox { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; background: rgba(5,6,9,.82); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 50; }
       .lightbox.open { display: grid; }
       .lightbox-inner { width: min(1100px, 96vw); }
-      .lightbox-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; color: #f2f0e8; }
-      .lightbox-title { font-weight: 900; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .lightbox-close { width: auto; padding: 8px 12px; background: #101619; color: #f2f0e8; border: 1px solid #3c4440; }
-      .lightbox img { display: block; width: 100%; max-height: 84vh; object-fit: contain; background: #06080a; border: 1px solid #2e3b41; border-radius: 6px; }
+      .lightbox-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; color: var(--text); }
+      .lightbox-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .lightbox-close { width: auto; padding: 8px 14px; background: var(--bg-overlay); color: var(--text); border: 1px solid var(--line-strong); }
+      .lightbox img { display: block; width: 100%; max-height: 84vh; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); }
       @keyframes progress-stripes { from { background-position: 0 0, 0 0; } to { background-position: 28px 0, 0 0; } }
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
@@ -568,42 +1013,81 @@ def app_style():
         .log-box { height: 52vh; }
       }
       .modal-overlay {
-        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-        background: rgba(0,0,0,0.8); z-index: 1000;
-        display: flex; justify-content: center; align-items: center;
+        position: fixed; inset: 0; width: 100%; height: 100%;
+        background: rgba(5,6,9,.7); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 1000;
+        display: flex; justify-content: center; align-items: flex-start;
+        padding: 7vh 16px 24px; box-sizing: border-box; overflow-y: auto;
         opacity: 0; pointer-events: none; transition: opacity 0.2s;
       }
       .modal-overlay.active { opacity: 1; pointer-events: auto; }
       .modal-content {
-        position: relative;
-        background: #111; padding: 26px 28px; border-radius: 10px;
-        border: 1px solid var(--line); width: 100%; max-width: 600px;
-        box-shadow: 0 18px 50px rgba(0,0,0,0.5);
+        position: relative; margin: auto;
+        background: var(--bg-raised);
+        padding: 26px 28px; border-radius: var(--r-lg);
+        border: 1px solid var(--line-strong); width: 100%; max-width: 600px;
+        max-height: 86vh; overflow-y: auto;
+        box-shadow: var(--sh-3);
       }
       .modal-content h2 { margin-top: 0; padding-right: 36px; }
       /* high-specificity so it beats the global button rule (no full-width box) */
       .modal-content .modal-close {
-        position: absolute; top: 10px; right: 12px;
+        position: absolute; top: 12px; right: 14px;
         width: auto; min-width: 0; margin: 0; padding: 0 6px;
         border: none; background: none; box-shadow: none;
         color: var(--muted); font-size: 24px; line-height: 1; font-weight: 400; cursor: pointer;
       }
       .modal-content .modal-close::after { display: none; }
-      .modal-content .modal-close:hover { color: #fff; background: none; box-shadow: none; transform: none; }
+      .modal-content .modal-close:hover { color: var(--text); background: none; box-shadow: none; transform: none; }
+      /* --- Preset popup --- */
+      .preset-popup-card { max-width: 440px; padding: 22px 22px 20px; }
+      .pp-group-label { font-family: var(--pixel); text-transform: uppercase; font-size: 10px; letter-spacing: .12em; color: var(--faint); margin: 14px 0 6px; }
+      .pp-group-label:first-child { margin-top: 2px; }
+      .pp-empty { color: var(--faint); font-size: 13px; padding: 4px 2px 2px; }
+      .pp-row { display: flex; align-items: stretch; gap: 6px; margin-bottom: 6px; }
+      .pp-row .pp-load {
+        flex: 1; text-align: left; justify-content: flex-start;
+        width: auto; min-width: 0; margin: 0; padding: 10px 12px;
+        background: var(--bg-input); color: var(--ink);
+        border: 1px solid var(--line-strong); border-radius: var(--r-md);
+        box-shadow: var(--sh-1); font-weight: 700; font-size: 14px; cursor: pointer;
+      }
+      .pp-row .pp-load::after { display: none; }
+      .pp-row .pp-load:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); background: var(--bg-raised); }
+      .pp-row .pp-del {
+        width: 38px; min-width: 38px; margin: 0; padding: 0;
+        background: var(--bg-input); color: var(--muted);
+        border: 1px solid var(--line-strong); border-radius: var(--r-md);
+        box-shadow: var(--sh-1); font-size: 18px; line-height: 1; cursor: pointer;
+      }
+      .pp-row .pp-del::after { display: none; }
+      .pp-row .pp-del:hover { color: #fff; background: var(--accent-2); border-color: var(--accent-2); transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); }
+      .pp-save { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+      .pp-save-label { font-family: var(--pixel); text-transform: uppercase; font-size: 10px; letter-spacing: .12em; color: var(--faint); margin-bottom: 8px; }
+      .pp-save-row { display: flex; gap: 6px; }
+      .pp-save-row #pp-name { flex: 1; min-width: 0; margin: 0; }
+      .pp-save-row .button { width: auto; min-width: 0; margin: 0; white-space: nowrap; }
+      .pp-overwrite {
+        width: 100%; margin: 8px 0 0; padding: 9px 12px;
+        background: var(--bg-input); color: var(--ink);
+        border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+        box-shadow: none; font-weight: 700; font-size: 13px; cursor: pointer;
+      }
+      .pp-overwrite::after { display: none; }
+      .pp-overwrite:hover { background: var(--accent); color: #fff; border-style: solid; border-color: var(--accent); }
       /* --- Form-page polish --- */
-      .mode-selector { background: linear-gradient(180deg, #15191d, #11151a); }
+      .mode-selector { background: var(--bg-input); }
       .mode-selector > label { font-size: 16px; letter-spacing: .2px; }
       .run-mode-btn { min-width: 168px; }
-      .button.primary { border-color: var(--accent-2); background: #2c1d0a; color: #fff7e9; box-shadow: inset 0 -3px 0 rgba(240,180,95,.95), 0 12px 28px rgba(0,0,0,.34); }
+      .button.primary { border-color: var(--accent-active); background: linear-gradient(180deg, var(--accent-hover), var(--accent)); color: #fff; box-shadow: 0 8px 22px rgba(124,92,255,.36); }
       .loaded-media-panel {
-        background: linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
-        border: 1px solid var(--line) !important; border-radius: 10px !important;
-        box-shadow: 0 18px 50px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.045);
+        background: var(--bg-raised) !important;
+        border: 1px solid var(--line) !important; border-radius: var(--r-lg) !important;
+        box-shadow: var(--sh-1);
       }
       #project-media-hint {
         text-align: center; min-height: 220px; padding: 64px 24px;
-        border: 1px dashed #303c42; border-radius: 10px; color: var(--muted);
-        background: repeating-linear-gradient(45deg, rgba(255,255,255,.014) 0 12px, transparent 12px 24px);
+        border: 1px dashed var(--line-strong); border-radius: var(--r-md); color: var(--faint);
+        background: repeating-linear-gradient(45deg, rgba(255,255,255,.012) 0 12px, transparent 12px 24px);
       }
       body { overflow-x: hidden; }
       @media (max-width: 820px) {
@@ -655,12 +1139,23 @@ def app_script():
         }
 
         var autosaveTimer = null;
-        var autosaveKey = "autonomous-shorts-agent-ui-state-v1";
+        // v2: advanced toggles became always-on hidden inputs; bump key so stale
+        // boolean localStorage from the old checkboxes can't corrupt them to "true".
+        var autosaveKey = "autonomous-shorts-agent-ui-state-v2";
         var autosaveSkip = {
           initial_replace_media_path: true,
           loaded_project_source: true,
           slug: true,
-          loaded_project_mode: true
+          loaded_project_mode: true,
+          autonomous_director: true,
+          use_audio_timing: true,
+          use_llm_search: true,
+          use_llm_video_review: true,
+          auto_web_images: true,
+          generate_missing_sfx: true,
+          allow_gpt: true,
+          allow_seedance: true,
+          background_music_enabled: true
         };
 
         function collectFormState() {
@@ -763,6 +1258,7 @@ def app_script():
             return [
               '<article class="media-tile">',
               '<span class="media-kind">' + kind + '</span>',
+              '<button class="media-del" type="button" data-del-path="' + path + '" data-del-name="' + name + '" title="Delete this file" aria-label="Delete this file">&times;</button>',
               '<button class="preview-button" type="button" data-preview-src="' + url + '" data-preview-title="' + name + '">',
               preview + '</button>',
               '<small>' + name + '</small>',
@@ -795,6 +1291,7 @@ def app_script():
               clearProjectMedia();
               return;
             }
+            mediaBox.dataset.slug = slug;
             var mediaHint = document.getElementById("project-media-hint");
             if (mediaHint) mediaHint.style.display = 'none';
             mediaBox.innerHTML = '<div class="hint">Loading media previews...</div>';
@@ -814,6 +1311,32 @@ def app_script():
               .catch(function (err) {
                 mediaBox.innerHTML = '<div class="hint">' + (err.message || "Could not load media previews.") + '</div>';
               });
+          }
+          if (mediaBox) {
+            mediaBox.addEventListener("click", function (ev) {
+              var del = ev.target.closest(".media-del");
+              if (!del) return;
+              ev.preventDefault();
+              ev.stopPropagation();
+              var path = del.getAttribute("data-del-path");
+              var name = del.getAttribute("data-del-name") || "this file";
+              if (!path) return;
+              if (!window.confirm('Delete "' + name + '" permanently? This cannot be undone.')) return;
+              del.disabled = true;
+              fetch("/delete-media", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: "path=" + encodeURIComponent(path)
+              }).then(function (r) {
+                if (!r.ok) throw new Error("Delete failed.");
+                var tile = del.closest(".media-tile");
+                if (tile) tile.remove();
+              }).catch(function () {
+                del.disabled = false;
+                if (typeof setStatus === "function") setStatus("Could not delete the file.");
+                else alert("Could not delete the file.");
+              });
+            });
           }
         window.loadProject = function (slug) {
             if (!slug) {
@@ -878,7 +1401,79 @@ def app_script():
             document.querySelectorAll(".speaker-tile").forEach(function (t) { t.classList.remove("selected"); });
             var hidden = document.getElementById("speaker-image-path"); if (hidden) hidden.value = "";
             var cb = document.querySelector('[name="enable_speaker_hook"]');
-            if (cb && input.files && input.files.length) cb.checked = true;
+            if (cb && input.files && input.files.length) { cb.checked = true; if(typeof window.toggleSection==='function') window.toggleSection('speaker-panel', true); }
+            var add = document.getElementById('speaker-add-tile');
+            if (add && input.files && input.files.length) {
+              add.classList.add('selected');
+              try { var url = URL.createObjectURL(input.files[0]); add.innerHTML = '<img src="'+url+'" alt="">'; } catch(e){}
+            }
+          };
+          window.toggleSection = function (panelId, on) {
+            var p = document.getElementById(panelId); if (p) p.classList.toggle('off', !on);
+            if (typeof saveFormStateSoon === 'function') saveFormStateSoon();
+          };
+          function setupToggleSections() {
+            ['visual-panel','speaker-panel'].forEach(function (id) {
+              var p = document.getElementById(id); if (!p) return;
+              var cb = p.querySelector('.panel-head input[type="checkbox"]');
+              if (cb) p.classList.toggle('off', !cb.checked);
+            });
+            // drag a file onto the "+" speaker tile
+            var add = document.getElementById('speaker-add-tile');
+            var file = document.getElementById('speaker-file');
+            if (add && file) {
+              ['dragenter','dragover'].forEach(function(ev){ add.addEventListener(ev, function(e){ e.preventDefault(); add.classList.add('dragover'); }); });
+              ['dragleave','dragend'].forEach(function(ev){ add.addEventListener(ev, function(){ add.classList.remove('dragover'); }); });
+              add.addEventListener('drop', function(e){
+                e.preventDefault(); add.classList.remove('dragover');
+                if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+                  try { file.files = e.dataTransfer.files; } catch(err) {}
+                  window.onSpeakerUpload(file);
+                }
+              });
+            }
+          }
+          function syncClipSource() {
+            var hid = document.getElementById("clip-source"); if (!hid) return;
+            // scraping is TikTok-only now; force the (hidden) platforms value clean
+            var plat = document.querySelector('[name="scrape_platforms"]');
+            if (plat) plat.value = "tiktok";
+            var src = hid.value === "scrape" ? "scrape" : "generate";
+            Array.prototype.forEach.call(document.querySelectorAll(".csrc-btn"), function (b) {
+              b.classList.toggle("csrc-active", b.getAttribute("data-src") === src);
+            });
+            var box = document.getElementById("scrape-settings");
+            if (box) box.style.display = (src === "scrape") ? "block" : "none";
+            var rv = document.getElementById("relv-val"); var rng = document.getElementById("script-relevancy");
+            if (rv && rng) rv.textContent = rng.value + "%";
+          }
+          window.syncClipSource = syncClipSource;
+          window.setClipSource = function (src) {
+            var hid = document.getElementById("clip-source"); if (!hid) return;
+            hid.value = (src === "scrape") ? "scrape" : "generate";
+            syncClipSource();
+            var state = collectFormState();
+            if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
+          };
+          window.testConnection = function () {
+            var sel = document.getElementById("scrape-cookies");
+            var file = document.getElementById("scrape-cookies-file");
+            var st = document.getElementById("connect-status");
+            var btn = document.getElementById("connect-test-btn");
+            var cookies = (file && file.value.trim()) || (sel && sel.value) || "";
+            if (!cookies) { if (st) { st.className = "hint bad"; st.textContent = "Pick a browser you're signed in to, or give a cookies.txt path."; } return; }
+            if (st) { st.className = "hint"; st.textContent = "Testing connection (this can take ~15s)…"; }
+            if (btn) btn.disabled = true;
+            fetch("/test-connection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cookies: cookies }) })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (st) {
+                  st.className = "hint " + (d && d.ok ? "ok" : "bad");
+                  st.textContent = (d && d.message) || (d && d.ok ? "Connected." : "Connection failed.");
+                }
+              })
+              .catch(function () { if (st) { st.className = "hint bad"; st.textContent = "Connection test failed (network)."; } })
+              .finally(function () { if (btn) btn.disabled = false; });
           };
           window.applyTier = function (tier) {
             var TIERS = {
@@ -903,6 +1498,110 @@ def app_script():
             }
             if (typeof setStatus === "function") setStatus(tier.charAt(0).toUpperCase() + tier.slice(1) + " preset loaded.");
           };
+          var CUSTOM_PRESET_FIELDS = ["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","scrape_terms","script_relevancy","scrape_cookies","scrape_cookies_file"];
+          var activePresetName = null;
+          function collectPresetData() {
+            var form = document.getElementById("short-form"); if (!form) return {};
+            var data = {};
+            CUSTOM_PRESET_FIELDS.forEach(function (name) {
+              var f = form.querySelector('[name="' + name + '"]');
+              if (f) data[name] = (f.type === "checkbox") ? f.checked : f.value;
+            });
+            return data;
+          }
+          function applyPresetData(data, label) {
+            if (!data || !Object.keys(data).length) return;
+            applyFormState(data);
+            var hp = document.getElementById("speaker-image-path");
+            if (hp && data.speaker_image_path) { document.querySelectorAll(".speaker-tile").forEach(function (t) { t.classList.toggle("selected", t.getAttribute("data-path") === data.speaker_image_path); }); }
+            if (typeof setupToggleSections === "function") setupToggleSections();
+            if (typeof syncClipSource === "function") syncClipSource();
+            Array.prototype.forEach.call(document.querySelectorAll(".tier-btn"), function (b) { b.classList.remove("tier-active"); });
+            var active = document.querySelector('.tier-btn[onclick*="applyCustomPreset"]'); if (active) active.classList.add("tier-active");
+            var state = collectFormState();
+            if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
+            if (typeof setStatus === "function") setStatus((label || "Preset") + " loaded.");
+          }
+          function presetSavePost(name, data) {
+            return fetch("/save-preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name, data: data }) })
+              .then(function (r) { return r.json(); });
+          }
+          function renderPresetPopup(payload) {
+            var builtin = (payload && payload.builtin) || {};
+            var user = (payload && payload.user) || {};
+            function row(name, data, isBuiltin) {
+              var safe = name.replace(/"/g, "&quot;");
+              var del = isBuiltin ? "" : '<button type="button" class="pp-del" title="Delete preset" data-name="' + safe + '">&times;</button>';
+              return '<div class="pp-row" data-name="' + safe + '" data-builtin="' + (isBuiltin ? "1" : "0") + '">' +
+                     '<button type="button" class="pp-load" data-name="' + safe + '">' + name + '</button>' + del + '</div>';
+            }
+            var html = '';
+            html += '<div class="pp-group-label">Built-in</div>';
+            var bk = Object.keys(builtin);
+            html += bk.length ? bk.map(function (n) { return row(n, builtin[n], true); }).join("") : '<div class="pp-empty">none</div>';
+            html += '<div class="pp-group-label">Your presets</div>';
+            var uk = Object.keys(user);
+            html += uk.length ? uk.map(function (n) { return row(n, user[n], false); }).join("") : '<div class="pp-empty">No saved presets yet.</div>';
+            html += '<div class="pp-save">' +
+                    '<div class="pp-save-label">Save current settings</div>' +
+                    '<div class="pp-save-row"><input type="text" id="pp-name" placeholder="Preset name…" value="' + (activePresetName ? activePresetName.replace(/"/g, "&quot;") : "") + '">' +
+                    '<button type="button" class="button" id="pp-save-as">Save as</button></div>' +
+                    (activePresetName ? '<button type="button" class="pp-overwrite" id="pp-overwrite">Overwrite “' + activePresetName + '”</button>' : '') +
+                    '</div>';
+            var body = document.getElementById("preset-popup-body");
+            if (body) { body.innerHTML = html; wirePresetPopup(builtin, user); }
+          }
+          function wirePresetPopup(builtin, user) {
+            var body = document.getElementById("preset-popup-body"); if (!body) return;
+            Array.prototype.forEach.call(body.querySelectorAll(".pp-load"), function (b) {
+              b.addEventListener("click", function () {
+                var n = b.getAttribute("data-name");
+                var src = (user && user[n]) ? user[n] : (builtin && builtin[n]) ? builtin[n] : null;
+                if (src) { activePresetName = (user && user[n]) ? n : null; applyPresetData(src, n); closePresetPopup(); }
+              });
+            });
+            Array.prototype.forEach.call(body.querySelectorAll(".pp-del"), function (b) {
+              b.addEventListener("click", function (ev) {
+                ev.stopPropagation();
+                var n = b.getAttribute("data-name");
+                if (!window.confirm("Delete preset “" + n + "”?")) return;
+                fetch("/delete-preset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n }) })
+                  .then(function (r) { return r.json(); })
+                  .then(function () { if (activePresetName === n) activePresetName = null; loadPresetList(); });
+              });
+            });
+            var saveAs = document.getElementById("pp-save-as");
+            if (saveAs) saveAs.addEventListener("click", function () {
+              var inp = document.getElementById("pp-name");
+              var name = inp ? inp.value.trim() : "";
+              if (!name) { if (inp) inp.focus(); return; }
+              presetSavePost(name, collectPresetData()).then(function (d) {
+                if (d && d.ok) { activePresetName = name; if (typeof setStatus === "function") setStatus("Preset “" + name + "” saved."); loadPresetList(); }
+                else if (typeof setStatus === "function") setStatus("Could not save preset (name may be reserved).");
+              });
+            });
+            var ow = document.getElementById("pp-overwrite");
+            if (ow) ow.addEventListener("click", function () {
+              if (!activePresetName) return;
+              presetSavePost(activePresetName, collectPresetData()).then(function (d) {
+                if (d && d.ok) { if (typeof setStatus === "function") setStatus("Preset “" + activePresetName + "” overwritten."); loadPresetList(); }
+              });
+            });
+          }
+          function loadPresetList() {
+            return fetch("/presets").then(function (r) { return r.json(); }).then(function (d) { renderPresetPopup(d); return d; });
+          }
+          function openPresetPopup() {
+            var m = document.getElementById("preset-popup"); if (!m) return;
+            m.classList.add("active");
+            loadPresetList().catch(function () { if (typeof setStatus === "function") setStatus("Could not load presets."); });
+          }
+          function closePresetPopup() {
+            var m = document.getElementById("preset-popup"); if (m) m.classList.remove("active");
+          }
+          window.closePresetPopup = closePresetPopup;
+          window.applyCustomPreset = openPresetPopup;
+          window.saveCustomPreset = openPresetPopup;
           clearProjectMedia();
         }
 
@@ -932,8 +1631,12 @@ def app_script():
           } catch (e) {}
         }
         function setupUiSounds() {
+          var sel = "button, a.button, .button, .tier-btn, .action-btn, .speaker-tile, .speaker-pick, .media-tab, .back-arrow, .preview-button, .asset-figure, [role='button']";
           document.addEventListener("pointerdown", function (ev) {
-            var el = ev.target.closest("button, .button, .tier-btn, .action-btn, .speaker-tile");
+            // make sure the audio context is unlocked on the very first gesture so
+            // even the first button click is audible.
+            uiCtx();
+            var el = ev.target.closest(sel);
             if (el && !el.disabled) playClick();
           }, true);
         }
@@ -1051,6 +1754,8 @@ def app_script():
           var root = document.getElementById("job-root");
           if (!root) return;
           root.setAttribute("data-status", data.status || "");
+          // surface the speech-approval panel as soon as the run pauses for it
+          if (data.status === "awaiting_approval" && !document.getElementById("speech-approval")) { location.reload(); return; }
           var statusLabel = document.getElementById("job-status-label");
           if (statusLabel) {
             statusLabel.textContent = data.status || "";
@@ -1152,6 +1857,24 @@ def app_script():
           setupUiSounds();
           playDoneSoundOnce();
           setupJobPolling();
+          if (typeof setupToggleSections === "function") setupToggleSections();
+          if (typeof syncClipSource === "function") syncClipSource();
+          var sform = document.getElementById("short-form");
+          if (sform) sform.addEventListener("submit", function (ev) {
+            var cs = document.getElementById("clip-source");
+            if (!cs || cs.value !== "scrape") return;
+            var sel = document.getElementById("scrape-cookies");
+            var file = document.getElementById("scrape-cookies-file");
+            var connected = (file && file.value.trim()) || (sel && sel.value);
+            if (!connected) {
+              ev.preventDefault();
+              var st = document.getElementById("connect-status");
+              if (st) { st.className = "hint bad"; st.textContent = "Connect TikTok before a scrape run — pick the browser you're signed in to, then click Test."; }
+              var panel = document.getElementById("scrape-settings");
+              if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
+              if (typeof setStatus === "function") setStatus("Scrape runs require a TikTok connection.");
+            }
+          });
         });
         setInterval(stickLogToBottom, 5000);
       })();
@@ -1169,6 +1892,10 @@ def page(title, body, refresh=None):
         '<link rel="shortcut icon" href="/favicon.ico">'
         '<meta name="theme-color" content="#090d14">'
         '<meta name="application-name" content="Shortslab">'
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+        'family=Press+Start+2P&family=Silkscreen:wght@400;700&family=Space+Mono:wght@400;700&display=swap">'
     )
     return f"""<!doctype html>
     <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
@@ -1223,8 +1950,9 @@ def parse_multipart(content_type, body):
     return fields, files
 
 
-def form_page():
-    state = load_ui_state()
+def form_page(clear=False, open_load=False, load_slug=""):
+    # "New project" starts from clean defaults; normal load restores last session.
+    state = normalize_ui_state({}) if clear else load_ui_state()
     previous_project_options = project_options_html()
 
     voice_tones = {
@@ -1251,37 +1979,36 @@ def form_page():
         return " checked" if state.get(name) else ""
 
     body = f"""
-    <div class="top">
-      <div class="brand">
-        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
-        <div>
-          <h1>Shortslab</h1>
-          <p class="sub"><span class="tagline">script <span class="dot">&bull;</span> chill <span class="dot">&bull;</span> upload</span> &mdash; paste a script, pick a voice, and the Auto Director builds a viral 9:16 Short end to end: narration, footage, word-by-word captions, and cinematic motion.</p>
-        </div>
-      </div>
-      <div class="nav-actions">
-        <button type="button" class="button" onclick="newProject()">&#43; New Project</button>
-        <button type="button" class="button secondary" onclick="document.getElementById('load-modal').classList.add('active')">&#128193; Load Project</button>
-        <a class="button secondary" href="/sfx">&#128266; Add SFX to a Video</a>
-        <a class="button secondary" href="/assets">&#127916; Asset Library</a>
-      </div>
-    </div>
+    {brand_header()}
     <form id="short-form" method="post" action="/run" enctype="multipart/form-data">
       <input id="loaded-project-source" type="hidden" name="loaded_project_source" value="">
+      <input type="hidden" name="ui_form" value="1">
 
       <div class="create-bar panel">
-        <div class="tier-row">
-          <span class="tier-label">Quality preset</span>
-          <div class="tier-btns">
-            <button type="button" class="tier-btn" onclick="applyTier('cheap')">Cheap<small>~$0.50 / run</small></button>
-            <button type="button" class="tier-btn" onclick="applyTier('medium')">Medium<small>~$1.50 / run</small></button>
-            <button type="button" class="tier-btn" onclick="applyTier('best')">Best<small>~$3.50 / run</small></button>
+        <div class="cbar-row">
+          <div class="cbar-cell tiers">
+            <span class="cbar-cap">Preset {help_tip("Cheap/Medium/Best load model picks. Custom recalls your saved preset. Save stores the current speaker, models, speaker image, visual direction and all toggles as the Custom preset.")}
+              <button type="button" class="cbar-save-btn" onclick="saveCustomPreset()" title="Save current settings as the Custom preset" aria-label="Save Custom preset">&#128190;</button></span>
+            <div class="tier-btns">
+              <button type="button" class="tier-btn" onclick="applyTier('cheap')"><b>Cheap</b><small>~$0.50</small></button>
+              <button type="button" class="tier-btn" onclick="applyTier('medium')"><b>Medium</b><small>~$1.50</small></button>
+              <button type="button" class="tier-btn" onclick="applyTier('best')"><b>Best</b><small>~$3.50</small></button>
+              <button type="button" class="tier-btn" onclick="applyCustomPreset()"><b>Custom</b><small>recall</small></button>
+            </div>
           </div>
-          <span class="tier-hint hint">Presets just load the model picks below &mdash; tweak them anytime. Prices are rough estimates.</span>
+          <div class="cbar-divider" aria-hidden="true"></div>
+          <div class="cbar-cell runtype">
+            <span class="cbar-cap">Run type {help_tip("Normal: full agent pass. Smart: checks what media already exists in the project and only generates what is missing.")}</span>
+            <input type="hidden" name="run_type" id="run-type" value="{esc(state.get('run_type') or 'normal')}">
+            <div class="tier-btns runtype-btns">
+              <button type="button" class="tier-btn" data-run="normal" onclick="setRunType('normal')"><b>Normal</b><small>full agent run</small></button>
+              <button type="button" class="tier-btn" data-run="audit" onclick="setRunType('audit')"><b>Smart</b><small>fill missing media</small></button>
+            </div>
+          </div>
         </div>
-        <div class="create-bar-models">
-          <div class="field">
-            <label>Video model</label>
+        <div class="cbar-row cbar-models">
+          <div class="cbar-cell">
+            <span class="cbar-cap">Video model</span>
             <select name="video_model">
               <option value="seedance-2.0"{' selected' if state.get("video_model", state.get("seedance_model", "seedance-2.0")) == "seedance-2.0" else ""}>Seedance 2.0 (Web Search + Audio)</option>
               <option value="seedance-2.0-fast"{' selected' if state.get("video_model") == "seedance-2.0-fast" else ""}>Seedance 2.0 Fast (Web Search + Audio)</option>
@@ -1290,46 +2017,99 @@ def form_page():
               <option value="happyhorse-1.1"{' selected' if state.get("video_model") == "happyhorse-1.1" else ""}>Happy Horse 1.1 (720p)</option>
             </select>
           </div>
-          <div class="field">
-            <label>Image model</label>
+          <div class="cbar-cell">
+            <span class="cbar-cap">Image model</span>
             <select name="image_model">
               <option value="openai/gpt-image-2/text-to-image"{' selected' if state.get("image_model") == "openai/gpt-image-2/text-to-image" else ""}>GPT-Image-2 (best)</option>
               <option value="google/nano-banana-2/text-to-image"{' selected' if state.get("image_model") == "google/nano-banana-2/text-to-image" else ""}>Nano-Banana-2 (cheap)</option>
             </select>
           </div>
-          <div class="field">
-            <label>Reasoning model</label>
+          <div class="cbar-cell">
+            <span class="cbar-cap">Reasoning model</span>
             <select name="reasoning_model">
               <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
             </select>
           </div>
+          <button type="submit" class="create-short-btn">&#9889; Create Short</button>
         </div>
-        <button type="submit" class="button primary create-short-btn">&#9889; Create Short</button>
+        <div class="cbar-row" style="align-items:center; gap:14px;">
+          <label class="cbar-halt"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</span></label>
+        </div>
       </div>
 
       <section class="stack">
+        {advanced_hidden_inputs(state)}
         <div class="panel accent">
-          <label>Text script</label>
-          <textarea id="script-field" name="script" placeholder="Paste your timed/plain text script here. The voiceover is generated from it automatically.">{esc(state.get("script"))}</textarea>
-          <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
-          <div class="hook-controls" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-            <button type="button" class="button secondary" onclick="markHook()">&#9733; Mark selection as hook</button>
-            <button type="button" class="button secondary" onclick="clearHook()">Clear hook</button>
-            <span id="hook-indicator" class="hint" style="flex:1; min-width:160px;"></span>
+          <label>Text script {help_tip("The voiceover is generated from this with Gemini TTS. Mark the opening line(s) as the hook: it is spoken first, then a short pause, then the rest. With a speaker image it drives the InfiniteTalk talking-head opening.")}</label>
+          <div class="script-wrap">
+            <div class="script-highlight" id="script-highlight" aria-hidden="true"></div>
+            <textarea id="script-field" name="script" spellcheck="false" placeholder="Paste your script here. Write it as a punchy spoken narration — the AI generates the voiceover, finds visuals and cuts the Short from this text. Then select your opening line(s) and click &#8220;Mark hook&#8221;.">{esc(state.get("script"))}</textarea>
           </div>
-          <div class="hint">Select the opening line(s) in the script and click &ldquo;Mark selection as hook&rdquo;. The hook is spoken first, then a short pause, then the rest &mdash; and (with a speaker image) it drives the InfiniteTalk talking-head opening.</div>
+          <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
+          <div class="hook-controls">
+            <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
+            <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
+            <span id="hook-indicator" class="hook-dot" hidden></span>
+          </div>
         </div>
+        <div class="panel toggle-panel" id="visual-panel">
+          <div class="panel-head">
+            <label>Optional Visual Direction {help_tip("Optional. The Voice Script is authoritative; this is secondary style guidance (e.g. darker documentary look, faster cuts, more maps). If empty, the visual plan is inferred from the script.")}</label>
+            <label class="switch" title="Use this visual direction"><input type="checkbox" name="use_visual_direction"{checked("use_visual_direction")} onchange="toggleSection('visual-panel', this.checked)"></label>
+          </div>
+          <div class="panel-body">
+            <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty to let the agent plan visuals from the script. Use this only for style, e.g. darker documentary style, faster cuts, more maps.">{esc(state.get("visual_script"))}</textarea>
+          </div>
+        </div>
+
         <div class="panel">
-          <label>Optional Visual Direction</label>
-          <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty if you want the agent to create the visual plan automatically from the Voice Script. Use this only for style or direction, e.g. darker documentary style, faster cuts, more maps, more archive images, more dramatic reconstructions.">{esc(state.get("visual_script"))}</textarea>
-          <div class="hint">The Voice Script is authoritative. The Optional Visual Direction is secondary guidance. If empty, the full visual plan is inferred from the Voice Script.</div>
+          <label>Outputs {help_tip("Turn individual parts of the pipeline on or off. Off = that part is skipped entirely, and a Smart run will not generate it either.")}</label>
+          <div class="otoggles">
+            <label class="otoggle"><span>Web images</span><input type="checkbox" name="out_web_images"{checked("out_web_images")}></label>
+            <label class="otoggle"><span>Wikimedia images</span><input type="checkbox" name="out_wikimedia"{checked("out_wikimedia")}></label>
+            <label class="otoggle"><span>Generated images</span><input type="checkbox" name="out_gpt_images"{checked("out_gpt_images")}></label>
+            <label class="otoggle"><span>Video clips</span><input type="checkbox" name="out_video_clips"{checked("out_video_clips")}></label>
+            <label class="otoggle"><span>Sound effects</span><input type="checkbox" name="out_sfx"{checked("out_sfx")}></label>
+            <label class="otoggle"><span>Transition SFX</span><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}></label>
+            <label class="otoggle"><span>Background music</span><input type="checkbox" name="out_background_music"{checked("out_background_music")}></label>
+            <label class="otoggle"><span>Captions</span><input type="checkbox" name="out_captions"{checked("out_captions")}></label>
+          </div>
+        </div>
+
+        <div class="panel" id="clipsource-panel">
+          <label>Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok/Instagram clips that match a visual style and cut them together (used by the Japanese-facts preset). Scraping ignores the AI generation outputs above.")}</label>
+          <input type="hidden" name="clip_source" id="clip-source" value="{esc(state.get('clip_source') or 'generate')}">
+          <div class="csrc-btns">
+            <button type="button" class="csrc-btn" data-src="generate" onclick="setClipSource('generate')"><b>Generate</b><small>AI video &amp; images</small></button>
+            <button type="button" class="csrc-btn" data-src="scrape" onclick="setClipSource('scrape')"><b>Scrape clips</b><small>real TikTok</small></button>
+          </div>
+          <div id="scrape-settings" class="scrape-settings" style="display:none;">
+            <input type="hidden" name="scrape_platforms" value="tiktok">
+            <label class="scrape-lbl">Visual style / search terms {help_tip("What kind of clips to look for, independent of the spoken script. Describe the look as TikTok-style hashtags/words (e.g. japan street style, tokyo at night, salaryman commute, kimono). The scraper turns these into TikTok hashtags and downloads matching clips.")}</label>
+            <textarea name="scrape_terms" class="scrape-terms" placeholder="e.g. japan street style, tokyo night, salaryman commute, kimono, neon alley">{esc(state.get("scrape_terms"))}</textarea>
+            <label class="scrape-lbl">Script relevancy <span id="relv-val" class="relv-val">{esc(state.get('script_relevancy') or '70')}%</span> {help_tip("How tightly downloaded clips must match the spoken script versus pure visual style. High = clips closely follow what's being said. Low = prioritize the look (more b-roll of the vibe), looser tie to the words.")}</label>
+            <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
+            <label class="scrape-lbl">Connect TikTok <span class="req-tag">required</span> {help_tip("Scrape runs pull real TikTok clips, which need your logged-in session. Pick the browser where you're signed in to TikTok — the app reads that browser's cookies so yt-dlp downloads as you. No password is handled. For Chrome/Edge, fully close the browser so its cookie file can be read. Note: repurposing creators' clips is against TikTok's ToS/copyright; use responsibly.")}</label>
+            <div class="connect-row">
+              <select name="scrape_cookies" id="scrape-cookies">
+                <option value=""{' selected' if not (state.get('scrape_cookies')) else ''}>Not connected</option>
+                <option value="chrome"{' selected' if state.get('scrape_cookies')=='chrome' else ''}>Chrome (signed in to TikTok)</option>
+                <option value="edge"{' selected' if state.get('scrape_cookies')=='edge' else ''}>Edge (signed in to TikTok)</option>
+                <option value="firefox"{' selected' if state.get('scrape_cookies')=='firefox' else ''}>Firefox (signed in to TikTok)</option>
+                <option value="brave"{' selected' if state.get('scrape_cookies')=='brave' else ''}>Brave (signed in to TikTok)</option>
+              </select>
+              <button type="button" class="button" id="connect-test-btn" onclick="testConnection()">Test</button>
+            </div>
+            <input type="text" name="scrape_cookies_file" id="scrape-cookies-file" placeholder="…or path to an exported TikTok cookies.txt (optional)" value="{esc(state.get('scrape_cookies_file'))}">
+            <div id="connect-status" class="hint" style="margin-top:6px;"></div>
+          </div>
         </div>
 
         <div class="panel" id="loaded-actions-panel" style="display:none;">
           <button type="button" class="button" onclick="openTimeline()" style="margin-bottom:12px;">&#127902; Open timeline editor (trim, mix &amp; render)</button>
-          <label>Loaded project &mdash; what should the run do?</label>
+          <label>Loaded project &mdash; what should the run do? {help_tip("Only shown for a loaded project. Choose what to reuse versus regenerate before re-rendering.")}</label>
           <input type="hidden" name="loaded_project_mode" id="loaded-project-mode" value="{esc(state.get('loaded_project_mode') or 'normal')}">
           <div class="action-btns">
             <button type="button" class="action-btn" data-mode="normal" onclick="setProjectMode('normal')">Normal run<small>fresh pass in this folder</small></button>
@@ -1338,11 +2118,10 @@ def form_page():
             <button type="button" class="action-btn" data-mode="recut_regenerate_seedance" onclick="setProjectMode('recut_regenerate_seedance')">Regenerate clips<small>new Seedance clips + recut</small></button>
             <button type="button" class="action-btn" data-mode="recut_recreate_speaker_clip" onclick="setProjectMode('recut_recreate_speaker_clip')">Recreate hook<small>new speaker hook + recut</small></button>
           </div>
-          <div class="hint">Only shown for a loaded project. Choose what to reuse versus regenerate before re-rendering.</div>
         </div>
 
         <div class="panel">
-          <label>Voice &amp; narration</label>
+          <label>Voice &amp; narration {help_tip("Narration is generated from your script with Gemini TTS (English). The speaker name is sent ahead of the script; the voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts.")}</label>
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
             <input type="text" name="speaker_name" value="{esc(state.get('speaker_name') or 'Narrator')}" placeholder="Speaker name (e.g. Rose)" style="flex:1; min-width:150px;">
             <select name="tts_voice" style="flex:1; min-width:180px;">{voice_options}</select>
@@ -1352,47 +2131,26 @@ def form_page():
             </select>
           </div>
           <div class="checks">
-            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use the generated voice as the final narration (music/SFX ducked under it)</label>
+            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use generated voice as narration {help_tip("The generated voice becomes the final narration; music and SFX are ducked under it.")}</label>
           </div>
-          <div class="hint">The narration is generated from your script with Gemini TTS (English). The speaker name is sent ahead of the script, and the voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts.</div>
         </div>
-        <div class="panel">
-          <label>Speaker hook image</label>
-          <input type="hidden" name="speaker_image_path" id="speaker-image-path" value="{esc(state.get('speaker_image_path'))}">
-          {speaker_gallery_html(state.get('speaker_image_path'))}
-          <div class="speaker-upload">
-            <span class="hint">Or upload a new face:</span>
-            <input type="file" name="speaker_image_file" accept="image/*" onchange="onSpeakerUpload(this)">
+        <div class="panel toggle-panel" id="speaker-panel">
+          <div class="panel-head">
+            <label>Speaker hook clip {help_tip("Optional. Pick a saved speaker or upload a new face. The marked hook is spoken by this person as a lip-synced talking-head opening (InfiniteTalk). If no hook is marked, a Seedance speaker clip is the fallback.")}</label>
+            <label class="switch" title="Talking-head hook on/off"><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")} onchange="toggleSection('speaker-panel', this.checked)"></label>
           </div>
-          <div class="checks">
-            <label><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")}> Create a talking-head hook clip (InfiniteTalk) from this image</label>
+          <div class="panel-body">
+            <input type="hidden" name="speaker_image_path" id="speaker-image-path" value="{esc(state.get('speaker_image_path'))}">
+            <input type="file" name="speaker_image_file" id="speaker-file" accept="image/*" onchange="onSpeakerUpload(this)" style="display:none">
+            {speaker_gallery_html(state.get('speaker_image_path'))}
           </div>
-          <div class="hint">Optional. Pick a saved speaker or upload a new face. The marked hook is then spoken by this person as a lip-synced talking-head opening (InfiniteTalk), driven by the generated hook audio. (If no hook is marked, a Seedance speaker clip is the fallback.)</div>
         </div>
-
-        <details class="panel">
-          <summary style="cursor: pointer; font-weight: bold; padding: 5px;">Advanced options</summary>
-          <div style="margin-top: 20px;">
-            <label>Agent options</label>
-            <div class="checks">
-              <label><input type="checkbox" name="autonomous_director"{checked("autonomous_director")}> Auto Director decides APIs, media counts, and scene strategy</label>
-              <label><input type="checkbox" name="use_audio_timing"{checked("use_audio_timing")}> Force-align the generated voice for frame-accurate timing</label>
-              <label><input type="checkbox" name="use_llm_search"{checked("use_llm_search")}> Use Reasoning Agent to plan web image searches</label>
-              <label><input type="checkbox" name="use_llm_video_review"{checked("use_llm_video_review")}> Use Reasoning Agent two-pass review and auto-correction</label>
-              <label><input type="checkbox" name="auto_web_images"{checked("auto_web_images")}> Search and download web images automatically</label>
-              <label><input type="checkbox" name="background_music_enabled"{checked("background_music_enabled")}> Add background music</label>
-              <label><input type="checkbox" name="generate_missing_sfx"{checked("generate_missing_sfx")}> Generate missing sound effects with Kling when the library has no fit</label>
-              <label><input type="checkbox" name="allow_gpt"{checked("allow_gpt")}> Generate GPT source images for Seedance when needed</label>
-              <label><input type="checkbox" name="allow_seedance"{checked("allow_seedance")}> Generate missing Seedance clips</label>
-            </div>
-          </div>
-        </details>
       </section>
 
       <section class="stack preview-section">
         <div class="loaded-media-panel" style="border: 1px solid var(--line); border-radius: 10px; padding: 22px;">
           <h2 style="margin-bottom: 5px;">&#127916; Project media preview</h2>
-          <div class="hint" id="project-media-hint" style="margin-bottom: 18px;">No project loaded. Click &ldquo;Load Project&rdquo; in the top bar to browse a past project &mdash; its media appears here, full width.</div>
+          <div class="hint" id="project-media-hint" style="margin-bottom: 18px;">No project loaded. Click &ldquo;Load project&rdquo; in the top bar to browse a past project &mdash; its media appears here.</div>
           <div id="project-media-preview"></div>
         </div>
       </section>
@@ -1406,56 +2164,105 @@ def form_page():
           <div class="project-load-controls" style="display: flex; flex-direction: column; align-items: stretch; gap: 8px; max-height: 50vh; overflow-y: auto;">
             {previous_project_options}
           </div>
-          <div id="project-load-status" class="hint" style="margin-top: 15px;">Click a project above to load its script, visual direction, audio, and available settings. Web images will appear in the Media Preview.</div>
+          <div id="project-load-status" class="hint" style="margin-top: 15px;"></div>
         </div>
+      </div>
+    </div>
+
+    <div id="preset-popup" class="modal-overlay">
+      <div class="modal-content preset-popup-card">
+        <button class="modal-close" onclick="closePresetPopup()">&times;</button>
+        <h2 style="margin-bottom: 4px;">Presets</h2>
+        <p class="hint" style="margin: 0 0 14px;">Load a saved setup, or save the current settings. Save&nbsp;as makes a new one; Overwrite replaces the active preset.</p>
+        <div id="preset-popup-body"></div>
       </div>
     </div>
     """
     body += """
     <script>
     (function(){
-      function ind(){
+      function hesc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+      function renderHighlight(){
+        var ta=document.getElementById('script-field');
+        var hl=document.getElementById('script-highlight');
         var h=document.getElementById('hook-text');
-        var el=document.getElementById('hook-indicator');
-        if(!h||!el) return;
-        var v=(h.value||'').trim();
-        el.textContent = v ? ('Hook: “'+(v.length>70?v.slice(0,70)+'…':v)+'”') : 'No hook marked (the whole script is read straight through).';
-        el.style.color = v ? 'var(--accent, #ffd400)' : '';
+        if(!ta||!hl) return;
+        var text=ta.value||'';
+        var hook=(h&&h.value||'').trim();
+        var html;
+        var idx=hook?text.indexOf(hook):-1;
+        if(hook&&idx>=0){
+          html=hesc(text.slice(0,idx))+'<mark class="hook-mark">'+hesc(text.slice(idx,idx+hook.length))+'</mark>'+hesc(text.slice(idx+hook.length));
+        } else {
+          html=hesc(text);
+        }
+        hl.innerHTML=html+'\\n';
+        hl.scrollTop=ta.scrollTop; hl.scrollLeft=ta.scrollLeft;
+      }
+      function ind(){
+        // the marked hook is shown by the amber highlight in the script itself,
+        // so no separate status text is needed.
+        renderHighlight();
       }
       window.markHook=function(){
         var ta=document.getElementById('script-field'); if(!ta) return;
         var sel=ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
-        if(!sel){ alert('Select the hook text inside the script first, then click \\u201cMark selection as hook\\u201d.'); return; }
+        if(!sel){ alert('Select the opening line(s) inside the script first, then click \\u201cMark selection as hook\\u201d.'); return; }
         var h=document.getElementById('hook-text'); if(h){ h.value=sel; } ind();
       };
       window.clearHook=function(){ var h=document.getElementById('hook-text'); if(h){ h.value=''; } ind(); };
-      document.addEventListener('DOMContentLoaded', ind); ind();
+      window.setRunType=function(mode){
+        var f=document.getElementById('run-type'); if(f) f.value=mode;
+        Array.prototype.forEach.call(document.querySelectorAll('.runtype-btns .tier-btn'), function(b){
+          b.classList.toggle('run-active', b.getAttribute('data-run')===mode);
+        });
+      };
+      document.addEventListener('DOMContentLoaded', function(){
+        var ta=document.getElementById('script-field');
+        if(ta){
+          ta.addEventListener('input', renderHighlight);
+          ta.addEventListener('scroll', function(){ var hl=document.getElementById('script-highlight'); if(hl){ hl.scrollTop=ta.scrollTop; hl.scrollLeft=ta.scrollLeft; } });
+        }
+        var rt=document.getElementById('run-type'); if(rt){ window.setRunType(rt.value||'normal'); }
+        ind();
+      });
+      ind();
     })();
     </script>
     """
+    if clear:
+        # the server already rendered a clean form; also wipe the autosave so the
+        # client-side restore can't refill it (otherwise "New project" keeps the old script).
+        body += (
+            "<script>try{Object.keys(localStorage).forEach(function(k){"
+            "if(k.indexOf('autonomous-shorts-agent-ui-state')===0)localStorage.removeItem(k);});}catch(e){}</script>"
+        )
+    if open_load:
+        body += (
+            "<script>document.addEventListener('DOMContentLoaded',function(){"
+            "var m=document.getElementById('load-modal');if(m){m.classList.add('active');}"
+            "});</script>"
+        )
+    if load_slug:
+        body += (
+            "<script>(function(){var s=" + json.dumps(load_slug) + ";"
+            "function go(){if(typeof window.loadProject==='function'){window.loadProject(s);}"
+            "else{setTimeout(go,60);}}"
+            "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',go);}else{go();}"
+            "})();</script>"
+        )
     return page("Shortslab", body)
 
 
 def sfx_page():
-    body = """
-    <div class="top">
-      <div class="brand">
-        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
-        <div>
-          <h1>AI Sound-Effect Pass</h1>
-          <p class="sub">Upload a finished Short and an Opus&nbsp;4.8 agent adds fitting sound effects &mdash; whooshes on image changes, impacts and stingers to punch key spoken moments &mdash; mixed quietly under your existing audio. The video stream stays untouched (lossless).</p>
-        </div>
-      </div>
-      <div class="nav-actions">
-        <a class="button secondary" href="/">New project</a>
-        <a class="button secondary" href="/assets">Assets</a>
-      </div>
-    </div>
+    body = f"""
+    {brand_header()}
     <form method="post" action="/sfx-run" enctype="multipart/form-data">
       <section class="stack">
         <div class="panel accent">
           <label>Finished Short (video)</label>
-          <input type="file" name="video_file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required>
+          <label class="filepick" for="sfx-video-file"><span class="filepick-btn">&#128193; Choose video file</span><span class="filepick-name" id="sfx-video-name">No file chosen</span></label>
+          <input type="file" name="video_file" id="sfx-video-file" class="filepick-input" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required onchange="var n=document.getElementById('sfx-video-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
           <div class="hint">Rendered vertical MP4 / MOV / WebM. The video is copied losslessly; only the audio gets the new sound effects mixed in.</div>
         </div>
         <div class="panel">
@@ -1514,6 +2321,37 @@ def valid_replace_path_values(raw_paths):
     return list(dict.fromkeys(selected))
 
 
+def _make_speech_gate(job_id, cancel_event, approval_event):
+    """Blocks the run worker after voiceover generation until the user approves or
+    replaces it on the run page (only used when 'Halt after generating speech' is on)."""
+    def gate(audio):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise RunCancelled("Run cancelled by user.")
+            job["status"] = "awaiting_approval"
+            job["speech_audio"] = str(audio)
+            job["speech_decision"] = None
+            job["logs"].append("Voiceover ready — listen, then Approve to continue or Replace the voice.")
+            job.setdefault("log_times", []).append(time.time())
+        while not approval_event.wait(timeout=0.5):
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+        approval_event.clear()
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            decision = (job.get("speech_decision") if job else "approve") or "approve"
+        if decision == "replace":
+            raise RunCancelled("Voice replaced — restarting with a new speaker.")
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job["status"] = "running"
+                job["logs"].append("Voiceover approved — continuing the run.")
+                job.setdefault("log_times", []).append(time.time())
+    return gate
+
+
 def start_job(fields, files):
     job_id = str(int(time.time() * 1000))
     fields = dict(fields)
@@ -1537,9 +2375,12 @@ def start_job(fields, files):
             os.remove(path_to_remove)
         except Exception:
             pass
+    approval_event = threading.Event()
     fields["_cancel_event"] = cancel_event
     fields["_replace_lock"] = replace_lock
     fields["_replace_requests"] = replace_requests
+    fields["_speech_gate"] = _make_speech_gate(job_id, cancel_event, approval_event)
+    restart_fields = {k: v for k, v in fields.items() if not k.startswith("_") and k not in ("audio_path",)}
     if audio_path:
         fields["audio_path"] = audio_path
     if speaker_image_path:
@@ -1563,6 +2404,8 @@ def start_job(fields, files):
             "cancel_event": cancel_event,
             "replace_lock": replace_lock,
             "replace_requests": replace_requests,
+            "approval_event": approval_event,
+            "restart_fields": restart_fields,
             "project_dir": None,
             "created_at": time.time(),
         }
@@ -1715,17 +2558,11 @@ def link_for(path):
 
 
 def speaker_gallery_images():
-    """Saved speaker images: the repo 'speaker images' folder + previously uploaded."""
-    out, seen = [], set()
-    for folder in (SPEAKER_GALLERY_DIR, SPEAKER_UPLOADED_DIR):
-        if not folder.exists():
-            continue
-        files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SPEAKER_IMAGE_EXTS]
-        for p in sorted(files, key=lambda x: x.stat().st_mtime, reverse=True):
-            rp = str(p.resolve())
-            if rp not in seen:
-                seen.add(rp)
-                out.append(p)
+    """Saved speaker images — ONLY the repo 'speaker images' folder (per user)."""
+    out = []
+    if SPEAKER_GALLERY_DIR.exists():
+        files = [p for p in SPEAKER_GALLERY_DIR.iterdir() if p.is_file() and p.suffix.lower() in SPEAKER_IMAGE_EXTS]
+        out = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
     return out
 
 
@@ -1749,11 +2586,15 @@ def speaker_gallery_html(selected=""):
             selected_resolved = str(Path(selected).resolve())
     except Exception:
         selected_resolved = ""
-    if not images:
-        return ('<div class="hint">No saved speaker images yet. Drop face photos into the '
-                '<code>speaker images</code> folder in the repo, or upload one below &mdash; '
-                'uploaded speakers are remembered here.</div>')
-    tiles = []
+    # the upload "+" tile lives inside the gallery (same size as a speaker tile);
+    # click opens the file picker, drag-drop a file onto it also works.
+    add_tile = (
+        '<button type="button" class="speaker-tile speaker-add" id="speaker-add-tile" '
+        'title="Upload a new face" aria-label="Upload a new face" '
+        'onclick="document.getElementById(\'speaker-file\').click()">'
+        '<span class="speaker-add-plus">+</span></button>'
+    )
+    tiles = [add_tile]
     for p in images:
         rp = str(p.resolve())
         sel = " selected" if selected_resolved and selected_resolved == rp else ""
@@ -2387,36 +3228,37 @@ def project_summary(project_dir):
 
 def asset_card(summary):
     thumb = summary.get("thumb")
-    thumb_html = ""
+    has_video = bool(summary.get("video") and Path(summary["video"]).exists())
     if thumb and Path(thumb).exists() and is_image_path(thumb):
         thumb_html = (
-            f'<button class="preview-button" type="button" data-preview-src="{link_for(thumb)}" data-preview-title="{esc(summary["title"])}">'
+            f'<button class="asset-figure preview-button" type="button" data-preview-src="{link_for(thumb)}" data-preview-title="{esc(summary["title"])}">'
             f'<img class="asset-thumb" src="{link_for(thumb)}" alt="{esc(summary["title"])}"></button>'
         )
-    elif summary.get("video") and Path(summary["video"]).exists():
-        thumb_html = f'<video class="asset-thumb" preload="metadata" muted src="{link_for(summary["video"])}"></video>'
+    elif has_video:
+        thumb_html = f'<div class="asset-figure"><video class="asset-thumb" preload="metadata" muted src="{link_for(summary["video"])}"></video></div>'
     else:
-        thumb_html = '<div class="asset-thumb"></div>'
-    actions = [
-        f'<a class="button" href="{view_for(summary["project_dir"], "assets")}">Project</a>',
-        f'<a class="button secondary" href="{view_for(summary["renders"], "assets")}">Renders</a>',
-        f'<a class="button secondary" href="{view_for(summary["review"], "assets")}">Review</a>',
-    ]
-    if summary.get("video") and Path(summary["video"]).exists():
-        actions.insert(0, f'<a class="button" href="{view_for(summary["video"], "assets")}">Final video</a>')
+        thumb_html = '<div class="asset-figure"><div class="asset-thumb"></div></div>'
+
+    slug = summary["slug"]
+    # "Check results" opens the final video if it exists, otherwise the project folder.
+    results_href = view_for(summary["video"], "assets") if has_video else view_for(summary["project_dir"], "assets")
     return f"""
     <article class="panel asset-card">
       {thumb_html}
-      <div>
+      <div class="asset-body">
         <h2>{esc(summary["title"])}</h2>
-        <div class="hint">{esc(summary["slug"])} - {esc(summary["created_at"])}</div>
+        <div class="asset-sub">{esc(summary["created_at"])}</div>
+        <div class="asset-meta">
+          <span class="asset-pill">{summary["web_images"]} web</span>
+          <span class="asset-pill">{summary["gpt_images"]} GPT</span>
+          <span class="asset-pill">{summary["seedance"]} clips</span>
+        </div>
       </div>
-      <div class="asset-meta">
-        <span class="asset-pill">{summary["web_images"]} web</span>
-        <span class="asset-pill">{summary["gpt_images"]} GPT</span>
-        <span class="asset-pill">{summary["seedance"]} Seedance</span>
+      <div class="asset-primary">
+        <a class="button asset-go" href="{results_href}">&#9654; Check results</a>
+        <a class="button secondary" href="/?project={esc(slug)}">&#128194; Load project</a>
       </div>
-      <div class="asset-actions">{"".join(actions)}</div>
+      {f'<a class="button asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Open timeline editor</a>' if has_video else '<div class="asset-timeline-locked">&#128274; Timeline opens after first render</div>'}
     </article>
     """
 
@@ -2430,19 +3272,7 @@ def assets_page():
     if not cards:
         cards = '<section class="panel"><h2>No assets yet</h2><div class="hint">Finished runs and generated project folders will appear here.</div></section>'
     body = f"""
-    <div class="top">
-      <div class="brand">
-        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
-        <div>
-          <h1>Asset Library</h1>
-          <p class="sub">{count} project{"" if count == 1 else "s"} &mdash; final renders, review sheets, GPT &amp; web images, Seedance clips and speaker faces, all in one place.</p>
-        </div>
-      </div>
-      <div class="nav-actions">
-        <a class="button" href="/">&#43; New Project</a>
-        <a class="button secondary" href="/sfx">&#128266; Add SFX to a Video</a>
-      </div>
-    </div>
+    {brand_header()}
     <section class="asset-grid">{cards}</section>
     """
     return page("Asset Library", body)
@@ -2451,10 +3281,19 @@ def assets_page():
 TIMELINE_SKELETON = """
 <div id="timeline-root" data-slug="__SLUG__">
   <div class="tl-toolbar panel">
-    <button type="button" class="button primary tl-render-btn" id="tl-render">&#11015; Render final video</button>
-    <div class="tl-total" id="tl-total"></div>
-    <label class="tl-cap-toggle"><input type="checkbox" id="tl-captions"> Captions <span class="tl-lock">&#128274; locked to voice</span></label>
-    <div class="hint tl-help">Drag a clip to reorder, its right edge to trim. Click any clip, &#9670; transition, or &#9834; sound to tune it.</div>
+    <div class="tl-actions">
+      <button type="button" class="button secondary tl-save-btn" id="tl-save" title="Save timeline changes">&#128190; Save</button>
+      <button type="button" class="button primary tl-render-btn" id="tl-render">&#11015; Render</button>
+      <div class="tl-rework-group">
+        <button type="button" class="button tl-rework-btn" id="tl-rework">&#129302; Agent rework</button>
+        <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"> replace selected media</label>
+        <label class="tl-chk"><input type="checkbox" id="tl-rw-recut" checked> reorder &amp; recut</label>
+      </div>
+    </div>
+    <div class="tl-meta">
+      <span class="tl-total" id="tl-total"></span>
+      <label class="tl-cap-toggle"><span>Captions linked to speech</span><input type="checkbox" id="tl-captions"></label>
+    </div>
   </div>
   <div class="tl-grid tl-top">
     <div class="panel tl-player">
@@ -2465,9 +3304,10 @@ TIMELINE_SKELETON = """
         <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview</div>
       </div>
       <div class="tl-player-bar">
-        <button type="button" class="button secondary" id="tl-play">&#9654; Play</button>
+        <button type="button" class="tl-ctrl" id="tl-back" title="Back 5s" aria-label="Back 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 6h2.2v12H6zM20 6v12L9.5 12z"/></svg></button>
+        <button type="button" class="tl-ctrl tl-ctrl-main" id="tl-play" title="Play / Pause" aria-label="Play"><span id="tl-play-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></button>
+        <button type="button" class="tl-ctrl" id="tl-fwd" title="Forward 5s" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M15.8 6H18v12h-2.2zM4 6v12l10.5-6z"/></svg></button>
         <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
-        <span class="hint">Plays the real footage in order at the trimmed timing.</span>
       </div>
     </div>
     <div class="panel tl-inspector" id="tl-inspector">
@@ -2479,9 +3319,8 @@ TIMELINE_SKELETON = """
         <input type="number" id="tl-insp-dur" min="0.5" max="20" step="0.1">
         <div class="tl-insp-actions">
           <button type="button" class="button secondary" id="tl-insp-remove">Remove clip</button>
-          <button type="button" class="button" id="tl-insp-replace" hidden>&#129302; Replace via agent</button>
         </div>
-        <div class="hint" id="tl-insp-note">Removing a clip drops it and re-flows the timeline.</div>
+        <div class="hint" id="tl-insp-note">Tip: click the red strip on top of a clip to mark its media for the agent to replace.</div>
       </div>
       <div class="tl-insp-pane" id="tl-insp-fx" hidden>
         <div class="tl-insp-name" id="tl-fx-name"></div>
@@ -2519,70 +3358,128 @@ TIMELINE_SKELETON = """
       <div class="tl-slider"><label>Voice <span id="tl-v-voice"></span></label><input type="range" id="tl-voice-vol" min="0" max="1.5" step="0.05"></div>
       <div class="tl-slider"><label>Music <span id="tl-v-music"></span></label><input type="range" id="tl-music-vol" min="0" max="0.6" step="0.01"></div>
     </div>
-    <div class="hint">Each transition and sound effect is tuned individually on the timeline above &mdash; click it to open its controls.</div>
+  </div>
+  <div class="panel tl-library">
+    <div class="tl-lib-head">
+      <h2>Library</h2>
+      <div class="tl-lib-tabs">
+        <button type="button" class="tl-lib-tab active" data-lib="media">Project media</button>
+        <button type="button" class="tl-lib-tab" data-lib="sfx">Sound&nbsp;FX</button>
+      </div>
+      <span class="tl-lib-hint">drag onto the timeline</span>
+    </div>
+    <div class="tl-lib-body" id="tl-lib-media"><div class="tl-lib-loading">Loading media…</div></div>
+    <div class="tl-lib-body" id="tl-lib-sfx" hidden><div class="tl-lib-loading">Loading sounds…</div></div>
   </div>
 </div>
 """
 
 TIMELINE_ASSETS = """
 <style>
-  .tl-toolbar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
-  .tl-render-btn { width:auto; min-width:220px; font-size:16px; }
-  .tl-total { font-weight:900; color:#ffe6ad; }
-  .tl-cap-toggle { display:flex; align-items:center; gap:8px; font-weight:800; margin:0; cursor:pointer; }
-  .tl-cap-toggle input { width:auto; }
-  .tl-lock { font-weight:600; color:#9aa4a1; font-size:12px; }
-  .tl-help { flex:1; min-width:220px; margin:0; }
-  .tl-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .tl-toolbar { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
+  .tl-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  /* scope width:auto under .tl-actions so it beats the global button{width:100%} */
+  .tl-actions .button, .tl-actions .tl-render-btn, .tl-actions .tl-save-btn, .tl-actions .tl-rework-btn { width:auto; min-width:0; }
+  .tl-render-btn { font-size:13.5px; padding:9px 16px; }
+  .tl-save-btn { font-size:13.5px; padding:9px 14px; }
+  .tl-save-btn.tl-unsaved { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); color:var(--text); }
+  .tl-rework-group { display:flex; align-items:center; gap:8px 12px; flex-wrap:wrap; padding-left:12px; margin-left:4px; border-left:1px solid var(--line-strong); }
+  .tl-rework-btn { font-size:13px; padding:9px 14px; }
+  .tl-chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:#c9d2cf; margin:0; cursor:pointer; }
+  .tl-chk input { margin:0; }
+  .tl-meta { display:flex; align-items:center; gap:16px; }
+  .tl-total { font-weight:700; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .tl-cap-toggle { display:flex; align-items:center; gap:8px; font-weight:700; margin:0; cursor:pointer; }
+  .tl-cap-toggle input { margin:0; }
+  .tl-grid { display:grid; grid-template-columns:auto 1fr; gap:16px; align-items:start; }
   .tl-top { margin-bottom:16px; }
-  .tl-stage-view { position:relative; width:100%; aspect-ratio:16/9; background:#06080a; border:1px solid var(--line); border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
-  .tl-stage-view img, .tl-stage-view video { max-width:100%; max-height:100%; width:100%; height:100%; object-fit:contain; display:none; background:#000; }
-  .tl-stage-empty { position:absolute; color:#7e8884; font-weight:700; }
-  .tl-player-bar { display:flex; align-items:center; gap:12px; margin-top:12px; flex-wrap:wrap; }
-  .tl-player-bar .button { width:auto; min-width:96px; }
-  .tl-playtime { font-weight:800; color:#ffe6ad; font-variant-numeric:tabular-nums; }
+  .tl-player { display:flex; flex-direction:column; align-items:center; }
+  .tl-player h2 { align-self:flex-start; }
+  .tl-stage-view { position:relative; aspect-ratio:9/16; height:min(58vh,540px); width:auto; max-width:100%; background:#000; border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+  .tl-stage-view img, .tl-stage-view video { width:100%; height:100%; object-fit:cover; display:none; background:#000; }
+  .tl-stage-empty { position:absolute; color:var(--faint); font-weight:600; }
+  .tl-player-bar { display:flex; align-items:center; justify-content:center; gap:14px; margin-top:14px; }
+  .tl-player-bar .tl-ctrl { width:42px; height:42px; min-width:0; padding:0; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; color:var(--text); background:var(--bg-overlay); border:1px solid var(--line-strong); box-shadow:none; }
+  .tl-ctrl::after { display:none; }
+  .tl-player-bar .tl-ctrl:hover { background:var(--bg-raised); border-color:var(--accent); transform:translateY(-1px); box-shadow:none; }
+  .tl-player-bar .tl-ctrl-main { width:54px; height:54px; color:#fff; background:linear-gradient(180deg,var(--accent-hover),var(--accent)); border-color:var(--accent-active); }
+  .tl-ctrl-main:hover { background:linear-gradient(180deg,#a18dff,var(--accent-hover)); border-color:var(--accent-hover); }
+  .tl-playtime { font-weight:700; color:var(--muted); font-variant-numeric:tabular-nums; margin-left:6px; }
   .tl-stage { overflow:hidden; }
   .tl-rows { display:flex; gap:10px; }
   .tl-row-labels { display:flex; flex-direction:column; gap:6px; flex:0 0 auto; }
-  .tl-rlabel { display:flex; align-items:center; font-weight:800; color:#9aa4a1; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .tl-rlabel { display:flex; align-items:center; font-weight:600; color:var(--faint); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   .tl-rl-ruler { height:26px; }
   .tl-rl-clips { height:96px; }
   .tl-rl-cap, .tl-rl-voice, .tl-rl-tr, .tl-rl-sfx { height:40px; }
   .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:12px; user-select:none; -webkit-user-select:none; }
   .tl-ruler { position:relative; height:26px; cursor:pointer; }
-  .tl-tick { position:absolute; top:0; height:26px; border-left:1px solid #2a343a; padding-left:5px; font-size:10px; color:#7e8884; }
+  .tl-tick { position:absolute; top:0; height:26px; border-left:1px solid rgba(255,255,255,.2); padding-left:5px; font-size:10px; color:rgba(255,255,255,.6); }
   .tl-playhead { position:absolute; top:0; bottom:12px; width:2px; background:#ff5d5d; z-index:8; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
   .tl-playhead::before { content:''; position:absolute; top:0; left:-5px; border-left:6px solid transparent; border-right:6px solid transparent; border-top:8px solid #ff5d5d; }
-  .tl-track { position:relative; margin-top:6px; background:#0d1114; border:1px solid var(--line); border-radius:7px; }
+  .tl-track { position:relative; margin-top:6px; background:var(--bg-base); border:1px solid var(--line); border-radius:var(--r-md); }
   .tl-clips-track { height:96px; }
   .tl-cap, .tl-aud, .tl-trtrack, .tl-sfx { height:40px; }
-  .tl-clip { position:absolute; top:4px; bottom:4px; border:2px solid var(--accent-2); border-radius:7px; overflow:hidden; cursor:grab; background:#1a1407; background-size:cover; background-position:center; touch-action:none; }
-  .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.6); z-index:4; }
+  .tl-clip { position:absolute; top:4px; bottom:4px; border:2px solid var(--line-strong); border-radius:var(--r-md); overflow:hidden; cursor:grab; background:var(--bg-overlay); background-size:cover; background-position:center; touch-action:none; box-shadow:var(--sh-1); }
+  .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
   .tl-clip.dragging { opacity:.8; cursor:grabbing; z-index:9; }
   .tl-clip .tl-badge { position:absolute; top:5px; left:6px; font-size:11px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; background:rgba(0,0,0,.45); padding:1px 6px; border-radius:5px; }
   .tl-clip .tl-clip-label { position:absolute; left:0; right:0; bottom:0; padding:4px 8px; font-size:11px; font-weight:800; color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.85)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:13px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(240,180,95,.7)); }
-  .tl-seam { position:absolute; top:0; bottom:0; width:0; border-left:2px dashed rgba(143,214,238,.45); z-index:3; pointer-events:none; }
+  .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:13px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(124,92,255,.6)); }
+  .tl-seam { position:absolute; top:0; bottom:0; width:0; border-left:2px dashed rgba(124,92,255,.4); z-index:3; pointer-events:none; }
   .tl-trans { position:absolute; transform:translate(-50%,-50%); z-index:6; width:24px; height:24px; cursor:pointer; display:flex; align-items:center; justify-content:center; touch-action:none; }
-  .tl-trans .tl-diamond { width:17px; height:17px; transform:rotate(45deg); background:#2f7d9b; border:1px solid #8fd6ee; border-radius:3px; box-shadow:0 0 0 3px #0d1114; transition:transform .12s ease; }
+  .tl-trans .tl-diamond { width:16px; height:16px; transform:rotate(45deg); background:var(--accent-2); border:1px solid #fff; border-radius:4px; box-shadow:0 0 0 3px var(--bg-base); transition:transform .12s ease; }
   .tl-trans.selected .tl-diamond { background:var(--accent); border-color:#fff; }
-  .tl-trans.disabled .tl-diamond { background:#39424a; border-color:#5a646c; }
+  .tl-trans.disabled .tl-diamond { background:var(--faint); border-color:var(--line-strong); }
   .tl-trans:hover .tl-diamond { transform:rotate(45deg) scale(1.18); }
-  .tl-capbar { position:absolute; top:7px; bottom:7px; border-radius:5px; background:repeating-linear-gradient(90deg,#13311f 0 10px,#0f2a1a 10px 20px); border:1px solid #2f7d49; display:flex; align-items:center; padding-left:9px; color:#9fe6b6; font-size:11px; font-weight:800; white-space:nowrap; overflow:hidden; }
+  .tl-capbar { position:absolute; top:7px; bottom:7px; border-radius:7px; background:var(--accent-subtle); border:1px solid rgba(124,92,255,.4); display:flex; align-items:center; padding-left:9px; color:var(--text); font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; }
   .tl-capbar.off { opacity:.3; }
-  .tl-audbar { position:absolute; top:7px; bottom:7px; left:0; right:0; border-radius:5px; background:repeating-linear-gradient(90deg,#1a2a33 0 8px,#16242c 8px 16px); border:1px solid #2a3a44; }
-  .tl-fx { position:absolute; top:6px; bottom:6px; border-radius:5px; background:#3a2a12; border:1px solid var(--accent-2); cursor:pointer; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:800; color:#ffe6ad; white-space:nowrap; overflow:hidden; box-sizing:border-box; }
-  .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.5); z-index:4; }
+  .tl-audbar { position:absolute; top:7px; bottom:7px; left:0; right:0; border-radius:7px; background:rgba(111,211,255,.12); border:1px solid rgba(111,211,255,.3); }
+  .tl-fx { position:absolute; top:6px; bottom:6px; border-radius:7px; background:var(--bg-overlay); border:1px solid var(--line-strong); cursor:pointer; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; box-sizing:border-box; }
+  .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
   .tl-fx.disabled { opacity:.4; }
   .tl-mixer-wrap { margin-top:16px; }
   .tl-mixer { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
   .tl-slider label { display:flex; justify-content:space-between; margin-bottom:6px; }
-  .tl-insp-name { font-weight:800; color:#fff8eb; margin-bottom:12px; }
+  .tl-insp-name { font-weight:700; color:var(--text); margin-bottom:12px; }
   .tl-insp-actions { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 8px; }
   .tl-insp-actions .button { width:auto; flex:1; min-width:140px; }
   .tl-fx-enable { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
-  .tl-fx-enable input { width:auto; }
-  @media (max-width:760px){ .tl-grid{ grid-template-columns:1fr; } }
+  .tl-fx-enable input { margin:0; }
+  /* modern in-timeline replace selection: a thin red strip attached to the top of
+     each clip; click to toggle. It lives inside the clip so it scrolls with it. */
+  .tl-clip .tl-clip-mark { position:absolute; top:0; left:0; right:0; height:8px; z-index:7; cursor:pointer; background:transparent; transition:background var(--dur) var(--ease); }
+  .tl-clip .tl-clip-mark:hover { background:rgba(232,71,43,.35); }
+  .tl-clip .tl-clip-mark.on { height:4px; background:var(--accent-2); box-shadow:0 0 0 1px var(--ink), 0 0 10px rgba(232,71,43,.95); animation:markpulse 1.3s ease-in-out infinite; }
+  @keyframes markpulse { 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
+  .tl-clip.marked-replace { box-shadow:0 0 0 2px var(--accent-2), var(--sh-1); }
+  .tl-clip .tl-replace-tag { position:absolute; top:6px; right:6px; font-family:var(--pixel); font-size:8px; color:#fff; background:var(--accent-2); padding:2px 5px; border-radius:2px; z-index:5; border:1px solid var(--ink); }
+  .tl-library { margin-top:16px; }
+  .tl-lib-head { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:12px; }
+  .tl-lib-head h2 { margin:0; }
+  .tl-lib-tabs { display:flex; gap:6px; }
+  .tl-lib-tabs .tl-lib-tab { width:auto; min-width:0; padding:7px 14px; font-size:12.5px; font-weight:600; background:var(--bg-input); border:1px solid var(--line); color:var(--muted); box-shadow:none; }
+  .tl-lib-tab::after { display:none; }
+  .tl-lib-tab.active { border-color:var(--accent); background:var(--accent-subtle); color:var(--text); }
+  .tl-lib-hint { color:var(--faint); font-size:12px; }
+  .tl-lib-body { display:block; max-height:380px; overflow-y:auto; padding:2px; }
+  .tl-sublib-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; position:sticky; top:0; background:var(--bg-raised); padding-bottom:6px; z-index:2; }
+  .tl-sublib-tab { width:auto; min-width:0; padding:5px 10px; font-family:var(--pixel); font-size:9px; text-transform:uppercase; background:var(--bg-input); border:2px solid var(--ink); color:var(--ink); border-radius:var(--r-sm); box-shadow:none; }
+  .tl-sublib-tab::after { display:none; }
+  .tl-sublib-tab.active { background:var(--accent); color:#fff; }
+  .tl-sublib-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:10px; }
+  .tl-sfx-search { width:100%; margin-bottom:10px; position:sticky; top:0; }
+  .tl-lib-body[hidden] { display:none; }
+  .tl-lib-loading { color:var(--faint); font-size:13px; }
+  .tl-lib-item { position:relative; border:1px solid var(--line); border-radius:var(--r-md); overflow:hidden; background:var(--bg-input); cursor:grab; }
+  .tl-lib-item:hover { border-color:var(--accent); }
+  .tl-lib-item.dragging { opacity:.5; }
+  .tl-lib-item img, .tl-lib-item video { display:block; width:100%; aspect-ratio:9/14; object-fit:cover; background:var(--bg-base); pointer-events:none; }
+  .tl-lib-item .tl-lib-name { padding:4px 7px; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tl-lib-sound { display:flex; align-items:center; gap:8px; padding:9px 11px; }
+  .tl-lib-sound .tl-lib-ico { flex:0 0 auto; color:var(--accent); }
+  .tl-track.drop-ok { outline:2px dashed var(--accent); outline-offset:-2px; background:var(--accent-subtle); }
+  @media (max-width:760px){ .tl-grid{ grid-template-columns:1fr; } .tl-stage-view{ height:auto; width:100%; max-width:300px; } }
 </style>
 <script>
 (function(){
@@ -2598,6 +3495,9 @@ TIMELINE_ASSETS = """
   var captionsOn = !!model.captions;
   var SCALE = 70;
   var sel = null;
+  var markedReplace = {};   // scene id -> true when its media is marked for agent replacement
+  var dirty = false;        // unsaved edits
+  function markDirty(){ dirty = true; var b=document.getElementById('tl-save'); if(b){ b.classList.add('tl-unsaved'); } }
 
   var clipsEl=document.getElementById('tl-clips'), capEl=document.getElementById('tl-captrack'),
       voiceEl=document.getElementById('tl-voice'), trEl=document.getElementById('tl-trtrack'),
@@ -2621,13 +3521,16 @@ TIMELINE_ASSETS = """
     vis.forEach(function(s, i){
       var w=s.dur*SCALE;
       var b=document.createElement('div');
-      b.className='tl-clip'+(sel&&sel.type==='clip'&&sel.id===s.id?' selected':'');
+      b.className='tl-clip'+(sel&&sel.type==='clip'&&sel.id===s.id?' selected':'')+(markedReplace[s.id]?' marked-replace':'');
       b.style.left=x+'px'; b.style.width=w+'px'; b.setAttribute('data-id', s.id);
       if(s.poster) b.style.backgroundImage='url('+s.poster+')';
       var badge=(s.clip?'\\u25B6 ':'')+(s.speaker?'\\uD83C\\uDFA4 ':'');
-      b.innerHTML='<span class="tl-badge">'+badge+s.dur.toFixed(1)+'s</span><span class="tl-clip-label">'+esc(s.label)+'</span><span class="tl-handle"></span>';
+      var repTag=markedReplace[s.id]?'<span class="tl-replace-tag">REPLACE</span>':'';
+      var markCls='tl-clip-mark'+(markedReplace[s.id]?' on':'');
+      b.innerHTML='<span class="'+markCls+'" title="Mark this media for the agent to replace"></span><span class="tl-badge">'+badge+s.dur.toFixed(1)+'s</span>'+repTag+'<span class="tl-clip-label">'+esc(s.label)+'</span><span class="tl-handle"></span>';
+      (function(scn){ b.querySelector('.tl-clip-mark').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); ev.preventDefault(); if(markedReplace[scn.id]) delete markedReplace[scn.id]; else markedReplace[scn.id]=true; layout(); markDirty(); }); })(s);
       b.querySelector('.tl-handle').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startResize(ev, s); });
-      b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')) return; startClipDrag(ev, s, b); });
+      b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')||ev.target.classList.contains('tl-clip-mark')) return; startClipDrag(ev, s, b); });
       clipsEl.appendChild(b);
       if(i>0){ var seam=document.createElement('div'); seam.className='tl-seam'; seam.style.left=x+'px'; clipsEl.appendChild(seam); }
       x+=w;
@@ -2657,7 +3560,7 @@ TIMELINE_ASSETS = """
       node.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); selectFx(fx.id); });
       sfxEl.appendChild(node);
     });
-    capEl.innerHTML = total>0 ? ('<div class="tl-capbar'+(captionsOn?'':' off')+'" style="left:0;width:'+(total*SCALE)+'px">\\uD83D\\uDD12 captions '+(captionsOn?'on':'off')+' (locked to voice)</div>') : '';
+    capEl.innerHTML = total>0 ? ('<div class="tl-capbar'+(captionsOn?'':' off')+'" style="left:0;width:'+(total*SCALE)+'px">Captions '+(captionsOn?'on':'off')+'</div>') : '';
     voiceEl.innerHTML='<div class="tl-audbar"></div>';
     document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+vis.length+' clips';
     updatePlayhead();
@@ -2712,11 +3615,6 @@ TIMELINE_ASSETS = """
     showPane('clip');
     document.getElementById('tl-insp-name').textContent=s.label;
     document.getElementById('tl-insp-dur').value=s.dur;
-    var rep=document.getElementById('tl-insp-replace');
-    rep.hidden=!s.replaceable;
-    document.getElementById('tl-insp-note').textContent = s.replaceable
-      ? 'Replace via agent re-searches a fresh web image for this clip, then re-renders.'
-      : 'Removing a clip drops it and re-flows the timeline.';
   }
   function currentFx(){
     if(!sel) return null;
@@ -2732,25 +3630,13 @@ TIMELINE_ASSETS = """
     document.getElementById('tl-fx-enabled').checked = fx.enabled!==false;
     var v=fx.volume||0; document.getElementById('tl-fx-vol').value=v;
     document.getElementById('tl-fx-vol-val').textContent=Math.round(v*100)+'%';
-    document.getElementById('tl-fx-note').textContent = sel.type==='trans'
-      ? 'Plays on the cut between two clips. Tune just this one.'
-      : 'Plays inside this clip. Tune just this one.';
+    document.getElementById('tl-fx-note').textContent='';
   }
 
-  document.getElementById('tl-insp-dur').addEventListener('input', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); } });
-  document.getElementById('tl-insp-remove').addEventListener('click', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.removed=true; sel=null; layout(); showPane(null); } });
-  document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); } });
-  document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); } });
-  document.getElementById('tl-insp-replace').addEventListener('click', function(){
-    var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0];
-    if(!s || !s.replaceable || !s.path) return;
-    if(!confirm('Ask the agent to find a fresh web image for this clip and re-render?')) return;
-    var btn=this; btn.disabled=true; btn.textContent='Starting...';
-    fetch('/timeline-replace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, media_path:s.path})})
-      .then(function(r){return r.json();})
-      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Replace via agent'; alert((d&&d.error)||'Could not start.'); } })
-      .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Replace via agent'; alert('Could not start.'); });
-  });
+  document.getElementById('tl-insp-dur').addEventListener('input', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); markDirty(); } });
+  document.getElementById('tl-insp-remove').addEventListener('click', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.removed=true; sel=null; layout(); showPane(null); markDirty(); } });
+  document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); markDirty(); } });
+  document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); markDirty(); } });
 
   var pimg=document.getElementById('tl-pimg'), pvid=document.getElementById('tl-pvid'), pempty=document.getElementById('tl-stage-empty');
   var playing=false, clock=0, lastTs=0, curIdx=-1;
@@ -2771,39 +3657,160 @@ TIMELINE_ASSETS = """
     if(clock>=total){ clock=total; updatePlayhead(); stop(); return; }
     showScene(sceneAt(clock)); updatePlayhead(); requestAnimationFrame(tick);
   }
-  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); document.getElementById('tl-play').innerHTML='\\u2759\\u2759 Pause'; showScene(sceneAt(clock)); requestAnimationFrame(tick); }
-  function stop(){ playing=false; pvid.pause(); document.getElementById('tl-play').innerHTML='\\u25B6 Play'; }
+  var PLAY_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+  var PAUSE_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+  function setPlayIcon(p){ var el=document.getElementById('tl-play-ico'); if(el) el.innerHTML=p?PAUSE_ICO:PLAY_ICO; }
+  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); setPlayIcon(true); showScene(sceneAt(clock)); requestAnimationFrame(tick); }
+  function stop(){ playing=false; pvid.pause(); setPlayIcon(false); }
+  function seekBy(d){ clock=Math.max(0,Math.min(totalDur(), clock+d)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); }
   document.getElementById('tl-play').addEventListener('click', function(){ if(playing) stop(); else play(); });
+  document.getElementById('tl-back').addEventListener('click', function(){ seekBy(-5); });
+  document.getElementById('tl-fwd').addEventListener('click', function(){ seekBy(5); });
   ruler.addEventListener('pointerdown', function(e){ var rect=ruler.getBoundingClientRect(); clock=Math.max(0,Math.min(totalDur(),(e.clientX-rect.left+ruler.scrollLeft)/SCALE)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); });
 
   function bindVol(id, key, out){
     var el=document.getElementById(id), o=document.getElementById(out);
     el.value=volumes[key]; o.textContent=Math.round(volumes[key]*100)+'%';
-    el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; });
+    el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; markDirty(); });
   }
   bindVol('tl-voice-vol','voice','tl-v-voice');
   bindVol('tl-music-vol','music','tl-v-music');
   var capToggle=document.getElementById('tl-captions');
   capToggle.checked=captionsOn;
-  capToggle.addEventListener('change', function(){ captionsOn=this.checked; layout(); });
+  capToggle.addEventListener('change', function(){ captionsOn=this.checked; layout(); markDirty(); });
 
-  document.getElementById('tl-render').addEventListener('click', function(){
-    var btn=this; btn.disabled=true; btn.textContent='Starting render...';
+  function collectEdits(){
     var vis=visible();
-    var edits={
+    return {
       scenes: vis.map(function(s){return {id:s.id, duration:s.dur};}),
       order: vis.map(function(s){return s.id;}),
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
+      added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
+      replace: Object.keys(markedReplace),
       volumes: volumes,
       captions: captionsOn,
       transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:t.enabled};}),
-      sfx: sfx.map(function(f){return {id:f.id, volume:f.volume, enabled:f.enabled};})
+      sfx: sfx.map(function(f){return {id:f.id, volume:f.volume, enabled:f.enabled, added:!!f.added, path:f.path, scene_id:f.scene_id, offset:f.offset};})
     };
-    fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
+  }
+
+  document.getElementById('tl-save').addEventListener('click', function(){
+    var btn=this; btn.disabled=true;
+    fetch('/timeline-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:collectEdits()})})
       .then(function(r){return r.json();})
-      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.textContent='Render final video'; alert((d&&d.error)||'Could not start render.'); } })
-      .catch(function(){ btn.disabled=false; btn.textContent='Render final video'; alert('Could not start render.'); });
+      .then(function(d){ btn.disabled=false; if(d&&d.ok){ dirty=false; btn.classList.remove('tl-unsaved'); btn.innerHTML='\\u2713 Saved'; setTimeout(function(){ btn.innerHTML='\\uD83D\\uDCBE Save'; },1400); } else { alert((d&&d.error)||'Could not save.'); } })
+      .catch(function(){ btn.disabled=false; alert('Could not save.'); });
   });
+
+  document.getElementById('tl-render').addEventListener('click', function(){
+    var btn=this; btn.disabled=true; var old=btn.innerHTML; btn.textContent='Starting…';
+    fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:collectEdits()})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML=old; alert((d&&d.error)||'Could not start render.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML=old; alert('Could not start render.'); });
+  });
+
+  document.getElementById('tl-rework').addEventListener('click', function(){
+    var doReplace=document.getElementById('tl-rw-replace').checked;
+    var doRecut=document.getElementById('tl-rw-recut').checked;
+    if(!doReplace && !doRecut){ alert('Pick at least one rework option.'); return; }
+    if(doReplace && !Object.keys(markedReplace).length){ alert('Mark at least one clip\\'s media to replace (select a clip, then tick \"Mark this clip\\'s media to be replaced\").'); return; }
+    var btn=this; btn.disabled=true; btn.textContent='Starting…';
+    fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert((d&&d.error)||'Could not start rework.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert('Could not start rework.'); });
+  });
+
+  // ---- Library (drag media / sfx onto the timeline) ----
+  function setupLibrary(){
+    var tabs=rootEl.querySelectorAll('.tl-lib-tab');
+    Array.prototype.forEach.call(tabs, function(tab){
+      tab.addEventListener('click', function(){
+        Array.prototype.forEach.call(tabs, function(t){ t.classList.remove('active'); });
+        tab.classList.add('active');
+        var which=tab.getAttribute('data-lib');
+        document.getElementById('tl-lib-media').hidden = which!=='media';
+        document.getElementById('tl-lib-sfx').hidden = which!=='sfx';
+      });
+    });
+    fetch('/timeline-library?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
+      renderMediaLib(document.getElementById('tl-lib-media'), (d&&d.media)||[]);
+      renderSfxLib(document.getElementById('tl-lib-sfx'), (d&&d.sfx)||[]);
+    }).catch(function(){
+      document.getElementById('tl-lib-media').innerHTML='<div class="tl-lib-loading">Could not load media.</div>';
+      document.getElementById('tl-lib-sfx').innerHTML='<div class="tl-lib-loading">Could not load sounds.</div>';
+    });
+  }
+  function libItemEl(it, kind){
+    var el=document.createElement('div'); el.className='tl-lib-item'; el.draggable=true;
+    if(kind==='media'){
+      var media = it.type==='video' ? '<video src="'+esc(it.url)+'" muted preload="metadata"></video>' : '<img src="'+esc(it.url)+'" alt="">';
+      el.innerHTML=media+'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+    } else {
+      el.classList.add('tl-lib-sound');
+      el.innerHTML='<span class="tl-lib-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg></span><div class="tl-lib-name">'+esc(it.name)+'</div>';
+    }
+    el.addEventListener('dragstart', function(e){ el.classList.add('dragging'); e.dataTransfer.setData('text/plain', JSON.stringify({kind:kind, item:it})); e.dataTransfer.effectAllowed='copy'; });
+    el.addEventListener('dragend', function(){ el.classList.remove('dragging'); });
+    return el;
+  }
+  function renderMediaLib(box, items){
+    if(!box) return;
+    if(!items.length){ box.innerHTML='<div class="tl-lib-loading">No project media.</div>'; return; }
+    var groups={}, order=['web','wikimedia','gpt source','seedance','speaker','local','media'];
+    var labelMap={'web':'Web images','wikimedia':'Wikimedia','gpt source':'GPT','seedance':'Clips','speaker':'Speaker','local':'Local','media':'Other'};
+    items.forEach(function(it){ var k=it.kind||'media'; (groups[k]=groups[k]||[]).push(it); });
+    var keys=order.filter(function(k){return groups[k];}).concat(Object.keys(groups).filter(function(k){return order.indexOf(k)===-1;}));
+    box.innerHTML='<div class="tl-sublib-tabs"></div><div class="tl-sublib-grid"></div>';
+    var tabsEl=box.querySelector('.tl-sublib-tabs'), gridEl=box.querySelector('.tl-sublib-grid');
+    function show(k){
+      Array.prototype.forEach.call(tabsEl.children,function(t){ t.classList.toggle('active', t.getAttribute('data-k')===k); });
+      gridEl.innerHTML=''; (groups[k]||[]).forEach(function(it){ gridEl.appendChild(libItemEl(it,'media')); });
+    }
+    keys.forEach(function(k,i){ var t=document.createElement('button'); t.type='button'; t.className='tl-sublib-tab'+(i?'':' active'); t.setAttribute('data-k',k); t.textContent=(labelMap[k]||k)+' ('+groups[k].length+')'; t.addEventListener('click',function(){show(k);}); tabsEl.appendChild(t); });
+    show(keys[0]);
+  }
+  function renderSfxLib(box, items){
+    if(!box) return;
+    box.innerHTML='<input type="text" class="tl-sfx-search" placeholder="Search sounds\\u2026"><div class="tl-sublib-grid" id="tl-sfx-grid"></div>';
+    var grid=box.querySelector('#tl-sfx-grid'), search=box.querySelector('.tl-sfx-search');
+    function draw(q){ grid.innerHTML=''; q=(q||'').toLowerCase().trim(); var n=0; items.forEach(function(it){ if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.category||'').toLowerCase().indexOf(q)===-1) return; grid.appendChild(libItemEl(it,'sfx')); n++; }); if(!n) grid.innerHTML='<div class="tl-lib-loading">No matching sounds.</div>'; }
+    search.addEventListener('input', function(){ draw(this.value); });
+    draw('');
+  }
+  function enableDrop(trackEl, accept, handler){
+    if(!trackEl) return;
+    trackEl.addEventListener('dragover', function(e){ e.preventDefault(); e.dataTransfer.dropEffect='copy'; trackEl.classList.add('drop-ok'); });
+    trackEl.addEventListener('dragleave', function(){ trackEl.classList.remove('drop-ok'); });
+    trackEl.addEventListener('drop', function(e){
+      e.preventDefault(); trackEl.classList.remove('drop-ok');
+      var data; try{ data=JSON.parse(e.dataTransfer.getData('text/plain')); }catch(err){ return; }
+      if(!data || data.kind!==accept) return;
+      var rect=trackEl.getBoundingClientRect();
+      var x=e.clientX-rect.left+trackEl.scrollLeft;
+      handler(data.item, Math.max(0, x/SCALE));
+    });
+  }
+  enableDrop(clipsEl, 'media', function(it, atSec){
+    var vis=visible(), acc=0, idx=vis.length;
+    for(var i=0;i<vis.length;i++){ if(atSec < acc+vis[i].dur/2){ idx=i; break; } acc+=vis[i].dur; }
+    var ns={ id:'add-'+Date.now(), label:it.name, dur:Math.max(1.5, it.type==='video'?3.0:2.5), poster:it.poster||it.url, clip:it.type==='video'?it.url:'', path:it.path, kind:it.type==='video'?'clip':'image', added:true, replaceable:false, speaker:false };
+    var order=scenes.filter(function(x){return !x.removed;});
+    order.splice(idx,0,ns);
+    scenes=order.concat(scenes.filter(function(x){return x.removed;}));
+    layout(); markDirty(); selectClip(ns.id);
+  });
+  enableDrop(sfxEl, 'sfx', function(it, atSec){
+    var vis=visible(), best=vis.length?vis[0].id:null, acc=0;
+    for(var i=0;i<vis.length;i++){ if(atSec < acc+vis[i].dur){ best=vis[i].id; break; } acc+=vis[i].dur; }
+    if(best===null){ return; }
+    sfx.push({ id:'sfx-'+Date.now(), scene_id:best, label:it.name, category:it.category||'custom', offset:0, duration:it.duration||1.0, volume:0.25, enabled:true, added:true, path:it.path });
+    layout(); markDirty();
+  });
+  setupLibrary();
+
+  window.addEventListener('beforeunload', function(e){ if(dirty){ e.preventDefault(); e.returnValue=''; } });
   layout(); updatePlayhead();
 })();
 </script>
@@ -2823,18 +3830,30 @@ def _find_scene_image(project_dir, asset):
     return None
 
 
-def _timeline_media(project_dir, scene):
-    """Return (poster_url, clip_url, source_image_path). poster is always a still
-    image (a poster frame from the clip, or the source image) so it renders; clip
-    is the playable mp4 if one exists (so the preview plays the real video)."""
-    clip_name = scene.get("clip")
-    clip_path = (project_dir / "seedance 2.0" / clip_name) if clip_name else None
+def _timeline_media(project_dir, scene, config, index, manifest_clips=None):
+    """Return (poster_url, clip_url, source_image_path). Resolves the clip with the
+    SAME logic the renderer uses (pipeline.scene_clip_path: derived name, then the
+    seedance_manifest.json mapping) so the timeline mirrors exactly what the agent
+    cut/rendered — Seedance clips and the speaker-hook clip included."""
     img = _find_scene_image(project_dir, scene.get("asset"))
     clip_url = ""
     poster_url = ""
-    if clip_path and clip_path.exists() and is_video_path(clip_path):
+    clip_path = None
+    try:
+        if pipeline.scene_uses_seedance(config, scene):
+            clip_path = pipeline.scene_clip_path(
+                config, scene, index,
+                clip_dir=project_dir / "seedance 2.0", manifest_map=manifest_clips,
+            )
+    except Exception:
+        clip_path = None
+    # explicit clip name (e.g. speaker_hook.mp4) even if scene isn't seedance-flagged
+    if clip_path is None and scene.get("clip"):
+        cand = project_dir / "seedance 2.0" / Path(scene["clip"]).name
+        if cand.exists() and is_video_path(cand):
+            clip_path = cand
+    if clip_path is not None and is_video_path(clip_path):
         clip_url = link_for(clip_path)
-        # poster frame from the actual clip (cached) so the timeline shows the clip
         poster = clip_path.with_suffix(".poster.jpg")
         if not poster.exists():
             pipeline.extract_poster_frame(clip_path, poster)
@@ -2845,27 +3864,116 @@ def _timeline_media(project_dir, scene):
     return poster_url, clip_url, img
 
 
+def project_has_render(slug):
+    """True once the agent has produced at least one final render for this project.
+    The timeline editor is only available after that first render."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return False
+    try:
+        report = read_project_report(project_dir)
+        if existing_report_path(report, "video"):
+            return True
+    except Exception:
+        pass
+    return latest_media(project_dir / "renders", {".mp4", ".webm"}) is not None
+
+
+def resolve_replace_media_paths(slug, scene_ids):
+    """Map marked timeline clip ids -> their replaceable web-image asset paths."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return []
+    try:
+        config = agent_core.load_project_config(slug)
+    except Exception:
+        return []
+    wanted = {str(x) for x in (scene_ids or [])}
+    out = []
+    for scene in config.get("scenes", []):
+        if str(scene.get("id", "")) not in wanted:
+            continue
+        img = _find_scene_image(project_dir, scene.get("asset"))
+        if img:
+            out.append(str(Path(img).resolve()))
+    return [p for p in out if valid_replace_path_values([p])]
+
+
+def global_sfx_library():
+    """Every reusable sound effect: the builtin soundeffects/ folder plus every clip
+    ever generated via text-to-audio (all projects + the global cache)."""
+    exts = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
+    roots = [ROOT / "soundeffects", ROOT / "wavespeed_media" / "sfx_generated"]
+    projects = agent_core.PROJECTS_DIR
+    if projects.exists():
+        for proj in projects.iterdir():
+            if proj.is_dir():
+                roots.append(proj / "wavespeed_media" / "sfx_generated")
+    seen, out = set(), []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*"), key=lambda p: p.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in exts:
+                continue
+            key = path.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cat = path.parent.name
+            out.append({
+                "name": path.stem.replace("_", " "),
+                "path": str(path.resolve()),
+                "url": link_for(path),
+                "category": cat,
+                "duration": 1.0,
+            })
+    return out
+
+
+def timeline_library_payload(slug):
+    project_dir = safe_project_dir(slug)
+    media = []
+    if project_dir:
+        for kind, path in project_media_files(project_dir):
+            if kind in {"render", "review"}:
+                continue
+            if is_image_path(path) or is_video_path(path):
+                media.append({
+                    "kind": kind, "name": path.name, "path": str(path.resolve()),
+                    "url": link_for(path), "type": "video" if is_video_path(path) else "image",
+                })
+    return {"media": media, "sfx": global_sfx_library()}
+
+
 def timeline_model(slug):
     config = agent_core.load_project_config(slug)
     project_dir = agent_core.PROJECTS_DIR / slug
+    manifest_clips = pipeline.seedance_manifest_map(project_dir / "seedance 2.0")
     scenes = []
     for index, scene in enumerate(config.get("scenes", [])):
         start = float(scene.get("start", 0) or 0)
         end = float(scene.get("end", start) or start)
         dur = max(0.3, end - start)
-        poster, clip_url, img = _timeline_media(project_dir, scene)
+        poster, clip_url, img = _timeline_media(project_dir, scene, config, index + 1, manifest_clips)
+        is_speaker = bool(scene.get("speaker_hook"))
         label = scene.get("name") or scene.get("caption") or scene.get("script") or f"Scene {index + 1}"
         label = re.sub(r"\s+", " ", str(label)).strip()[:54] or f"Scene {index + 1}"
-        replaceable = bool(img and "web images" in {p.lower() for p in img.parts} and not scene.get("speaker_hook"))
+        if is_speaker:
+            label = "\U0001f3a4 Speaker hook — " + label
+        elif clip_url:
+            label = "\U0001f3ac " + label
+        replaceable = bool(img and "web images" in {p.lower() for p in img.parts} and not is_speaker)
         scenes.append({
             "id": str(scene.get("id", index)),
             "label": label,
             "dur": round(dur, 2),
             "poster": poster,
             "clip": clip_url,
+            "kind": "speaker" if is_speaker else ("clip" if clip_url else "image"),
             "path": str(img) if img else "",
             "replaceable": replaceable,
-            "speaker": bool(scene.get("speaker_hook")),
+            "speaker": is_speaker,
             "start": round(start, 3),
         })
     # SFX events (split into boundary transitions vs. content), each individually editable.
@@ -2946,24 +4054,18 @@ def start_timeline_job(slug, edits):
 def timeline_page(slug):
     project_dir = safe_project_dir(slug)
     if not project_dir:
-        return page("Timeline Editor", '<div class="top"><div class="brand"><h1>Timeline Editor</h1></div></div><section class="panel"><div class="hint">Unknown project.</div></section>')
+        return page("Shortslab", brand_header(back=True) + '<section class="panel"><div class="hint">Unknown project.</div></section>')
+    # The timeline editor is only available once the agent has produced a first render.
+    if not project_has_render(slug):
+        msg = ('<section class="panel"><h2>Timeline not ready yet</h2>'
+               '<div class="hint">The timeline editor opens once this project has its first complete render. '
+               'Run the agent (Create Short) first &mdash; then come back here to fine-tune and re-render.</div></section>')
+        return page("Shortslab", brand_header(back=True) + msg)
     try:
         model = timeline_model(slug)
     except Exception as exc:
-        return page("Timeline Editor", f'<div class="top"><div class="brand"><h1>Timeline Editor</h1></div></div><section class="panel"><div class="hint">Could not load timeline: {esc(str(exc))}</div></section>')
-    header = f"""
-    <div class="top">
-      <div class="brand">
-        <img class="brand-mark" src="/static/app_icon.png" width="56" height="56" alt="">
-        <div><h1>Timeline Editor</h1><p class="sub">{esc(model['title'])} &mdash; trim clips, set volumes, preview the order, then render the final video.</p></div>
-      </div>
-      <div class="nav-actions">
-        <button type="button" class="button" onclick="if(history.length&gt;1){{history.back()}}else{{location.href='/'}}">&#8592; Back</button>
-        <a class="button secondary" href="/">&#43; New Project</a>
-        <a class="button secondary" href="/assets">&#127916; Asset Library</a>
-      </div>
-    </div>
-    """
+        return page("Shortslab", brand_header(back=True) + f'<section class="panel"><div class="hint">Could not load timeline: {esc(str(exc))}</div></section>')
+    header = brand_header(back=True)
     model_tag = '<script id="timeline-model" type="application/json">' + json.dumps(model) + '</script>'
     body = header + model_tag + TIMELINE_SKELETON.replace("__SLUG__", esc(slug)) + TIMELINE_ASSETS
     return page("Timeline Editor", body)
@@ -2980,7 +4082,7 @@ def job_page(job_id):
     error_html = f'<section class="panel"><h2>Error</h2><pre>{esc(job.get("error"))}</pre></section>' if job.get("error") else ""
     media_html = render_media_replacer(job_id, job)
     cancel_html = ""
-    if status in {"running", "cancelling"}:
+    if status in {"running", "cancelling", "awaiting_approval"}:
         cancel_html = (
             f'<form class="inline-form" method="post" action="/cancel?id={urllib.parse.quote(job_id)}">'
             f'<button class="danger" type="submit">Cancel run</button></form>'
@@ -2990,6 +4092,31 @@ def job_page(job_id):
     if proj and Path(proj).exists() and job.get("job_kind") != "sfx":
         tslug = Path(proj).name
         timeline_html = f'<a class="button" href="/timeline?slug={urllib.parse.quote(tslug)}">&#127902; Timeline editor</a>'
+    speech_html = ""
+    if status == "awaiting_approval" and job.get("speech_audio"):
+        qid = urllib.parse.quote(job_id)
+        audio_url = link_for(Path(job["speech_audio"]))
+        voice_opts = "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in pipeline.GEMINI_TTS_VOICES)
+        speech_html = f"""
+        <section class="panel accent" id="speech-approval">
+          <h2>&#127908; Approve the voiceover</h2>
+          <div class="hint">Listen to the generated narration, then continue &mdash; or pick a different voice and regenerate.</div>
+          <audio controls preload="auto" style="width:100%; margin:14px 0;" src="{audio_url}"></audio>
+          <form class="inline-form" method="post" action="/approve-speech?id={qid}">
+            <button type="submit">&#10003; Approve &amp; continue</button>
+          </form>
+          <details style="margin-top:16px;">
+            <summary style="cursor:pointer; font-family:var(--pixel); font-size:11px; text-transform:uppercase; color:var(--accent-2);">Replace the voice (re-pick speaker)</summary>
+            <form method="post" action="/replace-speech?id={qid}" style="margin-top:14px;">
+              <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <input type="text" name="speaker_name" value="Narrator" placeholder="Speaker name" style="flex:1; min-width:150px;">
+                <select name="tts_voice" style="flex:1; min-width:180px;">{voice_opts}</select>
+                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option></select>
+              </div>
+              <button class="danger" type="submit" style="margin-top:14px;">&#8635; Replace voice &amp; regenerate</button>
+            </form>
+          </details>
+        </section>"""
     body = f"""
     <div id="job-root" data-status="{esc(status)}" data-job-id="{esc(job_id)}">
       <div class="job-head">
@@ -3004,6 +4131,7 @@ def job_page(job_id):
           {cancel_html}
         </div>
       </div>
+      {speech_html}
       {progress_html}
       <div id="job-outputs">{result_html}</div>
       <div id="job-error">{error_html}</div>
@@ -3140,7 +4268,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
-            self.send_bytes(form_page())
+            q = urllib.parse.parse_qs(parsed.query)
+            self.send_bytes(form_page(clear="new" in q, open_load="load" in q, load_slug=q.get("project", [""])[0]))
         elif parsed.path == "/manifest.webmanifest":
             manifest = {
                 "name": "Autonomous Shorts Agent",
@@ -3179,6 +4308,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(timeline_page(slug))
         elif parsed.path == "/ui-state":
             self.send_bytes(json.dumps(load_ui_state()).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/presets":
+            self.send_bytes(json.dumps({"user": load_presets(), "builtin": BUILTIN_PRESETS}).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/project-preset":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             project_dir = safe_project_dir(slug)
@@ -3199,6 +4330,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.send_bytes(json.dumps(project_media_payload(project_dir)).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/timeline-library":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            if not safe_project_dir(slug):
+                self.send_error(404)
+                return
+            self.send_bytes(json.dumps(timeline_library_payload(slug)).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/job":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
             self.send_bytes(job_page(job_id))
@@ -3236,6 +4373,120 @@ class Handler(BaseHTTPRequestHandler):
             save_ui_state(data)
             self.send_response(204)
             self.end_headers()
+            return
+        if parsed.path == "/save-preset":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                payload = {}
+            ok = save_named_preset(payload.get("name"), payload.get("data") if isinstance(payload.get("data"), dict) else {})
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
+            return
+        if parsed.path == "/delete-preset":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                payload = {}
+            ok = delete_named_preset(payload.get("name"))
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
+            return
+        if parsed.path == "/test-connection":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                payload = {}
+            result = test_scrape_connection(str(payload.get("cookies", "") or "").strip())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+            return
+        if parsed.path == "/approve-speech":
+            job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if job and job.get("status") == "awaiting_approval":
+                    job["speech_decision"] = "approve"
+                    ev = job.get("approval_event")
+                if job:
+                    ev = job.get("approval_event")
+            if job and job.get("approval_event"):
+                job["approval_event"].set()
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
+            self.end_headers()
+            return
+        if parsed.path == "/replace-speech":
+            job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            posted = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"))
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                restart_fields = dict(job.get("restart_fields") or {}) if job else None
+                proj = job.get("project_dir") if job else None
+            if not job or restart_fields is None:
+                self.send_error(404)
+                return
+            # tell the paused run to stop (the gate raises and the worker ends)
+            with JOB_LOCK:
+                job["speech_decision"] = "replace"
+            if job.get("approval_event"):
+                job["approval_event"].set()
+            # delete the old voiceover so the restarted run regenerates it with the new voice
+            if proj:
+                try:
+                    for sub in ("voice", "input"):
+                        d = Path(proj) / sub
+                        if d.exists():
+                            for f in d.glob("*"):
+                                if f.suffix.lower() in {".wav", ".mp3", ".m4a"} and ("voice" in f.name.lower() or "hook" in f.name.lower() or "narration" in f.name.lower()):
+                                    try: f.unlink()
+                                    except Exception: pass
+                except Exception:
+                    pass
+            # apply the user's new speaker choice and restart focusing on speech first
+            for key in ("speaker_name", "tts_voice", "tts_model", "speaker_image_path"):
+                vals = posted.get(key)
+                if vals:
+                    restart_fields[key] = vals[0]
+            restart_fields["halt_after_speech"] = "on"
+            restart_fields["loaded_project_source"] = restart_fields.get("loaded_project_source") or (Path(proj).name if proj else "")
+            new_job = start_job(restart_fields, {})
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={urllib.parse.quote(new_job)}")
+            self.end_headers()
+            return
+        if parsed.path == "/delete-media":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            raw = urllib.parse.parse_qs(body.decode("utf-8", errors="replace")).get("path", [""])[0]
+            resolved = safe_requested_path(raw)
+            projects_root = agent_core.PROJECTS_DIR.resolve()
+            ok = False
+            if (resolved and resolved.is_file()
+                    and projects_root in resolved.parents):
+                try:
+                    resolved.unlink()
+                    ok = True
+                except Exception:
+                    ok = False
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
             return
         if parsed.path == "/cancel":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
@@ -3307,6 +4558,62 @@ class Handler(BaseHTTPRequestHandler):
             fields["slug"] = slug
             fields["loaded_project_mode"] = "recut_existing_only"
             fields["initial_replace_media_path"] = [media_path]
+            job_id = start_job(fields, {})
+            self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-save":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            if not slug or not safe_project_dir(slug):
+                self.send_bytes(json.dumps({"ok": False, "error": "Unknown project."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            try:
+                result = agent_core.save_timeline_edits(slug, data.get("edits") or {})
+                self.send_bytes(json.dumps({"ok": True, "scenes": result.get("scenes")}).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self.send_bytes(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-rework":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            project_dir = safe_project_dir(slug)
+            if not project_dir:
+                self.send_bytes(json.dumps({"ok": False, "error": "Unknown project."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            do_replace = bool(data.get("replace_media"))
+            do_recut = bool(data.get("reorder_recut"))
+            # 1) persist the current timeline (order/durations/etc.) so the rework builds on it
+            try:
+                agent_core.save_timeline_edits(slug, data.get("edits") or {})
+            except Exception as exc:
+                self.send_bytes(json.dumps({"ok": False, "error": f"Could not save edits: {exc}"}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            # 2) resolve the marked clips' replaceable media paths
+            replace_paths = []
+            if do_replace:
+                replace_paths = resolve_replace_media_paths(slug, data.get("replace_ids") or [])
+                if not replace_paths:
+                    self.send_bytes(json.dumps({"ok": False, "error": "None of the marked clips use a replaceable web image."}).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+            fields = project_form_state(project_dir)
+            for key, value in list(fields.items()):
+                if isinstance(value, bool):
+                    fields[key] = "on" if value else ""
+            fields["loaded_project_source"] = slug
+            fields["slug"] = slug
+            fields["loaded_project_mode"] = "recut_existing_only"
+            if replace_paths:
+                fields["initial_replace_media_path"] = replace_paths
             job_id = start_job(fields, {})
             self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
             return

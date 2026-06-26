@@ -1377,6 +1377,45 @@ def clip_filename(scene, index):
     return f"scene_{index:02d}.mp4"
 
 
+def seedance_manifest_map(clip_dir):
+    """{scene_id: clip basename} from seedance_manifest.json — the authoritative
+    record of which generated clip belongs to which scene. Lets us recover the clip
+    even when the scene's current asset name no longer matches the clip filename."""
+    manifest = Path(clip_dir) / "seedance_manifest.json"
+    if not manifest.exists():
+        return {}
+    try:
+        records = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+    out = {}
+    for rec in records if isinstance(records, list) else []:
+        if not rec.get("seedance") or not rec.get("clip") or rec.get("skipped"):
+            continue
+        sid = str(rec.get("scene", ""))
+        name = Path(str(rec["clip"])).name
+        if sid and (clip_dir / name).exists():
+            out[sid] = name
+    return out
+
+
+def scene_clip_path(config, scene, index, clip_dir=None, manifest_map=None):
+    """The clip file the renderer should use for a scene, or None. Tries the derived
+    name (clip field / asset stem / scene_NN), then the manifest mapping by scene id."""
+    if clip_dir is None:
+        clip_dir = clip_dir_for(config)
+    cand = clip_dir / clip_filename(scene, index)
+    if cand.exists():
+        return cand
+    mp = seedance_manifest_map(clip_dir) if manifest_map is None else manifest_map
+    name = mp.get(str(scene.get("id", "")))
+    if name:
+        cand = clip_dir / name
+        if cand.exists():
+            return cand
+    return None
+
+
 def generate_clips(config, force=False, status_cb=None):
     check_cancel(config)
     _, asset_dir, _, _ = project_paths(config)
@@ -1885,16 +1924,43 @@ def sfx_event_plan(config, has_speech=False):
     return out
 
 
+def custom_sfx_segments(config):
+    """User-added sound effects dragged onto the timeline (config['custom_sfx']).
+    Always mixed in (not subject to the auto-SFX budget)."""
+    out = []
+    scene_start = {str(s.get("id")): float(s.get("start", 0) or 0) for s in config.get("scenes", [])}
+    for cs in (config.get("custom_sfx") or []):
+        if cs.get("enabled") is False:
+            continue
+        path = cs.get("path")
+        if not path or not Path(path).exists():
+            continue
+        st = scene_start.get(str(cs.get("scene_id")), 0.0) + float(cs.get("offset") or 0.0)
+        out.append({"path": path, "start": round(max(0.0, st), 3),
+                    "duration": float(cs.get("duration") or 1.0),
+                    "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.25))),
+                    "category": "custom", "id": str(cs.get("id") or "custom")})
+    return out
+
+
 def build_sfx_segments(config, has_speech=False):
     if not bool(config.get("sfx_enabled", True)):
-        return []
+        return custom_sfx_segments(config)
     if not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False)):
-        return []
+        return custom_sfx_segments(config)
     if not config.get("scenes"):
-        return []
+        return custom_sfx_segments(config)
     overrides = config.get("sfx_overrides") or {}
+    # per-output toggles: content SFX vs transition SFX can be turned off independently
+    content_on = config.get("sfx_content_enabled", config.get("sfx_enabled", True))
+    transition_on = config.get("transition_sfx_enabled", config.get("sfx_enabled", True))
     events = []
     for ev in plan_sfx_events(config, has_speech):
+        is_transition = bool(ev.get("transition"))
+        if is_transition and not transition_on:
+            continue
+        if (not is_transition) and not content_on:
+            continue
         ov = overrides.get(ev["id"]) or {}
         if ov.get("enabled") is False:
             continue
@@ -1918,7 +1984,9 @@ def build_sfx_segments(config, has_speech=False):
     transition_events = [e for e in events if e.get("category") == "analog_transitions"]
     other_events = [e for e in events if e.get("category") != "analog_transitions"]
     allowed_other = max(0, max_events - len(transition_events))
-    return sorted(transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other], key=lambda e: e["start"])
+    result = transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other]
+    result.extend(custom_sfx_segments(config))
+    return sorted(result, key=lambda e: e["start"])
 
 
 # Content SFX categories that can be AI-generated when the library has no fit.
@@ -2138,11 +2206,12 @@ def render_video(config, basename=None):
     use_clips = bool(config.get("use_seedance_clips", True))
     clips = {}
     if use_clips:
+        manifest_map = seedance_manifest_map(clip_dir)
         for i, scene in enumerate(config["scenes"], 1):
             if not scene_uses_seedance(config, scene):
                 continue
-            path = clip_dir / clip_filename(scene, i)
-            if path.exists():
+            path = scene_clip_path(config, scene, i, clip_dir=clip_dir, manifest_map=manifest_map)
+            if path and path.exists():
                 clips[scene.get("id", str(i))] = SceneClip(path)
 
     writer = cv2.VideoWriter(str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
