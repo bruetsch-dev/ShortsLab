@@ -2839,6 +2839,7 @@ def timeline_page(slug):
         <div><h1>Timeline Editor</h1><p class="sub">{esc(model['title'])} &mdash; trim clips, set volumes, preview the order, then render the final video.</p></div>
       </div>
       <div class="nav-actions">
+        <button type="button" class="button" onclick="if(history.length&gt;1){{history.back()}}else{{location.href='/'}}">&#8592; Back</button>
         <a class="button secondary" href="/">&#43; New Project</a>
         <a class="button secondary" href="/assets">&#127916; Asset Library</a>
       </div>
