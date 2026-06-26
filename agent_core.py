@@ -683,7 +683,8 @@ def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent
         f"Camera: {camera_motion}. Subject: {subject_motion}. Environment: {environment_motion}. "
         f"Mood: {emotional_action}. Motion focus: {seedance_motion_focus(scene)} "
         "Deliver real physical motion with a clear start, action change, and end pose -- not a static frame with only a zoom. "
-        "No speech, voices, dialogue, narration or vocalizations. No captions, subtitles or added text. No watermark or logo. "
+        "Silent clip: no speech, voices, dialogue, narration, singing or vocalizations of any kind. "
+        "ABSOLUTELY NO on-screen text anywhere in the frame: no captions, subtitles, titles, lyrics, letters, words, numbers, signs, labels, UI, watermark or logo. "
         "Realistic, serious, vertical 9:16, one continuous shot, not a montage."
     )
     return prompt[:1200]
@@ -1690,7 +1691,7 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
             "video_model": "bytedance/seedance-2.0/image-to-video",
             "video_aspect_ratio": "9:16",
             "video_resolution": "480p",
-            "video_generate_audio": True,
+            "video_generate_audio": False,  # never let the clip model generate speech/voices; SFX come from the app layer
             "video_enable_web_search": False,
             "video_timeout_s": 1800,
             "video_concurrency": 2,

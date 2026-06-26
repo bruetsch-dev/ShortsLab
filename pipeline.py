@@ -1172,7 +1172,7 @@ def submit_wavespeed_clip(image_url, prompt, duration, config, scene, key):
     # (LTX, Happy Horse, ...) can reject unknown params, so only send for Seedance.
     if "seedance" in str(model):
         payload["enable_web_search"] = bool(scene.get("video_enable_web_search", wavespeed.get("video_enable_web_search", False)))
-        payload["generate_audio"] = bool(wavespeed.get("video_generate_audio", True))
+        payload["generate_audio"] = bool(wavespeed.get("video_generate_audio", False))
     if scene.get("last_image"):
         payload["last_image"] = scene["last_image"]
     response = request_json("POST", f"{API_BASE}/{model}", key, payload, timeout=240)
