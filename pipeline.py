@@ -1625,6 +1625,22 @@ def find_ffmpeg():
     return str(seen[0]) if seen else None
 
 
+def extract_poster_frame(clip_path, out_path, ffmpeg=None, at=0.3):
+    """Grab a single still frame from a video clip (so the timeline can show it)."""
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg:
+        return None
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([ffmpeg, "-y", "-ss", str(at), "-i", str(clip_path),
+                        "-frames:v", "1", "-q:v", "4", str(out_path)],
+                       check=True, capture_output=True, timeout=30)
+    except Exception:
+        return None
+    return out_path if out_path.exists() and out_path.stat().st_size > 500 else None
+
+
 def find_ffprobe(ffmpeg=None):
     exe = shutil.which("ffprobe")
     if exe:
@@ -1812,21 +1828,61 @@ def choose_sfx(config, category, seed_text):
     return files[int(digest[:8], 16) % len(files)]
 
 
-def add_sfx_event(events, config, at, category, seed_text, duration, volume, min_spacing=0.28):
-    if at < 0.05:
-        return
-    if any(abs(event["start"] - at) < min_spacing for event in events):
-        return
-    path = choose_sfx(config, category, seed_text)
-    if not path:
-        return
-    events.append({
-        "path": path,
-        "start": round(float(at), 3),
-        "duration": round(float(duration), 3),
-        "volume": round(float(volume), 3),
-        "category": category,
-    })
+SFX_ACTION_WORDS = {"hit", "impact", "crash", "explode", "explosion", "shot", "fire", "attack", "slam", "collapse", "fall", "burst", "blast"}
+SFX_TECH_WORDS = {"signal", "screen", "computer", "electric", "power", "digital"}
+SFX_FOLEY_WORDS = {"map", "paper", "photo", "card", "coin", "door", "step", "footstep", "metal", "wood", "weapon"}
+
+
+def plan_sfx_events(config, has_speech=False):
+    """Plan SFX event descriptors (no file choice). Stable ids keyed by SCENE id so
+    they survive reorder/trim. Transitions sit on clip boundaries; content SFX sit
+    inside a scene. The timeline editor and the renderer both read this so what you
+    tweak in the editor is exactly what gets mixed."""
+    base = min(float(config.get("sfx_volume_with_speech" if has_speech else "sfx_volume", 0.075)), 0.14)
+    tvol = min(float(config.get("sfx_transition_volume_with_speech" if has_speech else "sfx_transition_volume", base * 1.05)), 0.12)
+    plan = []
+    for index, scene in enumerate(config.get("scenes", [])):
+        sid = str(scene.get("id", index))
+        start = float(scene.get("start", 0))
+        dur = max(0.1, float(scene.get("end", start)) - start)
+        text = f"{scene.get('script', '')} {scene.get('visual_direction', '')}".lower()
+        words_set = set(re.findall(r"[a-z]+", text))
+        if index > 0:
+            plan.append({"id": f"tr-{sid}", "scene_id": sid, "at": round(start, 3), "category": "analog_transitions",
+                         "duration": 0.36, "volume": round(tvol, 3), "transition": True, "label": "Transition"})
+        for shot_index, shot in enumerate(scene.get("shots") or []):
+            at = start + float(shot.get("at", 0))
+            if shot_index == 0 or at <= 0.05:
+                continue
+            plan.append({"id": f"trs-{sid}-{shot_index}", "scene_id": sid, "at": round(at, 3), "category": "analog_transitions",
+                         "duration": 0.32, "volume": round(tvol * 0.92, 3), "transition": True, "label": "Shot transition"})
+        if words_set & SFX_ACTION_WORDS:
+            plan.append({"id": f"impact-{sid}", "scene_id": sid, "at": round(start + min(0.45, dur * 0.2), 3), "category": "subtle_impacts",
+                         "duration": 0.58, "volume": round(base * 0.72, 3), "transition": False, "label": "Impact"})
+        elif words_set & SFX_TECH_WORDS:
+            plan.append({"id": f"tech-{sid}", "scene_id": sid, "at": round(start + min(0.35, dur * 0.18), 3), "category": "subtle_tones",
+                         "duration": 0.48, "volume": round(base * 0.45, 3), "transition": False, "label": "Tech tone"})
+        elif words_set & SFX_FOLEY_WORDS:
+            plan.append({"id": f"foley-{sid}", "scene_id": sid, "at": round(start + min(0.3, dur * 0.15), 3), "category": "serious_foley",
+                         "duration": 0.4, "volume": round(base * 0.55, 3), "transition": False, "label": "Foley"})
+    return plan
+
+
+def sfx_event_plan(config, has_speech=False):
+    """plan_sfx_events with the user's per-event overrides applied (for the editor)."""
+    overrides = config.get("sfx_overrides") or {}
+    out = []
+    for ev in plan_sfx_events(config, has_speech):
+        ev = dict(ev)
+        ov = overrides.get(ev["id"]) or {}
+        ev["enabled"] = ov.get("enabled", True) is not False
+        if ov.get("volume") is not None:
+            try:
+                ev["volume"] = round(float(ov["volume"]), 3)
+            except (TypeError, ValueError):
+                pass
+        out.append(ev)
+    return out
 
 
 def build_sfx_segments(config, has_speech=False):
@@ -1834,41 +1890,35 @@ def build_sfx_segments(config, has_speech=False):
         return []
     if not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False)):
         return []
-    base_volume = min(float(config.get("sfx_volume_with_speech" if has_speech else "sfx_volume", 0.075)), 0.14)
-    transition_volume = min(
-        float(config.get("sfx_transition_volume_with_speech" if has_speech else "sfx_transition_volume", base_volume * 1.05)),
-        0.12,
-    )
-    scenes = config.get("scenes", [])
-    if not scenes:
+    if not config.get("scenes"):
         return []
+    overrides = config.get("sfx_overrides") or {}
     events = []
-    action_words = {"hit", "impact", "crash", "explode", "explosion", "shot", "fire", "attack", "slam", "collapse", "fall"}
-    tech_words = {"signal", "screen", "computer", "electric", "power", "digital"}
-    foley_words = {"map", "paper", "photo", "card", "coin", "door", "step", "footstep", "metal", "wood", "weapon"}
-    for scene_index, scene in enumerate(scenes):
-        scene_start = float(scene.get("start", 0))
-        scene_duration = max(0.1, float(scene.get("end", scene_start)) - scene_start)
-        text = f"{scene.get('script', '')} {scene.get('visual_direction', '')}".lower()
-        if scene_index > 0:
-            add_sfx_event(events, config, scene_start, "analog_transitions", f"slide-scene-{scene_index}-{text}", 0.36, transition_volume, min_spacing=0.18)
-        shots = scene.get("shots") or []
-        for shot_index, shot in enumerate(shots):
-            at = scene_start + float(shot.get("at", 0))
-            if shot_index == 0 or at <= 0.05:
-                continue
-            add_sfx_event(events, config, at, "analog_transitions", f"slide-shot-{scene_index}-{shot_index}-{shot.get('asset', '')}", 0.32, transition_volume * 0.92, min_spacing=0.18)
-        if any(word in text for word in action_words):
-            add_sfx_event(events, config, scene_start + min(0.45, scene_duration * 0.2), "subtle_impacts", f"impact-{scene_index}-{text}", 0.58, base_volume * 0.72)
-        elif any(word in text for word in tech_words):
-            add_sfx_event(events, config, scene_start + min(0.35, scene_duration * 0.18), "subtle_tones", f"tech-{scene_index}-{text}", 0.48, base_volume * 0.45)
-        elif any(word in text for word in foley_words):
-            add_sfx_event(events, config, scene_start + min(0.3, scene_duration * 0.15), "serious_foley", f"foley-{scene_index}-{text}", 0.40, base_volume * 0.55)
+    for ev in plan_sfx_events(config, has_speech):
+        ov = overrides.get(ev["id"]) or {}
+        if ov.get("enabled") is False:
+            continue
+        volume = ev["volume"]
+        if ov.get("volume") is not None:
+            try:
+                volume = float(ov["volume"])
+            except (TypeError, ValueError):
+                pass
+        volume = max(0.0, min(0.6, volume))
+        if volume <= 0.0:
+            continue
+        if any(abs(e["start"] - ev["at"]) < 0.18 for e in events):
+            continue
+        path = choose_sfx(config, ev["category"], f"{ev['id']}|{ev['scene_id']}")
+        if not path:
+            continue
+        events.append({"path": path, "start": ev["at"], "duration": ev["duration"],
+                       "volume": round(volume, 3), "category": ev["category"], "id": ev["id"]})
     max_events = max(3, int(float(config.get("duration", 60)) / 60.0 * int(config.get("sfx_max_per_minute", 24))))
-    transition_events = [event for event in events if event.get("category") == "analog_transitions"]
-    other_events = [event for event in events if event.get("category") != "analog_transitions"]
-    allowed_other_count = max(0, max_events - len(transition_events))
-    return sorted(transition_events + sorted(other_events, key=lambda event: event["start"])[:allowed_other_count], key=lambda event: event["start"])
+    transition_events = [e for e in events if e.get("category") == "analog_transitions"]
+    other_events = [e for e in events if e.get("category") != "analog_transitions"]
+    allowed_other = max(0, max_events - len(transition_events))
+    return sorted(transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other], key=lambda e: e["start"])
 
 
 # Content SFX categories that can be AI-generated when the library has no fit.

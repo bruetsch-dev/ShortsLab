@@ -2451,9 +2451,10 @@ def assets_page():
 TIMELINE_SKELETON = """
 <div id="timeline-root" data-slug="__SLUG__">
   <div class="tl-toolbar panel">
-    <button type="button" class="button primary tl-render-btn" id="tl-render">&#127902; Render final video</button>
+    <button type="button" class="button primary tl-render-btn" id="tl-render">&#11015; Render final video</button>
     <div class="tl-total" id="tl-total"></div>
-    <div class="hint tl-help">Drag a clip to reorder, drag its right edge to trim. Click a clip to select it &mdash; then trim, remove, or ask the agent to replace it.</div>
+    <label class="tl-cap-toggle"><input type="checkbox" id="tl-captions"> Captions <span class="tl-lock">&#128274; locked to voice</span></label>
+    <div class="hint tl-help">Drag a clip to reorder, its right edge to trim. Click any clip, &#9670; transition, or &#9834; sound to tune it.</div>
   </div>
   <div class="tl-grid tl-top">
     <div class="panel tl-player">
@@ -2461,18 +2462,18 @@ TIMELINE_SKELETON = """
       <div class="tl-stage-view" id="tl-stage-view">
         <img id="tl-pimg" alt="">
         <video id="tl-pvid" muted playsinline></video>
-        <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview the sequence</div>
+        <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview</div>
       </div>
       <div class="tl-player-bar">
         <button type="button" class="button secondary" id="tl-play">&#9654; Play</button>
         <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
-        <span class="hint">Plays the real footage in order at the trimmed timing. Captions, voice &amp; SFX are added at render.</span>
+        <span class="hint">Plays the real footage in order at the trimmed timing.</span>
       </div>
     </div>
     <div class="panel tl-inspector" id="tl-inspector">
       <h2>Inspector</h2>
-      <div class="hint" id="tl-insp-empty">Click a clip in the timeline to edit it.</div>
-      <div id="tl-insp-body" hidden>
+      <div class="hint" id="tl-insp-empty">Click a clip, transition or sound effect to edit it.</div>
+      <div class="tl-insp-pane" id="tl-insp-clip" hidden>
         <div class="tl-insp-name" id="tl-insp-name"></div>
         <label>Duration (seconds)</label>
         <input type="number" id="tl-insp-dur" min="0.5" max="20" step="0.1">
@@ -2480,26 +2481,35 @@ TIMELINE_SKELETON = """
           <button type="button" class="button secondary" id="tl-insp-remove">Remove clip</button>
           <button type="button" class="button" id="tl-insp-replace" hidden>&#129302; Replace via agent</button>
         </div>
-        <div class="hint" id="tl-insp-note">Removing a clip drops it from the render and re-flows the timeline.</div>
+        <div class="hint" id="tl-insp-note">Removing a clip drops it and re-flows the timeline.</div>
+      </div>
+      <div class="tl-insp-pane" id="tl-insp-fx" hidden>
+        <div class="tl-insp-name" id="tl-fx-name"></div>
+        <label class="tl-fx-enable"><input type="checkbox" id="tl-fx-enabled"> Enabled</label>
+        <label>Volume <span id="tl-fx-vol-val"></span></label>
+        <input type="range" id="tl-fx-vol" min="0" max="0.6" step="0.01">
+        <div class="hint" id="tl-fx-note"></div>
       </div>
     </div>
   </div>
   <div class="panel tl-stage">
     <div class="tl-rows">
       <div class="tl-row-labels">
-        <div class="tl-rlabel" style="height:22px"></div>
-        <div class="tl-rlabel">Clips</div>
-        <div class="tl-rlabel tl-rlabel-sm">Captions</div>
-        <div class="tl-rlabel tl-rlabel-sm">Voice</div>
-        <div class="tl-rlabel tl-rlabel-sm">SFX / Music</div>
+        <div class="tl-rlabel tl-rl-ruler"></div>
+        <div class="tl-rlabel tl-rl-clips">Clips</div>
+        <div class="tl-rlabel tl-rl-cap">Captions</div>
+        <div class="tl-rlabel tl-rl-voice">Voice</div>
+        <div class="tl-rlabel tl-rl-tr">Transitions</div>
+        <div class="tl-rlabel tl-rl-sfx">Sound&nbsp;FX</div>
       </div>
       <div class="tl-scroll" id="tl-scroll">
         <div class="tl-playhead" id="tl-playhead"></div>
         <div class="tl-ruler" id="tl-ruler"></div>
-        <div class="tl-track" id="tl-clips"></div>
-        <div class="tl-track tl-cap" id="tl-captions"></div>
+        <div class="tl-track tl-clips-track" id="tl-clips"></div>
+        <div class="tl-track tl-cap" id="tl-captrack"></div>
         <div class="tl-track tl-aud" id="tl-voice"></div>
-        <div class="tl-track tl-aud" id="tl-sfx"></div>
+        <div class="tl-track tl-trtrack" id="tl-trtrack"></div>
+        <div class="tl-track tl-sfx" id="tl-sfx"></div>
       </div>
     </div>
   </div>
@@ -2507,10 +2517,9 @@ TIMELINE_SKELETON = """
     <h2>Audio mixer</h2>
     <div class="tl-mixer">
       <div class="tl-slider"><label>Voice <span id="tl-v-voice"></span></label><input type="range" id="tl-voice-vol" min="0" max="1.5" step="0.05"></div>
-      <div class="tl-slider"><label>Clip audio <span id="tl-v-seedance"></span></label><input type="range" id="tl-seedance-vol" min="0" max="1" step="0.02"></div>
-      <div class="tl-slider"><label>Sound effects <span id="tl-v-sfx"></span></label><input type="range" id="tl-sfx-vol" min="0" max="0.6" step="0.01"></div>
       <div class="tl-slider"><label>Music <span id="tl-v-music"></span></label><input type="range" id="tl-music-vol" min="0" max="0.6" step="0.01"></div>
     </div>
+    <div class="hint">Each transition and sound effect is tuned individually on the timeline above &mdash; click it to open its controls.</div>
   </div>
 </div>
 """
@@ -2518,8 +2527,11 @@ TIMELINE_SKELETON = """
 TIMELINE_ASSETS = """
 <style>
   .tl-toolbar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
-  .tl-render-btn { width:auto; min-width:230px; font-size:16px; }
+  .tl-render-btn { width:auto; min-width:220px; font-size:16px; }
   .tl-total { font-weight:900; color:#ffe6ad; }
+  .tl-cap-toggle { display:flex; align-items:center; gap:8px; font-weight:800; margin:0; cursor:pointer; }
+  .tl-cap-toggle input { width:auto; }
+  .tl-lock { font-weight:600; color:#9aa4a1; font-size:12px; }
   .tl-help { flex:1; min-width:220px; margin:0; }
   .tl-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   .tl-top { margin-bottom:16px; }
@@ -2531,30 +2543,45 @@ TIMELINE_ASSETS = """
   .tl-playtime { font-weight:800; color:#ffe6ad; font-variant-numeric:tabular-nums; }
   .tl-stage { overflow:hidden; }
   .tl-rows { display:flex; gap:10px; }
-  .tl-row-labels { display:flex; flex-direction:column; gap:8px; flex:0 0 auto; }
-  .tl-rlabel { height:64px; display:flex; align-items:center; font-weight:800; color:#9aa4a1; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
-  .tl-rlabel-sm { height:40px; }
-  .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:10px; }
-  .tl-ruler { position:relative; height:22px; cursor:pointer; }
-  .tl-tick { position:absolute; top:0; height:22px; border-left:1px solid #2a343a; padding-left:4px; font-size:10px; color:#7e8884; }
-  .tl-playhead { position:absolute; top:0; bottom:10px; width:2px; background:var(--accent-3, #ff5d5d); z-index:5; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
-  .tl-playhead::before { content:''; position:absolute; top:0; left:-4px; border-left:5px solid transparent; border-right:5px solid transparent; border-top:7px solid var(--accent-3,#ff5d5d); }
-  .tl-track { position:relative; height:64px; margin-top:8px; background:#0d1114; border:1px solid var(--line); border-radius:6px; }
-  .tl-track.tl-cap, .tl-track.tl-aud { height:40px; }
-  .tl-clip { position:absolute; top:3px; bottom:3px; border:1px solid var(--accent-2); border-radius:6px; overflow:hidden; cursor:grab; background:#1a1407; background-size:cover; background-position:center; touch-action:none; }
-  .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.55); }
-  .tl-clip.dragging { opacity:.75; cursor:grabbing; z-index:6; }
-  .tl-clip .tl-clip-label { position:absolute; left:0; right:0; bottom:0; padding:3px 6px; font-size:11px; font-weight:800; color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.82)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .tl-clip .tl-clip-dur { position:absolute; top:2px; left:5px; font-size:10px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; }
-  .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:11px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(240,180,95,.6)); }
-  .tl-capblock { position:absolute; top:6px; bottom:6px; border-radius:4px; background:#13311f; border:1px solid #2f7d49; }
-  .tl-audbar { position:absolute; top:6px; bottom:6px; left:0; right:0; border-radius:4px; background:repeating-linear-gradient(90deg,#1a2a33 0 6px,#16242c 6px 12px); border:1px solid #2a3a44; }
+  .tl-row-labels { display:flex; flex-direction:column; gap:6px; flex:0 0 auto; }
+  .tl-rlabel { display:flex; align-items:center; font-weight:800; color:#9aa4a1; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .tl-rl-ruler { height:26px; }
+  .tl-rl-clips { height:96px; }
+  .tl-rl-cap, .tl-rl-voice, .tl-rl-tr, .tl-rl-sfx { height:40px; }
+  .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:12px; user-select:none; -webkit-user-select:none; }
+  .tl-ruler { position:relative; height:26px; cursor:pointer; }
+  .tl-tick { position:absolute; top:0; height:26px; border-left:1px solid #2a343a; padding-left:5px; font-size:10px; color:#7e8884; }
+  .tl-playhead { position:absolute; top:0; bottom:12px; width:2px; background:#ff5d5d; z-index:8; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
+  .tl-playhead::before { content:''; position:absolute; top:0; left:-5px; border-left:6px solid transparent; border-right:6px solid transparent; border-top:8px solid #ff5d5d; }
+  .tl-track { position:relative; margin-top:6px; background:#0d1114; border:1px solid var(--line); border-radius:7px; }
+  .tl-clips-track { height:96px; }
+  .tl-cap, .tl-aud, .tl-trtrack, .tl-sfx { height:40px; }
+  .tl-clip { position:absolute; top:4px; bottom:4px; border:2px solid var(--accent-2); border-radius:7px; overflow:hidden; cursor:grab; background:#1a1407; background-size:cover; background-position:center; touch-action:none; }
+  .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.6); z-index:4; }
+  .tl-clip.dragging { opacity:.8; cursor:grabbing; z-index:9; }
+  .tl-clip .tl-badge { position:absolute; top:5px; left:6px; font-size:11px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; background:rgba(0,0,0,.45); padding:1px 6px; border-radius:5px; }
+  .tl-clip .tl-clip-label { position:absolute; left:0; right:0; bottom:0; padding:4px 8px; font-size:11px; font-weight:800; color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.85)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:13px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(240,180,95,.7)); }
+  .tl-seam { position:absolute; top:0; bottom:0; width:0; border-left:2px dashed rgba(143,214,238,.45); z-index:3; pointer-events:none; }
+  .tl-trans { position:absolute; transform:translate(-50%,-50%); z-index:6; width:24px; height:24px; cursor:pointer; display:flex; align-items:center; justify-content:center; touch-action:none; }
+  .tl-trans .tl-diamond { width:17px; height:17px; transform:rotate(45deg); background:#2f7d9b; border:1px solid #8fd6ee; border-radius:3px; box-shadow:0 0 0 3px #0d1114; transition:transform .12s ease; }
+  .tl-trans.selected .tl-diamond { background:var(--accent); border-color:#fff; }
+  .tl-trans.disabled .tl-diamond { background:#39424a; border-color:#5a646c; }
+  .tl-trans:hover .tl-diamond { transform:rotate(45deg) scale(1.18); }
+  .tl-capbar { position:absolute; top:7px; bottom:7px; border-radius:5px; background:repeating-linear-gradient(90deg,#13311f 0 10px,#0f2a1a 10px 20px); border:1px solid #2f7d49; display:flex; align-items:center; padding-left:9px; color:#9fe6b6; font-size:11px; font-weight:800; white-space:nowrap; overflow:hidden; }
+  .tl-capbar.off { opacity:.3; }
+  .tl-audbar { position:absolute; top:7px; bottom:7px; left:0; right:0; border-radius:5px; background:repeating-linear-gradient(90deg,#1a2a33 0 8px,#16242c 8px 16px); border:1px solid #2a3a44; }
+  .tl-fx { position:absolute; top:6px; bottom:6px; border-radius:5px; background:#3a2a12; border:1px solid var(--accent-2); cursor:pointer; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:800; color:#ffe6ad; white-space:nowrap; overflow:hidden; box-sizing:border-box; }
+  .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.5); z-index:4; }
+  .tl-fx.disabled { opacity:.4; }
   .tl-mixer-wrap { margin-top:16px; }
   .tl-mixer { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
   .tl-slider label { display:flex; justify-content:space-between; margin-bottom:6px; }
   .tl-insp-name { font-weight:800; color:#fff8eb; margin-bottom:12px; }
   .tl-insp-actions { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 8px; }
   .tl-insp-actions .button { width:auto; flex:1; min-width:140px; }
+  .tl-fx-enable { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+  .tl-fx-enable input { width:auto; }
   @media (max-width:760px){ .tl-grid{ grid-template-columns:1fr; } }
 </style>
 <script>
@@ -2565,47 +2592,81 @@ TIMELINE_ASSETS = """
   try { model = JSON.parse(document.getElementById('timeline-model').textContent); } catch(e){ return; }
   var slug = rootEl.getAttribute('data-slug');
   var scenes = (model.scenes||[]).map(function(s){ return Object.assign({}, s); });
-  var volumes = Object.assign({voice:1, seedance:0.16, sfx:0.075, music:0}, model.volumes||{});
-  var SCALE = 30;
-  var selectedId = null;
-  var clips=document.getElementById('tl-clips'), caps=document.getElementById('tl-captions'), ruler=document.getElementById('tl-ruler');
-  var playhead=document.getElementById('tl-playhead');
+  var transitions = (model.transitions||[]).map(function(t){ return Object.assign({}, t); });
+  var sfx = (model.sfx||[]).map(function(s){ return Object.assign({}, s); });
+  var volumes = Object.assign({voice:1, music:0}, model.volumes||{});
+  var captionsOn = !!model.captions;
+  var SCALE = 70;
+  var sel = null;
+
+  var clipsEl=document.getElementById('tl-clips'), capEl=document.getElementById('tl-captrack'),
+      voiceEl=document.getElementById('tl-voice'), trEl=document.getElementById('tl-trtrack'),
+      sfxEl=document.getElementById('tl-sfx'), ruler=document.getElementById('tl-ruler'),
+      playhead=document.getElementById('tl-playhead');
+
   function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
   function visible(){ return scenes.filter(function(s){ return !s.removed; }); }
-  function totalDur(){ return visible().reduce(function(a,s){ return a + s.dur; }, 0); }
+  function totalDur(){ return visible().reduce(function(a,s){ return a+s.dur; },0); }
   function fmt(t){ t=Math.max(0,t); var m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+(s<10?'0':'')+s; }
+  function startOf(id){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(vis[i].id===id) return acc; acc+=vis[i].dur; } return null; }
 
   function layout(){
-    var total=totalDur(), width=Math.max(640, total*SCALE);
-    [clips,caps,ruler,document.getElementById('tl-voice'),document.getElementById('tl-sfx')].forEach(function(el){ if(el) el.style.width=width+'px'; });
+    var vis=visible(), total=totalDur(), width=Math.max(720, total*SCALE);
+    [clipsEl,capEl,voiceEl,trEl,sfxEl,ruler].forEach(function(el){ if(el) el.style.width=width+'px'; });
     ruler.innerHTML='';
-    for(var t=0;t<=total+0.01;t+=5){ var d=document.createElement('div'); d.className='tl-tick'; d.style.left=(t*SCALE)+'px'; d.textContent=fmt(t); ruler.appendChild(d); }
-    clips.innerHTML=''; caps.innerHTML='';
+    var step = total>40?10:5;
+    for(var t=0;t<=total+0.01;t+=step){ var d=document.createElement('div'); d.className='tl-tick'; d.style.left=(t*SCALE)+'px'; d.textContent=fmt(t); ruler.appendChild(d); }
+    clipsEl.innerHTML='';
     var x=0;
-    visible().forEach(function(s){
+    vis.forEach(function(s, i){
       var w=s.dur*SCALE;
       var b=document.createElement('div');
-      b.className='tl-clip'+(s.id===selectedId?' selected':'');
-      b.style.left=x+'px'; b.style.width=w+'px';
-      b.setAttribute('data-id', s.id);
-      if(s.thumb) b.style.backgroundImage='url('+s.thumb+')';
-      b.innerHTML='<span class="tl-clip-dur">'+s.dur.toFixed(1)+'s</span><span class="tl-clip-label">'+(s.speaker?'(speaker) ':'')+esc(s.label)+'</span><span class="tl-handle"></span>';
+      b.className='tl-clip'+(sel&&sel.type==='clip'&&sel.id===s.id?' selected':'');
+      b.style.left=x+'px'; b.style.width=w+'px'; b.setAttribute('data-id', s.id);
+      if(s.poster) b.style.backgroundImage='url('+s.poster+')';
+      var badge=(s.clip?'\\u25B6 ':'')+(s.speaker?'\\uD83C\\uDFA4 ':'');
+      b.innerHTML='<span class="tl-badge">'+badge+s.dur.toFixed(1)+'s</span><span class="tl-clip-label">'+esc(s.label)+'</span><span class="tl-handle"></span>';
       b.querySelector('.tl-handle').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startResize(ev, s); });
       b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')) return; startClipDrag(ev, s, b); });
-      clips.appendChild(b);
-      if(s.caption){ var c=document.createElement('div'); c.className='tl-capblock'; c.style.left=(x+2)+'px'; c.style.width=Math.max(2,w-4)+'px'; caps.appendChild(c); }
+      clipsEl.appendChild(b);
+      if(i>0){ var seam=document.createElement('div'); seam.className='tl-seam'; seam.style.left=x+'px'; clipsEl.appendChild(seam); }
       x+=w;
     });
-    document.getElementById('tl-voice').innerHTML='<div class="tl-audbar"></div>';
-    document.getElementById('tl-sfx').innerHTML='<div class="tl-audbar"></div>';
-    document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+visible().length+' clips';
+    trEl.innerHTML='';
+    vis.forEach(function(s, i){
+      if(i===0) return;
+      var tr=transitions.filter(function(t){ return t.scene_id===s.id; })[0];
+      if(!tr) return;
+      var bx=startOf(s.id)*SCALE;
+      var node=document.createElement('div');
+      node.className='tl-trans'+(sel&&sel.type==='trans'&&sel.id===tr.id?' selected':'')+(tr.enabled===false?' disabled':'');
+      node.style.left=bx+'px'; node.style.top='50%'; node.title='Transition between clips';
+      node.innerHTML='<span class="tl-diamond"></span>';
+      node.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); selectTrans(tr.id); });
+      trEl.appendChild(node);
+    });
+    sfxEl.innerHTML='';
+    sfx.forEach(function(fx){
+      var st=startOf(fx.scene_id);
+      if(st===null) return;
+      var fxx=(st+(fx.offset||0))*SCALE;
+      var node=document.createElement('div');
+      node.className='tl-fx'+(sel&&sel.type==='fx'&&sel.id===fx.id?' selected':'')+(fx.enabled===false?' disabled':'');
+      node.style.left=fxx+'px'; node.style.width=Math.max(60,(fx.duration||0.5)*SCALE)+'px';
+      node.innerHTML='\\u266A '+esc(fx.label);
+      node.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); selectFx(fx.id); });
+      sfxEl.appendChild(node);
+    });
+    capEl.innerHTML = total>0 ? ('<div class="tl-capbar'+(captionsOn?'':' off')+'" style="left:0;width:'+(total*SCALE)+'px">\\uD83D\\uDD12 captions '+(captionsOn?'on':'off')+' (locked to voice)</div>') : '';
+    voiceEl.innerHTML='<div class="tl-audbar"></div>';
+    document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+vis.length+' clips';
     updatePlayhead();
   }
 
   function startResize(ev, s){
     ev.preventDefault();
     var startX=ev.clientX, startDur=s.dur;
-    function move(e){ var dd=(e.clientX-startX)/SCALE; s.dur=Math.max(0.5, Math.min(20, +(startDur+dd).toFixed(1))); layout(); if(selectedId===s.id) syncInspector(); }
+    function move(e){ var dd=(e.clientX-startX)/SCALE; s.dur=Math.max(0.5, Math.min(20, +(startDur+dd).toFixed(1))); layout(); if(sel&&sel.type==='clip'&&sel.id===s.id) syncInspector(); }
     function up(){ document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up); }
     document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
   }
@@ -2616,83 +2677,104 @@ TIMELINE_ASSETS = """
     function move(e){
       if(!dragging && Math.abs(e.clientX-startX) < 6) return;
       dragging=true; block.classList.add('dragging');
-      var rect=clips.getBoundingClientRect();
-      var px=e.clientX-rect.left+clips.scrollLeft;
+      var rect=clipsEl.getBoundingClientRect();
+      var px=e.clientX-rect.left+clipsEl.scrollLeft;
       var vis=visible(), acc=0, target=vis.length-1;
       for(var i=0;i<vis.length;i++){ var w=vis[i].dur*SCALE; if(px < acc+w/2){ target=i; break; } acc+=w; if(i===vis.length-1) target=vis.length-1; }
       var order=scenes.filter(function(x){return !x.removed;});
       var from=order.indexOf(s);
       if(from!==-1 && from!==target){
         order.splice(from,1); order.splice(target,0,s);
-        var removed=scenes.filter(function(x){return x.removed;});
-        scenes=order.concat(removed);
-        layout(); block=clips.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(block) block.classList.add('dragging');
+        scenes=order.concat(scenes.filter(function(x){return x.removed;}));
+        layout(); block=clipsEl.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(block) block.classList.add('dragging');
       }
     }
     function up(){
       document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up);
-      var b=clips.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(b) b.classList.remove('dragging');
-      if(!dragging) select(s.id);
+      var b=clipsEl.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(b) b.classList.remove('dragging');
+      if(!dragging) selectClip(s.id);
     }
     document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
   }
 
-  function select(id){ selectedId=id; layout(); syncInspector(); }
+  function showPane(which){
+    document.getElementById('tl-insp-empty').hidden = !!which;
+    document.getElementById('tl-insp-clip').hidden = which!=='clip';
+    document.getElementById('tl-insp-fx').hidden = which!=='fx';
+  }
+  function selectClip(id){ sel={type:'clip',id:id}; layout(); syncInspector(); }
+  function selectTrans(id){ sel={type:'trans',id:id}; layout(); syncFx(); }
+  function selectFx(id){ sel={type:'fx',id:id}; layout(); syncFx(); }
+
   function syncInspector(){
-    var s=scenes.filter(function(x){return x.id===selectedId;})[0];
-    var empty=document.getElementById('tl-insp-empty'), body=document.getElementById('tl-insp-body');
-    if(!s||s.removed){ empty.hidden=false; body.hidden=true; return; }
-    empty.hidden=true; body.hidden=false;
+    var s=scenes.filter(function(x){return x.id===sel.id;})[0];
+    if(!s||s.removed){ sel=null; showPane(null); return; }
+    showPane('clip');
     document.getElementById('tl-insp-name').textContent=s.label;
     document.getElementById('tl-insp-dur').value=s.dur;
     var rep=document.getElementById('tl-insp-replace');
     rep.hidden=!s.replaceable;
     document.getElementById('tl-insp-note').textContent = s.replaceable
       ? 'Replace via agent re-searches a fresh web image for this clip, then re-renders.'
-      : 'Removing a clip drops it from the render and re-flows the timeline.';
+      : 'Removing a clip drops it and re-flows the timeline.';
   }
-  document.getElementById('tl-insp-dur').addEventListener('input', function(){ var s=scenes.filter(function(x){return x.id===selectedId;})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); } });
-  document.getElementById('tl-insp-remove').addEventListener('click', function(){ var s=scenes.filter(function(x){return x.id===selectedId;})[0]; if(s){ s.removed=true; selectedId=null; layout(); syncInspector(); } });
+  function currentFx(){
+    if(!sel) return null;
+    if(sel.type==='trans') return transitions.filter(function(t){return t.id===sel.id;})[0];
+    if(sel.type==='fx') return sfx.filter(function(f){return f.id===sel.id;})[0];
+    return null;
+  }
+  function syncFx(){
+    var fx=currentFx();
+    if(!fx){ sel=null; showPane(null); return; }
+    showPane('fx');
+    document.getElementById('tl-fx-name').textContent=(sel.type==='trans'?'Transition: ':'Sound: ')+(fx.label||'');
+    document.getElementById('tl-fx-enabled').checked = fx.enabled!==false;
+    var v=fx.volume||0; document.getElementById('tl-fx-vol').value=v;
+    document.getElementById('tl-fx-vol-val').textContent=Math.round(v*100)+'%';
+    document.getElementById('tl-fx-note').textContent = sel.type==='trans'
+      ? 'Plays on the cut between two clips. Tune just this one.'
+      : 'Plays inside this clip. Tune just this one.';
+  }
+
+  document.getElementById('tl-insp-dur').addEventListener('input', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); } });
+  document.getElementById('tl-insp-remove').addEventListener('click', function(){ var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0]; if(s){ s.removed=true; sel=null; layout(); showPane(null); } });
+  document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); } });
+  document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); } });
   document.getElementById('tl-insp-replace').addEventListener('click', function(){
-    var s=scenes.filter(function(x){return x.id===selectedId;})[0];
+    var s=scenes.filter(function(x){return x.id===(sel&&sel.id);})[0];
     if(!s || !s.replaceable || !s.path) return;
-    if(!confirm('Ask the agent to find a fresh web image for this clip and re-render the video?')) return;
+    if(!confirm('Ask the agent to find a fresh web image for this clip and re-render?')) return;
     var btn=this; btn.disabled=true; btn.textContent='Starting...';
     fetch('/timeline-replace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, media_path:s.path})})
       .then(function(r){return r.json();})
-      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='&#129302; Replace via agent'; alert((d&&d.error)||'Could not start replacement.'); } })
-      .catch(function(){ btn.disabled=false; btn.innerHTML='&#129302; Replace via agent'; alert('Could not start replacement.'); });
+      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Replace via agent'; alert((d&&d.error)||'Could not start.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Replace via agent'; alert('Could not start.'); });
   });
 
-  // ---- preview player ----
   var pimg=document.getElementById('tl-pimg'), pvid=document.getElementById('tl-pvid'), pempty=document.getElementById('tl-stage-empty');
   var playing=false, clock=0, lastTs=0, curIdx=-1;
-  function sceneAt(t){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(t < acc+vis[i].dur){ return {scene:vis[i], idx:i, local:t-acc}; } acc+=vis[i].dur; } return vis.length? {scene:vis[vis.length-1], idx:vis.length-1, local:0} : null; }
+  function sceneAt(t){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(t < acc+vis[i].dur){ return {scene:vis[i], idx:i}; } acc+=vis[i].dur; } return vis.length? {scene:vis[vis.length-1], idx:vis.length-1} : null; }
   function showScene(info){
     if(!info){ pimg.style.display='none'; pvid.style.display='none'; pempty.style.display='block'; return; }
     pempty.style.display='none';
     if(curIdx===info.idx) return;
-    curIdx=info.idx;
-    var s=info.scene;
-    if(s.video && s.thumb){ pimg.style.display='none'; pvid.style.display='block'; try{ pvid.src=s.thumb; pvid.currentTime=0; if(playing) pvid.play().catch(function(){}); }catch(e){} }
-    else { pvid.pause(); pvid.style.display='none'; pimg.style.display='block'; pimg.src=s.thumb||''; }
+    curIdx=info.idx; var s=info.scene;
+    if(s.clip){ pimg.style.display='none'; pvid.style.display='block'; try{ pvid.src=s.clip; pvid.currentTime=0; if(playing) pvid.play().catch(function(){}); }catch(e){} }
+    else { pvid.pause(); pvid.style.display='none'; pimg.style.display='block'; pimg.src=s.poster||''; }
   }
-  function updatePlayhead(){
-    playhead.style.left=(clock*SCALE)+'px';
-    document.getElementById('tl-playtime').textContent=fmt(clock)+' / '+fmt(totalDur());
-  }
+  function updatePlayhead(){ playhead.style.left=(clock*SCALE)+'px'; document.getElementById('tl-playtime').textContent=fmt(clock)+' / '+fmt(totalDur()); }
   function tick(ts){
     if(!playing) return;
     var dt=(ts-lastTs)/1000; lastTs=ts; clock+=dt;
     var total=totalDur();
     if(clock>=total){ clock=total; updatePlayhead(); stop(); return; }
-    showScene(sceneAt(clock)); updatePlayhead();
-    requestAnimationFrame(tick);
+    showScene(sceneAt(clock)); updatePlayhead(); requestAnimationFrame(tick);
   }
-  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); document.getElementById('tl-play').innerHTML='&#10073;&#10073; Pause'; showScene(sceneAt(clock)); requestAnimationFrame(tick); }
-  function stop(){ playing=false; pvid.pause(); document.getElementById('tl-play').innerHTML='&#9654; Play'; }
+  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); document.getElementById('tl-play').innerHTML='\\u2759\\u2759 Pause'; showScene(sceneAt(clock)); requestAnimationFrame(tick); }
+  function stop(){ playing=false; pvid.pause(); document.getElementById('tl-play').innerHTML='\\u25B6 Play'; }
   document.getElementById('tl-play').addEventListener('click', function(){ if(playing) stop(); else play(); });
-  ruler.addEventListener('click', function(e){ var rect=ruler.getBoundingClientRect(); clock=Math.max(0,Math.min(totalDur(),(e.clientX-rect.left+ruler.scrollLeft)/SCALE)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); });
+  ruler.addEventListener('pointerdown', function(e){ var rect=ruler.getBoundingClientRect(); clock=Math.max(0,Math.min(totalDur(),(e.clientX-rect.left+ruler.scrollLeft)/SCALE)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); });
 
   function bindVol(id, key, out){
     var el=document.getElementById(id), o=document.getElementById(out);
@@ -2700,17 +2782,23 @@ TIMELINE_ASSETS = """
     el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; });
   }
   bindVol('tl-voice-vol','voice','tl-v-voice');
-  bindVol('tl-seedance-vol','seedance','tl-v-seedance');
-  bindVol('tl-sfx-vol','sfx','tl-v-sfx');
   bindVol('tl-music-vol','music','tl-v-music');
+  var capToggle=document.getElementById('tl-captions');
+  capToggle.checked=captionsOn;
+  capToggle.addEventListener('change', function(){ captionsOn=this.checked; layout(); });
 
   document.getElementById('tl-render').addEventListener('click', function(){
     var btn=this; btn.disabled=true; btn.textContent='Starting render...';
     var vis=visible();
-    var edits={ scenes: vis.map(function(s){return {id:s.id, duration:s.dur};}),
-                order: vis.map(function(s){return s.id;}),
-                removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
-                volumes: volumes };
+    var edits={
+      scenes: vis.map(function(s){return {id:s.id, duration:s.dur};}),
+      order: vis.map(function(s){return s.id;}),
+      removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
+      volumes: volumes,
+      captions: captionsOn,
+      transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:t.enabled};}),
+      sfx: sfx.map(function(f){return {id:f.id, volume:f.volume, enabled:f.enabled};})
+    };
     fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
       .then(function(r){return r.json();})
       .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.textContent='Render final video'; alert((d&&d.error)||'Could not start render.'); } })
@@ -2722,23 +2810,39 @@ TIMELINE_ASSETS = """
 """
 
 
-def _timeline_thumb(project_dir, scene):
-    """Return (thumb_url, is_video, resolved_path_or_None) for a scene's media."""
-    asset = scene.get("asset")
-    clip = scene.get("clip")
-    if asset:
-        direct = Path(asset)
-        if direct.is_absolute() and direct.exists():
-            return link_for(direct), is_video_path(direct), direct
-        for sub in ("web images", "gpt images", "local media", "speaker", "seedance 2.0"):
-            candidate = project_dir / sub / asset
-            if candidate.exists():
-                return link_for(candidate), is_video_path(candidate), candidate
-    if clip:
-        candidate = project_dir / "seedance 2.0" / clip
-        if candidate.exists():
-            return link_for(candidate), True, candidate
-    return "", False, None
+def _find_scene_image(project_dir, asset):
+    if not asset:
+        return None
+    direct = Path(asset)
+    if direct.is_absolute() and direct.exists() and is_image_path(direct):
+        return direct
+    for sub in ("web images", "gpt images", "local media", "speaker"):
+        candidate = project_dir / sub / asset
+        if candidate.exists() and is_image_path(candidate):
+            return candidate
+    return None
+
+
+def _timeline_media(project_dir, scene):
+    """Return (poster_url, clip_url, source_image_path). poster is always a still
+    image (a poster frame from the clip, or the source image) so it renders; clip
+    is the playable mp4 if one exists (so the preview plays the real video)."""
+    clip_name = scene.get("clip")
+    clip_path = (project_dir / "seedance 2.0" / clip_name) if clip_name else None
+    img = _find_scene_image(project_dir, scene.get("asset"))
+    clip_url = ""
+    poster_url = ""
+    if clip_path and clip_path.exists() and is_video_path(clip_path):
+        clip_url = link_for(clip_path)
+        # poster frame from the actual clip (cached) so the timeline shows the clip
+        poster = clip_path.with_suffix(".poster.jpg")
+        if not poster.exists():
+            pipeline.extract_poster_frame(clip_path, poster)
+        if poster.exists():
+            poster_url = link_for(poster)
+    if not poster_url and img:
+        poster_url = link_for(img)
+    return poster_url, clip_url, img
 
 
 def timeline_model(slug):
@@ -2749,26 +2853,38 @@ def timeline_model(slug):
         start = float(scene.get("start", 0) or 0)
         end = float(scene.get("end", start) or start)
         dur = max(0.3, end - start)
-        thumb, is_video, resolved = _timeline_thumb(project_dir, scene)
+        poster, clip_url, img = _timeline_media(project_dir, scene)
         label = scene.get("name") or scene.get("caption") or scene.get("script") or f"Scene {index + 1}"
         label = re.sub(r"\s+", " ", str(label)).strip()[:54] or f"Scene {index + 1}"
-        replaceable = bool(resolved and "web images" in {p.lower() for p in resolved.parts}
-                           and not scene.get("speaker_hook"))
+        replaceable = bool(img and "web images" in {p.lower() for p in img.parts} and not scene.get("speaker_hook"))
         scenes.append({
             "id": str(scene.get("id", index)),
             "label": label,
             "dur": round(dur, 2),
-            "thumb": thumb,
-            "video": bool(is_video),
-            "path": str(resolved) if resolved else "",
+            "poster": poster,
+            "clip": clip_url,
+            "path": str(img) if img else "",
             "replaceable": replaceable,
-            "caption": bool(scene.get("caption") or scene.get("render_caption") or scene.get("script")),
             "speaker": bool(scene.get("speaker_hook")),
+            "start": round(start, 3),
         })
+    # SFX events (split into boundary transitions vs. content), each individually editable.
+    overrides = config.get("sfx_overrides") or {}
+    plan = pipeline.sfx_event_plan(config, has_speech=True)
+    start_by_id = {s["id"]: s["start"] for s in scenes}
+    transitions, content = [], []
+    for ev in plan:
+        if ev["transition"]:
+            if ev["id"].startswith("tr-"):  # clip-boundary transition (CapCut connector)
+                transitions.append({"id": ev["id"], "scene_id": ev["scene_id"], "label": ev["label"],
+                                    "volume": ev["volume"], "enabled": ev["enabled"]})
+        else:
+            offset = round(ev["at"] - start_by_id.get(ev["scene_id"], ev["at"]), 3)
+            content.append({"id": ev["id"], "scene_id": ev["scene_id"], "label": ev["label"], "category": ev["category"],
+                            "offset": max(0.0, offset), "duration": ev["duration"], "volume": ev["volume"], "enabled": ev["enabled"]})
+    captions_on = bool(config.get("render_captions", True))
     volumes = {
         "voice": float(config.get("audio_master_gain", 1.0) or 1.0),
-        "seedance": float(config.get("seedance_audio_volume", 0.16) or 0.0),
-        "sfx": float(config.get("sfx_volume", 0.075) or 0.0),
         "music": float(config.get("background_music_volume", 0.0) or 0.0),
     }
     return {
@@ -2776,6 +2892,9 @@ def timeline_model(slug):
         "title": config.get("title", slug),
         "duration": round(float(config.get("duration", 0) or 0), 2),
         "scenes": scenes,
+        "transitions": transitions,
+        "sfx": content,
+        "captions": captions_on,
         "volumes": volumes,
     }
 

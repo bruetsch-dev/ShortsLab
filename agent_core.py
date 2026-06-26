@@ -1683,7 +1683,7 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
         "output_basename": f"{slug}_auto_short",
         "use_seedance_clips": True,
         "seedance_default": False,
-        "render_captions": False,
+        "render_captions": True,  # word-by-word captions, locked to the voice timing
         "animated_captions": True,
         "caption_max_words": 3,
         "caption_uppercase": True,
@@ -4254,15 +4254,37 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
 
     if "voice" in volumes:
         set_volume("audio_master_gain", volumes["voice"])
-    if "seedance" in volumes:
-        set_volume("seedance_audio_volume", volumes["seedance"])
-        set_volume("seedance_audio_volume_with_speech", volumes["seedance"])
-    if "sfx" in volumes:
-        for key in ("sfx_volume", "sfx_volume_with_speech", "sfx_transition_volume", "sfx_transition_volume_with_speech"):
-            set_volume(key, volumes["sfx"])
     if "music" in volumes:
         set_volume("background_music_volume", volumes["music"])
         set_volume("background_music_volume_with_speech", volumes["music"])
+        try:
+            config["background_music_enabled"] = float(volumes["music"]) > 0.0
+        except (TypeError, ValueError):
+            pass
+
+    # Captions are locked to the voice timing; the editor only toggles them on/off.
+    if "captions" in edits:
+        config["render_captions"] = bool(edits["captions"])
+
+    # Per-event SFX edits (each transition and content effect tuned individually).
+    overrides = {}
+    for item in (edits.get("transitions") or []) + (edits.get("sfx") or []):
+        eid = str(item.get("id") or "")
+        if not eid:
+            continue
+        entry = {}
+        if item.get("volume") is not None:
+            try:
+                entry["volume"] = max(0.0, min(0.6, float(item["volume"])))
+            except (TypeError, ValueError):
+                pass
+        if item.get("enabled") is not None:
+            entry["enabled"] = bool(item["enabled"])
+        if entry:
+            overrides[eid] = entry
+    if overrides:
+        config["sfx_overrides"] = overrides
+        config["sfx_enabled"] = True
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     config["output_basename"] = f"{slug}_timeline_{stamp}"
