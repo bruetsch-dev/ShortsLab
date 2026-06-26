@@ -163,7 +163,7 @@ CUSTOM_PRESET_PATH = ROOT / "custom_preset.json"   # legacy single file (migrate
 # Read-only built-in preset: "found-footage" style like the Japan dark-facts short —
 # ALL AI generation off, clips come from a TikTok/Instagram scrape, loose relevancy.
 BUILTIN_PRESETS = {
-    "\U0001F1EF\U0001F1F5 Japanese Dark Facts": {
+    "\U0001F1EF\U0001F1F5 Facts about Japan": {
         "speaker_name": "Narrator", "tts_voice": "Charon", "tts_model": "pro",
         "video_model": "seedance-2.0", "image_model": "openai/gpt-image-2/text-to-image",
         "reasoning_model": "openai/gpt-5.5",
@@ -582,6 +582,13 @@ def app_style():
       .cbar-cell select { padding: 10px 12px; font-size: 13px; }
       .cbar-divider { align-self: stretch; width: 3px; background: var(--ink); margin: 2px 2px; flex: 0 0 auto; }
       @media (max-width: 760px) { .cbar-divider { display: none; } }
+      /* horizontal separator between the moved-in sections (clip source, outputs) */
+      .cbar-sep { border: 0; border-top: 2px dashed var(--line-strong); margin: 4px 0 2px; width: 100%; }
+      .cbar-section { display: block; }
+      .cbar-section .cbar-cap { margin-bottom: 10px; }
+      .cbar-section .csrc-btns, .cbar-section .otoggles, .cbar-section .scrape-settings { margin-top: 2px; }
+      /* grayed-out controls (AI models + AI-image outputs when scraping) */
+      .ctrl-disabled { opacity: .4; pointer-events: none; }
       /* segmented control — chunky pixel cards */
       .tier-btns { display: flex; gap: 7px; }
       .tier-btns .tier-btn {
@@ -1039,7 +1046,9 @@ def app_style():
       .modal-content .modal-close::after { display: none; }
       .modal-content .modal-close:hover { color: var(--text); background: none; box-shadow: none; transform: none; }
       /* --- Preset popup --- */
-      .preset-popup-card { max-width: 440px; padding: 22px 22px 20px; }
+      /* pin near the top instead of vertically centered (the inherited margin:auto
+         centered this short popup, making it open too far down the viewport) */
+      .preset-popup-card { max-width: 440px; padding: 22px 22px 20px; margin: 0 auto auto; }
       .pp-group-label { font-family: var(--pixel); text-transform: uppercase; font-size: 10px; letter-spacing: .12em; color: var(--faint); margin: 14px 0 6px; }
       .pp-group-label:first-child { margin-top: 2px; }
       .pp-empty { color: var(--faint); font-size: 13px; padding: 4px 2px 2px; }
@@ -1446,6 +1455,27 @@ def app_script():
             if (box) box.style.display = (src === "scrape") ? "block" : "none";
             var rv = document.getElementById("relv-val"); var rng = document.getElementById("script-relevancy");
             if (rv && rng) rv.textContent = rng.value + "%";
+            // Scraping uses real footage, so the AI video/image models and the AI-image
+            // outputs don't apply — disable + gray them out.
+            var scrape = (src === "scrape");
+            ["video_model", "image_model"].forEach(function (n) {
+              var f = document.querySelector('[name="' + n + '"]'); if (!f) return;
+              f.disabled = scrape;
+              var cell = f.closest(".cbar-cell"); if (cell) cell.classList.toggle("ctrl-disabled", scrape);
+            });
+            ["out_web_images", "out_wikimedia", "out_gpt_images"].forEach(function (n) {
+              var f = document.querySelector('[name="' + n + '"]'); if (!f) return;
+              var lbl = f.closest(".otoggle");
+              if (scrape) {
+                if (!f.disabled) f.dataset.prevChecked = f.checked ? "1" : "0";
+                f.checked = false; f.disabled = true;
+                if (lbl) lbl.classList.add("ctrl-disabled");
+              } else {
+                if (f.dataset.prevChecked !== undefined) { f.checked = (f.dataset.prevChecked === "1"); delete f.dataset.prevChecked; }
+                f.disabled = false;
+                if (lbl) lbl.classList.remove("ctrl-disabled");
+              }
+            });
           }
           window.syncClipSource = syncClipSource;
           window.setClipSource = function (src) {
@@ -2037,49 +2067,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
         <div class="cbar-row" style="align-items:center; gap:14px;">
           <label class="cbar-halt"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</span></label>
         </div>
-      </div>
 
-      <section class="stack">
-        {advanced_hidden_inputs(state)}
-        <div class="panel accent">
-          <label>Text script {help_tip("The voiceover is generated from this with Gemini TTS. Mark the opening line(s) as the hook: it is spoken first, then a short pause, then the rest. With a speaker image it drives the InfiniteTalk talking-head opening.")}</label>
-          <div class="script-wrap">
-            <div class="script-highlight" id="script-highlight" aria-hidden="true"></div>
-            <textarea id="script-field" name="script" spellcheck="false" placeholder="Paste your script here. Write it as a punchy spoken narration — the AI generates the voiceover, finds visuals and cuts the Short from this text. Then select your opening line(s) and click &#8220;Mark hook&#8221;.">{esc(state.get("script"))}</textarea>
-          </div>
-          <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
-          <div class="hook-controls">
-            <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
-            <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
-            <span id="hook-indicator" class="hook-dot" hidden></span>
-          </div>
-        </div>
-        <div class="panel toggle-panel" id="visual-panel">
-          <div class="panel-head">
-            <label>Optional Visual Direction {help_tip("Optional. The Voice Script is authoritative; this is secondary style guidance (e.g. darker documentary look, faster cuts, more maps). If empty, the visual plan is inferred from the script.")}</label>
-            <label class="switch" title="Use this visual direction"><input type="checkbox" name="use_visual_direction"{checked("use_visual_direction")} onchange="toggleSection('visual-panel', this.checked)"></label>
-          </div>
-          <div class="panel-body">
-            <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty to let the agent plan visuals from the script. Use this only for style, e.g. darker documentary style, faster cuts, more maps.">{esc(state.get("visual_script"))}</textarea>
-          </div>
-        </div>
-
-        <div class="panel">
-          <label>Outputs {help_tip("Turn individual parts of the pipeline on or off. Off = that part is skipped entirely, and a Smart run will not generate it either.")}</label>
-          <div class="otoggles">
-            <label class="otoggle"><span>Web images</span><input type="checkbox" name="out_web_images"{checked("out_web_images")}></label>
-            <label class="otoggle"><span>Wikimedia images</span><input type="checkbox" name="out_wikimedia"{checked("out_wikimedia")}></label>
-            <label class="otoggle"><span>Generated images</span><input type="checkbox" name="out_gpt_images"{checked("out_gpt_images")}></label>
-            <label class="otoggle"><span>Video clips</span><input type="checkbox" name="out_video_clips"{checked("out_video_clips")}></label>
-            <label class="otoggle"><span>Sound effects</span><input type="checkbox" name="out_sfx"{checked("out_sfx")}></label>
-            <label class="otoggle"><span>Transition SFX</span><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}></label>
-            <label class="otoggle"><span>Background music</span><input type="checkbox" name="out_background_music"{checked("out_background_music")}></label>
-            <label class="otoggle"><span>Captions</span><input type="checkbox" name="out_captions"{checked("out_captions")}></label>
-          </div>
-        </div>
-
-        <div class="panel" id="clipsource-panel">
-          <label>Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok/Instagram clips that match a visual style and cut them together (used by the Japanese-facts preset). Scraping ignores the AI generation outputs above.")}</label>
+        <div class="cbar-sep" aria-hidden="true"></div>
+        <div class="cbar-section" id="clipsource-panel">
+          <span class="cbar-cap">Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok clips that match a visual style and cut them together. Scraping disables the AI video/image models and the AI-image outputs.")}</span>
           <input type="hidden" name="clip_source" id="clip-source" value="{esc(state.get('clip_source') or 'generate')}">
           <div class="csrc-btns">
             <button type="button" class="csrc-btn" data-src="generate" onclick="setClipSource('generate')"><b>Generate</b><small>AI video &amp; images</small></button>
@@ -2104,6 +2095,47 @@ def form_page(clear=False, open_load=False, load_slug=""):
             </div>
             <input type="text" name="scrape_cookies_file" id="scrape-cookies-file" placeholder="…or path to an exported TikTok cookies.txt (optional)" value="{esc(state.get('scrape_cookies_file'))}">
             <div id="connect-status" class="hint" style="margin-top:6px;"></div>
+          </div>
+        </div>
+
+        <div class="cbar-sep" aria-hidden="true"></div>
+        <div class="cbar-section">
+          <span class="cbar-cap">Outputs {help_tip("Turn individual parts of the pipeline on or off. Off = that part is skipped entirely, and a Smart run will not generate it either. Scraping disables the AI-image outputs.")}</span>
+          <div class="otoggles">
+            <label class="otoggle"><span>Web images</span><input type="checkbox" name="out_web_images"{checked("out_web_images")}></label>
+            <label class="otoggle"><span>Wikimedia images</span><input type="checkbox" name="out_wikimedia"{checked("out_wikimedia")}></label>
+            <label class="otoggle"><span>Generated images</span><input type="checkbox" name="out_gpt_images"{checked("out_gpt_images")}></label>
+            <label class="otoggle"><span>Video clips</span><input type="checkbox" name="out_video_clips"{checked("out_video_clips")}></label>
+            <label class="otoggle"><span>Sound effects</span><input type="checkbox" name="out_sfx"{checked("out_sfx")}></label>
+            <label class="otoggle"><span>Transition SFX</span><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}></label>
+            <label class="otoggle"><span>Background music</span><input type="checkbox" name="out_background_music"{checked("out_background_music")}></label>
+            <label class="otoggle"><span>Captions</span><input type="checkbox" name="out_captions"{checked("out_captions")}></label>
+          </div>
+        </div>
+      </div>
+
+      <section class="stack">
+        {advanced_hidden_inputs(state)}
+        <div class="panel accent">
+          <label>Text script {help_tip("The voiceover is generated from this with Gemini TTS. Mark the opening line(s) as the hook: it is spoken first, then a short pause, then the rest. With a speaker image it drives the InfiniteTalk talking-head opening.")}</label>
+          <div class="script-wrap">
+            <div class="script-highlight" id="script-highlight" aria-hidden="true"></div>
+            <textarea id="script-field" name="script" spellcheck="false" placeholder="Paste your script here. Write it as a punchy spoken narration — the AI generates the voiceover, finds visuals and cuts the Short from this text. Then select your opening line(s) and click &#8220;Mark hook&#8221;.">{esc(state.get("script"))}</textarea>
+          </div>
+          <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
+          <div class="hook-controls">
+            <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
+            <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
+            <span id="hook-indicator" class="hook-dot" hidden></span>
+          </div>
+        </div>
+        <div class="panel toggle-panel" id="visual-panel">
+          <div class="panel-head">
+            <label>Optional Visual Direction {help_tip("Optional. The Voice Script is authoritative; this is secondary style guidance (e.g. darker documentary look, faster cuts, more maps). If empty, the visual plan is inferred from the script.")}</label>
+            <label class="switch" title="Use this visual direction"><input type="checkbox" name="use_visual_direction"{checked("use_visual_direction")} onchange="toggleSection('visual-panel', this.checked)"></label>
+          </div>
+          <div class="panel-body">
+            <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty to let the agent plan visuals from the script. Use this only for style, e.g. darker documentary style, faster cuts, more maps.">{esc(state.get("visual_script"))}</textarea>
           </div>
         </div>
 
