@@ -1140,7 +1140,7 @@ def submit_wavespeed_image(prompt, config, key):
     # quality/resolution are gpt-image-2 knobs; other models (e.g. nano-banana-2)
     # can reject unknown params, so only send them for gpt-image models.
     if "gpt-image" in model:
-        payload["quality"] = "low"
+        payload["quality"] = "medium"  # medium is the recommended default; low looked rough
         payload["resolution"] = "1k"
     response = request_json("POST", f"{API_BASE}/{model}", key, payload)
     return unwrap_id(response), response

@@ -585,63 +585,52 @@ def choose_seedance_scenes(scenes, max_clips=4, preferred_indexes=None, exclude_
 
 
 # Image source-frame must also be text-free, or the I2V model inherits/echoes it.
-_IMAGE_NO_TEXT = ("Do not render any text, captions, subtitles, letters, words, numbers, signs, "
-                  "labels, UI, watermark or logo anywhere in the image.")
+_IMAGE_NO_TEXT = "No text, captions, letters, numbers or logos anywhere in the image."
 
 
 def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
+    # Kept lean on purpose: over-stuffed image prompts make the models render weird,
+    # conflicting detail. Carry the topic, the spoken line, the must-show subjects,
+    # the look, and the hard constraints -- nothing redundant.
     visual_direction = scene.get("visual_script", "")
     voice_line = scene.get("exact_voice_text") or scene.get("voice_line") or scene["script"]
-    objective = scene.get("scene_objective") or scene.get("beat_purpose") or f"Visually answer this voice line: {voice_line}"
-    visual_meaning = scene.get("visual_meaning") or scene.get("required_visual_information") or voice_line
     must_show = scene.get("must_show") or important_terms(voice_line, 5, SEARCH_NOISE)
-    must_not_show = scene.get("must_not_show") or ["off-topic symbols", "random book cover", "caption text"]
+    must_not_show = scene.get("must_not_show") or ["off-topic symbols", "caption text"]
     topic = humanize_title(title)
-    show_phrase = ", ".join(str(item) for item in must_show[:6])
-    avoid_phrase = ", ".join(str(item) for item in must_not_show[:5])
+    show_phrase = ", ".join(str(item) for item in must_show[:5])
+    avoid_phrase = ", ".join(str(item) for item in must_not_show[:4])
     model = str(image_model or "").lower()
 
     if "nano-banana" in model or "gemini" in model:
-        # Nano-Banana 2 is a reasoning image model: it reads a flowing creative brief,
-        # and comma-separated keyword soup actively hurts it. Use natural sentences and
-        # put the aspect ratio at the very end.
+        # Nano-Banana 2 reads a flowing creative brief; comma keyword-soup hurts it.
+        # Natural sentences, aspect ratio at the very end.
         parts = [
-            f'Act as an art director and create ONE realistic documentary still for a vertical short about "{topic}".',
-            f'The frame must clearly illustrate this exact spoken line: "{voice_line}". {objective}.',
-            f"Make sure the viewer understands: {visual_meaning}.",
+            f'Create ONE realistic documentary still for a vertical short about "{topic}".',
+            f'It must clearly illustrate this spoken line: "{voice_line}".',
         ]
         if show_phrase:
-            parts.append(f"Clearly show {show_phrase}.")
+            parts.append(f"Show {show_phrase}.")
         if visual_direction:
-            parts.append(f"Use this direction only if it genuinely fits the spoken line, otherwise ignore it: {visual_direction}.")
-        parts.append(
-            "Stage it as a believable, period-accurate mini-documentary reconstruction with cinematic, slightly "
-            "desaturated lighting, clear foreground/midground/background depth, and the main subject frozen at the "
-            "start of a visible action so it can be animated afterwards."
-        )
-        parts.append("Keep it a single coherent scene -- no collage, split-screen, grid or inset images. Every person is fully clothed in period attire; no nudity, no gore.")
+            parts.append(f"Direction (only if it fits): {visual_direction}.")
+        parts.append("Period-accurate, cinematic and slightly desaturated, with clear depth; the main subject frozen at the start of a visible action.")
+        parts.append("Single coherent scene, fully clothed period attire, no nudity or gore.")
         parts.append(_IMAGE_NO_TEXT)
-        parts.append("Photorealistic and serious in tone, not meme-like. Vertical 9:16 aspect ratio, composition readable on a phone.")
+        parts.append("Photorealistic and serious. Vertical 9:16.")
         return " ".join(part for part in parts if part)
 
-    # GPT-Image-2 (default): structured, skimmable sections with measurable visual
-    # facts (it follows an art-director brief better than dense keyword stacks).
+    # GPT-Image-2 (default): short, skimmable sections with concrete visual facts.
     prompt = (
-        f'Scene: a period-accurate, realistic documentary reconstruction for the short "{topic}"; '
-        "every visible subject, object, place and era must support this topic.\n"
-        f'Subject: one clear main subject that visually answers the spoken line "{voice_line}". '
-        f"Clearly show: {show_phrase}.\n"
-        "Important details: cinematic mini-documentary look, slightly desaturated period palette, soft realistic "
-        "lighting, clear foreground/midground/background depth, 35-50mm feel, the subject frozen at the start of a "
-        f"visible action with room to move. The image must make this understood: {visual_meaning}.\n"
+        f'Scene: period-accurate documentary reconstruction for "{topic}".\n'
+        f'Subject: one clear subject that answers the spoken line "{voice_line}". Show: {show_phrase}.\n'
+        "Details: cinematic, slightly desaturated period palette, soft realistic light, clear depth, 35-50mm; "
+        "the subject frozen at the start of a visible action.\n"
     )
     if visual_direction:
-        prompt += f"Optional direction (use only if it fits the spoken line, otherwise ignore): {visual_direction}\n"
+        prompt += f"Direction (only if it fits): {visual_direction}\n"
     prompt += (
-        "Use case: a vertical 9:16 YouTube Short scene plate and image-to-video source frame that intensifies the "
-        "spoken beat, not just sets a mood.\n"
-        f"Constraints: one coherent scene (no collage, split-screen, grid, scrapbook or inset images); avoid {avoid_phrase}; "
-        f"every figure fully clothed in period attire; no nudity; no gore. {_IMAGE_NO_TEXT}"
+        "Use case: vertical 9:16 Short scene plate and image-to-video source frame.\n"
+        f"Constraints: single coherent scene (no collage, grid or inset); avoid {avoid_phrase}; "
+        f"fully clothed period attire; no nudity; no gore. {_IMAGE_NO_TEXT}"
     )
     return prompt
 
@@ -675,71 +664,53 @@ def seedance_motion_focus(scene):
     return "beat-specific motion: one unique movement that only visualizes this exact script beat, not a generic repeated action."
 
 
-# Shared clip guardrails (model-agnostic): no speech, no on-screen text, keep the
-# source image intact. Reused by every image-to-video model prompt.
-_CLIP_NO_SPEECH = "Silent clip: no speech, voices, dialogue, narration, singing or vocalizations of any kind."
-_CLIP_NO_TEXT = ("ABSOLUTELY NO on-screen text anywhere in the frame: no captions, subtitles, titles, "
-                 "lyrics, letters, words, numbers, signs, labels, UI, watermark or logo.")
-_CLIP_PRESERVE = ("Preserve the source image's composition, colors, subject and clothing exactly; "
-                  "do not add, remove or redraw any people or objects, and keep every figure fully clothed.")
+# Shared clip guardrails -- kept SHORT on purpose: overlong, over-stuffed prompts
+# make these models render weird artifacts. One tight clause each.
+_CLIP_NO_SPEECH = "No speech, voices or dialogue."
+_CLIP_NO_TEXT = "No on-screen text, captions, letters, numbers or logos anywhere."
+_CLIP_PRESERVE = "Preserve the source image's composition, colors, subject and clothing; add or remove nothing."
 
 
 def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent="", title="", video_model="seedance-2.0"):
     visual_direction = scene.get("visual_script", "")
     script_beat = str(scene.get("exact_voice_text") or scene.get("voice_line") or scene.get("script", "")).strip().rstrip(".!?")
     position = f"Scene {scene_index}/{total_scenes}. " if scene_index and total_scenes else ""
-    objective = scene.get("scene_objective") or scene.get("beat_purpose") or f"Visually answer this voice line: {script_beat}"
-    camera_motion = scene.get("camera_motion") or "purposeful handheld/parallax camera motion"
-    subject_motion = scene.get("subject_motion") or "script-specific visible subject action"
+    # Use a real director objective only when it adds something; never repeat the beat.
+    raw_obj = scene.get("scene_objective") or scene.get("beat_purpose") or ""
+    obj_clause = f" {raw_obj.rstrip('.')}." if raw_obj else ""
+    camera_motion = scene.get("camera_motion") or "slow, deliberate camera move"
+    subject_motion = scene.get("subject_motion") or "the main subject's clear action"
     environment_motion = scene.get("environment_motion") or "natural ambient motion"
-    emotional_action = scene.get("emotional_action") or scene.get("emotion") or infer_emotion(script_beat)
     model = str(video_model or "").lower()
     is_hook = scene_index == 1  # the opener must stop the scroll in the first ~1.3s
-    # Per the video-prompting skill: the prompt TEXT carries narrative + motion only;
-    # model name, aspect ratio and resolution stay out (they are API parameters).
+    # Keep prompts SHORT -- over-stuffed prompts make these models render weird artifacts.
+    # Model name / aspect ratio / resolution stay out (they are API parameters).
 
     if "ltx" in model:
-        # LTX-2.3 (official guide): scope motion to clip length -- for a short clip use
-        # ONE main action beat + ONE camera move; do NOT stack subject + camera +
-        # environment at once. Direct layout like blocking, keep texture, use motion
-        # verbs, and keep motion gentle/plausible (chaotic motion -> artifacts).
-        idea = f" Use this idea only if it fits the line: {visual_direction}." if visual_direction else ""
+        # LTX-2.3: ONE action beat + ONE camera move (don't stack subject+camera+
+        # environment); blocking + texture; gentle motion (chaotic motion -> artifacts).
+        idea = f" Idea (only if it fits): {visual_direction}." if visual_direction else ""
         if is_hook:
-            beat_phrase = (f"Open on immediate, bold motion in the very first frame: {subject_motion}, "
-                           f"while a {camera_motion} drives in.")
+            beat = f"Open on immediate, bold motion in the first frame: {subject_motion}, as a {camera_motion} drives in."
         else:
-            beat_phrase = f"{subject_motion} as a single slow, deliberate {camera_motion} unfolds."
+            beat = f"{subject_motion} as a single {camera_motion} unfolds."
         return (
-            f"Animate this still as one continuous, cinematic documentary shot. It shows: {script_beat}. {objective}.{idea} "
-            f"{beat_phrase} "
-            "Direct the layout like blocking (clear foreground and background, who faces where) and keep fine texture -- "
-            "fabric, surfaces, environmental wear, edge light. "
-            "One main action beat plus one clear camera move only; keep motion gentle and physically plausible -- "
-            "no jumping, juggling, fast twisting, morphing or chaotic action, and no still-photo stillness. "
-            f"{_CLIP_PRESERVE} Slightly desaturated and realistic, one flowing shot, not a montage. "
-            f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT}"
-        )[:1200]
+            f"One continuous cinematic documentary shot. It shows: {script_beat}.{obj_clause}{idea} "
+            f"{beat} Clear foreground/background blocking, real texture. "
+            "One action beat plus one camera move only; gentle, physically plausible motion -- no fast twisting, morphing or chaotic action. "
+            f"{_CLIP_PRESERVE} {_CLIP_NO_SPEECH} {_CLIP_NO_TEXT}"
+        )[:900]
 
-    # Seedance 2.0 / 2.0-fast / Happy Horse (official guide): director-style shot
-    # breakdown with literal section labels, chronological action beats, and concrete
-    # VISIBLE physical outcomes (splashes, debris, fabric drag) -- not mood words.
-    hook_lead = "Opening hook shot -- start on bold, immediate motion that grabs attention in the first frame. " if is_hook else ""
-    idea = f"Reference idea (use only if it fits the beat): {visual_direction}. " if visual_direction else ""
-    intent = f"Director intent: {visual_intent}. " if visual_intent else ""
-    prompt = (
+    # Seedance 2.0 / 2.0-fast / Happy Horse: tight director shot-breakdown with literal
+    # labels, chronological beats, and concrete VISIBLE physical outcomes (not mood words).
+    hook_lead = "Opening hook -- bold immediate motion in the first frame. " if is_hook else ""
+    idea = f"Idea (only if it fits): {visual_direction}. " if visual_direction else ""
+    return (
         f"Single continuous documentary shot, silent. {position}{hook_lead}"
-        f"Action: {script_beat}; {objective}. {subject_motion}, then {environment_motion}, "
-        "with concrete visible physical detail -- splashes, debris, dust, fabric and surfaces reacting. "
-        f"{idea}{intent}"
-        f"Camera: {camera_motion}. "
-        f"Style: realistic and slightly desaturated, serious; concrete visible behaviour, no abstract mood words. "
-        f"Motion focus: {seedance_motion_focus(scene)} "
-        f"{_CLIP_PRESERVE} "
-        "Keep a clear start, action change and end pose -- not a static frame with only a zoom. "
-        f"{_CLIP_NO_SPEECH} {_CLIP_NO_TEXT} "
-        "Realistic, serious, one continuous shot, not a montage."
-    )
-    return prompt[:1200]
+        f"Action: {script_beat}.{obj_clause} {subject_motion}, then {environment_motion}, with visible physical detail (splashes, debris, fabric reacting). "
+        f"{idea}Camera: {camera_motion}. Style: realistic, slightly desaturated, concrete not moody, one continuous shot. "
+        f"{_CLIP_PRESERVE} {_CLIP_NO_SPEECH} {_CLIP_NO_TEXT}"
+    )[:900]
 
 
 def safe_copy_audio(audio_path, project_dir):
