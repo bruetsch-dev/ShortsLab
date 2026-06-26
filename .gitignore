@@ -35,3 +35,13 @@ server.err.log
 .DS_Store
 Thumbs.db
 *.tmp
+
+# --- Merged-out duplicate project folders (archived media, not source) ---
+_archive_merged/
+
+# --- Speaker face gallery: keep the folder + readme, not the user's photos ---
+/speaker images/*
+!/speaker images/README.txt
+
+# --- Local one-off dev/test scripts ---
+scripts/_*.py

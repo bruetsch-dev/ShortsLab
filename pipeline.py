@@ -24,6 +24,210 @@ API_BASE = "https://api.wavespeed.ai/api/v3"
 DEFAULT_IMAGE_MODEL = "openai/gpt-image-2/text-to-image"
 DEFAULT_VIDEO_MODEL = "bytedance/seedance-2.0/image-to-video"
 
+# --- Content safety: keep every prompt sent to WaveSpeed strictly SFW ---
+# Image/video models (especially uncensored variants) can hallucinate nudity or
+# gore from ambiguous shapes. We steer them away with POSITIVE framing only.
+#
+# We deliberately do NOT send a negative_prompt listing words like "nudity" or
+# "gore": Seedance I2V doesn't use one for safety, and -- more importantly --
+# putting explicit terms anywhere in the request (even in a negative field) can
+# itself trip the provider's content filter and block generation entirely. So
+# we (a) scrub explicit request terms out of the incoming prompt and (b) append
+# a short positive clause that steers toward clothed, tasteful, documentary
+# imagery without ever naming the forbidden concepts.
+SAFETY_PROMPT_SUFFIX = (
+    " Wholesome, tasteful documentary realism: every figure is fully clothed in "
+    "modest, period-appropriate attire, with respectful, non-graphic framing."
+)
+_NSFW_REQUEST_RE = re.compile(
+    r"\b(nudes?|nudity|naked|topless|bottomless|undress\w*|lingerie|underwear|"
+    r"sexual|erotic|nsfw|explicit|porn\w*|genitals?|nipples?|breasts?|buttocks?|"
+    r"gore|gory|dismember\w*|mutilat\w*|disembowel\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def make_prompt_safe(prompt):
+    """Scrub explicit NSFW/gore request terms and append a positive SFW clause.
+
+    Uses positive framing only -- no negative-prompt word list -- so explicit
+    tokens never reach the provider's content filter (which can otherwise block
+    an otherwise-safe generation just for mentioning the forbidden concept).
+    """
+    text = _NSFW_REQUEST_RE.sub("clothed", str(prompt or "")).strip()
+    if not text:
+        return SAFETY_PROMPT_SUFFIX.strip()
+    return text + SAFETY_PROMPT_SUFFIX
+
+
+# --- Voiceover generation (Gemini 2.5 text-to-speech on WaveSpeed) ------------
+# The user picks a speaker name + voice; we generate the spoken track instead of
+# requiring an upload. Request shape (per WaveSpeed docs):
+#   {"text": "Rose: <script>", "language": "English (United States)",
+#    "speakers": [{"speaker": "Rose", "voice": "Achernar"}]}
+# The speaker name MUST prefix the script text, and also appears in `speakers`.
+GEMINI_TTS_MODELS = {
+    "flash": "google/gemini-2.5-flash/text-to-speech",
+    "pro": "google/gemini-2.5-pro/text-to-speech",
+}
+DEFAULT_TTS_MODEL = "flash"
+DEFAULT_TTS_LANGUAGE = "English (United States)"
+DEFAULT_TTS_SPEAKER = "Narrator"
+DEFAULT_TTS_VOICE = "Achernar"
+# Canonical Gemini TTS voice set (30 voices). Shown in the speaker/voice picker.
+GEMINI_TTS_VOICES = [
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+]
+
+
+def format_tts_script(speaker_name, text):
+    """Prefix the script with the chosen speaker name, e.g. 'Rose: In 1814, ...'.
+
+    Gemini multi-speaker TTS keys lines by the speaker label, so the same name
+    must lead the text and appear in the `speakers` array.
+    """
+    speaker = (str(speaker_name or "").strip() or DEFAULT_TTS_SPEAKER)
+    body = str(text or "").strip()
+    return f"{speaker}: {body}" if body else speaker
+
+
+def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER,
+                           voice=DEFAULT_TTS_VOICE, model=DEFAULT_TTS_MODEL,
+                           language=DEFAULT_TTS_LANGUAGE, cancel_event=None,
+                           status_cb=None):
+    """Generate a spoken voiceover with Gemini TTS and download it to out_path.
+
+    Returns the local Path. `model` accepts 'flash'/'pro' or a full model id.
+    """
+    key = key or api_key()
+    model_id = GEMINI_TTS_MODELS.get(model, model)
+    speaker = (str(speaker or "").strip() or DEFAULT_TTS_SPEAKER)
+    payload = {
+        "text": format_tts_script(speaker, text),
+        "language": language or DEFAULT_TTS_LANGUAGE,
+        "speakers": [{"speaker": speaker, "voice": voice or DEFAULT_TTS_VOICE}],
+    }
+    status_log(status_cb, f"Generating voiceover ({speaker}/{voice}) with {model_id}...")
+    response = request_json("POST", f"{API_BASE}/{model_id}", key, payload, timeout=180)
+    prediction_id = unwrap_id(response)
+    outputs, _ = poll_wavespeed(prediction_id, key, timeout_s=420, cancel_event=cancel_event,
+                                status_cb=status_cb, label="Voiceover")
+    out_path = Path(out_path)
+    # Respect the real output extension (wav/mp3) so downstream tools sniff it right.
+    ext = output_extension(outputs[0], out_path.suffix or ".wav")
+    if out_path.suffix.lower() != ext.lower():
+        out_path = out_path.with_suffix(ext)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    download_file(outputs[0], out_path)
+    return out_path
+
+
+def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
+                            sample_rate=44100, ffmpeg=None):
+    """Join two audio clips with a short silent gap between them.
+
+    Used so the spoken hook and the rest of the narration don't run together:
+    a small pause after the hook makes the intro->body transition feel edited
+    rather than like one continuous take. Returns the output Path, or None if
+    ffmpeg is unavailable.
+    """
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg:
+        return None
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pause_s = max(0.0, float(pause_s))
+    fmt = f"aformat=sample_rates={sample_rate}:channel_layouts=stereo"
+    cmd = [
+        ffmpeg, "-y",
+        "-i", str(first_path),
+        "-i", str(second_path),
+        "-f", "lavfi", "-t", f"{pause_s:.3f}",
+        "-i", f"anullsrc=r={sample_rate}:cl=stereo",
+        "-filter_complex",
+        f"[0:a]{fmt}[a];[2:a]{fmt}[s];[1:a]{fmt}[b];[a][s][b]concat=n=3:v=0:a=1[out]",
+        "-map", "[out]",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return out_path
+
+
+# --- Talking-head hook clip (InfiniteTalk on WaveSpeed) -----------------------
+# The opening "speaker hook" is now a lip-synced talking head driven by the
+# spoken hook audio + the speaker image -- not a Seedance I2V clip. Schema:
+#   {"image": <url>, "audio": <url>, "prompt": <str?>, "resolution": "480p"|"720p", "seed": -1}
+# Output video at data.outputs[0].
+INFINITETALK_MODEL = "wavespeed-ai/infinitetalk"
+
+
+def submit_infinitetalk(image_url, audio_url, key=None, prompt="", resolution="480p", seed=-1):
+    key = key or api_key()
+    payload = {
+        "image": image_url,
+        "audio": audio_url,
+        "resolution": resolution,
+        "seed": int(seed),
+    }
+    if prompt:
+        payload["prompt"] = make_prompt_safe(prompt)
+    response = request_json("POST", f"{API_BASE}/{INFINITETALK_MODEL}", key, payload, timeout=240)
+    return unwrap_id(response), response
+
+
+def generate_infinitetalk_clip(image_path, audio_path, out_path, key=None, prompt="",
+                               resolution="480p", cancel_event=None, status_cb=None):
+    """Render a lip-synced talking-head clip from a still image + spoken audio.
+
+    Uploads the image and audio, submits InfiniteTalk, polls, and downloads the
+    resulting video to out_path. Returns the output Path.
+    """
+    key = key or api_key()
+    status_log(status_cb, "InfiniteTalk: uploading speaker image + hook audio...")
+    image_url, _ = upload_media(Path(image_path), key)
+    audio_url, _ = upload_media(Path(audio_path), key)
+    prediction_id, _ = submit_infinitetalk(image_url, audio_url, key=key, prompt=prompt,
+                                            resolution=resolution)
+    outputs, _ = poll_wavespeed(prediction_id, key, timeout_s=900, interval_s=5,
+                                cancel_event=cancel_event, status_cb=status_cb,
+                                label="InfiniteTalk hook")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    download_file(outputs[0], out_path)
+    return out_path
+
+
+# --- Sound-effect generation (Kling text-to-audio on WaveSpeed) ---------------
+# Fallback when no fitting sound effect exists in the local library: describe the
+# sound and generate it. Schema: {"prompt": <str>, "duration": <1-10 s>}.
+KLING_SFX_MODEL = "kwaivgi/kling-text-to-audio"
+
+
+def generate_sfx_clip(prompt, duration, out_path, key=None, cancel_event=None, status_cb=None):
+    """Generate a sound effect from a text prompt via Kling text-to-audio.
+
+    `duration` is clamped to 1-10 seconds. Returns the downloaded audio Path.
+    """
+    key = key or api_key()
+    dur = int(max(1, min(10, round(float(duration or 2)))))
+    payload = {"prompt": str(prompt or "").strip()[:500], "duration": dur}
+    status_log(status_cb, f"Generating SFX ({dur}s): {payload['prompt'][:60]}...")
+    response = request_json("POST", f"{API_BASE}/{KLING_SFX_MODEL}", key, payload, timeout=180)
+    prediction_id = unwrap_id(response)
+    outputs, _ = poll_wavespeed(prediction_id, key, timeout_s=420, cancel_event=cancel_event,
+                                status_cb=status_cb, label="SFX generation")
+    out_path = Path(out_path)
+    ext = output_extension(outputs[0], out_path.suffix or ".wav")
+    if out_path.suffix.lower() != ext.lower():
+        out_path = out_path.with_suffix(ext)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    download_file(outputs[0], out_path)
+    return out_path
+
 
 class PipelineCancelled(RuntimeError):
     pass
@@ -931,10 +1135,13 @@ def submit_wavespeed_image(prompt, config, key):
         "enable_base64_output": False,
         "enable_sync_mode": False,
         "output_format": wavespeed.get("output_format", "png"),
-        "prompt": prompt,
-        "quality": "low",
-        "resolution": "1k",
+        "prompt": make_prompt_safe(prompt),
     }
+    # quality/resolution are gpt-image-2 knobs; other models (e.g. nano-banana-2)
+    # can reject unknown params, so only send them for gpt-image models.
+    if "gpt-image" in model:
+        payload["quality"] = "low"
+        payload["resolution"] = "1k"
     response = request_json("POST", f"{API_BASE}/{model}", key, payload)
     return unwrap_id(response), response
 
@@ -956,13 +1163,16 @@ def submit_wavespeed_clip(image_url, prompt, duration, config, scene, key):
     payload = {
         "aspect_ratio": wavespeed.get("video_aspect_ratio", wavespeed.get("aspect_ratio", "9:16")),
         "duration": int(clamp(int(math.ceil(duration)), 4, 15)),
-        "enable_web_search": bool(scene.get("video_enable_web_search", wavespeed.get("video_enable_web_search", False))),
-        "generate_audio": bool(wavespeed.get("video_generate_audio", True)),
         "image": image_url,
-        "prompt": prompt,
+        "prompt": make_prompt_safe(prompt),
         "resolution": scene.get("video_resolution", wavespeed.get("video_resolution", "480p")),
         "seed": int(scene.get("seed", wavespeed.get("seed", -1))),
     }
+    # enable_web_search / generate_audio are Seedance-specific; other I2V models
+    # (LTX, Happy Horse, ...) can reject unknown params, so only send for Seedance.
+    if "seedance" in str(model):
+        payload["enable_web_search"] = bool(scene.get("video_enable_web_search", wavespeed.get("video_enable_web_search", False)))
+        payload["generate_audio"] = bool(wavespeed.get("video_generate_audio", True))
     if scene.get("last_image"):
         payload["last_image"] = scene["last_image"]
     response = request_json("POST", f"{API_BASE}/{model}", key, payload, timeout=240)
@@ -1582,6 +1792,13 @@ def sfx_category_files(config, category):
                 if not any(token in name for token in SFX_TRANSITION_NAME_TOKENS):
                     continue
             files.append(path)
+    # Project-local AI-generated SFX (Kling fallback) count as library files too.
+    if config.get("project_slug"):
+        gen_folder = wavespeed_media_dir_for(config) / "sfx_generated" / category
+        if gen_folder.exists():
+            for path in sorted(gen_folder.iterdir()):
+                if path.is_file() and path.suffix.lower() in SFX_EXTS:
+                    files.append(path)
     return list(dict.fromkeys(files))
 
 
@@ -1615,7 +1832,7 @@ def add_sfx_event(events, config, at, category, seed_text, duration, volume, min
 def build_sfx_segments(config, has_speech=False):
     if not bool(config.get("sfx_enabled", True)):
         return []
-    if not sfx_library_root(config):
+    if not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False)):
         return []
     base_volume = min(float(config.get("sfx_volume_with_speech" if has_speech else "sfx_volume", 0.075)), 0.14)
     transition_volume = min(
@@ -1652,6 +1869,77 @@ def build_sfx_segments(config, has_speech=False):
     other_events = [event for event in events if event.get("category") != "analog_transitions"]
     allowed_other_count = max(0, max_events - len(transition_events))
     return sorted(transition_events + sorted(other_events, key=lambda event: event["start"])[:allowed_other_count], key=lambda event: event["start"])
+
+
+# Content SFX categories that can be AI-generated when the library has no fit.
+# (Transitions are excluded -- builtin whoosh/click clips always exist.)
+SFX_GEN_CATEGORIES = {
+    "subtle_impacts": {
+        "words": {"hit", "impact", "crash", "explode", "explosion", "shot", "fire",
+                  "attack", "slam", "collapse", "fall", "burst", "blast", "smash"},
+        "prompt": "a short deep cinematic impact boom, subtle low-end hit, tight and clean, no music",
+        "duration": 2,
+    },
+    "subtle_tones": {
+        "words": {"signal", "screen", "computer", "electric", "power", "digital",
+                  "data", "online", "broadcast", "radio"},
+        "prompt": "a subtle digital tech tone, soft electronic pulse and clean UI beep, no music",
+        "duration": 2,
+    },
+    "serious_foley": {
+        "words": {"map", "paper", "photo", "card", "coin", "door", "step", "footstep",
+                  "metal", "wood", "weapon", "letter", "book"},
+        "prompt": "subtle realistic foley, soft paper and prop handling texture, documentary feel, no music",
+        "duration": 2,
+    },
+}
+
+
+def generated_sfx_dir(config, category=None):
+    base = wavespeed_media_dir_for(config) / "sfx_generated"
+    folder = base / category if category else base
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def ensure_generated_sfx(config, status_cb=None):
+    """Pre-render step: generate fallback SFX (Kling) for content categories the
+    scenes need but the local library can't cover. Generated clips land in the
+    project's sfx_generated/<category> folder, where choose_sfx then finds them.
+    Returns the list of newly generated file paths.
+    """
+    if not bool(config.get("sfx_enabled", True)):
+        return []
+    if not bool(config.get("sfx_generation_enabled", False)):
+        return []
+    key = config.get("wavespeed_api_key") or os.environ.get("WAVESPEED_API_KEY", "")
+    if not key:
+        return []
+    scenes = config.get("scenes", [])
+    if not scenes:
+        return []
+    words_present = set(re.findall(r"[a-z]+", " ".join(
+        f"{scene.get('script', '')} {scene.get('visual_direction', '')}" for scene in scenes).lower()))
+    generated = []
+    for category, spec in SFX_GEN_CATEGORIES.items():
+        if not (spec["words"] & words_present):
+            continue
+        if sfx_category_files(config, category):  # library or prior generation already covers it
+            continue
+        out = generated_sfx_dir(config, category) / f"{category}_generated_01.wav"
+        if out.exists():
+            continue
+        try:
+            generate_sfx_clip(spec["prompt"], spec["duration"], out, key=key,
+                              cancel_event=config.get("_cancel_event"), status_cb=status_cb)
+            generated.append(str(out))
+        except PipelineCancelled:
+            raise
+        except Exception as exc:
+            status_log(status_cb, f"SFX generation failed for {category}: {exc}")
+    if generated:
+        status_log(status_cb, f"Generated {len(generated)} fallback SFX clip(s) via Kling.")
+    return generated
 
 
 def background_music_root(config):

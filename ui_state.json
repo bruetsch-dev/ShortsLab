@@ -1,5 +1,5 @@
 {
-  "script": "This man killed over 500 soldiers in 100 days.\nThey called him the White Death.\nFinland. The Winter War. Minus forty degrees.\nThe Soviet Union attacks with everything \u2014 tanks, artillery, thousands of men.\nAnd somewhere in the snow\u2026 lies one man.\nSimo H\u00e4yh\u00e4.\nNo scope. No modern gear.\nJust a rifle, white camo, and total silence.\nHe packs snow in his mouth so his breath won't give him away.\nHe doesn't move. He waits.\nAnd every time a Soviet soldier spots him \u2014 it's already too late.\nThe Red Army wants him dead.\nThey shell entire forests. They send counter-snipers.\nBut H\u00e4yh\u00e4 just vanishes into the white.\nThen a round hits him in the face and tears it open.\nHe survives.\nWhen he finally wakes from the coma \u2014 the war is over.\nAnd his name is already a legend.\nThe White Death.",
+  "script": "In 1814, London was hit by a flood. But it wasn't rain. It was beer. Inside the Horse Shoe Brewery, a massive wooden vat was holding thousands of barrels of porter. Then one of its iron bands snapped. At first, workers didn't panic. These bands had slipped before. But about an hour later, the entire tank burst. A wall of beer exploded through the brewery, smashed open more vats, and rushed into the streets. Buildings were damaged. Cellars filled instantly. People were trapped before they even understood what was happening. This wasn't a funny accident. It was an industrial disaster. Eight people died. And somehow, the brewery was later cleared of responsibility. London hadn't been hit by a storm. It had been flooded by beer.",
   "visual_script": "",
   "title": "The Great Emu War",
   "slug": "",
@@ -12,9 +12,10 @@
   "loaded_project_mode": "normal",
   "autonomous_director": true,
   "use_audio_timing": true,
+  "mix_voice_in_final": true,
   "use_llm_search": true,
   "use_llm_video_review": true,
-  "enable_speaker_hook": true,
+  "enable_speaker_hook": false,
   "auto_web_images": true,
   "background_music_enabled": true,
   "allow_gpt": true,

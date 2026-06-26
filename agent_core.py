@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import json
 import math
 import base64
@@ -52,11 +53,27 @@ WAVESPEED_LLM_API = "https://llm.wavespeed.ai/v1/chat/completions"
 # DuckDuckGo's unofficial image endpoint constantly returns 403 / times out (bot
 # blocking), which stalled every search. Bing + Wikimedia are reliable, so DDG is
 # dropped from the active providers (the duckduckgo_* helpers are kept but unused).
-WEB_IMAGE_SEARCH_PROVIDERS = ("bing", "wikimedia")
+WEB_IMAGE_SEARCH_PROVIDERS = ("wikimedia", "bing")
+
+# Web image candidates whose TITLE matches this are junk/NSFW SEO noise (Bing's
+# scraped results often inject unrelated trending/shopping/adult tiles). They get
+# a hard-negative score so they're rejected before download/review.
+_WEB_JUNK_TITLE_RE = re.compile(
+    r"\b(nsfw|porn\w*|nude|naked|topless|lingerie|mistress|fetish|bdsm|erotic|"
+    r"sexy|onlyfans|escort|rule\s*34|hentai|xxx|nft|crypto|\bdvd\b|for sale|"
+    r"buy now|coupon|onlyfan)\b",
+    re.IGNORECASE,
+)
+
+
+def web_candidate_title_is_junk(result):
+    title = f"{result.get('title', '')} {result.get('source_url', '')}".lower()
+    return bool(_WEB_JUNK_TITLE_RE.search(title))
 GPT55_MODEL = "openai/gpt-5.5"
 GEMINI_AUDIO_MODEL = "google/gemini-3.5-flash"
 SEEDANCE_VIDEO_MODELS = {
-    "seedance-2.0": "bytedance/seedance-2.0/image-to-video-spicy",
+    "seedance-2.0": "bytedance/seedance-2.0/image-to-video",
+    "seedance-2.0-fast": "bytedance/seedance-2.0-fast/image-to-video",
     "seedance-v1.5-pro": "bytedance/seedance-v1.5-pro/image-to-video",
     "ltx-2.3": "wavespeed-ai/ltx-2.3/image-to-video",
     "happyhorse-1.1": "alibaba/happyhorse-1.1/image-to-video",
@@ -96,6 +113,41 @@ def host_throttle(url, min_interval):
         if wait > 0:
             time.sleep(wait)
         _HOST_LAST[host] = time.monotonic()
+
+
+@contextlib.contextmanager
+def step_watchdog(form, label, limit_s=600, status_cb=None):
+    """Abort a step if it runs longer than `limit_s` (default 10 min).
+
+    The user's rule: any single step over ~10 minutes means something is wrong.
+    On timeout we log a loud WATCHDOG warning and trip the run's cancel event so
+    the step's cooperative check_cancel() calls unwind it instead of hanging.
+    """
+    cancel_event = form.get("_cancel_event") if isinstance(form, dict) else None
+    start = time.monotonic()
+    timer = None
+
+    def _fire():
+        minutes = int(round(limit_s / 60.0))
+        log(status_cb, f"WATCHDOG: '{label}' exceeded {minutes} min ({int(limit_s)}s) - aborting this step; something is wrong (check network/providers).")
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+
+    if limit_s and limit_s > 0:
+        timer = threading.Timer(limit_s, _fire)
+        timer.daemon = True
+        timer.start()
+    try:
+        yield
+    finally:
+        if timer is not None:
+            timer.cancel()
+        elapsed = time.monotonic() - start
+        if limit_s and elapsed > limit_s * 0.8:
+            log(status_cb, f"Note: '{label}' took {elapsed:.0f}s, close to the {int(limit_s)}s watchdog limit.")
 ACTION_WORDS = {
     "chase", "chased", "run", "running", "escape", "escaping", "scatter", "scattered",
     "attack", "fight", "truck", "drive", "moving", "collapse", "failed", "failure",
@@ -156,6 +208,58 @@ def unique_project_slug(base_slug):
     while (PROJECTS_DIR / f"{stamped}_{counter}").exists():
         counter += 1
     return f"{stamped}_{counter}"
+
+
+# Matches the duplicate folders the old new-folder-on-load bug created:
+# "<base>_20260626_143000" or "<base>_20260626_143000_2".
+_PROJECT_DUP_SUFFIX_RE = re.compile(r"_\d{8}_\d{6}(?:_\d+)?$")
+
+
+def consolidate_project_folders(canonical_slug, status_cb=None):
+    """Merge timestamped duplicate project folders of the same topic into the
+    canonical folder, so all media of one project lives together.
+
+    Non-destructive: copies only files that are MISSING in the canonical folder
+    (never overwrites), then leaves the duplicate behind renamed with a
+    '_merged_' marker so it's obvious and recoverable. Returns the count merged.
+    """
+    base = _PROJECT_DUP_SUFFIX_RE.sub("", canonical_slug)
+    canonical = PROJECTS_DIR / base
+    if not canonical.exists():
+        return 0
+    merged_files = 0
+    merged_dirs = 0
+    for sibling in sorted(PROJECTS_DIR.iterdir()):
+        if not sibling.is_dir() or sibling.name == base:
+            continue
+        if not (sibling.name.startswith(base + "_") and _PROJECT_DUP_SUFFIX_RE.search(sibling.name)):
+            continue
+        copied_here = 0
+        for src in sibling.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(sibling)
+            dest = canonical / rel
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, dest)
+                copied_here += 1
+            except Exception:
+                pass
+        if copied_here:
+            merged_files += copied_here
+            merged_dirs += 1
+            try:
+                marker = sibling.with_name(sibling.name + "_merged_" + time.strftime("%Y%m%d_%H%M%S"))
+                if not marker.exists():
+                    sibling.rename(marker)
+            except Exception:
+                pass
+    if merged_dirs:
+        log(status_cb, f"Consolidated {merged_files} file(s) from {merged_dirs} duplicate folder(s) into '{base}'.")
+    return merged_files
 
 
 def log(status_cb, message):
@@ -557,30 +661,29 @@ def scene_video_prompt(scene, scene_index=None, total_scenes=None, visual_intent
     subject_motion = scene.get("subject_motion") or "script-specific visible subject action"
     environment_motion = scene.get("environment_motion") or "natural ambient motion"
     emotional_action = scene.get("emotional_action") or scene.get("emotion") or infer_emotion(script_beat)
-    must_show = scene.get("must_show") or important_terms(script_beat, 5, SEARCH_NOISE)
-    must_not_show = scene.get("must_not_show") or ["generic cinematic filler", "off-topic media", "caption text"]
+    # Seedance I2V prompting: lead with the beat + core action (first words carry
+    # the most weight), describe MOTION and CAMERA rather than re-describing the
+    # subject (the source image already provides it), and stay ~60-160 words.
+    # "Preserve the source image's composition/colors" is both a consistency win
+    # and the strongest guard against the model inventing new bodies/objects.
     prompt = (
-        f"Animate this vertical documentary scene for Seedance I2V. {position}Script beat: \"{script_beat}\". "
-        f"The action must clearly answer this voice line: {objective}. "
-        f"Must show: {', '.join(str(item) for item in must_show[:5])}. "
+        f"Animate this still image for Seedance image-to-video. {position}"
+        f"Spoken beat: \"{script_beat}\". Core action: {objective}. "
+        "Preserve the source image's composition, colors, subject and clothing exactly; "
+        "do not add, remove, or redraw any people or objects, and keep every figure fully clothed. "
     )
     if visual_direction:
-        prompt += f"Use this visual idea only if it fits the voice line: {visual_direction}. "
+        prompt += f"Motion idea (use only if it fits the beat): {visual_direction}. "
     if visual_intent:
         prompt += f"Director intent: {visual_intent}. "
     prompt += (
-        f"camera_motion: {camera_motion}. "
-        f"subject_motion: {subject_motion}. "
-        f"environment_motion: {environment_motion}. "
-        f"emotional_action: {emotional_action}. "
-        f"motion_focus: {seedance_motion_focus(scene)} "
-        "Make real physical motion with a clear beginning, action change, and end pose; avoid a still image with only zoom. "
-        "no_speech: no speech, no voices, no dialogue, no narration, no talking, no vocalizations. "
-        "no_text: no captions, subtitles, readable added text, or labels. "
-        "no_logo: no watermark, logo, insignia, or brand mark. "
-        "Keep it realistic, serious, vertical 9:16, and not a montage."
+        f"Camera: {camera_motion}. Subject: {subject_motion}. Environment: {environment_motion}. "
+        f"Mood: {emotional_action}. Motion focus: {seedance_motion_focus(scene)} "
+        "Deliver real physical motion with a clear start, action change, and end pose -- not a static frame with only a zoom. "
+        "No speech, voices, dialogue, narration or vocalizations. No captions, subtitles or added text. No watermark or logo. "
+        "Realistic, serious, vertical 9:16, one continuous shot, not a montage."
     )
-    return prompt[:1400]
+    return prompt[:1200]
 
 
 def safe_copy_audio(audio_path, project_dir):
@@ -593,6 +696,128 @@ def safe_copy_audio(audio_path, project_dir):
     if source.resolve() != target.resolve():
         shutil.copyfile(source, target)
     return target
+
+
+def find_existing_voiceover(project_dir):
+    """Return a previously generated/uploaded voiceover in this project, if any."""
+    input_dir = Path(project_dir) / "input"
+    for stem in ("voiceover", "speech_audio"):
+        for ext in sorted(AUDIO_EXTS):
+            candidate = input_dir / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def find_existing_hook_audio(project_dir):
+    """Return the separately-saved spoken hook audio, if any (drives InfiniteTalk)."""
+    input_dir = Path(project_dir) / "input"
+    for ext in sorted(AUDIO_EXTS):
+        candidate = input_dir / f"hook{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def split_hook_from_script(script, hook_text):
+    """Split the script into (hook, body) using the user-marked hook substring.
+
+    Whitespace is normalized for matching so a selection from the textarea still
+    lines up with the cleaned script. Returns ("", script) when no hook is marked
+    or the marked text can't be located.
+    """
+    script = (script or "").strip()
+    hook = clean_text(hook_text or "").strip()
+    if not hook or not script:
+        return "", script
+
+    def collapse(text):
+        return re.sub(r"\s+", " ", text).strip()
+
+    s_norm = collapse(script)
+    h_norm = collapse(hook)
+    idx = s_norm.lower().find(h_norm.lower())
+    if idx == -1:
+        return "", script
+    matched = s_norm[idx:idx + len(h_norm)]
+    body = collapse(s_norm[:idx] + " " + s_norm[idx + len(h_norm):])
+    return matched.strip(), body
+
+
+def generate_project_voiceover(script, project_dir, form, status_cb=None):
+    """Generate the spoken voiceover from the script with Gemini TTS.
+
+    This is the default audio path now: the user picks a speaker name + voice
+    and we synthesize the narration instead of requiring an upload. Returns the
+    saved audio Path, or None if disabled/empty/failed (the run then falls back
+    to estimated text timing).
+
+    When the user has marked a hook, the hook and the body are synthesized
+    separately and joined with a short pause, so the intro->body transition feels
+    edited. The hook audio is saved on its own (input/hook.*) to drive the
+    InfiniteTalk talking-head opening clip. Reuses an existing voiceover when the
+    script is unchanged (so recuts of a loaded project don't re-synthesize).
+    """
+    if not script or not script.strip():
+        return None
+    is_form = isinstance(form, dict)
+    cancel_event = form.get("_cancel_event") if is_form else None
+
+    existing = find_existing_voiceover(project_dir)
+    if existing:
+        prior_script_path = Path(project_dir) / "input" / "script.txt"
+        prior_script = prior_script_path.read_text(encoding="utf-8") if prior_script_path.exists() else ""
+        if prior_script.strip() and prior_script.strip() == script.strip():
+            log(status_cb, f"Reusing existing voiceover (script unchanged): {existing.name}")
+            if is_form:
+                hook_audio = find_existing_hook_audio(project_dir)
+                if hook_audio:
+                    form["_hook_audio_path"] = str(hook_audio)
+            return existing
+
+    speaker = (str(form.get("speaker_name") or "").strip() or pipeline.DEFAULT_TTS_SPEAKER) if is_form else pipeline.DEFAULT_TTS_SPEAKER
+    voice = (str(form.get("tts_voice") or "").strip() or pipeline.DEFAULT_TTS_VOICE) if is_form else pipeline.DEFAULT_TTS_VOICE
+    model = (str(form.get("tts_model") or "").strip() or pipeline.DEFAULT_TTS_MODEL) if is_form else pipeline.DEFAULT_TTS_MODEL
+    input_dir = project_dir / "input"
+    hook_text = form.get("hook_text", "") if is_form else ""
+    hook, body = split_hook_from_script(script, hook_text)
+    ffmpeg = pipeline.find_ffmpeg()
+
+    try:
+        if hook and body and ffmpeg:
+            log(status_cb, "Generating hook + body voiceover separately (with pause between)...")
+            hook_path = pipeline.generate_speech_gemini(
+                hook, input_dir / "hook", speaker=speaker, voice=voice, model=model,
+                cancel_event=cancel_event, status_cb=status_cb)
+            body_path = pipeline.generate_speech_gemini(
+                body, input_dir / "body", speaker=speaker, voice=voice, model=model,
+                cancel_event=cancel_event, status_cb=status_cb)
+            pause_s = 0.45
+            if is_form:
+                try:
+                    pause_s = float(form.get("hook_pause_s", 0.45) or 0.45)
+                except (TypeError, ValueError):
+                    pause_s = 0.45
+            full = input_dir / f"voiceover{hook_path.suffix}"
+            joined = pipeline.concat_audio_with_pause(
+                hook_path, body_path, full, pause_s=pause_s, ffmpeg=ffmpeg)
+            if joined:
+                if is_form:
+                    form["_hook_audio_path"] = str(hook_path)
+                log(status_cb, f"Voiceover generated with hook + {pause_s:.2f}s pause ({speaker} / {voice}).")
+                return joined
+            log(status_cb, "Hook/body join failed; falling back to single-pass voiceover.")
+
+        path = pipeline.generate_speech_gemini(
+            script, input_dir / "voiceover", speaker=speaker, voice=voice, model=model,
+            cancel_event=cancel_event, status_cb=status_cb)
+        log(status_cb, f"Voiceover generated ({speaker} / {voice}): {path.name}")
+        return path
+    except pipeline.PipelineCancelled:
+        raise
+    except Exception as exc:
+        log(status_cb, f"Voiceover generation failed ({exc}); continuing with estimated timing.")
+        return None
 
 
 def probe_audio_duration(audio_path):
@@ -1447,7 +1672,7 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
         "still_motion_scale": 0.38,
         "contain_motion_scale": 0.42,
         "visual_style": (director_plan or {}).get("visual_style") or "realistic cinematic mini-documentary, clean, clear, script-matched",
-        "global_constraints": "No embedded captions, no watermark, no logo, no gore. GPT images are only Seedance I2V source images and must never appear as static stills in the final render. Avoid collage/multi-panel layouts except for at most 1-2 deliberate document-board images across the Short.",
+        "global_constraints": "Strictly SFW: any people are fully clothed in period attire, no nudity, no nude or partially-nude figures, no exposed bodies, no gore or graphic injury. No embedded captions, no watermark, no logo. GPT images are only Seedance I2V source images and must never appear as static stills in the final render. Avoid collage/multi-panel layouts except for at most 1-2 deliberate document-board images across the Short.",
         "caption_y": 150,
         "grain": 16,
         "dust": False,
@@ -2057,22 +2282,64 @@ def apply_speaker_hook_to_config(config, project_dir, title, script, visual_scri
         return {}
     first = scenes[0]
     first["speaker_hook"] = True
-    first["seedance"] = True
+    first["seedance"] = True  # keeps scene 0 in the clip pipeline; the prebuilt clip is reused
     first["asset"] = asset.name
     first["clip"] = "speaker_hook.mp4"
     first["needs_gpt_asset"] = False
-    first["prompt"] = (
-        "Uploaded speaker image used as Seedance I2V source for the opening hook. "
-        f"Hook line: {plan.get('hook_line') or first_hook_line(script)}"
-    )
-    first["video_prompt"] = clean_text(plan.get("seedance_prompt") or "")
-    first["video_model"] = "bytedance/seedance-2.0/image-to-video-spicy"
     first["video_resolution"] = "480p"
-    first["video_enable_web_search"] = True
     first["max_duration"] = 9.0
     first["shots"] = [{"at": 0.0, "use_clip": True}]
-    first["seedance_audio_volume"] = 0.16
+    first["seedance_start_trim"] = 0.0  # never trim the start of a talking head
+
+    # Preferred path: lip-synced talking head via InfiniteTalk, driven by the
+    # spoken hook audio + the speaker image. The clip's own audio is excluded in
+    # the render (the master voiceover already carries the hook), so the lips
+    # move while the master track -- which opens with the same hook audio -- plays.
+    clip_dir = Path(project_dir) / "seedance 2.0"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = clip_dir / "speaker_hook.mp4"
+    hook_audio = find_existing_hook_audio(project_dir)
+    image_src = asset if asset.exists() else (Path(archived) if archived and Path(archived).exists() else None)
+    used_infinitetalk = False
+    if hook_audio and image_src:
+        if recreate or not clip_path.exists():
+            try:
+                log(status_cb, "Speaker hook: rendering InfiniteTalk talking-head from hook audio + speaker image...")
+                pipeline.generate_infinitetalk_clip(
+                    image_src, hook_audio, clip_path,
+                    prompt=(clean_text(plan.get("visual_plan") or "")
+                            or "energetic close-up creator hook, natural head and mouth movement, direct eye contact"),
+                    resolution="480p",
+                    cancel_event=config.get("_cancel_event"),
+                    status_cb=status_cb,
+                )
+                used_infinitetalk = True
+            except pipeline.PipelineCancelled:
+                raise
+            except Exception as exc:
+                log(status_cb, f"InfiniteTalk hook failed ({exc}); falling back to Seedance speaker clip.")
+        else:
+            used_infinitetalk = True
+            log(status_cb, "Speaker hook: reusing existing InfiniteTalk clip.")
+
+    if used_infinitetalk:
+        first["video_model"] = pipeline.INFINITETALK_MODEL
+        first["video_enable_web_search"] = False
+        first["prompt"] = f"InfiniteTalk talking-head opening hook. Hook line: {plan.get('hook_line') or first_hook_line(script)}"
+        first["video_prompt"] = clean_text(plan.get("visual_plan") or "")
+        first["seedance_audio_volume"] = 0.0
+    else:
+        # Fallback: Seedance I2V speaker clip (standard SFW model, no spicy).
+        first["prompt"] = (
+            "Uploaded speaker image used as Seedance I2V source for the opening hook. "
+            f"Hook line: {plan.get('hook_line') or first_hook_line(script)}"
+        )
+        first["video_prompt"] = clean_text(plan.get("seedance_prompt") or "")
+        first["video_model"] = "bytedance/seedance-2.0/image-to-video"
+        first["video_enable_web_search"] = True
+        first["seedance_audio_volume"] = 0.16
     first["seedance_audio_locked"] = True
+
     config["speaker_hook"] = {
         "enabled": True,
         "source_image": str(archived or source_path),
@@ -2082,10 +2349,11 @@ def apply_speaker_hook_to_config(config, project_dir, title, script, visual_scri
         "voice_style": plan.get("voice_style", ""),
         "visual_plan": plan.get("visual_plan", ""),
         "reference_style": SPEAKER_HOOK_REFERENCE_STYLE,
-        "prompt": first["video_prompt"],
+        "prompt": first.get("video_prompt", ""),
+        "method": "infinitetalk" if used_infinitetalk else "seedance",
         "recreated": bool(recreate),
     }
-    log(status_cb, "Speaker hook: configured first scene for Seedance speaker clip.")
+    log(status_cb, f"Speaker hook: configured first scene ({'InfiniteTalk talking-head' if used_infinitetalk else 'Seedance fallback'}).")
     return config["speaker_hook"]
 
 
@@ -2431,6 +2699,8 @@ def web_candidate_score(result, profile, scene):
     searchable = web_searchable_text(result)
     scene_terms = words(scene.get("script", ""))
     profile_terms = set(profile.get("terms", set()))
+    if web_candidate_title_is_junk(result):
+        return -999  # NSFW / trending-SEO junk (common from broken Bing scraping)
     if is_book_or_scan_candidate(result, scene):
         return -999
     title_words = words(title_text)
@@ -2504,7 +2774,22 @@ def verify_image_file(path):
         return False
 
 
-def download_url_to_file(url, path, referer=""):
+WIKIMEDIA_HOSTS = ("wikimedia.org", "wikipedia.org", "wikidata.org")
+
+
+def _download_min_interval(url):
+    """Per-host spacing for downloads. Wikimedia rate-limits hard, so give it more
+    room; generic CDNs can go faster. Different hosts still run concurrently."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        host = ""
+    if any(token in host for token in WIKIMEDIA_HOSTS):
+        return 1.1
+    return 0.5
+
+
+def download_url_to_file(url, path, referer="", retries=2):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -2512,12 +2797,34 @@ def download_url_to_file(url, path, referer=""):
     }
     if referer:
         headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=90) as response:
-        content_type = (response.headers.get("Content-Type") or "").lower()
-        if content_type and "image/" not in content_type and "octet-stream" not in content_type:
-            raise RuntimeError(f"URL did not return an image content type: {content_type}")
-        path.write_bytes(response.read())
+    min_interval = _download_min_interval(url)
+    attempt = 0
+    while True:
+        # Per-host throttle prevents parallel downloads from hammering one host
+        # (the Wikimedia 429s came from concurrent fetches against upload.wikimedia.org).
+        host_throttle(url, min_interval)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if content_type and "image/" not in content_type and "octet-stream" not in content_type:
+                    raise RuntimeError(f"URL did not return an image content type: {content_type}")
+                data = response.read()
+            path.write_bytes(data)
+            break
+        except urllib.error.HTTPError as exc:
+            # Back off and retry on rate-limit / transient blocks; honor Retry-After.
+            if exc.code in (429, 403, 503) and attempt < retries:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else 0.0
+                except (TypeError, ValueError):
+                    delay = 0.0
+                delay = max(delay, 1.5 * (2 ** attempt))
+                time.sleep(min(delay, 12.0))
+                attempt += 1
+                continue
+            raise
     if path.stat().st_size < 1000 or not verify_image_file(path):
         path.unlink(missing_ok=True)
         raise RuntimeError("Downloaded file is not a readable image.")
@@ -2865,6 +3172,7 @@ def review_and_correct_web_images(
     target_count = clamp_web_image_target(target_count)
     review_dir = project_dir / "review"
     last_reviewed_paths = []
+    zero_accept_streak = 0
     for pass_no in range(1, 6):
         if not paths:
             break
@@ -2910,6 +3218,16 @@ def review_and_correct_web_images(
             rejected_resolved = {str(Path(path).resolve()).lower() for path in rejected}
             paths = [path for path in paths if str(Path(path).resolve()).lower() not in rejected_resolved and Path(path).exists()]
         last_reviewed_paths = list(paths)
+        # Give up quickly when web search keeps yielding nothing usable (niche
+        # topic / only junk results) instead of burning all 5 passes -- fall back
+        # to generated images.
+        if not paths:
+            zero_accept_streak += 1
+            if zero_accept_streak >= 2:
+                log(status_cb, "Web image review accepted nothing across 2 passes; stopping web search and falling back to generated images.")
+                break
+        else:
+            zero_accept_streak = 0
         try:
             requested_replacements = int(review.get("needed_replacements", 0) or 0)
         except (TypeError, ValueError):
@@ -3825,6 +4143,97 @@ def gather_web_images_for_script(
     return downloaded
 
 
+def load_project_config(slug):
+    """Load the latest saved render config for a project (for the timeline editor)."""
+    config_dir = PROJECTS_DIR / slug / "config"
+    if not config_dir.exists():
+        raise RuntimeError(f"No saved config for project '{slug}'.")
+    preferred = config_dir / "project.json"
+    if preferred.exists():
+        path = preferred
+    else:
+        candidates = sorted(config_dir.glob("project*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError(f"No saved config for project '{slug}'.")
+        path = candidates[0]
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["project_slug"] = slug
+    return config
+
+
+def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
+    """Re-render a project from the timeline editor's edits.
+
+    edits = {scenes:[{id,duration}], removed:[id...], order:[id...],
+             volumes:{voice,seedance,sfx,music}}. Scene timing is recomputed
+    contiguously from the (edited) durations, volumes are mapped onto the config,
+    then pipeline.render_video produces the final MP4.
+    """
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    if cancel_event is not None:
+        config["_cancel_event"] = cancel_event
+    edits = edits or {}
+    scenes = config.get("scenes", [])
+    removed = {str(x) for x in (edits.get("removed") or [])}
+    dur_by_id = {str(d.get("id")): d.get("duration") for d in (edits.get("scenes") or []) if d.get("duration") is not None}
+    order = edits.get("order")
+    if order:
+        idmap = {str(s.get("id", i)): s for i, s in enumerate(scenes)}
+        scenes = [idmap[str(i)] for i in order if str(i) in idmap] or scenes
+
+    new_scenes, t = [], 0.0
+    for i, scene in enumerate(scenes):
+        sid = str(scene.get("id", i))
+        if sid in removed:
+            continue
+        try:
+            dur = float(dur_by_id.get(sid)) if sid in dur_by_id else float(scene.get("end", 0)) - float(scene.get("start", 0))
+        except (TypeError, ValueError):
+            dur = float(scene.get("end", 0)) - float(scene.get("start", 0))
+        dur = max(0.5, min(20.0, dur or 1.0))
+        scene = dict(scene)
+        scene["start"] = round(t, 3)
+        scene["end"] = round(t + dur, 3)
+        t += dur
+        new_scenes.append(scene)
+    if not new_scenes:
+        raise RuntimeError("Timeline has no scenes left to render.")
+    config["scenes"] = new_scenes
+    config["duration"] = round(t, 3)
+
+    volumes = edits.get("volumes") or {}
+
+    def set_volume(key, value):
+        try:
+            config[key] = max(0.0, min(1.5, float(value)))
+        except (TypeError, ValueError):
+            pass
+
+    if "voice" in volumes:
+        set_volume("audio_master_gain", volumes["voice"])
+    if "seedance" in volumes:
+        set_volume("seedance_audio_volume", volumes["seedance"])
+        set_volume("seedance_audio_volume_with_speech", volumes["seedance"])
+    if "sfx" in volumes:
+        for key in ("sfx_volume", "sfx_volume_with_speech", "sfx_transition_volume", "sfx_transition_volume_with_speech"):
+            set_volume(key, volumes["sfx"])
+    if "music" in volumes:
+        set_volume("background_music_volume", volumes["music"])
+        set_volume("background_music_volume_with_speech", volumes["music"])
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    config["output_basename"] = f"{slug}_timeline_{stamp}"
+    out_config_path = project_dir / "config" / f"project_timeline_{stamp}.json"
+    out_config_path.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
+    config["_config_path"] = str(out_config_path)
+
+    log(status_cb, f"Rendering timeline edit: {len(new_scenes)} scenes, {config['duration']:.1f}s...")
+    output = pipeline.render_video(config)
+    log(status_cb, f"Timeline render complete: {Path(output).name}")
+    return {"title": config.get("title", slug), "project_dir": str(project_dir), "video": str(output)}
+
+
 def run_project(form, status_cb=None):
     check_cancel(form)
     script = clean_text(form.get("script", ""))
@@ -3836,18 +4245,28 @@ def run_project(form, status_cb=None):
     if not title:
         title = f"Short {int(time.time())}"
         
-    requested_slug = form.get("slug", "").strip()
+    # Loading a previous project must REUSE its folder, never spawn a new one.
+    # The UI sends the loaded slug in loaded_project_source; honor it as the slug.
+    requested_slug = (form.get("slug", "") or form.get("loaded_project_source", "")).strip()
     slug = slugify(requested_slug or title)
     if not requested_slug:
         slug = unique_project_slug(slug)
     project_dir = PROJECTS_DIR / slug
     for folder in ["seedance 2.0", "gpt images", "web images", "input", "config", "renders", "review", "local media", "speaker", "speaker clip"]:
         (project_dir / folder).mkdir(parents=True, exist_ok=True)
+    if requested_slug:
+        # Fuse any timestamped duplicate folders (left over from the old new-folder
+        # bug) of the same topic back into this canonical project folder.
+        consolidate_project_folders(slug, status_cb=status_cb)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
 
     visual_script = clean_text(form.get("visual_script", ""))
     audio_path = safe_copy_audio(form.get("audio_path", ""), project_dir)
     speaker_image_path = form.get("speaker_image_path", "")
+    # Default audio path: synthesize the narration from the script with Gemini TTS
+    # (the user picks speaker + voice). An uploaded file, if any, still wins.
+    if not audio_path and form.get("generate_voice", "on") == "on":
+        audio_path = generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
     audio_analysis = None
     word_timeline_cache = None
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
@@ -4052,19 +4471,20 @@ def run_project(form, status_cb=None):
         web_candidate_count = web_candidate_pool_target(web_image_count)
         log(status_cb, f"Web image pipeline: collecting {web_candidate_count} candidates; Reasoning Agent visual review will choose the final {web_image_count}.")
         check_cancel(form)
-        web_paths = gather_web_images_for_script(
-            project_dir,
-            title,
-            script,
-            target_duration,
-            images_per_scene=max(1, web_images_per_scene * 3),
-            target_count=web_candidate_count,
-            use_llm_search=use_llm_search,
-            scenes_override=scenes_override,
-            force_new=force_new_web_images,
-            reasoning_model=reasoning_model,
-            status_cb=status_cb,
-        )
+        with step_watchdog(form, "Web image search", limit_s=600, status_cb=status_cb):
+            web_paths = gather_web_images_for_script(
+                project_dir,
+                title,
+                script,
+                target_duration,
+                images_per_scene=max(1, web_images_per_scene * 3),
+                target_count=web_candidate_count,
+                use_llm_search=use_llm_search,
+                scenes_override=scenes_override,
+                force_new=force_new_web_images,
+                reasoning_model=reasoning_model,
+                status_cb=status_cb,
+            )
         check_cancel(form)
         web_sheet = create_media_contact_sheet(
             web_paths,
@@ -4106,16 +4526,22 @@ def run_project(form, status_cb=None):
     )
     config["project_slug"] = slug
     config["loaded_project_mode"] = recut_mode
+    attach_cancel_event(config, form)  # so the InfiniteTalk hook render below is cancellable
     config.setdefault("wavespeed", {})
     config["wavespeed"]["seedance_model"] = seedance_model_choice
     config["wavespeed"]["video_model"] = SEEDANCE_VIDEO_MODELS.get(seedance_model_choice)
     config["wavespeed"]["video_resolution"] = "720p" if seedance_model_choice == "happyhorse-1.1" else "480p"
-    config["wavespeed"]["video_enable_web_search"] = (seedance_model_choice == "seedance-2.0")
+    config["wavespeed"]["video_enable_web_search"] = seedance_model_choice in ("seedance-2.0", "seedance-2.0-fast")
+    image_model_choice = (form.get("image_model") or "").strip()
+    if image_model_choice:
+        config["wavespeed"]["image_model"] = image_model_choice
     config["wavespeed"]["reasoning_model"] = form.get("reasoning_model", "openai/gpt-5.5")
     config["background_music_enabled"] = background_music_enabled
     config["background_music_user_enabled"] = background_music_enabled
+    config["sfx_generation_enabled"] = form.get("generate_missing_sfx", "on") == "on"
     log(status_cb, f"Seedance model selected: {seedance_model_choice}.")
     log(status_cb, f"Background music: {'enabled' if background_music_enabled else 'disabled'}.")
+    log(status_cb, f"SFX generation fallback: {'enabled' if config['sfx_generation_enabled'] else 'disabled'}.")
     if recut_mode == "normal":
         config["output_basename"] = f"{slug}_auto_short"
     else:
@@ -4146,11 +4572,11 @@ def run_project(form, status_cb=None):
         if mix_voice:
             config["audio_path"] = str(audio_path)
             config["speech_audio_in_final"] = True
-            log(status_cb, "Uploaded voice is the primary audio; music and SFX are ducked under it.")
+            log(status_cb, "Voice is the primary audio track; music and SFX are ducked under it.")
         else:
             config["audio_path"] = None
             config["speech_audio_in_final"] = False
-            log(status_cb, "Uploaded speech audio is used for timing only; it will not be mixed into the final video.")
+            log(status_cb, "Voice track used for timing only; it will not be mixed into the final video.")
         config["audio_model"] = GEMINI_AUDIO_MODEL if audio_analysis else None
         config["audio_duration_seconds"] = audio_duration
         config["audio_timing_source"] = audio_timing_source
@@ -4295,6 +4721,10 @@ def run_project(form, status_cb=None):
             else:
                 log(status_cb, "Reasoning Agent pre-render audit accepted the planned edit.")
 
+    check_cancel(form)
+    if config.get("sfx_generation_enabled"):
+        log(status_cb, "Generating any missing sound effects (Kling fallback)...")
+        pipeline.ensure_generated_sfx(config, status_cb=status_cb)
     check_cancel(form)
     log(status_cb, "Rendering final 9:16 MP4...")
     output = pipeline.render_video(config)

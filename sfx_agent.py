@@ -12,6 +12,7 @@ The LLM is primary; a deterministic fallback places transition whooshes on the
 detected cuts so the feature still works without an API key.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -177,11 +178,14 @@ def transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=None
 
 
 def library_catalog(config):
-    """Categories actually present in the local library, for the LLM prompt."""
+    """Categories offered to the LLM: those present in the local library, plus --
+    when SFX generation is enabled -- every category, since a missing one can be
+    generated on demand via Kling."""
+    gen = bool(config.get("sfx_generation_enabled", False))
     catalog = {}
     for name, meta in AGENT_SFX_CATEGORIES.items():
         files = pipeline.sfx_category_files(config, meta["lib"])
-        if files:
+        if files or gen:
             catalog[name] = {"desc": meta["desc"], "available": len(files)}
     return catalog
 
@@ -244,7 +248,31 @@ def fallback_plan(cuts, phrases, duration):
     return events
 
 
-def resolve_segments(config, events, duration, ffprobe):
+def generate_agent_sfx(config, category, meta, event, status_cb=None):
+    """Generate a fitting SFX via Kling when the library has no match for this event."""
+    if not bool(config.get("sfx_generation_enabled", False)):
+        return None
+    key = config.get("wavespeed_api_key") or os.environ.get("WAVESPEED_API_KEY", "")
+    if not key:
+        return None
+    gen_dir = Path(config.get("_gen_sfx_dir") or (ROOT / "soundeffects" / "generated"))
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    reason = str(event.get("reason") or "").strip()
+    prompt = f"{meta['desc']}. {reason}".strip().rstrip(".") + ", clean isolated sound effect, no music, no speech"
+    digest = hashlib.sha1(prompt.lower().encode("utf-8", "ignore")).hexdigest()[:10]
+    out = gen_dir / f"{category}_{digest}.wav"
+    if out.exists():
+        return out
+    dur = int(max(1, min(10, round(float(meta.get("max_dur", 2)) + 0.5))))
+    try:
+        return pipeline.generate_sfx_clip(prompt, dur, out, key=key,
+                                          cancel_event=config.get("_cancel_event"), status_cb=status_cb)
+    except Exception as exc:
+        log(status_cb, f"SFX generation failed ({category}): {exc}")
+        return None
+
+
+def resolve_segments(config, events, duration, ffprobe, status_cb=None):
     """Turn agent events into concrete mix segments with files, timing, volume."""
     segments = []
     last_at = {}
@@ -261,6 +289,8 @@ def resolve_segments(config, events, duration, ffprobe):
             continue
         seed = f"{category}|{round(at, 2)}|{event.get('reason', '')}"
         path = pipeline.choose_sfx(config, meta["lib"], seed)
+        if not path:
+            path = generate_agent_sfx(config, category, meta, event, status_cb=status_cb)
         if not path:
             continue
         sfx_dur = media_duration(path, ffprobe) or meta["max_dur"] * 0.7
@@ -332,7 +362,8 @@ def mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, st
     return out_path
 
 
-def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out_dir=None):
+def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out_dir=None,
+                           generate_missing=True):
     video_path = Path(video_path)
     if not video_path.exists():
         raise RuntimeError("Uploaded video not found.")
@@ -344,16 +375,20 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found; cannot process video.")
 
+    out_dir = Path(out_dir) if out_dir else SFX_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{video_path.stem}_sfx_{stamp}.mp4"
+
     config = {
         "project_slug": "sfx_enhance",
         "output_basename": video_path.stem,
         "sfx_library_dir": str(ROOT / "soundeffects"),
         "sfx_single_transition_sound_per_video": False,
+        "sfx_generation_enabled": bool(generate_missing) and bool(os.environ.get("WAVESPEED_API_KEY", "")),
+        "wavespeed_api_key": os.environ.get("WAVESPEED_API_KEY", ""),
+        "_gen_sfx_dir": str(out_dir / "generated_sfx"),
     }
-    out_dir = Path(out_dir) if out_dir else SFX_OUTPUT_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"{video_path.stem}_sfx_{stamp}.mp4"
 
     duration = media_duration(video_path, ffprobe)
     log(status_cb, f"Loaded video: {duration:.1f}s.")
@@ -375,7 +410,7 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
         plan_source = "automatic"
     log(status_cb, f"Planned {len(events)} sound-effect event(s) [{plan_source}].")
 
-    segments = resolve_segments(config, events, duration, ffprobe)
+    segments = resolve_segments(config, events, duration, ffprobe, status_cb=status_cb)
     log(status_cb, f"Placed {len(segments)} sound effect(s) after spacing/dedup.")
     if not segments:
         raise RuntimeError("No sound effects could be placed (empty plan or library).")

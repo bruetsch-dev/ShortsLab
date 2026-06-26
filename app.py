@@ -10,10 +10,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import agent_core
+import pipeline
 import sfx_agent
 
 
 ROOT = Path(__file__).resolve().parent
+SPEAKER_GALLERY_DIR = ROOT / "speaker images"
+SPEAKER_UPLOADED_DIR = ROOT / "speaker" / "uploaded"
+SPEAKER_GALLERY_DIR.mkdir(exist_ok=True)
+SPEAKER_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 JOBS = {}
 JOB_LOCK = threading.Lock()
 STATIC_DIR = ROOT / "static"
@@ -30,6 +35,13 @@ UI_TEXT_DEFAULTS = {
     "seedance_model": "seedance-2.0",
     "reasoning_model": "openai/gpt-5.5",
     "loaded_project_mode": "normal",
+    "speaker_name": "Narrator",
+    "tts_voice": "Achernar",
+    "tts_model": "flash",
+    "image_model": "openai/gpt-image-2/text-to-image",
+    "hook_text": "",
+    "hook_pause_s": "0.45",
+    "speaker_image_path": "",
 }
 UI_CHECKBOX_DEFAULTS = {
     "autonomous_director": True,
@@ -40,6 +52,7 @@ UI_CHECKBOX_DEFAULTS = {
     "enable_speaker_hook": False,
     "auto_web_images": True,
     "background_music_enabled": False,
+    "generate_missing_sfx": True,
     "allow_gpt": True,
     "allow_seedance": True,
 }
@@ -62,7 +75,11 @@ def normalize_ui_state(raw):
             if key in UI_PERSIST_SKIP_FIELDS:
                 continue
             if key in raw and raw[key] is not None:
-                state[key] = str(raw[key])
+                value = str(raw[key])
+                # Normalize line endings so CRLF doesn't accumulate across save/load
+                # round-trips (was injecting extra blank paragraphs in the script).
+                value = value.replace("\r\n", "\n").replace("\r", "\n")
+                state[key] = value
         for key in UI_CHECKBOX_DEFAULTS:
             if key in raw:
                 value = raw[key]
@@ -250,6 +267,55 @@ def app_style():
       .sub { color: var(--muted); margin-top: 7px; max-width: 760px; line-height: 1.5; font-size: 14px; }
       .nav-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; min-width: 170px; }
       .nav-actions .button { width: auto; min-width: 132px; }
+      .tagline { font-weight: 800; letter-spacing: .3px; color: #ffe6ad; text-transform: lowercase; }
+      .tagline .dot { color: var(--accent-2); padding: 0 5px; }
+      .create-bar {
+        grid-column: 1 / -1;
+        position: sticky; top: 10px; z-index: 30;
+        display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap;
+        margin-bottom: 22px; border: 1px solid var(--line-strong);
+        background: linear-gradient(180deg, rgba(34,25,11,.95), rgba(18,18,20,.95));
+        box-shadow: 0 14px 34px rgba(0,0,0,.4);
+      }
+      .create-bar-models { display: flex; gap: 14px; flex: 1; flex-wrap: wrap; min-width: 0; }
+      .create-bar .field { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 190px; }
+      .create-bar .field label { margin: 0; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+      .create-short-btn { width: auto; min-width: 200px; font-size: 16px; font-weight: 800; padding: 14px 26px; align-self: stretch; }
+      @media (max-width: 720px) { .create-short-btn { width: 100%; } }
+      .tier-row { flex-basis: 100%; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .tier-label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 700; }
+      .tier-btns { display: flex; gap: 10px; flex: 1; min-width: 280px; }
+      .create-bar .tier-btns .tier-btn { flex: 1 1 0; }
+      .tier-btn {
+        width: auto; min-width: 104px; display: flex; flex-direction: column; align-items: center; gap: 1px;
+        padding: 8px 16px; line-height: 1.15; font-weight: 800; cursor: pointer;
+        border: 1px solid var(--line-strong); border-radius: 10px; background: #161a1d; color: #f3efe6;
+        transition: transform .12s ease, border-color .12s ease, background .12s ease;
+      }
+      .tier-btn small { font-weight: 600; font-size: 11px; color: var(--muted); }
+      .tier-btn:hover { transform: translateY(-1px); border-color: var(--accent-2); background: #1d2226; }
+      .tier-btn.tier-active { border-color: var(--accent); background: #2c1d0a; color: #fff7e9; box-shadow: inset 0 -2px 0 rgba(240,180,95,.8); }
+      .tier-btn.tier-active small { color: #f6dcae; }
+      .tier-hint { flex: 1; min-width: 180px; margin: 0; }
+      .action-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+      .action-btns .action-btn {
+        width: auto; flex: 1 1 150px; min-width: 140px;
+        display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+        padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px;
+        background: #12181b; color: #d7d2c6; font-weight: 800; cursor: pointer; line-height: 1.2;
+        transition: transform .12s ease, border-color .12s ease, background .12s ease;
+      }
+      .action-btns .action-btn small { font-weight: 600; font-size: 11px; color: var(--muted); }
+      .action-btns .action-btn:hover { transform: translateY(-1px); border-color: var(--accent-2); }
+      .action-btns .action-btn.active { border-color: var(--accent); background: #2c1d0a; color: #fff7e9; }
+      .action-btns .action-btn.active small { color: #f6dcae; }
+      .speaker-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-bottom: 10px; max-height: 232px; overflow-y: auto; padding: 2px; }
+      .speaker-tile { width: 100%; padding: 0; border: 2px solid var(--line); border-radius: 8px; overflow: hidden; background: #06080a; cursor: pointer; aspect-ratio: 3 / 4; transition: border-color .12s ease, transform .12s ease; }
+      .speaker-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .speaker-tile:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+      .speaker-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(240,180,95,.4); }
+      .speaker-upload { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 8px; }
+      .speaker-upload .hint { margin: 0; }
       form { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; align-items: start; }
       label { display: block; font-weight: 850; margin-bottom: 7px; color: #fff8eb; }
       input, textarea, select {
@@ -333,6 +399,10 @@ def app_style():
         box-shadow: inset 0 -3px 0 rgba(240, 180, 95, .95), 0 14px 30px rgba(0,0,0,.36);
       }
       button:not(.preview-button):hover::after, .button:hover::after { transform: translateX(120%) skewX(-18deg); }
+      button:not(.preview-button):active, .button:active, .tier-btn:active, .action-btn:active { transform: translateY(1px) scale(.992); box-shadow: inset 0 2px 7px rgba(0,0,0,.45); }
+      @keyframes page-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+      main { animation: page-fade .34s ease both; }
+      @media (prefers-reduced-motion: reduce) { main { animation: none; } }
       button[type="submit"] { background: #281908; border-color: var(--accent-2); color: #fff7e9; }
       .button.secondary {
         background: #101619;
@@ -390,6 +460,29 @@ def app_style():
         transition: width .35s ease;
         animation: progress-stripes 1.2s linear infinite;
       }
+      .steps-strip { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+      .step-chip {
+        position: relative; overflow: hidden; flex: 1 1 96px; min-width: 96px;
+        display: flex; flex-direction: column; gap: 2px; justify-content: center;
+        padding: 9px 12px; border-radius: 9px; border: 1px solid var(--line);
+        background: #0e1316; color: #8b938f; font-weight: 800; font-size: 12.5px;
+        transition: color .25s ease, border-color .25s ease, background .25s ease;
+      }
+      .step-chip .step-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; z-index: 0;
+        background: linear-gradient(90deg, rgba(240,180,95,.32), rgba(240,180,95,.08)); }
+      .step-chip .step-name, .step-chip .step-time { position: relative; z-index: 1; }
+      .step-chip .step-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .step-chip .step-time { font-size: 11px; font-weight: 700; color: #c9c3b6; font-variant-numeric: tabular-nums; }
+      .step-chip.pending { opacity: .5; }
+      .step-chip.active { color: #fff7e9; border-color: var(--accent); background: #1a1407; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+      .step-chip.active .step-fill { animation: stepfill 45s linear forwards; animation-delay: calc(-1 * var(--el)); }
+      .step-chip.done { color: #d8ffe2; border-color: #2f7d49; background: #102316; }
+      .step-chip.done .step-fill { width: 100%; background: linear-gradient(90deg, #1f6b3a, #2f9b54); }
+      .step-chip.done .step-time { color: #9fe6b6; }
+      .step-chip.stopped { color: #ffd9d3; border-color: #7d3030; background: #221010; }
+      .step-chip.stopped .step-fill { width: 100%; background: linear-gradient(90deg, #6b1f1f, #9b2f2f); }
+      @keyframes stepfill { from { width: 6%; } to { width: 94%; } }
+      .progress-current { color: #cbc7ba; font-weight: 700; font-size: 13px; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; margin-top: 16px; }
       .job-layout > .panel, .job-layout > aside { min-height: min(76vh, 860px); min-width: 0; }
       .log-box { height: calc(min(78vh, 900px) - 70px); max-height: none; overflow: auto; font-size: 13px; }
@@ -421,8 +514,9 @@ def app_style():
       .media-tile input { width: auto; margin: 0; accent-color: var(--accent); }
       .media-tile small { display: block; color: #8d9895; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
       .media-kind { position: absolute; top: 10px; left: 10px; padding: 3px 5px; border-radius: 3px; background: rgba(4,7,8,.82); border: 1px solid rgba(210,217,206,.18); color: #e7e4db; font-size: 10px; font-weight: 950; text-transform: uppercase; }
-      .loaded-media-panel { max-height: 720px; overflow: auto; }
-      .loaded-media-panel .media-tiny-grid { grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
+      .preview-section { grid-column: 1 / -1; }
+      .loaded-media-panel .media-tiny-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+      .loaded-media-panel .media-tab-panel { max-height: none; }
       .media-tabs { display: flex; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; gap: 6px; margin: 10px 0; }
       .media-tab {
         border: 1px solid #334247; background: #0f1518; color: #d8dbd2; padding: 7px 9px;
@@ -523,29 +617,28 @@ def app_script():
     return """
     <script>
       (function () {
-        window.setRunMode = function(mode) {
-          var form = document.getElementById("short-form");
-          if (!form) return;
-          if (mode === "quality_run") {
-            form.querySelector("[name='autonomous_director']").checked = true;
-            form.querySelector("[name='use_llm_search']").checked = true;
-            form.querySelector("[name='use_llm_video_review']").checked = true;
-            form.querySelector("[name='allow_seedance']").checked = true;
-            form.querySelector("[name='allow_gpt']").checked = true;
-          } else if (mode === "repair_recut") {
-            document.getElementById("load-modal").classList.add("active");
-            var select = document.getElementById("project-select");
-            if (select) select.focus();
-          }
-          document.querySelectorAll(".run-mode-btn").forEach(function(b) {
-            b.classList.remove("primary");
-            b.classList.add("secondary");
+        window.setProjectMode = function (mode) {
+          var hidden = document.getElementById("loaded-project-mode");
+          if (hidden) hidden.value = mode;
+          document.querySelectorAll("#loaded-actions-panel .action-btn").forEach(function (b) {
+            b.classList.toggle("active", b.getAttribute("data-mode") === mode);
           });
-          var activeBtn = document.getElementById("btn-mode-" + mode);
-          if (activeBtn) {
-            activeBtn.classList.remove("secondary");
-            activeBtn.classList.add("primary");
-          }
+        };
+        window.showLoadedActions = function () {
+          var panel = document.getElementById("loaded-actions-panel");
+          if (panel) panel.style.display = "";
+          window.setProjectMode("normal");
+        };
+        window.hideLoadedActions = function () {
+          var panel = document.getElementById("loaded-actions-panel");
+          if (panel) panel.style.display = "none";
+          var hidden = document.getElementById("loaded-project-mode");
+          if (hidden) hidden.value = "normal";
+        };
+        window.openTimeline = function () {
+          var src = document.getElementById("loaded-project-source");
+          var slug = src ? src.value : "";
+          if (slug) window.location.href = "/timeline?slug=" + encodeURIComponent(slug);
         };
 
         function stickLogToBottom() {
@@ -659,17 +752,11 @@ def app_script():
               : item.type === "image"
                 ? '<img src="' + url + '" alt="' + name + '">'
                 : '<div class="media-audio-tile">' + htmlEscape(item.type || "file") + '</div>';
-            var replace = item.replaceable
-              ? '<label><input type="checkbox" name="initial_replace_media_path" value="' + path + '"> Replace</label> ' +
-                '<label><input type="checkbox" name="initial_remove_media_path" value="' + path + '"> Remove</label>'
-              : '<label>' + kind + '</label> ' +
-                '<label><input type="checkbox" name="initial_remove_media_path" value="' + path + '"> Remove</label>';
             return [
               '<article class="media-tile">',
               '<span class="media-kind">' + kind + '</span>',
               '<button class="preview-button" type="button" data-preview-src="' + url + '" data-preview-title="' + name + '">',
               preview + '</button>',
-              replace,
               '<small>' + name + '</small>',
               '</article>'
             ].join('');
@@ -736,6 +823,7 @@ def app_script():
                 if (!data || !data.state) throw new Error("Project has no loadable state.");
                 applyFormState(data.state);
                 if (loadedSource) loadedSource.value = slug;
+                if (typeof window.showLoadedActions === "function") window.showLoadedActions();
                 document.getElementById('load-modal').classList.remove('active');
                 var storedState = collectFormState();
                 try { localStorage.setItem(autosaveKey, JSON.stringify(storedState)); } catch (err) {}
@@ -749,9 +837,98 @@ def app_script():
                 setStatus("Error loading project: " + err.toString() + (err.stack ? " " + err.stack : ""));
               });
           };
+          window.newProject = function () {
+            var form = document.getElementById("short-form");
+            if (form) {
+              ["script", "visual_script", "title", "hook_text", "slug"].forEach(function (name) {
+                var field = form.querySelector('[name="' + name + '"]');
+                if (field) field.value = "";
+              });
+            }
+            if (loadedSource) loadedSource.value = "";
+            if (typeof window.hideLoadedActions === "function") window.hideLoadedActions();
+            if (typeof window.clearHook === "function") window.clearHook();
+            if (typeof clearProjectMedia === "function") clearProjectMedia();
+            var state = collectFormState();
+            if (state) {
+              try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {}
+              sendFormState(state);
+            }
+            if (typeof setStatus === "function") setStatus("New project — fields cleared.");
+            var ht = document.getElementById("speaker-image-path"); if (ht) ht.value = "";
+            document.querySelectorAll(".speaker-tile").forEach(function (t) { t.classList.remove("selected"); });
+          };
+          window.selectSpeakerImage = function (el) {
+            var hidden = document.getElementById("speaker-image-path");
+            if (hidden) hidden.value = el.getAttribute("data-path") || "";
+            document.querySelectorAll(".speaker-tile").forEach(function (t) { t.classList.toggle("selected", t === el); });
+            var fileInput = document.querySelector('[name="speaker_image_file"]'); if (fileInput) fileInput.value = "";
+            var cb = document.querySelector('[name="enable_speaker_hook"]'); if (cb) cb.checked = true;
+            if (typeof saveFormStateSoon === "function") saveFormStateSoon();
+          };
+          window.onSpeakerUpload = function (input) {
+            document.querySelectorAll(".speaker-tile").forEach(function (t) { t.classList.remove("selected"); });
+            var hidden = document.getElementById("speaker-image-path"); if (hidden) hidden.value = "";
+            var cb = document.querySelector('[name="enable_speaker_hook"]');
+            if (cb && input.files && input.files.length) cb.checked = true;
+          };
+          window.applyTier = function (tier) {
+            var TIERS = {
+              cheap:  { video_model: "ltx-2.3",           image_model: "google/nano-banana-2/text-to-image", reasoning_model: "z-ai/glm-5.2",              tts_model: "flash" },
+              medium: { video_model: "seedance-2.0-fast", image_model: "google/nano-banana-2/text-to-image", reasoning_model: "openai/gpt-5.5",            tts_model: "pro" },
+              best:   { video_model: "seedance-2.0",      image_model: "openai/gpt-image-2/text-to-image",   reasoning_model: "anthropic/claude-opus-4.8", tts_model: "pro" }
+            };
+            var preset = TIERS[tier];
+            var form = document.getElementById("short-form");
+            if (!preset || !form) return;
+            Object.keys(preset).forEach(function (name) {
+              var field = form.querySelector('[name="' + name + '"]');
+              if (field) field.value = preset[name];
+            });
+            Array.prototype.forEach.call(document.querySelectorAll(".tier-btn"), function (b) { b.classList.remove("tier-active"); });
+            var active = document.querySelector('.tier-btn[onclick*="' + tier + '"]');
+            if (active) active.classList.add("tier-active");
+            var state = collectFormState();
+            if (state) {
+              try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {}
+              sendFormState(state);
+            }
+            if (typeof setStatus === "function") setStatus(tier.charAt(0).toUpperCase() + tier.slice(1) + " preset loaded.");
+          };
           clearProjectMedia();
         }
 
+        var _uiCtx = null;
+        function uiCtx() {
+          try {
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return null;
+            if (!_uiCtx) _uiCtx = new AudioCtx();
+            if (_uiCtx.state === "suspended") _uiCtx.resume();
+            return _uiCtx;
+          } catch (e) { return null; }
+        }
+        function playClick() {
+          var ctx = uiCtx(); if (!ctx) return;
+          try {
+            var now = ctx.currentTime;
+            var osc = ctx.createOscillator(), g = ctx.createGain();
+            osc.type = "triangle";
+            osc.frequency.setValueAtTime(540, now);
+            osc.frequency.exponentialRampToValueAtTime(320, now + 0.05);
+            g.gain.setValueAtTime(0.0001, now);
+            g.gain.exponentialRampToValueAtTime(0.05, now + 0.005);
+            g.gain.exponentialRampToValueAtTime(0.0001, now + 0.07);
+            osc.connect(g); g.connect(ctx.destination);
+            osc.start(now); osc.stop(now + 0.09);
+          } catch (e) {}
+        }
+        function setupUiSounds() {
+          document.addEventListener("pointerdown", function (ev) {
+            var el = ev.target.closest("button, .button, .tier-btn, .action-btn, .speaker-tile");
+            if (el && !el.disabled) playClick();
+          }, true);
+        }
         function playDoneSoundOnce() {
           var root = document.getElementById("job-root");
           if (!root || root.getAttribute("data-status") !== "done") return;
@@ -768,21 +945,22 @@ def app_script():
             var now = ctx.currentTime + 0.02;
             var master = ctx.createGain();
             master.gain.setValueAtTime(0.0001, now);
-            master.gain.exponentialRampToValueAtTime(0.18, now + 0.018);
-            master.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+            master.gain.exponentialRampToValueAtTime(0.16, now + 0.02);
+            master.gain.setValueAtTime(0.16, now + 0.42);
+            master.gain.exponentialRampToValueAtTime(0.0001, now + 0.66);
             master.connect(ctx.destination);
-            [660, 990].forEach(function (freq, index) {
+            [523.25, 659.25, 783.99, 1046.5].forEach(function (freq, index) {
               var osc = ctx.createOscillator();
               var gain = ctx.createGain();
               osc.type = "sine";
-              osc.frequency.setValueAtTime(freq, now + index * 0.055);
-              gain.gain.setValueAtTime(0.0001, now + index * 0.055);
-              gain.gain.exponentialRampToValueAtTime(1.0, now + index * 0.055 + 0.018);
-              gain.gain.exponentialRampToValueAtTime(0.0001, now + index * 0.055 + 0.22);
+              osc.frequency.setValueAtTime(freq, now + index * 0.07);
+              gain.gain.setValueAtTime(0.0001, now + index * 0.07);
+              gain.gain.exponentialRampToValueAtTime(1.0, now + index * 0.07 + 0.018);
+              gain.gain.exponentialRampToValueAtTime(0.0001, now + index * 0.07 + 0.30);
               osc.connect(gain);
               gain.connect(master);
-              osc.start(now + index * 0.055);
-              osc.stop(now + index * 0.055 + 0.26);
+              osc.start(now + index * 0.07);
+              osc.stop(now + index * 0.07 + 0.34);
             });
             setTimeout(function () { try { ctx.close(); } catch (err) {} }, 700);
           } catch (err) {}
@@ -963,6 +1141,7 @@ def app_script():
           setupProjectLoader();
           setupMediaTabs(document);
           setupReplacementForms(document);
+          setupUiSounds();
           playDoneSoundOnce();
           setupJobPolling();
         });
@@ -981,7 +1160,7 @@ def page(title, body, refresh=None):
         '<link rel="apple-touch-icon" href="/static/app_icon.png">'
         '<link rel="shortcut icon" href="/favicon.ico">'
         '<meta name="theme-color" content="#090d14">'
-        '<meta name="application-name" content="Autonomous Shorts Agent">'
+        '<meta name="application-name" content="Shortslab">'
     )
     return f"""<!doctype html>
     <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
@@ -1040,6 +1219,26 @@ def form_page():
     state = load_ui_state()
     previous_project_options = project_options_html()
 
+    voice_tones = {
+        "Zephyr": "Bright", "Puck": "Upbeat", "Charon": "Informative",
+        "Kore": "Firm", "Fenrir": "Excitable", "Leda": "Youthful",
+        "Orus": "Firm", "Aoede": "Breezy", "Callirrhoe": "Easy-going",
+        "Autonoe": "Bright", "Enceladus": "Breathy", "Iapetus": "Clear",
+        "Umbriel": "Easy-going", "Algieba": "Smooth", "Despina": "Smooth",
+        "Erinome": "Clear", "Algenib": "Gravelly", "Rasalgethi": "Informative",
+        "Laomedeia": "Upbeat", "Achernar": "Soft", "Alnilam": "Firm",
+        "Schedar": "Even", "Gacrux": "Mature", "Pulcherrima": "Forward",
+        "Achird": "Friendly", "Zubenelgenubi": "Casual", "Vindemiatrix": "Gentle",
+        "Sadachbia": "Lively", "Sadaltager": "Knowledgeable", "Sulafat": "Warm",
+    }
+    sel_voice = state.get("tts_voice", pipeline.DEFAULT_TTS_VOICE)
+    voice_options = "".join(
+        f'<option value="{esc(v)}"{" selected" if sel_voice == v else ""}>'
+        f'{esc(v)}{" &mdash; " + voice_tones[v] if v in voice_tones else ""}</option>'
+        for v in pipeline.GEMINI_TTS_VOICES
+    )
+    sel_tts_model = state.get("tts_model", "flash")
+
     def checked(name):
         return " checked" if state.get(name) else ""
 
@@ -1048,32 +1247,71 @@ def form_page():
       <div class="brand">
         <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
         <div>
-          <h1>Autonomous Shorts Agent</h1>
-          <p class="sub">Paste a script, optionally drop in voice audio, and the Auto Director builds a viral 9:16 Short end to end &mdash; sourcing footage, writing word-by-word captions, and rendering with cinematic motion.</p>
+          <h1>Shortslab</h1>
+          <p class="sub"><span class="tagline">script <span class="dot">&bull;</span> chill <span class="dot">&bull;</span> upload</span> &mdash; paste a script, pick a voice, and the Auto Director builds a viral 9:16 Short end to end: narration, footage, word-by-word captions, and cinematic motion.</p>
         </div>
       </div>
       <div class="nav-actions">
-        <button type="button" class="button secondary" onclick="document.getElementById('load-modal').classList.add('active')">Load Project</button>
-        <a class="button secondary" href="/sfx">Add SFX</a>
-        <a class="button secondary" href="/assets">Assets</a>
+        <button type="button" class="button" onclick="newProject()">&#43; New Project</button>
+        <button type="button" class="button secondary" onclick="document.getElementById('load-modal').classList.add('active')">&#128193; Load Project</button>
+        <a class="button secondary" href="/sfx">&#128266; Add SFX to a Video</a>
+        <a class="button secondary" href="/assets">&#127916; Asset Library</a>
       </div>
     </div>
     <form id="short-form" method="post" action="/run" enctype="multipart/form-data">
       <input id="loaded-project-source" type="hidden" name="loaded_project_source" value="">
-      
-      <section class="stack">
-        <div class="panel mode-selector" style="text-align: center; margin-bottom: 20px;">
-          <label style="font-size: 1.2em; margin-bottom: 10px; display: block;">Run Mode</label>
-          <div style="display: flex; gap: 10px; justify-content: center;">
-            <button type="button" id="btn-mode-quality_run" class="button primary run-mode-btn" onclick="window.setRunMode('quality_run')">Quality Run</button>
-            <button type="button" id="btn-mode-repair_recut" class="button secondary run-mode-btn" onclick="window.setRunMode('repair_recut')">Repair / Recut</button>
-          </div>
-          <div id="mode-description" class="hint" style="margin-top: 10px;">Quality Run: Auto Director, GPT review, full search, and Seedance generation.</div>
-        </div>
 
+      <div class="create-bar panel">
+        <div class="tier-row">
+          <span class="tier-label">Quality preset</span>
+          <div class="tier-btns">
+            <button type="button" class="tier-btn" onclick="applyTier('cheap')">Cheap<small>~$0.50 / run</small></button>
+            <button type="button" class="tier-btn" onclick="applyTier('medium')">Medium<small>~$1.50 / run</small></button>
+            <button type="button" class="tier-btn" onclick="applyTier('best')">Best<small>~$3.50 / run</small></button>
+          </div>
+          <span class="tier-hint hint">Presets just load the model picks below &mdash; tweak them anytime. Prices are rough estimates.</span>
+        </div>
+        <div class="create-bar-models">
+          <div class="field">
+            <label>Video model</label>
+            <select name="video_model">
+              <option value="seedance-2.0"{' selected' if state.get("video_model", state.get("seedance_model", "seedance-2.0")) == "seedance-2.0" else ""}>Seedance 2.0 (Web Search + Audio)</option>
+              <option value="seedance-2.0-fast"{' selected' if state.get("video_model") == "seedance-2.0-fast" else ""}>Seedance 2.0 Fast (Web Search + Audio)</option>
+              <option value="seedance-v1.5-pro"{' selected' if state.get("video_model", state.get("seedance_model")) == "seedance-v1.5-pro" else ""}>Seedance 1.5 Pro</option>
+              <option value="ltx-2.3"{' selected' if state.get("video_model") == "ltx-2.3" else ""}>LTX-2.3 (cheap)</option>
+              <option value="happyhorse-1.1"{' selected' if state.get("video_model") == "happyhorse-1.1" else ""}>Happy Horse 1.1 (720p)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Image model</label>
+            <select name="image_model">
+              <option value="openai/gpt-image-2/text-to-image"{' selected' if state.get("image_model") == "openai/gpt-image-2/text-to-image" else ""}>GPT-Image-2 (best)</option>
+              <option value="google/nano-banana-2/text-to-image"{' selected' if state.get("image_model") == "google/nano-banana-2/text-to-image" else ""}>Nano-Banana-2 (cheap)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Reasoning model</label>
+            <select name="reasoning_model">
+              <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
+              <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
+              <option value="z-ai/glm-5.2"{' selected' if state.get("reasoning_model") == "z-ai/glm-5.2" else ""}>GLM-5.2 (cheap)</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="button primary create-short-btn">&#9889; Create Short</button>
+      </div>
+
+      <section class="stack">
         <div class="panel accent">
           <label>Text script</label>
-          <textarea name="script" placeholder="Paste timed/plain text script here, or leave empty when uploading speech audio.">{esc(state.get("script"))}</textarea>
+          <textarea id="script-field" name="script" placeholder="Paste your timed/plain text script here. The voiceover is generated from it automatically.">{esc(state.get("script"))}</textarea>
+          <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
+          <div class="hook-controls" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+            <button type="button" class="button secondary" onclick="markHook()">&#9733; Mark selection as hook</button>
+            <button type="button" class="button secondary" onclick="clearHook()">Clear hook</button>
+            <span id="hook-indicator" class="hint" style="flex:1; min-width:160px;"></span>
+          </div>
+          <div class="hint">Select the opening line(s) in the script and click &ldquo;Mark selection as hook&rdquo;. The hook is spoken first, then a short pause, then the rest &mdash; and (with a speaker image) it drives the InfiniteTalk talking-head opening.</div>
         </div>
         <div class="panel">
           <label>Optional Visual Direction</label>
@@ -1081,53 +1319,47 @@ def form_page():
           <div class="hint">The Voice Script is authoritative. The Optional Visual Direction is secondary guidance. If empty, the full visual plan is inferred from the Voice Script.</div>
         </div>
 
-        <div class="panel">
-          <label>Loaded project action / regenerate</label>
-          <select name="loaded_project_mode">
-            <option value="normal"{' selected' if state.get("loaded_project_mode") == "normal" else ""}>Normal agent run in this folder</option>
-            <option value="recut_existing_only"{' selected' if state.get("loaded_project_mode") == "recut_existing_only" else ""}>Replace selected media + recut existing</option>
-            <option value="recut_new_web_images"{' selected' if state.get("loaded_project_mode") == "recut_new_web_images" else ""}>Regenerate web/wiki images + recut</option>
-            <option value="recut_regenerate_seedance"{' selected' if state.get("loaded_project_mode") == "recut_regenerate_seedance" else ""}>Regenerate Seedance clips + recut</option>
-            <option value="recut_recreate_speaker_clip"{' selected' if state.get("loaded_project_mode") == "recut_recreate_speaker_clip" else ""}>Recreate speaker hook clip + recut</option>
-          </select>
-          <div class="hint">For old projects, choose what should be reused or regenerated. Selected web/wiki images are replaced before the recut.</div>
+        <div class="panel" id="loaded-actions-panel" style="display:none;">
+          <button type="button" class="button" onclick="openTimeline()" style="margin-bottom:12px;">&#127902; Open timeline editor (trim, mix &amp; render)</button>
+          <label>Loaded project &mdash; what should the run do?</label>
+          <input type="hidden" name="loaded_project_mode" id="loaded-project-mode" value="{esc(state.get('loaded_project_mode') or 'normal')}">
+          <div class="action-btns">
+            <button type="button" class="action-btn" data-mode="normal" onclick="setProjectMode('normal')">Normal run<small>fresh pass in this folder</small></button>
+            <button type="button" class="action-btn" data-mode="recut_existing_only" onclick="setProjectMode('recut_existing_only')">Recut existing<small>reuse current media, re-edit</small></button>
+            <button type="button" class="action-btn" data-mode="recut_new_web_images" onclick="setProjectMode('recut_new_web_images')">New web images<small>refetch images + recut</small></button>
+            <button type="button" class="action-btn" data-mode="recut_regenerate_seedance" onclick="setProjectMode('recut_regenerate_seedance')">Regenerate clips<small>new Seedance clips + recut</small></button>
+            <button type="button" class="action-btn" data-mode="recut_recreate_speaker_clip" onclick="setProjectMode('recut_recreate_speaker_clip')">Recreate hook<small>new speaker hook + recut</small></button>
+          </div>
+          <div class="hint">Only shown for a loaded project. Choose what to reuse versus regenerate before re-rendering.</div>
         </div>
 
         <div class="panel">
-          <label>Speech audio</label>
-          <input type="file" name="audio_file" accept="audio/*,video/mp4,video/webm">
-          <div class="checks">
-            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use the uploaded voice as the final narration (music/SFX ducked under it)</label>
+          <label>Voice &amp; narration</label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <input type="text" name="speaker_name" value="{esc(state.get('speaker_name') or 'Narrator')}" placeholder="Speaker name (e.g. Rose)" style="flex:1; min-width:150px;">
+            <select name="tts_voice" style="flex:1; min-width:180px;">{voice_options}</select>
+            <select name="tts_model" style="flex:1; min-width:180px;">
+              <option value="flash"{' selected' if sel_tts_model == 'flash' else ''}>Gemini 2.5 Flash TTS (cheaper)</option>
+              <option value="pro"{' selected' if sel_tts_model == 'pro' else ''}>Gemini 2.5 Pro TTS (higher quality)</option>
+            </select>
           </div>
-          <div class="hint">Optional. The voice is force-aligned to your script for frame-accurate word-by-word captions and beat-synced cuts. With the box checked it is also the primary audio of the final video.</div>
+          <div class="checks">
+            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use the generated voice as the final narration (music/SFX ducked under it)</label>
+          </div>
+          <div class="hint">The narration is generated from your script with Gemini TTS (English). The speaker name is sent ahead of the script, and the voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts.</div>
         </div>
         <div class="panel">
           <label>Speaker hook image</label>
-          <input type="file" name="speaker_image_file" accept="image/*">
-          <div class="checks">
-            <label><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")}> Create Seedance speaker hook clip from uploaded image</label>
+          <input type="hidden" name="speaker_image_path" id="speaker-image-path" value="{esc(state.get('speaker_image_path'))}">
+          {speaker_gallery_html(state.get('speaker_image_path'))}
+          <div class="speaker-upload">
+            <span class="hint">Or upload a new face:</span>
+            <input type="file" name="speaker_image_file" accept="image/*" onchange="onSpeakerUpload(this)">
           </div>
-          <div class="hint">Optional. Reasoning Agent analyzes the uploaded speaker image, then Seedance creates a close-up, energetic self-recorded hook clip with the uploaded person's appearance.</div>
-        </div>
-
-        <div class="panel">
-          <label>Video Model</label>
-          <select name="video_model">
-            <option value="seedance-2.0"{' selected' if state.get("video_model", state.get("seedance_model", "seedance-2.0")) == "seedance-2.0" else ""}>Seedance 2.0 (Spicy + Web Search)</option>
-            <option value="seedance-v1.5-pro"{' selected' if state.get("video_model", state.get("seedance_model")) == "seedance-v1.5-pro" else ""}>Seedance 1.5 Pro</option>
-            <option value="ltx-2.3"{' selected' if state.get("video_model") == "ltx-2.3" else ""}>LTX-2.3</option>
-            <option value="happyhorse-1.1"{' selected' if state.get("video_model") == "happyhorse-1.1" else ""}>Happy Horse 1.1 (720p)</option>
-          </select>
-          <div class="hint">Select the primary model used for generating video clips. (Speaker hook is always Seedance 2.0).</div>
-        </div>
-
-        <div class="panel">
-          <label>Reasoning Model</label>
-          <select name="reasoning_model">
-            <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (Fast, standard)</option>
-            <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (Slower, higher quality)</option>
-          </select>
-          <div class="hint">Select the LLM that will act as the Auto Director, Video Reviewer, Search Planner, and Script Editor.</div>
+          <div class="checks">
+            <label><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")}> Create a talking-head hook clip (InfiniteTalk) from this image</label>
+          </div>
+          <div class="hint">Optional. Pick a saved speaker or upload a new face. The marked hook is then spoken by this person as a lip-synced talking-head opening (InfiniteTalk), driven by the generated hook audio. (If no hook is marked, a Seedance speaker clip is the fallback.)</div>
         </div>
 
         <details class="panel">
@@ -1136,23 +1368,23 @@ def form_page():
             <label>Agent options</label>
             <div class="checks">
               <label><input type="checkbox" name="autonomous_director"{checked("autonomous_director")}> Auto Director decides APIs, media counts, and scene strategy</label>
-              <label><input type="checkbox" name="use_audio_timing"{checked("use_audio_timing")}> Use Gemini audio timing when audio is uploaded</label>
+              <label><input type="checkbox" name="use_audio_timing"{checked("use_audio_timing")}> Force-align the generated voice for frame-accurate timing</label>
               <label><input type="checkbox" name="use_llm_search"{checked("use_llm_search")}> Use Reasoning Agent to plan web image searches</label>
               <label><input type="checkbox" name="use_llm_video_review"{checked("use_llm_video_review")}> Use Reasoning Agent two-pass review and auto-correction</label>
               <label><input type="checkbox" name="auto_web_images"{checked("auto_web_images")}> Search and download web images automatically</label>
               <label><input type="checkbox" name="background_music_enabled"{checked("background_music_enabled")}> Add background music</label>
+              <label><input type="checkbox" name="generate_missing_sfx"{checked("generate_missing_sfx")}> Generate missing sound effects with Kling when the library has no fit</label>
               <label><input type="checkbox" name="allow_gpt"{checked("allow_gpt")}> Generate GPT source images for Seedance when needed</label>
               <label><input type="checkbox" name="allow_seedance"{checked("allow_seedance")}> Generate missing Seedance clips</label>
             </div>
           </div>
         </details>
-        <button type="submit">Create Short</button>
       </section>
 
-      <section class="stack">
-        <div class="loaded-media-panel" style="flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 20px;">
-          <h2 style="margin-bottom: 5px;">Project Media Preview</h2>
-          <div class="hint" id="project-media-hint" style="margin-bottom: 20px;">No project loaded. Click "Load Project" in the top bar to select a past project.</div>
+      <section class="stack preview-section">
+        <div class="loaded-media-panel" style="border: 1px solid var(--line); border-radius: 10px; padding: 22px;">
+          <h2 style="margin-bottom: 5px;">&#127916; Project media preview</h2>
+          <div class="hint" id="project-media-hint" style="margin-bottom: 18px;">No project loaded. Click &ldquo;Load Project&rdquo; in the top bar to browse a past project &mdash; its media appears here, full width.</div>
           <div id="project-media-preview"></div>
         </div>
       </section>
@@ -1171,7 +1403,29 @@ def form_page():
       </div>
     </div>
     """
-    return page("Autonomous Shorts Agent", body)
+    body += """
+    <script>
+    (function(){
+      function ind(){
+        var h=document.getElementById('hook-text');
+        var el=document.getElementById('hook-indicator');
+        if(!h||!el) return;
+        var v=(h.value||'').trim();
+        el.textContent = v ? ('Hook: “'+(v.length>70?v.slice(0,70)+'…':v)+'”') : 'No hook marked (the whole script is read straight through).';
+        el.style.color = v ? 'var(--accent, #ffd400)' : '';
+      }
+      window.markHook=function(){
+        var ta=document.getElementById('script-field'); if(!ta) return;
+        var sel=ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+        if(!sel){ alert('Select the hook text inside the script first, then click \\u201cMark selection as hook\\u201d.'); return; }
+        var h=document.getElementById('hook-text'); if(h){ h.value=sel; } ind();
+      };
+      window.clearHook=function(){ var h=document.getElementById('hook-text'); if(h){ h.value=''; } ind(); };
+      document.addEventListener('DOMContentLoaded', ind); ind();
+    })();
+    </script>
+    """
+    return page("Shortslab", body)
 
 
 def sfx_page():
@@ -1281,7 +1535,11 @@ def start_job(fields, files):
     if audio_path:
         fields["audio_path"] = audio_path
     if speaker_image_path:
+        # A freshly uploaded face wins over a gallery selection.
         fields["speaker_image_path"] = speaker_image_path
+    elif fields.get("speaker_image_path") and not is_allowed_speaker_path(fields.get("speaker_image_path")):
+        # Drop a gallery path that isn't a real image inside an allowed local folder.
+        fields["speaker_image_path"] = ""
     with JOB_LOCK:
         initial_logs = ["Queued."]
         if replace_requests:
@@ -1291,6 +1549,7 @@ def start_job(fields, files):
         JOBS[job_id] = {
             "status": "running",
             "logs": initial_logs,
+            "log_times": [time.time()] * len(initial_logs),
             "result": None,
             "error": None,
             "cancel_event": cancel_event,
@@ -1308,6 +1567,7 @@ def start_job(fields, files):
             if cancel_event.is_set():
                 raise RunCancelled("Run cancelled by user.")
             job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
             if isinstance(message, str) and message.startswith("PROJECT_DIR|"):
                 job["project_dir"] = message.split("|", 1)[1]
 
@@ -1348,6 +1608,7 @@ def start_sfx_job(fields, files):
         JOBS[job_id] = {
             "status": "running",
             "logs": ["Queued."],
+            "log_times": [time.time()],
             "result": None,
             "error": None,
             "cancel_event": cancel_event,
@@ -1368,6 +1629,7 @@ def start_sfx_job(fields, files):
             if not job or cancel_event.is_set():
                 raise RunCancelled("Run cancelled by user.")
             job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
 
     def worker():
         try:
@@ -1442,6 +1704,57 @@ def link_for(path):
     p = Path(path)
     rel = urllib.parse.quote(str(p.resolve()))
     return f"/file?path={rel}"
+
+
+def speaker_gallery_images():
+    """Saved speaker images: the repo 'speaker images' folder + previously uploaded."""
+    out, seen = [], set()
+    for folder in (SPEAKER_GALLERY_DIR, SPEAKER_UPLOADED_DIR):
+        if not folder.exists():
+            continue
+        files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SPEAKER_IMAGE_EXTS]
+        for p in sorted(files, key=lambda x: x.stat().st_mtime, reverse=True):
+            rp = str(p.resolve())
+            if rp not in seen:
+                seen.add(rp)
+                out.append(p)
+    return out
+
+
+def is_allowed_speaker_path(path):
+    """True if a gallery-selected speaker path is inside an allowed local folder."""
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return False
+    if not resolved.is_file() or resolved.suffix.lower() not in SPEAKER_IMAGE_EXTS:
+        return False
+    allowed = [SPEAKER_GALLERY_DIR.resolve(), (ROOT / "speaker").resolve(), (ROOT / "projects").resolve()]
+    return any(str(resolved).startswith(str(base)) for base in allowed)
+
+
+def speaker_gallery_html(selected=""):
+    images = speaker_gallery_images()
+    selected_resolved = ""
+    try:
+        if selected:
+            selected_resolved = str(Path(selected).resolve())
+    except Exception:
+        selected_resolved = ""
+    if not images:
+        return ('<div class="hint">No saved speaker images yet. Drop face photos into the '
+                '<code>speaker images</code> folder in the repo, or upload one below &mdash; '
+                'uploaded speakers are remembered here.</div>')
+    tiles = []
+    for p in images:
+        rp = str(p.resolve())
+        sel = " selected" if selected_resolved and selected_resolved == rp else ""
+        tiles.append(
+            f'<button type="button" class="speaker-tile{sel}" data-path="{esc(rp)}" '
+            f'onclick="selectSpeakerImage(this)" title="{esc(p.stem)}">'
+            f'<img src="{link_for(p)}" alt="{esc(p.stem)}" loading="lazy"></button>'
+        )
+    return '<div class="speaker-gallery">' + "".join(tiles) + "</div>"
 
 
 def view_for(path, job_id=""):
@@ -1580,14 +1893,106 @@ def format_duration(seconds):
     return f"{minutes:d}:{secs:02d}"
 
 
-def render_progress(status, logs, created_at=None):
-    percent, activity = progress_state(status, logs)
+# Ordered, high-level run phases shown as button-like step bars. Each phase is
+# detected by any of its marker substrings appearing in the live log.
+RUN_STEPS = [
+    ("Voiceover", ("Generating voiceover", "Voiceover generated", "Reusing existing voiceover", "Generating hook + body")),
+    ("Voice timing", ("Aligning script to voice", "Voice timing", "forced alignment", "Analyzing audio", "audio timing")),
+    ("Director", ("Auto Director", "Director choices", "Planning scenes", "micro-beat", "edit map", "Estimated speaking")),
+    ("Web search", ("Searching web images", "Searching general web images", "Reviewing web images", "Web image", "web image query")),
+    ("Images", ("GPT image", "GPT source images", "Waiting for GPT Image", "nano-banana", "GPT Image")),
+    ("Video clips", ("Seedance clip", "Generating missing Seedance", "Waiting for Seedance", "InfiniteTalk", "Speaker hook")),
+    ("Sound", ("missing sound effects", "Generating any missing sound", "fallback SFX", "background music")),
+    ("Render", ("Rendering final", "Rendering frames", "Mixing audio", "Encoding final MP4")),
+    ("Review", ("review sheet", "Reviewing video with Reasoning Agent", "review pass", "pre-render audit")),
+]
+
+SFX_STEPS = [
+    ("Load video", ("Loaded video",)),
+    ("Scene cuts", ("Detecting scene changes",)),
+    ("Transcribe", ("Transcrib",)),
+    ("Plan SFX", ("planning sound effects", "Planned")),
+    ("Place SFX", ("sound-effect event", "after spacing/dedup", "Placed")),
+    ("Mix", ("under the original audio", "Mixing", "into")),
+    ("Finish", ("SFX enhancement complete",)),
+]
+
+
+def _match_step_index(text, steps):
+    for index, (_name, markers) in enumerate(steps):
+        if any(marker in text for marker in markers):
+            return index
+    return -1
+
+
+def compute_step_view(status, logs, log_times=None, job_kind=None):
+    """Return per-step view: [{name, state, elapsed}] for the button-like bars.
+
+    state is one of done / active / stopped / pending. elapsed (seconds) is the
+    real per-step duration (from log timestamps) for started steps.
+    """
+    steps = SFX_STEPS if job_kind == "sfx" else RUN_STEPS
+    log_times = log_times or []
+    start_times = [None] * len(steps)
+    active = -1
+    for index, line in enumerate(logs):
+        text = str(line)
+        if text.startswith("PREVIEW_IMAGE|") or text.startswith("PROJECT_DIR|"):
+            continue
+        step_index = _match_step_index(text, steps)
+        if step_index >= 0:
+            active = max(active, step_index)
+            ts = log_times[index] if index < len(log_times) else None
+            if start_times[step_index] is None and ts is not None:
+                start_times[step_index] = ts
+    now = time.time()
+    view = []
+    for index, (name, _markers) in enumerate(steps):
+        if status == "done":
+            state = "done"
+        elif status in ("error", "cancelled") and index == active:
+            state = "stopped"
+        elif index < active:
+            state = "done"
+        elif index == active and status in ("running", "cancelling"):
+            state = "active"
+        elif index == active:
+            state = "done"
+        else:
+            state = "pending"
+        start = start_times[index]
+        elapsed = None
+        if start is not None:
+            end = next((start_times[j] for j in range(index + 1, len(steps)) if start_times[j] is not None), None)
+            if state in ("done", "stopped") and end is not None:
+                elapsed = max(0.0, end - start)
+            else:
+                elapsed = max(0.0, now - start)
+        view.append({"name": name, "state": state, "elapsed": elapsed})
+    return view
+
+
+def render_progress(status, logs, created_at=None, log_times=None, job_kind=None):
+    _percent, activity = progress_state(status, logs)
     elapsed = format_duration(time.time() - float(created_at or time.time()))
+    steps = compute_step_view(status, logs, log_times=log_times, job_kind=job_kind)
+    chips = []
+    for step in steps:
+        seconds = step["elapsed"]
+        time_html = f'<span class="step-time">{esc(format_duration(seconds))}</span>' if seconds is not None else ""
+        delay = f"{seconds:.1f}" if (step["state"] == "active" and seconds is not None) else "0"
+        chips.append(
+            f'<div class="step-chip {step["state"]}" style="--el:{delay}s">'
+            f'<span class="step-fill"></span>'
+            f'<span class="step-name">{esc(step["name"])}</span>{time_html}'
+            f'</div>'
+        )
+    steps_html = '<div class="steps-strip">' + "".join(chips) + "</div>"
     return f"""
     <div id="job-progress-wrap" class="progress-wrap">
       <div class="elapsed-line"><span>Total time elapsed</span><strong>{esc(elapsed)}</strong></div>
-      <div class="progress-label"><span>Current: {esc(activity)}</span><strong>{percent}%</strong></div>
-      <div class="progress-track"><div class="progress-fill" style="width:{percent}%"></div></div>
+      {steps_html}
+      <div class="progress-current">{esc(activity)}</div>
     </div>
     """
 
@@ -1784,30 +2189,20 @@ def media_tabs_html(items, replaceable_paths=None, queued_paths=None, input_name
 
 
 def render_media_replacer(job_id, job):
+    # Read-only live gallery. The agent auto-checks each asset for topic relevance
+    # and fit, so there are no manual replace/remove controls.
     project_dir = project_dir_for_job(job)
-    media_all = project_media_files(project_dir)
-    replaceable = replaceable_media_files(project_dir)
-    queued = queued_replacement_paths(job)
     if not project_dir:
-        return '<section class="panel media-sidebar"><h2>Media Files</h2><div class="hint">Media appears here after the project folder is created.</div></section>'
+        return '<section class="panel media-sidebar"><h2>Project media</h2><div class="hint">Media appears here once the project folder is created.</div></section>'
+    media_all = project_media_files(project_dir)
     if not media_all:
-        return '<section class="panel media-sidebar"><h2>Media Files</h2><div class="hint">Media appears here as soon as files exist.</div></section>'
-    replaceable_set = {str(path.resolve()).lower() for _, path in replaceable}
-    visible_items = [(kind, path) for kind, path in media_all if str(path.resolve()).lower() not in queued]
-    queued_count = len(queued)
-    tabs = media_tabs_html(visible_items, replaceable_paths=replaceable_set, queued_paths=queued, input_name="media_path")
+        return '<section class="panel media-sidebar"><h2>Project media</h2><div class="hint">Media appears here as soon as files exist.</div></section>'
+    tabs = media_tabs_html(media_all)
     return f"""
     <section class="panel media-sidebar">
-      <div class="panel-head">
-        <h2>Media Files</h2>
-      </div>
-      <form method="post" action="/replace-media?id={urllib.parse.quote(job_id)}" data-replace-media-form="1">
-        <div class="media-toolbar">
-          <button class="secondary" type="submit">Queue selected replacements</button>
-        </div>
-        <div class="hint">Select web/wiki images while Seedance runs. Queued images disappear here and are replaced before rendering.{f" {queued_count} queued." if queued_count else ""}</div>
-        {tabs}
-      </form>
+      <div class="panel-head"><h2>Project media</h2></div>
+      <div class="hint">Live preview of everything the agent gathered and generated. Each asset is auto-reviewed for topic relevance and fit &mdash; no manual swapping needed.</div>
+      {tabs}
     </section>
     """
 
@@ -2022,23 +2417,428 @@ def assets_page():
     projects_dir = agent_core.PROJECTS_DIR
     projects = [p for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.exists() else []
     projects.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    count = len(projects)
     cards = "".join(asset_card(project_summary(project)) for project in projects)
     if not cards:
         cards = '<section class="panel"><h2>No assets yet</h2><div class="hint">Finished runs and generated project folders will appear here.</div></section>'
     body = f"""
     <div class="top">
-      <div>
-        <h1>Assets</h1>
-        <div class="sub">Previous runs, renders, review sheets, generated images, Seedance clips, and downloaded web media.</div>
+      <div class="brand">
+        <img class="brand-mark" src="/static/app_icon.png" alt="" width="56" height="56">
+        <div>
+          <h1>Asset Library</h1>
+          <p class="sub">{count} project{"" if count == 1 else "s"} &mdash; final renders, review sheets, GPT &amp; web images, Seedance clips and speaker faces, all in one place.</p>
+        </div>
       </div>
       <div class="nav-actions">
-        <a class="button secondary" href="/sfx">Add SFX</a>
-        <a class="button secondary" href="/">New project</a>
+        <a class="button" href="/">&#43; New Project</a>
+        <a class="button secondary" href="/sfx">&#128266; Add SFX to a Video</a>
       </div>
     </div>
     <section class="asset-grid">{cards}</section>
     """
-    return page("Assets", body)
+    return page("Asset Library", body)
+
+
+TIMELINE_SKELETON = """
+<div id="timeline-root" data-slug="__SLUG__">
+  <div class="tl-toolbar panel">
+    <button type="button" class="button primary tl-render-btn" id="tl-render">&#127902; Render final video</button>
+    <div class="tl-total" id="tl-total"></div>
+    <div class="hint tl-help">Drag a clip to reorder, drag its right edge to trim. Click a clip to select it &mdash; then trim, remove, or ask the agent to replace it.</div>
+  </div>
+  <div class="tl-grid tl-top">
+    <div class="panel tl-player">
+      <h2>Preview</h2>
+      <div class="tl-stage-view" id="tl-stage-view">
+        <img id="tl-pimg" alt="">
+        <video id="tl-pvid" muted playsinline></video>
+        <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview the sequence</div>
+      </div>
+      <div class="tl-player-bar">
+        <button type="button" class="button secondary" id="tl-play">&#9654; Play</button>
+        <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
+        <span class="hint">Plays the real footage in order at the trimmed timing. Captions, voice &amp; SFX are added at render.</span>
+      </div>
+    </div>
+    <div class="panel tl-inspector" id="tl-inspector">
+      <h2>Inspector</h2>
+      <div class="hint" id="tl-insp-empty">Click a clip in the timeline to edit it.</div>
+      <div id="tl-insp-body" hidden>
+        <div class="tl-insp-name" id="tl-insp-name"></div>
+        <label>Duration (seconds)</label>
+        <input type="number" id="tl-insp-dur" min="0.5" max="20" step="0.1">
+        <div class="tl-insp-actions">
+          <button type="button" class="button secondary" id="tl-insp-remove">Remove clip</button>
+          <button type="button" class="button" id="tl-insp-replace" hidden>&#129302; Replace via agent</button>
+        </div>
+        <div class="hint" id="tl-insp-note">Removing a clip drops it from the render and re-flows the timeline.</div>
+      </div>
+    </div>
+  </div>
+  <div class="panel tl-stage">
+    <div class="tl-rows">
+      <div class="tl-row-labels">
+        <div class="tl-rlabel" style="height:22px"></div>
+        <div class="tl-rlabel">Clips</div>
+        <div class="tl-rlabel tl-rlabel-sm">Captions</div>
+        <div class="tl-rlabel tl-rlabel-sm">Voice</div>
+        <div class="tl-rlabel tl-rlabel-sm">SFX / Music</div>
+      </div>
+      <div class="tl-scroll" id="tl-scroll">
+        <div class="tl-playhead" id="tl-playhead"></div>
+        <div class="tl-ruler" id="tl-ruler"></div>
+        <div class="tl-track" id="tl-clips"></div>
+        <div class="tl-track tl-cap" id="tl-captions"></div>
+        <div class="tl-track tl-aud" id="tl-voice"></div>
+        <div class="tl-track tl-aud" id="tl-sfx"></div>
+      </div>
+    </div>
+  </div>
+  <div class="panel tl-mixer-wrap">
+    <h2>Audio mixer</h2>
+    <div class="tl-mixer">
+      <div class="tl-slider"><label>Voice <span id="tl-v-voice"></span></label><input type="range" id="tl-voice-vol" min="0" max="1.5" step="0.05"></div>
+      <div class="tl-slider"><label>Clip audio <span id="tl-v-seedance"></span></label><input type="range" id="tl-seedance-vol" min="0" max="1" step="0.02"></div>
+      <div class="tl-slider"><label>Sound effects <span id="tl-v-sfx"></span></label><input type="range" id="tl-sfx-vol" min="0" max="0.6" step="0.01"></div>
+      <div class="tl-slider"><label>Music <span id="tl-v-music"></span></label><input type="range" id="tl-music-vol" min="0" max="0.6" step="0.01"></div>
+    </div>
+  </div>
+</div>
+"""
+
+TIMELINE_ASSETS = """
+<style>
+  .tl-toolbar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
+  .tl-render-btn { width:auto; min-width:230px; font-size:16px; }
+  .tl-total { font-weight:900; color:#ffe6ad; }
+  .tl-help { flex:1; min-width:220px; margin:0; }
+  .tl-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .tl-top { margin-bottom:16px; }
+  .tl-stage-view { position:relative; width:100%; aspect-ratio:16/9; background:#06080a; border:1px solid var(--line); border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+  .tl-stage-view img, .tl-stage-view video { max-width:100%; max-height:100%; width:100%; height:100%; object-fit:contain; display:none; background:#000; }
+  .tl-stage-empty { position:absolute; color:#7e8884; font-weight:700; }
+  .tl-player-bar { display:flex; align-items:center; gap:12px; margin-top:12px; flex-wrap:wrap; }
+  .tl-player-bar .button { width:auto; min-width:96px; }
+  .tl-playtime { font-weight:800; color:#ffe6ad; font-variant-numeric:tabular-nums; }
+  .tl-stage { overflow:hidden; }
+  .tl-rows { display:flex; gap:10px; }
+  .tl-row-labels { display:flex; flex-direction:column; gap:8px; flex:0 0 auto; }
+  .tl-rlabel { height:64px; display:flex; align-items:center; font-weight:800; color:#9aa4a1; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  .tl-rlabel-sm { height:40px; }
+  .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:10px; }
+  .tl-ruler { position:relative; height:22px; cursor:pointer; }
+  .tl-tick { position:absolute; top:0; height:22px; border-left:1px solid #2a343a; padding-left:4px; font-size:10px; color:#7e8884; }
+  .tl-playhead { position:absolute; top:0; bottom:10px; width:2px; background:var(--accent-3, #ff5d5d); z-index:5; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
+  .tl-playhead::before { content:''; position:absolute; top:0; left:-4px; border-left:5px solid transparent; border-right:5px solid transparent; border-top:7px solid var(--accent-3,#ff5d5d); }
+  .tl-track { position:relative; height:64px; margin-top:8px; background:#0d1114; border:1px solid var(--line); border-radius:6px; }
+  .tl-track.tl-cap, .tl-track.tl-aud { height:40px; }
+  .tl-clip { position:absolute; top:3px; bottom:3px; border:1px solid var(--accent-2); border-radius:6px; overflow:hidden; cursor:grab; background:#1a1407; background-size:cover; background-position:center; touch-action:none; }
+  .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px rgba(240,180,95,.55); }
+  .tl-clip.dragging { opacity:.75; cursor:grabbing; z-index:6; }
+  .tl-clip .tl-clip-label { position:absolute; left:0; right:0; bottom:0; padding:3px 6px; font-size:11px; font-weight:800; color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.82)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tl-clip .tl-clip-dur { position:absolute; top:2px; left:5px; font-size:10px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; }
+  .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:11px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(240,180,95,.6)); }
+  .tl-capblock { position:absolute; top:6px; bottom:6px; border-radius:4px; background:#13311f; border:1px solid #2f7d49; }
+  .tl-audbar { position:absolute; top:6px; bottom:6px; left:0; right:0; border-radius:4px; background:repeating-linear-gradient(90deg,#1a2a33 0 6px,#16242c 6px 12px); border:1px solid #2a3a44; }
+  .tl-mixer-wrap { margin-top:16px; }
+  .tl-mixer { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
+  .tl-slider label { display:flex; justify-content:space-between; margin-bottom:6px; }
+  .tl-insp-name { font-weight:800; color:#fff8eb; margin-bottom:12px; }
+  .tl-insp-actions { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 8px; }
+  .tl-insp-actions .button { width:auto; flex:1; min-width:140px; }
+  @media (max-width:760px){ .tl-grid{ grid-template-columns:1fr; } }
+</style>
+<script>
+(function(){
+  var rootEl = document.getElementById('timeline-root');
+  if (!rootEl) return;
+  var model;
+  try { model = JSON.parse(document.getElementById('timeline-model').textContent); } catch(e){ return; }
+  var slug = rootEl.getAttribute('data-slug');
+  var scenes = (model.scenes||[]).map(function(s){ return Object.assign({}, s); });
+  var volumes = Object.assign({voice:1, seedance:0.16, sfx:0.075, music:0}, model.volumes||{});
+  var SCALE = 30;
+  var selectedId = null;
+  var clips=document.getElementById('tl-clips'), caps=document.getElementById('tl-captions'), ruler=document.getElementById('tl-ruler');
+  var playhead=document.getElementById('tl-playhead');
+  function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function visible(){ return scenes.filter(function(s){ return !s.removed; }); }
+  function totalDur(){ return visible().reduce(function(a,s){ return a + s.dur; }, 0); }
+  function fmt(t){ t=Math.max(0,t); var m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+(s<10?'0':'')+s; }
+
+  function layout(){
+    var total=totalDur(), width=Math.max(640, total*SCALE);
+    [clips,caps,ruler,document.getElementById('tl-voice'),document.getElementById('tl-sfx')].forEach(function(el){ if(el) el.style.width=width+'px'; });
+    ruler.innerHTML='';
+    for(var t=0;t<=total+0.01;t+=5){ var d=document.createElement('div'); d.className='tl-tick'; d.style.left=(t*SCALE)+'px'; d.textContent=fmt(t); ruler.appendChild(d); }
+    clips.innerHTML=''; caps.innerHTML='';
+    var x=0;
+    visible().forEach(function(s){
+      var w=s.dur*SCALE;
+      var b=document.createElement('div');
+      b.className='tl-clip'+(s.id===selectedId?' selected':'');
+      b.style.left=x+'px'; b.style.width=w+'px';
+      b.setAttribute('data-id', s.id);
+      if(s.thumb) b.style.backgroundImage='url('+s.thumb+')';
+      b.innerHTML='<span class="tl-clip-dur">'+s.dur.toFixed(1)+'s</span><span class="tl-clip-label">'+(s.speaker?'(speaker) ':'')+esc(s.label)+'</span><span class="tl-handle"></span>';
+      b.querySelector('.tl-handle').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startResize(ev, s); });
+      b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')) return; startClipDrag(ev, s, b); });
+      clips.appendChild(b);
+      if(s.caption){ var c=document.createElement('div'); c.className='tl-capblock'; c.style.left=(x+2)+'px'; c.style.width=Math.max(2,w-4)+'px'; caps.appendChild(c); }
+      x+=w;
+    });
+    document.getElementById('tl-voice').innerHTML='<div class="tl-audbar"></div>';
+    document.getElementById('tl-sfx').innerHTML='<div class="tl-audbar"></div>';
+    document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+visible().length+' clips';
+    updatePlayhead();
+  }
+
+  function startResize(ev, s){
+    ev.preventDefault();
+    var startX=ev.clientX, startDur=s.dur;
+    function move(e){ var dd=(e.clientX-startX)/SCALE; s.dur=Math.max(0.5, Math.min(20, +(startDur+dd).toFixed(1))); layout(); if(selectedId===s.id) syncInspector(); }
+    function up(){ document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up); }
+    document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
+  }
+
+  function startClipDrag(ev, s, block){
+    ev.preventDefault();
+    var startX=ev.clientX, dragging=false;
+    function move(e){
+      if(!dragging && Math.abs(e.clientX-startX) < 6) return;
+      dragging=true; block.classList.add('dragging');
+      var rect=clips.getBoundingClientRect();
+      var px=e.clientX-rect.left+clips.scrollLeft;
+      var vis=visible(), acc=0, target=vis.length-1;
+      for(var i=0;i<vis.length;i++){ var w=vis[i].dur*SCALE; if(px < acc+w/2){ target=i; break; } acc+=w; if(i===vis.length-1) target=vis.length-1; }
+      var order=scenes.filter(function(x){return !x.removed;});
+      var from=order.indexOf(s);
+      if(from!==-1 && from!==target){
+        order.splice(from,1); order.splice(target,0,s);
+        var removed=scenes.filter(function(x){return x.removed;});
+        scenes=order.concat(removed);
+        layout(); block=clips.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(block) block.classList.add('dragging');
+      }
+    }
+    function up(){
+      document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up);
+      var b=clips.querySelector('.tl-clip[data-id="'+s.id+'"]'); if(b) b.classList.remove('dragging');
+      if(!dragging) select(s.id);
+    }
+    document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
+  }
+
+  function select(id){ selectedId=id; layout(); syncInspector(); }
+  function syncInspector(){
+    var s=scenes.filter(function(x){return x.id===selectedId;})[0];
+    var empty=document.getElementById('tl-insp-empty'), body=document.getElementById('tl-insp-body');
+    if(!s||s.removed){ empty.hidden=false; body.hidden=true; return; }
+    empty.hidden=true; body.hidden=false;
+    document.getElementById('tl-insp-name').textContent=s.label;
+    document.getElementById('tl-insp-dur').value=s.dur;
+    var rep=document.getElementById('tl-insp-replace');
+    rep.hidden=!s.replaceable;
+    document.getElementById('tl-insp-note').textContent = s.replaceable
+      ? 'Replace via agent re-searches a fresh web image for this clip, then re-renders.'
+      : 'Removing a clip drops it from the render and re-flows the timeline.';
+  }
+  document.getElementById('tl-insp-dur').addEventListener('input', function(){ var s=scenes.filter(function(x){return x.id===selectedId;})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); } });
+  document.getElementById('tl-insp-remove').addEventListener('click', function(){ var s=scenes.filter(function(x){return x.id===selectedId;})[0]; if(s){ s.removed=true; selectedId=null; layout(); syncInspector(); } });
+  document.getElementById('tl-insp-replace').addEventListener('click', function(){
+    var s=scenes.filter(function(x){return x.id===selectedId;})[0];
+    if(!s || !s.replaceable || !s.path) return;
+    if(!confirm('Ask the agent to find a fresh web image for this clip and re-render the video?')) return;
+    var btn=this; btn.disabled=true; btn.textContent='Starting...';
+    fetch('/timeline-replace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, media_path:s.path})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='&#129302; Replace via agent'; alert((d&&d.error)||'Could not start replacement.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML='&#129302; Replace via agent'; alert('Could not start replacement.'); });
+  });
+
+  // ---- preview player ----
+  var pimg=document.getElementById('tl-pimg'), pvid=document.getElementById('tl-pvid'), pempty=document.getElementById('tl-stage-empty');
+  var playing=false, clock=0, lastTs=0, curIdx=-1;
+  function sceneAt(t){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(t < acc+vis[i].dur){ return {scene:vis[i], idx:i, local:t-acc}; } acc+=vis[i].dur; } return vis.length? {scene:vis[vis.length-1], idx:vis.length-1, local:0} : null; }
+  function showScene(info){
+    if(!info){ pimg.style.display='none'; pvid.style.display='none'; pempty.style.display='block'; return; }
+    pempty.style.display='none';
+    if(curIdx===info.idx) return;
+    curIdx=info.idx;
+    var s=info.scene;
+    if(s.video && s.thumb){ pimg.style.display='none'; pvid.style.display='block'; try{ pvid.src=s.thumb; pvid.currentTime=0; if(playing) pvid.play().catch(function(){}); }catch(e){} }
+    else { pvid.pause(); pvid.style.display='none'; pimg.style.display='block'; pimg.src=s.thumb||''; }
+  }
+  function updatePlayhead(){
+    playhead.style.left=(clock*SCALE)+'px';
+    document.getElementById('tl-playtime').textContent=fmt(clock)+' / '+fmt(totalDur());
+  }
+  function tick(ts){
+    if(!playing) return;
+    var dt=(ts-lastTs)/1000; lastTs=ts; clock+=dt;
+    var total=totalDur();
+    if(clock>=total){ clock=total; updatePlayhead(); stop(); return; }
+    showScene(sceneAt(clock)); updatePlayhead();
+    requestAnimationFrame(tick);
+  }
+  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); document.getElementById('tl-play').innerHTML='&#10073;&#10073; Pause'; showScene(sceneAt(clock)); requestAnimationFrame(tick); }
+  function stop(){ playing=false; pvid.pause(); document.getElementById('tl-play').innerHTML='&#9654; Play'; }
+  document.getElementById('tl-play').addEventListener('click', function(){ if(playing) stop(); else play(); });
+  ruler.addEventListener('click', function(e){ var rect=ruler.getBoundingClientRect(); clock=Math.max(0,Math.min(totalDur(),(e.clientX-rect.left+ruler.scrollLeft)/SCALE)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); });
+
+  function bindVol(id, key, out){
+    var el=document.getElementById(id), o=document.getElementById(out);
+    el.value=volumes[key]; o.textContent=Math.round(volumes[key]*100)+'%';
+    el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; });
+  }
+  bindVol('tl-voice-vol','voice','tl-v-voice');
+  bindVol('tl-seedance-vol','seedance','tl-v-seedance');
+  bindVol('tl-sfx-vol','sfx','tl-v-sfx');
+  bindVol('tl-music-vol','music','tl-v-music');
+
+  document.getElementById('tl-render').addEventListener('click', function(){
+    var btn=this; btn.disabled=true; btn.textContent='Starting render...';
+    var vis=visible();
+    var edits={ scenes: vis.map(function(s){return {id:s.id, duration:s.dur};}),
+                order: vis.map(function(s){return s.id;}),
+                removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
+                volumes: volumes };
+    fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.textContent='Render final video'; alert((d&&d.error)||'Could not start render.'); } })
+      .catch(function(){ btn.disabled=false; btn.textContent='Render final video'; alert('Could not start render.'); });
+  });
+  layout(); updatePlayhead();
+})();
+</script>
+"""
+
+
+def _timeline_thumb(project_dir, scene):
+    """Return (thumb_url, is_video, resolved_path_or_None) for a scene's media."""
+    asset = scene.get("asset")
+    clip = scene.get("clip")
+    if asset:
+        direct = Path(asset)
+        if direct.is_absolute() and direct.exists():
+            return link_for(direct), is_video_path(direct), direct
+        for sub in ("web images", "gpt images", "local media", "speaker", "seedance 2.0"):
+            candidate = project_dir / sub / asset
+            if candidate.exists():
+                return link_for(candidate), is_video_path(candidate), candidate
+    if clip:
+        candidate = project_dir / "seedance 2.0" / clip
+        if candidate.exists():
+            return link_for(candidate), True, candidate
+    return "", False, None
+
+
+def timeline_model(slug):
+    config = agent_core.load_project_config(slug)
+    project_dir = agent_core.PROJECTS_DIR / slug
+    scenes = []
+    for index, scene in enumerate(config.get("scenes", [])):
+        start = float(scene.get("start", 0) or 0)
+        end = float(scene.get("end", start) or start)
+        dur = max(0.3, end - start)
+        thumb, is_video, resolved = _timeline_thumb(project_dir, scene)
+        label = scene.get("name") or scene.get("caption") or scene.get("script") or f"Scene {index + 1}"
+        label = re.sub(r"\s+", " ", str(label)).strip()[:54] or f"Scene {index + 1}"
+        replaceable = bool(resolved and "web images" in {p.lower() for p in resolved.parts}
+                           and not scene.get("speaker_hook"))
+        scenes.append({
+            "id": str(scene.get("id", index)),
+            "label": label,
+            "dur": round(dur, 2),
+            "thumb": thumb,
+            "video": bool(is_video),
+            "path": str(resolved) if resolved else "",
+            "replaceable": replaceable,
+            "caption": bool(scene.get("caption") or scene.get("render_caption") or scene.get("script")),
+            "speaker": bool(scene.get("speaker_hook")),
+        })
+    volumes = {
+        "voice": float(config.get("audio_master_gain", 1.0) or 1.0),
+        "seedance": float(config.get("seedance_audio_volume", 0.16) or 0.0),
+        "sfx": float(config.get("sfx_volume", 0.075) or 0.0),
+        "music": float(config.get("background_music_volume", 0.0) or 0.0),
+    }
+    return {
+        "slug": slug,
+        "title": config.get("title", slug),
+        "duration": round(float(config.get("duration", 0) or 0), 2),
+        "scenes": scenes,
+        "volumes": volumes,
+    }
+
+
+def start_timeline_job(slug, edits):
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued timeline render."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": str(agent_core.PROJECTS_DIR / slug),
+            "created_at": time.time(),
+            "job_kind": "timeline",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            result = agent_core.render_project_timeline(slug, edits, status_cb=status_cb, cancel_event=cancel_event)
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = result
+        except (RunCancelled, pipeline.PipelineCancelled):
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def timeline_page(slug):
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return page("Timeline Editor", '<div class="top"><div class="brand"><h1>Timeline Editor</h1></div></div><section class="panel"><div class="hint">Unknown project.</div></section>')
+    try:
+        model = timeline_model(slug)
+    except Exception as exc:
+        return page("Timeline Editor", f'<div class="top"><div class="brand"><h1>Timeline Editor</h1></div></div><section class="panel"><div class="hint">Could not load timeline: {esc(str(exc))}</div></section>')
+    header = f"""
+    <div class="top">
+      <div class="brand">
+        <img class="brand-mark" src="/static/app_icon.png" width="56" height="56" alt="">
+        <div><h1>Timeline Editor</h1><p class="sub">{esc(model['title'])} &mdash; trim clips, set volumes, preview the order, then render the final video.</p></div>
+      </div>
+      <div class="nav-actions">
+        <a class="button secondary" href="/">&#43; New Project</a>
+        <a class="button secondary" href="/assets">&#127916; Asset Library</a>
+      </div>
+    </div>
+    """
+    model_tag = '<script id="timeline-model" type="application/json">' + json.dumps(model) + '</script>'
+    body = header + model_tag + TIMELINE_SKELETON.replace("__SLUG__", esc(slug)) + TIMELINE_ASSETS
+    return page("Timeline Editor", body)
 
 
 def job_page(job_id):
@@ -2047,7 +2847,7 @@ def job_page(job_id):
     status = job["status"]
     klass = "done" if status == "done" else "error" if status == "error" else "cancelled" if status == "cancelled" else "cancelling" if status == "cancelling" else ""
     logs = job.get("logs", [])
-    progress_html = render_progress(status, logs, job.get("created_at"))
+    progress_html = render_progress(status, logs, job.get("created_at"), log_times=job.get("log_times"), job_kind=job.get("job_kind"))
     result_html = render_outputs(job.get("result"), job_id)
     error_html = f'<section class="panel"><h2>Error</h2><pre>{esc(job.get("error"))}</pre></section>' if job.get("error") else ""
     media_html = render_media_replacer(job_id, job)
@@ -2057,6 +2857,11 @@ def job_page(job_id):
             f'<form class="inline-form" method="post" action="/cancel?id={urllib.parse.quote(job_id)}">'
             f'<button class="danger" type="submit">Cancel run</button></form>'
         )
+    timeline_html = ""
+    proj = job.get("project_dir")
+    if proj and Path(proj).exists() and job.get("job_kind") != "sfx":
+        tslug = Path(proj).name
+        timeline_html = f'<a class="button" href="/timeline?slug={urllib.parse.quote(tslug)}">&#127902; Timeline editor</a>'
     body = f"""
     <div id="job-root" data-status="{esc(status)}" data-job-id="{esc(job_id)}">
       <div class="job-head">
@@ -2065,6 +2870,7 @@ def job_page(job_id):
           <p>Status: <span id="job-status-label" class="status {klass}">{esc(status)}</span></p>
         </div>
         <div class="job-actions">
+          {timeline_html}
           <a class="button secondary" href="/">New project</a>
           <a class="button secondary" href="/assets">Assets</a>
           {cancel_html}
@@ -2100,7 +2906,7 @@ def job_status_payload(job_id):
         "exists": status != "missing",
         "status": status,
         "klass": klass,
-        "progress_html": render_progress(status, logs, job.get("created_at")),
+        "progress_html": render_progress(status, logs, job.get("created_at"), log_times=job.get("log_times"), job_kind=job.get("job_kind")),
         "log_text": visible_log_text(logs),
         "outputs_html": render_outputs(job.get("result"), job_id),
         "error_html": f'<section class="panel"><h2>Error</h2><pre>{esc(job.get("error"))}</pre></section>' if job.get("error") else "",
@@ -2240,6 +3046,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(assets_page())
         elif parsed.path == "/sfx":
             self.send_bytes(sfx_page())
+        elif parsed.path == "/timeline":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            self.send_bytes(timeline_page(slug))
         elif parsed.path == "/ui-state":
             self.send_bytes(json.dumps(load_ui_state()).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/project-preset":
@@ -2333,6 +3142,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
             self.end_headers()
+            return
+        if parsed.path == "/timeline-render":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            edits = data.get("edits") or {}
+            if not slug or not safe_project_dir(slug):
+                self.send_bytes(json.dumps({"ok": False, "error": "Unknown project."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            job_id = start_timeline_job(slug, edits)
+            self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-replace":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            media_path = str(data.get("media_path", ""))
+            project_dir = safe_project_dir(slug)
+            if not project_dir or not media_path or not valid_replace_path_values([media_path]):
+                self.send_bytes(json.dumps({"ok": False, "error": "Only web images of this project can be replaced."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            fields = project_form_state(project_dir)
+            for key, value in list(fields.items()):
+                if isinstance(value, bool):
+                    fields[key] = "on" if value else ""
+            fields["loaded_project_source"] = slug
+            fields["slug"] = slug
+            fields["loaded_project_mode"] = "recut_existing_only"
+            fields["initial_replace_media_path"] = [media_path]
+            job_id = start_job(fields, {})
+            self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/sfx-run":
             length = int(self.headers.get("Content-Length", "0"))
