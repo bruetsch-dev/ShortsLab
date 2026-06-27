@@ -31,6 +31,7 @@ import json
 import shutil
 import tempfile
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 try:
@@ -220,8 +221,17 @@ def apify_search(queries, results_per_query, status_cb=None):
         with urllib.request.urlopen(req, timeout=290) as r:
             items = json.loads(r.read().decode("utf-8"))
         return items if isinstance(items, list) else []
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()[:180]
+        except Exception:
+            pass
+        hint = " (run-sync timed out; fewer queries per call needed)" if exc.code in (408, 504) else ""
+        _status(status_cb, f"Apify: search failed (HTTP {exc.code}{': ' + detail if detail else ''}){hint}.")
+        return []
     except Exception as exc:  # noqa: BLE001
-        _status(status_cb, f"Apify: search failed ({exc.__class__.__name__}).")
+        _status(status_cb, f"Apify: search failed ({exc.__class__.__name__}: {exc}).")
         return []
 
 
@@ -567,15 +577,28 @@ def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
         _status(status_cb, "Apify: searching TikTok for a hook clip (real influencer)...")
         _take(apify_search([lead_query], 6, status_cb=status_cb), 1, hook=True)
 
-    # 2) The rest from per-style queries.
+    # 2) The rest from per-style queries. Apify's run-sync endpoint caps near 300s and
+    #    downloads every matched video before returning, so sending all queries at once
+    #    (with shouldDownloadVideos) routinely times out. Search in small chunks instead:
+    #    each sync run stays fast, one failing chunk can't wipe out the whole pool, and we
+    #    stop early once enough clips are accepted.
     queries = build_queries(["tiktok"], terms, script_text, script_relevancy, count=max(count, 3))
     _status(status_cb, f"Apify: searching TikTok for {len(queries)} style queries...")
     per_q = max(2, (count // max(len(queries), 1)) + 2)
-    items = apify_search(queries, per_q, status_cb=status_cb)
-    if not items and not accepted:
+    need_total = count + (1 if accepted else 0)
+    CHUNK = 3
+    got_any = False
+    for i in range(0, len(queries), CHUNK):
+        if (cancel_check and cancel_check()) or len(accepted) >= need_total:
+            break
+        chunk = queries[i:i + CHUNK]
+        items = apify_search(chunk, per_q, status_cb=status_cb)
+        if items:
+            got_any = True
+            _take(items, need_total)
+    if not got_any and not accepted:
         _status(status_cb, "Apify: no clips returned for these queries. Try broader style terms.")
         return []
-    _take(items, count + (1 if accepted else 0))
 
     # 3) Normalize accepted raws into the seedance folder, hook first.
     results = []

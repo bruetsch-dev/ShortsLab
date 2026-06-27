@@ -109,12 +109,10 @@ def top_nav():
         '<nav class="nav-actions">'
         f'<a class="button" href="/?new=1">{ICON_NEW}<span>New project</span></a>'
         f'<a class="button secondary" href="/assets">{ICON_GRID}<span>Assets</span></a>'
-        '<span class="nav-sep" aria-hidden="true"></span>'
-        '<div class="nav-sfx-wrap">'
-        '<button type="button" class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">'
-        '<span class="tt-ico tt-sun">&#9728;</span><span class="tt-ico tt-moon">&#9789;</span><span class="tt-knob"></span></button>'
         f'<a class="button secondary nav-sfx" href="/sfx">{ICON_SFX}<span>SFX master</span></a>'
-        '</div>'
+        '<span class="nav-sep" aria-hidden="true"></span>'
+        '<button type="button" class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">'
+        '<span class="tt-knob"><span class="tt-sun">&#9728;</span><span class="tt-moon">&#9789;</span></span></button>'
         '</nav>'
     )
 
@@ -533,23 +531,29 @@ def app_style():
       .nav-actions .button.nav-sfx .ico { color: #fff; }
       /* dark-mode switch, humbly stacked above the SFX master button */
       .nav-sfx-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-      .theme-toggle {
-        width: 46px; height: 22px; min-width: 0; margin: 0; padding: 0; position: relative;
-        border: 2px solid var(--ink); border-radius: 999px; background: var(--bg-input);
-        box-shadow: var(--sh-1); cursor: pointer; display: inline-flex; align-items: center;
+      /* dark-mode switch: identical apple toggle to the green on/off ones, turns green
+         when dark; the sliding knob carries the sun (light) / moon (dark) glyph */
+      .nav-actions .theme-toggle {
+        appearance: none; -webkit-appearance: none; flex: 0 0 auto;
+        width: 46px; height: 24px; min-width: 46px; padding: 0; margin: 0; position: relative;
+        border: 2px solid var(--ink); border-radius: 999px; background: var(--bg-overlay);
+        box-shadow: none; cursor: pointer; transition: background var(--dur) var(--ease);
       }
-      .theme-toggle::after { display: none; }
-      .theme-toggle:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); background: var(--bg-input); }
+      .nav-actions .theme-toggle::after { display: none; }
+      .nav-actions .theme-toggle:hover { box-shadow: 2px 2px 0 var(--ink); transform: none; background: var(--bg-overlay); }
       .theme-toggle .tt-knob {
-        position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; border-radius: 50%;
-        background: var(--warning); transition: transform var(--dur) var(--ease), background var(--dur) var(--ease);
+        position: absolute; top: 1px; left: 1px; width: 18px; height: 18px; border-radius: 50%;
+        background: var(--ink); display: flex; align-items: center; justify-content: center;
+        transition: transform var(--dur) var(--ease), background var(--dur) var(--ease);
       }
-      html.theme-dark .theme-toggle .tt-knob { transform: translateX(24px); background: var(--accent); }
-      .theme-toggle .tt-ico { position: absolute; top: 50%; transform: translateY(-50%); font-size: 10px; line-height: 1; pointer-events: none; }
-      .theme-toggle .tt-sun { left: 5px; opacity: 1; }
-      .theme-toggle .tt-moon { right: 5px; opacity: .45; }
-      html.theme-dark .theme-toggle .tt-sun { opacity: .45; }
-      html.theme-dark .theme-toggle .tt-moon { opacity: 1; }
+      html.theme-dark .nav-actions .theme-toggle { background: var(--success); }
+      html.theme-dark .nav-actions .theme-toggle:hover { background: var(--success); }
+      html.theme-dark .theme-toggle .tt-knob { transform: translateX(22px); background: #fff; }
+      .theme-toggle .tt-sun, .theme-toggle .tt-moon { font-size: 10px; line-height: 1; pointer-events: none; transition: opacity var(--dur) var(--ease); }
+      .theme-toggle .tt-sun { opacity: 1; color: var(--warning); }
+      .theme-toggle .tt-moon { opacity: 0; position: absolute; color: var(--ink); }
+      html.theme-dark .theme-toggle .tt-sun { opacity: 0; position: absolute; }
+      html.theme-dark .theme-toggle .tt-moon { opacity: 1; position: static; }
       .top-left { display: flex; align-items: center; gap: 0; min-width: 0; }
       .top-left .back-arrow {
         flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
@@ -642,32 +646,64 @@ def app_style():
       }
       .create-bar .create-short-btn.create-short-big:hover { transform: translate(-2px,-2px); box-shadow: 8px 8px 0 var(--ink); }
       /* top row: preset symbols + reasoning model + halt */
-      .cbar-top { align-items: flex-end; }
-      .cbar-top .preset-cell { flex: 0 0 auto; }
-      .cbar-top .reasoning-cell { flex: 0 1 300px; max-width: 100%; }
+      .cbar-top { display: grid; grid-template-columns: auto auto; justify-content: space-between; align-items: start; gap: 12px 28px; }
+      .cbar-top .reasoning-cell select { width: 320px; max-width: 100%; }
+      .preset-actions { display: flex; align-items: center; gap: 18px; min-height: 42px; }
+      @media (max-width: 600px) { .cbar-top { grid-template-columns: 1fr; justify-content: stretch; } .cbar-top .reasoning-cell select { width: 100%; } }
       /* borderless preset symbols (high specificity to beat the global button rule) */
-      .cbar-cap .cbar-icon-btn { width: auto; min-width: 0; height: auto; margin: 0; padding: 0 2px; line-height: 1; font-size: 14px; background: transparent; color: var(--muted); border: 0; border-radius: 0; box-shadow: none; cursor: pointer; }
-      .cbar-cap .cbar-icon-btn::after { display: none; }
-      .cbar-cap .cbar-icon-btn:hover { background: transparent; box-shadow: none; transform: translateY(-1px); color: var(--accent); }
-      /* clip-source apple switch — own line under the caption */
-      .csrc-switch { display: flex; align-items: center; gap: 11px; margin: 9px 0 4px; }
-      .csrc-label { font-family: var(--pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; color: var(--faint); cursor: pointer; transition: color var(--dur) var(--ease); }
-      .csrc-label.on { color: var(--ink); }
-      .bigswitch { position: relative; display: inline-block; width: 50px; height: 26px; flex: 0 0 auto; cursor: pointer; }
-      .bigswitch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
-      .bigswitch .bigswitch-knob {
-        position: absolute; inset: 0; border-radius: 999px; border: 2px solid var(--ink);
-        background: var(--accent-subtle); box-shadow: var(--sh-1); transition: background var(--dur) var(--ease);
+      .cbar-cap .cbar-icon-btn, .preset-actions .cbar-icon-btn { width: auto; min-width: 0; height: auto; margin: 0; padding: 0 2px; line-height: 1; font-size: 20px; background: transparent; color: var(--muted); border: 0; border-radius: 0; box-shadow: none; cursor: pointer; }
+      .cbar-cap .cbar-icon-btn::after, .preset-actions .cbar-icon-btn::after { display: none; }
+      .cbar-cap .cbar-icon-btn:hover, .preset-actions .cbar-icon-btn:hover { background: transparent; box-shadow: none; transform: translateY(-1px); color: var(--accent); }
+      /* clip-source segmented switch — labels sit inside, a thumb slides under the active one */
+      .seg-switch {
+        position: relative; display: flex; width: fit-content; margin: 9px 0 4px; padding: 3px; isolation: isolate;
+        border: 2px solid var(--ink); border-radius: 999px; background: var(--bg-input); box-shadow: var(--sh-1);
       }
-      .bigswitch .bigswitch-knob::before {
-        content: ""; position: absolute; top: 1px; left: 1px; width: 20px; height: 20px; border-radius: 50%;
-        background: var(--ink); transition: transform var(--dur) var(--ease);
+      .seg-switch .seg-opt {
+        position: relative; z-index: 1; width: auto; min-width: 0; margin: 0; border: 0; box-shadow: none;
+        background: transparent; cursor: pointer; padding: 7px 16px; border-radius: 999px;
+        font-family: var(--pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .3px;
+        color: var(--muted); transition: color var(--dur) var(--ease);
       }
-      .bigswitch input:checked + .bigswitch-knob { background: var(--accent); }
-      .bigswitch input:checked + .bigswitch-knob::before { transform: translateX(24px); background: #fff; }
+      .seg-switch .seg-opt::after { display: none; }
+      .seg-switch .seg-opt:hover { background: transparent; box-shadow: none; transform: none; color: var(--ink); }
+      .seg-switch .seg-opt.on { color: #fff; }
+      .seg-switch .seg-thumb {
+        position: absolute; z-index: 0; top: 3px; bottom: 3px; left: 3px; width: calc(50% - 3px);
+        border-radius: 999px; background: var(--accent); transition: transform var(--dur) var(--ease);
+      }
+      .seg-switch[data-src="scrape"] .seg-thumb { transform: translateX(100%); }
       /* AI model pickers (generate mode only) */
       .ai-models { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; margin-top: 10px; }
       @media (max-width: 560px) { .ai-models { grid-template-columns: 1fr; } }
+      /* ===== Onboarding wizard ===== */
+      form#short-form { display: block; }                 /* single-column wizard flow */
+      #wizard { max-width: 780px; margin: 0 auto; position: relative; }
+      [data-step] { will-change: transform, opacity; }
+      [data-step].wiz-anim { animation: wizIn .3s var(--ease) both; }
+      @keyframes wizIn { from { opacity: 0; transform: translateX(46px); } to { opacity: 1; transform: translateX(0); } }
+      .wiz-headline { text-align: center; padding: 30px 16px 10px; margin-bottom: 6px; }
+      .wiz-type { font-family: var(--display); font-size: clamp(17px, 3.2vw, 28px); color: var(--ink); line-height: 1.45; text-shadow: 2px 2px 0 rgba(232,71,43,.22); }
+      .wiz-type::after { content: "\\2588"; margin-left: 2px; color: var(--accent-2); animation: wizCaret 1s steps(1) infinite; }
+      @keyframes wizCaret { 50% { opacity: 0; } }
+      .wiz-nav { display: flex; justify-content: flex-end; gap: 10px; margin: 14px 0 6px; }
+      .wiz-nav .button { width: auto; min-width: 0; margin: 0; }
+      /* Back / Continue sit beside the menu column (not above it), vertically centred. Anchored
+         to the menu column itself (right:100% / left:100%), so they hug the panel regardless of
+         where the column lands on screen. */
+      .wiz-topnav { display: block; }
+      .wiz-topnav .button { position: absolute; top: 0; z-index: 40; width: auto; min-width: 0; margin: 0; white-space: nowrap; }
+      #wiz-back-btn { right: 100%; margin-right: 16px; }   /* just left of the menu column, top corner */
+      #wiz-cont-btn { left: 100%; margin-left: 16px; }     /* just right of it, top corner */
+      .wiz-topnav .wiz-back-btn[data-hidden="1"] { visibility: hidden; }
+      @media (max-width: 1120px) {
+        /* not enough side room: pin to the bottom corners instead */
+        .wiz-topnav .button { position: fixed; top: auto; bottom: 16px; transform: none; }
+        #wiz-back-btn { right: auto; left: 14px; margin: 0; }
+        #wiz-cont-btn { left: auto; right: 14px; margin: 0; }
+      }
+      .wiz-backbar { margin-bottom: 14px; }
+      .wiz-backbar .button { width: auto; min-width: 0; margin: 0; padding: 7px 13px; font-size: 10px; }
       .help { display: inline-flex; align-items: center; justify-content: center; color: var(--faint); cursor: help; vertical-align: middle; position: relative; }
       .help:hover, .help:focus { color: var(--accent); outline: none; }
       .help::after {
@@ -734,9 +770,9 @@ def app_style():
       /* a label-wrapped checkbox is just the toggle switch (no box around it) */
       label.switch { display: inline-flex; padding: 0; margin: 0; cursor: pointer; }
       label.switch input[type="checkbox"] { margin: 0; }
-      .otoggles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 11px 22px; }
-      .otoggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; font-family: var(--mono); text-transform: none; letter-spacing: 0; font-size: 13.5px; font-weight: 700; color: var(--ink); }
-      .otoggle input[type="checkbox"] { margin: 0; }
+      .otoggles { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px 34px; }
+      .otoggle { display: flex; align-items: center; justify-content: flex-start; gap: 12px; margin: 0; font-family: var(--mono); text-transform: none; letter-spacing: 0; font-size: 14px; font-weight: 700; color: var(--ink); cursor: pointer; }
+      .otoggle input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
       @media (max-width: 560px){ .otoggles { grid-template-columns: 1fr; } }
       /* --- Clip source --- */
       .csrc-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1177,6 +1213,65 @@ def app_script():
           document.documentElement.classList.toggle("theme-dark", dark);
           try { localStorage.setItem("shortslab-theme", dark ? "dark" : "light"); } catch (e) {}
         };
+        // ===== Onboarding wizard: headline types, then script -> visual -> voice+speaker -> main =====
+        var WIZ_INTRO = "What are we creating today\\u2026?";
+        var wizCur = null;
+        function wizGoto(step) {
+          var hl = document.getElementById("wiz-headline");
+          if (hl) hl.style.display = (step === 1) ? "" : "none";   // headline only over the script step
+          Array.prototype.forEach.call(document.querySelectorAll("[data-step]"), function (el) {
+            var s = parseInt(el.getAttribute("data-step"), 10);
+            if (s === step) { el.style.display = ""; el.classList.remove("wiz-anim"); void el.offsetWidth; el.classList.add("wiz-anim"); }
+            else { el.style.display = "none"; el.classList.remove("wiz-anim"); }
+          });
+          wizCur = step;
+          var tn = document.getElementById("wiz-topnav");
+          var bb = document.getElementById("wiz-back-btn");
+          var cc = document.getElementById("wiz-cont-btn");
+          if (tn) tn.style.display = (step >= 1 && step <= 4) ? "block" : "none";   // Back also shows on the main create step
+          if (bb) bb.setAttribute("data-hidden", step <= 1 ? "1" : "0");            // no Back on the first step
+          if (cc) cc.style.display = (step >= 4) ? "none" : "";                     // no Continue on the main create step
+          try { if (typeof playClick === "function") playClick(); } catch (e) {}
+          try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) { window.scrollTo(0, 0); }
+        }
+        window.wizNext = function () { wizGoto((wizCur == null ? 1 : wizCur) + 1); };
+        window.wizBack = function () { wizGoto(Math.max(1, (wizCur == null ? 1 : wizCur) - 1)); };
+        function wizTypeIntro(cb) {
+          var el = document.getElementById("wiz-type"); if (!el) { if (cb) cb(); return; }
+          var i = 0; el.textContent = "";
+          (function tick() {
+            if (i <= WIZ_INTRO.length) {
+              el.textContent = WIZ_INTRO.slice(0, i);
+              if (i > 0 && WIZ_INTRO.charAt(i - 1) !== " ") { try { if (typeof playKeyTick === "function") playKeyTick(); } catch (e) {} }
+              i++; setTimeout(tick, 60);
+            } else if (cb) cb();
+          })();
+        }
+        function wizInit() {
+          if (!document.getElementById("wizard")) return;
+          var sf = document.getElementById("script-field");
+          var loaded = (document.getElementById("loaded-project-source") || {}).value;
+          var hasScript = sf && sf.value && sf.value.trim();
+          if (hasScript || loaded) { wizGoto(4); return; }
+          // fresh start: show the headline, type it, then reveal the script step below it
+          var hl = document.getElementById("wiz-headline"); if (hl) hl.style.display = "";
+          Array.prototype.forEach.call(document.querySelectorAll("[data-step]"), function (el) { el.style.display = "none"; });
+          // Browsers block Web Audio until the first user gesture, so the typewriter
+          // ticks are silent if we type on load. Wait for the first real interaction
+          // (which also unlocks the audio context) and type WITH sound; a short
+          // fallback types it anyway so the headline never stays blank.
+          var EVT = ["pointerdown", "keydown", "touchstart"];
+          var started = false;
+          function startIntro() {
+            if (started) return; started = true;
+            EVT.forEach(function (e) { window.removeEventListener(e, startIntro, true); });
+            try { uiCtx(); } catch (e) {}
+            wizTypeIntro(function () { setTimeout(function () { wizGoto(1); }, 500); });
+          }
+          EVT.forEach(function (e) { window.addEventListener(e, startIntro, true); });
+          setTimeout(startIntro, 4000);
+        }
+        window.wizInit = wizInit;
         function termList() {
           var hid = document.getElementById("scrape-terms");
           if (!hid) return [];
@@ -1539,11 +1634,13 @@ def app_script():
             var plat = document.querySelector('[name="scrape_platforms"]');
             if (plat) plat.value = "tiktok";
             var scrape = hid.value === "scrape";
-            var tog = document.getElementById("clip-source-toggle");
-            if (tog) tog.checked = scrape;
-            var gen = document.querySelector(".csrc-label.gen"), scr = document.querySelector(".csrc-label.scr");
-            if (gen) gen.classList.toggle("on", !scrape);
-            if (scr) scr.classList.toggle("on", scrape);
+            var seg = document.getElementById("clip-seg");
+            if (seg) {
+              seg.setAttribute("data-src", scrape ? "scrape" : "generate");
+              Array.prototype.forEach.call(seg.querySelectorAll(".seg-opt"), function (o) {
+                o.classList.toggle("on", o.getAttribute("data-src") === (scrape ? "scrape" : "generate"));
+              });
+            }
             // AI model pickers only matter for Generate; hidden entirely in Scrape.
             var ai = document.getElementById("ai-models");
             if (ai) ai.style.display = scrape ? "none" : "grid";
@@ -1554,7 +1651,7 @@ def app_script():
             if (relBlock) relBlock.style.display = scrape ? "block" : "none";
             var rv = document.getElementById("relv-val"); var rng = document.getElementById("script-relevancy");
             if (rv && rng) rv.textContent = rng.value + "%";
-            // AI-image outputs don't apply when scraping — disable + gray them out.
+            // AI-image outputs don't apply when scraping — force them OFF + gray out.
             ["out_web_images", "out_wikimedia", "out_gpt_images"].forEach(function (n) {
               var f = document.querySelector('[name="' + n + '"]'); if (!f) return;
               var lbl = f.closest(".otoggle");
@@ -1568,6 +1665,12 @@ def app_script():
                 if (lbl) lbl.classList.remove("ctrl-disabled");
               }
             });
+            // Video clips are the scraped footage itself — force ON (and lock) when scraping.
+            var vc = document.querySelector('[name="out_video_clips"]');
+            if (vc) {
+              if (scrape) { if (!vc.disabled) vc.dataset.prevChecked = vc.checked ? "1" : "0"; vc.checked = true; vc.disabled = true; }
+              else { if (vc.dataset.prevChecked !== undefined) { vc.checked = (vc.dataset.prevChecked === "1"); delete vc.dataset.prevChecked; } vc.disabled = false; }
+            }
           }
           window.syncClipSource = syncClipSource;
           window.setClipSource = function (src) {
@@ -1710,6 +1813,23 @@ def app_script():
             osc.start(now); osc.stop(now + 0.09);
           } catch (e) {}
         }
+        function playKeyTick() {
+          var ctx = uiCtx(); if (!ctx) return;
+          try {
+            var now = ctx.currentTime, dur = 0.028;
+            var buf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * dur), ctx.sampleRate);
+            var data = buf.getChannelData(0);
+            for (var i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 2);
+            var src = ctx.createBufferSource(); src.buffer = buf;
+            var hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 1700;
+            var g = ctx.createGain();
+            g.gain.setValueAtTime(0.07, now);
+            g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+            src.connect(hp); hp.connect(g); g.connect(ctx.destination);
+            src.start(now); src.stop(now + dur);
+          } catch (e) {}
+        }
+        window.playKeyTick = playKeyTick;
         function setupUiSounds() {
           var sel = "button, a.button, .button, .tier-btn, .action-btn, .speaker-tile, .speaker-pick, .media-tab, .back-arrow, .preview-button, .asset-figure, [role='button']";
           document.addEventListener("pointerdown", function (ev) {
@@ -1940,6 +2060,7 @@ def app_script():
           if (typeof setupToggleSections === "function") setupToggleSections();
           if (typeof syncClipSource === "function") syncClipSource();
           if (typeof renderTermChips === "function") renderTermChips();
+          if (typeof wizInit === "function") wizInit();
           var sform = document.getElementById("short-form");
           if (sform) sform.addEventListener("submit", function (ev) {
             var cs = document.getElementById("clip-source");
@@ -2063,12 +2184,21 @@ def form_page(clear=False, open_load=False, load_slug=""):
       <input id="loaded-project-source" type="hidden" name="loaded_project_source" value="">
       <input type="hidden" name="ui_form" value="1">
 
-      <div class="create-bar panel">
+      <div id="wizard">
+        <div class="wiz-topnav" id="wiz-topnav" style="display:none;">
+          <button type="button" class="button secondary wiz-back-btn" id="wiz-back-btn" onclick="wizBack()">&#8592; Back</button>
+          <button type="button" class="button wiz-cont" id="wiz-cont-btn" onclick="wizNext()">Continue &#8594;</button>
+        </div>
+        <div id="wiz-headline" class="wiz-headline"><span class="wiz-type" id="wiz-type" aria-live="polite"></span></div>
+
+      <div class="create-bar panel" data-step="4">
         <div class="cbar-row cbar-top">
           <div class="cbar-cell preset-cell">
-            <span class="cbar-cap">Preset {help_tip("Save stores the current speaker, models, speaker image, visual direction and all toggles as a preset. Load opens your saved presets plus the built-in Japanese one. The agent decides automatically whether to do a full or a smart (fill-missing) run.")}
+            <span class="cbar-cap">Preset {help_tip("Save stores the current speaker, models, speaker image, visual direction and all toggles as a preset. Load opens your saved presets plus the built-in Japanese one. The agent decides automatically whether to do a full or a smart (fill-missing) run.")}</span>
+            <div class="preset-actions">
               <button type="button" class="cbar-icon-btn" onclick="saveCustomPreset()" title="Save preset" aria-label="Save preset">&#128190;</button>
-              <button type="button" class="cbar-icon-btn" onclick="applyCustomPreset()" title="Load / recall preset" aria-label="Load preset">&#128194;</button></span>
+              <button type="button" class="cbar-icon-btn" onclick="applyCustomPreset()" title="Load / recall preset" aria-label="Load preset">&#128194;</button>
+            </div>
           </div>
           <div class="cbar-cell reasoning-cell">
             <span class="cbar-cap">Reasoning model</span>
@@ -2084,13 +2214,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
         <div class="cbar-section" id="clipsource-panel">
           <span class="cbar-cap">Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok clips that match a visual style and cut them together. Scraping disables the AI video/image models and the AI-image outputs.")}</span>
           <input type="hidden" name="clip_source" id="clip-source" value="{esc(state.get('clip_source') or 'generate')}">
-          <div class="csrc-switch">
-            <span class="csrc-label gen">&#9881;&#65039; AI Generate</span>
-            <label class="bigswitch" title="Toggle AI Generate / Scrape TikTok">
-              <input type="checkbox" id="clip-source-toggle" onchange="onClipToggle(this)">
-              <span class="bigswitch-knob" aria-hidden="true"></span>
-            </label>
-            <span class="csrc-label scr">&#127916; Scrape TikTok</span>
+          <div class="seg-switch" id="clip-seg" data-src="{esc(state.get('clip_source') or 'generate')}">
+            <span class="seg-thumb" aria-hidden="true"></span>
+            <button type="button" class="seg-opt" data-src="generate" onclick="setClipSource('generate')">&#9881;&#65039; AI Generate</button>
+            <button type="button" class="seg-opt" data-src="scrape" onclick="setClipSource('scrape')">&#127916; Scrape TikTok</button>
           </div>
           <div id="ai-models" class="ai-models">
             <div class="cbar-cell">
@@ -2130,14 +2257,14 @@ def form_page(clear=False, open_load=False, load_slug=""):
         <div class="cbar-section">
           <span class="cbar-cap">Outputs {help_tip("Turn individual parts of the pipeline on or off. Off = that part is skipped entirely, and a Smart run will not generate it either. Scraping disables the AI-image outputs.")}</span>
           <div class="otoggles">
-            <label class="otoggle"><span>Web images</span><input type="checkbox" name="out_web_images"{checked("out_web_images")}></label>
-            <label class="otoggle"><span>Wikimedia images</span><input type="checkbox" name="out_wikimedia"{checked("out_wikimedia")}></label>
-            <label class="otoggle"><span>Generated images</span><input type="checkbox" name="out_gpt_images"{checked("out_gpt_images")}></label>
-            <label class="otoggle"><span>Video clips</span><input type="checkbox" name="out_video_clips"{checked("out_video_clips")}></label>
-            <label class="otoggle"><span>Sound effects</span><input type="checkbox" name="out_sfx"{checked("out_sfx")}></label>
-            <label class="otoggle"><span>Transition SFX</span><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}></label>
-            <label class="otoggle"><span>Background music</span><input type="checkbox" name="out_background_music"{checked("out_background_music")}></label>
-            <label class="otoggle"><span>Captions</span><input type="checkbox" name="out_captions"{checked("out_captions")}></label>
+            <label class="otoggle"><input type="checkbox" name="out_web_images"{checked("out_web_images")}><span>Web images</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_wikimedia"{checked("out_wikimedia")}><span>Wikimedia images</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_gpt_images"{checked("out_gpt_images")}><span>Generated images</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_video_clips"{checked("out_video_clips")}><span>Video clips</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_sfx"{checked("out_sfx")}><span>Sound effects</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}><span>Transition SFX</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_background_music"{checked("out_background_music")}><span>Background music</span></label>
+            <label class="otoggle"><input type="checkbox" name="out_captions"{checked("out_captions")}><span>Captions</span></label>
           </div>
         </div>
 
@@ -2146,7 +2273,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
 
       <section class="stack">
         {advanced_hidden_inputs(state)}
-        <div class="panel accent">
+        <div class="panel accent" data-step="1">
           <label>Text script {help_tip("The voiceover is generated from this with Gemini TTS. Mark the opening line(s) as the hook: it is spoken first, then a short pause, then the rest. With a speaker image it drives the InfiniteTalk talking-head opening.")}</label>
           <div class="script-wrap">
             <div class="script-highlight" id="script-highlight" aria-hidden="true"></div>
@@ -2163,14 +2290,11 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
           </div>
         </div>
-        <div class="panel toggle-panel" id="visual-panel">
-          <div class="panel-head">
-            <label>Optional Visual Direction {help_tip("Optional. The Voice Script is authoritative; this is secondary style guidance (e.g. darker documentary look, faster cuts, more maps). If empty, the visual plan is inferred from the script.")}</label>
-            <label class="switch" title="Use this visual direction"><input type="checkbox" name="use_visual_direction"{checked("use_visual_direction")} onchange="toggleSection('visual-panel', this.checked)"></label>
-          </div>
-          <div class="panel-body">
-            <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty to let the agent plan visuals from the script. Use this only for style, e.g. darker documentary style, faster cuts, more maps.">{esc(state.get("visual_script"))}</textarea>
-          </div>
+
+        <div class="panel" id="visual-panel" data-step="2">
+          <label>Optional Visual Direction {help_tip("Optional. The Voice Script is authoritative; this is secondary style guidance (e.g. darker documentary look, faster cuts, more maps). Leave empty to let the agent plan visuals from the script.")}</label>
+          <input type="hidden" name="use_visual_direction" value="on">
+          <textarea class="visual-textarea" name="visual_script" placeholder="Optional. Leave empty to let the agent plan visuals from the script. Use this only for style, e.g. darker documentary style, faster cuts, more maps.">{esc(state.get("visual_script"))}</textarea>
         </div>
 
         <div class="panel" id="loaded-actions-panel" style="display:none;">
@@ -2186,25 +2310,25 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
         </div>
 
-        <div class="panel">
-          <label>Voice &amp; narration {help_tip("Narration is generated from your script with Gemini TTS (English). The speaker name is sent ahead of the script; the voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts.")}</label>
+        <div class="panel" data-step="3">
+          <label>Voice &amp; narration {help_tip("Narration is generated from your script with Gemini TTS (English). The voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts. Optionally add a speaker face below for a lip-synced talking-head opening.")}</label>
+          <input type="hidden" name="speaker_name" value="{esc(state.get('speaker_name') or 'Narrator')}">
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <input type="text" name="speaker_name" value="{esc(state.get('speaker_name') or 'Narrator')}" placeholder="Speaker name (e.g. Rose)" style="flex:1; min-width:150px;">
             <select name="tts_voice" style="flex:1; min-width:180px;">{voice_options}</select>
             <select name="tts_model" style="flex:1; min-width:180px;">
               <option value="flash"{' selected' if sel_tts_model == 'flash' else ''}>Gemini 2.5 Flash TTS (cheaper)</option>
               <option value="pro"{' selected' if sel_tts_model == 'pro' else ''}>Gemini 2.5 Pro TTS (higher quality)</option>
             </select>
           </div>
-          <div class="checks">
-            <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use generated voice as narration {help_tip("The generated voice becomes the final narration; music and SFX are ducked under it.")}</label>
+          <input type="hidden" name="mix_voice_in_final" value="on">
+          <div class="checks" style="margin-top:18px;">
             <label><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}> Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</label>
           </div>
         </div>
-        <div class="panel toggle-panel" id="speaker-panel">
+        <div class="panel toggle-panel" id="speaker-panel" data-step="3">
           <div class="panel-head">
-            <label>Speaker hook clip {help_tip("Optional. Pick a saved speaker or upload a new face. The marked hook is spoken by this person as a lip-synced talking-head opening (InfiniteTalk). If no hook is marked, a Seedance speaker clip is the fallback.")}</label>
-            <label class="switch" title="Talking-head hook on/off"><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")} onchange="toggleSection('speaker-panel', this.checked)"></label>
+            <label>Use generated speaker video clip {help_tip("Optional. When on, pick (or upload) a face below — the marked hook line is spoken by this person as a lip-synced talking-head opening clip (InfiniteTalk). When off, no talking-head clip is made.")}</label>
+            <label class="switch" title="Generate a talking-head speaker clip on/off"><input type="checkbox" name="enable_speaker_hook"{checked("enable_speaker_hook")} onchange="toggleSection('speaker-panel', this.checked)"></label>
           </div>
           <div class="panel-body">
             <input type="hidden" name="speaker_image_path" id="speaker-image-path" value="{esc(state.get('speaker_image_path'))}">
@@ -2213,14 +2337,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
         </div>
       </section>
-
-      <section class="stack preview-section">
-        <div class="loaded-media-panel" style="border: 1px solid var(--line); border-radius: 10px; padding: 22px;">
-          <h2 style="margin-bottom: 5px;">&#127916; Project media preview</h2>
-          <div class="hint" id="project-media-hint" style="margin-bottom: 18px;">No project loaded. Click &ldquo;Load project&rdquo; in the top bar to browse a past project &mdash; its media appears here.</div>
-          <div id="project-media-preview"></div>
-        </div>
-      </section>
+      </div>
     </form>
 
     <div id="load-modal" class="modal-overlay">
@@ -2981,6 +3098,8 @@ def media_kind_for_path(project_dir, path, manifest=None):
             return "web replaced"
         return "web"
     if "seedance 2.0" in rel_parts:
+        if Path(path).name.lower().startswith("scraped"):
+            return "tiktok"
         return "seedance"
     if "gpt images" in rel_parts:
         return "gpt source"
@@ -3316,9 +3435,8 @@ def asset_card(summary):
       </div>
       <div class="asset-primary">
         <a class="button asset-go" href="{results_href}">&#9654; Check results</a>
-        <a class="button secondary" href="/?project={esc(slug)}">&#128194; Load project</a>
+        {f'<a class="button secondary asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Edit</a>' if has_video else '<a class="button secondary" href="/?project={esc(slug)}">&#128194; Open</a>'}
       </div>
-      {f'<a class="button asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Open timeline editor</a>' if has_video else '<div class="asset-timeline-locked">&#128274; Timeline opens after first render</div>'}
     </article>
     """
 

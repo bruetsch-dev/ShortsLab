@@ -5110,7 +5110,7 @@ def run_project(form, status_cb=None):
             log(status_cb, f"Word alignment skipped ({exc}); captions use estimated timing.")
 
     config_path = project_dir / "config" / "project.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    config_path.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
     config["_config_path"] = str(config_path.resolve())
     
     import edit_plan
