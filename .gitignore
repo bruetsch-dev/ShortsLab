@@ -45,3 +45,4 @@ _archive_merged/
 
 # --- Local one-off dev/test scripts ---
 scripts/_*.py
+/_*.py
