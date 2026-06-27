@@ -1,6 +1,7 @@
 import argparse
 import html
 import json
+import os
 import re
 import threading
 import time
@@ -109,7 +110,11 @@ def top_nav():
         f'<a class="button" href="/?new=1">{ICON_NEW}<span>New project</span></a>'
         f'<a class="button secondary" href="/assets">{ICON_GRID}<span>Assets</span></a>'
         '<span class="nav-sep" aria-hidden="true"></span>'
+        '<div class="nav-sfx-wrap">'
+        '<button type="button" class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">'
+        '<span class="tt-ico tt-sun">&#9728;</span><span class="tt-ico tt-moon">&#9789;</span><span class="tt-knob"></span></button>'
         f'<a class="button secondary nav-sfx" href="/sfx">{ICON_SFX}<span>SFX master</span></a>'
+        '</div>'
         '</nav>'
     )
 
@@ -231,45 +236,6 @@ def delete_named_preset(name):
     except Exception:
         pass
     return False
-
-
-def test_scrape_connection(cookies):
-    """Probe TikTok/Instagram with the given connection (browser name or cookies.txt
-    path) and report whether real clips are reachable. Returns {ok, message}."""
-    if not cookies:
-        return {"ok": False, "message": "Pick a browser you're signed in to, or give a cookies.txt path."}
-    try:
-        import clip_scraper
-        import yt_dlp
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": f"Scraper unavailable ({exc.__class__.__name__})."}
-    clip_scraper.set_cookies(cookies)
-    try:
-        opts = clip_scraper._ydl_opts({"playlistend": 3, "socket_timeout": 12})
-        targets = [
-            ("TikTok", "https://www.tiktok.com/tag/tokyofashion"),
-            ("TikTok", "https://www.tiktok.com/tag/japan"),
-        ]
-        found, errors = [], []
-        for name, url in targets:
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                ents = clip_scraper._entries(info)
-                if ents:
-                    found.append(f"{name} ({len(ents)} clips)")
-                else:
-                    errors.append(f"{name}: no clips")
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{name}: {exc.__class__.__name__}")
-    finally:
-        clip_scraper.set_cookies(None)
-    if found:
-        return {"ok": True, "message": "Connected — reachable: " + ", ".join(found) + "."}
-    detail = "; ".join(errors) if errors else "nothing returned"
-    return {"ok": False, "message": "Couldn't reach TikTok clips (" + detail + "). Sign in to TikTok "
-                                    "in that browser first; for Chrome/Edge, fully close the browser so its "
-                                    "cookie file can be read."}
 
 
 # These were the old "Advanced options" toggles. They are always on in practice,
@@ -493,6 +459,30 @@ def app_style():
         --dur: 120ms; --ease: cubic-bezier(.2,.8,.2,1);
         --blur: blur(0);
       }
+      /* ===== Dark mode — same neo-brutalist look, warm-charcoal paper, light ink.
+         Everything keyed off --ink flips together (text, borders, hard shadows), so the
+         offset-shadow signature stays coherent as light-on-dark. ===== */
+      html.theme-dark {
+        color-scheme: dark;
+        --ink: #ece4d2;
+        --bg-base: #14120d;
+        --bg-raised: #201c14;
+        --bg-overlay: #2a2418;
+        --bg-input: #1a1610;
+        --text: #ece4d2;
+        --muted: #b8b09b;
+        --faint: #8c8470;
+        --line: #3a3426;
+        --line-strong: #ece4d2;
+        --accent: #5b93ec;
+        --accent-hover: #6c9fef;
+        --accent-active: #4a82e0;
+        --accent-subtle: #1c2740;
+        --accent-2: #ff5b3f;
+        --success: #46b06e;
+        --warning: #f0a830;
+        --danger: #ff5b3f;
+      }
       * { scrollbar-color: var(--ink) transparent; }
       *::-webkit-scrollbar { width: 12px; height: 12px; }
       *::-webkit-scrollbar-thumb { background: var(--ink); border-radius: 0; border: 3px solid var(--bg-base); background-clip: padding-box; }
@@ -536,9 +526,30 @@ def app_style():
       }
       .nav-actions .button .ico { opacity: 1; width: 15px; height: 15px; }
       .nav-sep { display: none; }
-      .nav-sfx { background: var(--accent-2); color: #fff; border-color: var(--ink); }
-      .nav-sfx:hover { background: #d63d22; }
-      .nav-sfx .ico { color: #fff; }
+      /* high specificity so it beats .button.secondary (which was leaving a light bg
+         under the white icon -> the icon was invisible). SFX master is the red button. */
+      .nav-actions .button.nav-sfx { background: var(--accent-2); color: #fff; border-color: var(--ink); }
+      .nav-actions .button.nav-sfx:hover { background: var(--accent-active); }
+      .nav-actions .button.nav-sfx .ico { color: #fff; }
+      /* dark-mode switch, humbly stacked above the SFX master button */
+      .nav-sfx-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+      .theme-toggle {
+        width: 46px; height: 22px; min-width: 0; margin: 0; padding: 0; position: relative;
+        border: 2px solid var(--ink); border-radius: 999px; background: var(--bg-input);
+        box-shadow: var(--sh-1); cursor: pointer; display: inline-flex; align-items: center;
+      }
+      .theme-toggle::after { display: none; }
+      .theme-toggle:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); background: var(--bg-input); }
+      .theme-toggle .tt-knob {
+        position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; border-radius: 50%;
+        background: var(--warning); transition: transform var(--dur) var(--ease), background var(--dur) var(--ease);
+      }
+      html.theme-dark .theme-toggle .tt-knob { transform: translateX(24px); background: var(--accent); }
+      .theme-toggle .tt-ico { position: absolute; top: 50%; transform: translateY(-50%); font-size: 10px; line-height: 1; pointer-events: none; }
+      .theme-toggle .tt-sun { left: 5px; opacity: 1; }
+      .theme-toggle .tt-moon { right: 5px; opacity: .45; }
+      html.theme-dark .theme-toggle .tt-sun { opacity: .45; }
+      html.theme-dark .theme-toggle .tt-moon { opacity: 1; }
       .top-left { display: flex; align-items: center; gap: 0; min-width: 0; }
       .top-left .back-arrow {
         flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
@@ -564,7 +575,7 @@ def app_style():
       .steps .arrow::before { content: "//"; font-family: var(--mono); font-size: 12px; }
       .create-bar {
         grid-column: 1 / -1;
-        position: sticky; top: 10px; z-index: 30;
+        position: relative; z-index: 1;
         display: flex; flex-direction: column; gap: 15px;
         padding: 17px 19px; border-radius: var(--r-lg);
         margin-bottom: 22px; border: 3px solid var(--ink);
@@ -625,7 +636,38 @@ def app_style():
         box-shadow: 7px 7px 0 var(--ink);
       }
       .create-bar .create-short-btn:active { transform: translate(0,0); box-shadow: 2px 2px 0 var(--ink); }
-      @media (max-width: 720px) { .create-bar .create-short-btn { width: 100%; align-self: stretch; } }
+      /* big primary CTA at the bottom of the settings bar */
+      .create-bar .create-short-btn.create-short-big {
+        align-self: stretch; width: 100%; margin-top: 4px; padding: 17px 26px; font-size: 15px;
+      }
+      .create-bar .create-short-btn.create-short-big:hover { transform: translate(-2px,-2px); box-shadow: 8px 8px 0 var(--ink); }
+      /* top row: preset symbols + reasoning model + halt */
+      .cbar-top { align-items: flex-end; }
+      .cbar-top .preset-cell { flex: 0 0 auto; }
+      .cbar-top .reasoning-cell { flex: 0 1 300px; max-width: 100%; }
+      /* borderless preset symbols (high specificity to beat the global button rule) */
+      .cbar-cap .cbar-icon-btn { width: auto; min-width: 0; height: auto; margin: 0; padding: 0 2px; line-height: 1; font-size: 14px; background: transparent; color: var(--muted); border: 0; border-radius: 0; box-shadow: none; cursor: pointer; }
+      .cbar-cap .cbar-icon-btn::after { display: none; }
+      .cbar-cap .cbar-icon-btn:hover { background: transparent; box-shadow: none; transform: translateY(-1px); color: var(--accent); }
+      /* clip-source apple switch — own line under the caption */
+      .csrc-switch { display: flex; align-items: center; gap: 11px; margin: 9px 0 4px; }
+      .csrc-label { font-family: var(--pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; color: var(--faint); cursor: pointer; transition: color var(--dur) var(--ease); }
+      .csrc-label.on { color: var(--ink); }
+      .bigswitch { position: relative; display: inline-block; width: 50px; height: 26px; flex: 0 0 auto; cursor: pointer; }
+      .bigswitch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+      .bigswitch .bigswitch-knob {
+        position: absolute; inset: 0; border-radius: 999px; border: 2px solid var(--ink);
+        background: var(--accent-subtle); box-shadow: var(--sh-1); transition: background var(--dur) var(--ease);
+      }
+      .bigswitch .bigswitch-knob::before {
+        content: ""; position: absolute; top: 1px; left: 1px; width: 20px; height: 20px; border-radius: 50%;
+        background: var(--ink); transition: transform var(--dur) var(--ease);
+      }
+      .bigswitch input:checked + .bigswitch-knob { background: var(--accent); }
+      .bigswitch input:checked + .bigswitch-knob::before { transform: translateX(24px); background: #fff; }
+      /* AI model pickers (generate mode only) */
+      .ai-models { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; margin-top: 10px; }
+      @media (max-width: 560px) { .ai-models { grid-template-columns: 1fr; } }
       .help { display: inline-flex; align-items: center; justify-content: center; color: var(--faint); cursor: help; vertical-align: middle; position: relative; }
       .help:hover, .help:focus { color: var(--accent); outline: none; }
       .help::after {
@@ -713,13 +755,25 @@ def app_style():
       .scrape-lbl { margin-top: 12px; }
       .scrape-lbl:first-child { margin-top: 0; }
       .scrape-terms { min-height: 64px; resize: vertical; }
+      .scrape-auto-note { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--ink); background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 10px; margin: 2px 0 6px; }
+      .chip-add { display: flex; gap: 8px; }
+      .chip-add #term-input { flex: 1; min-width: 0; margin: 0; }
+      .chip-add .button { width: auto; min-width: 0; margin: 0; padding: 0 16px; font-size: 18px; line-height: 1; }
+      .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+      .chips:empty { margin: 0; }
+      .chip { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--ink); background: var(--accent-subtle); border: 1px solid var(--line-strong); border-radius: 999px; padding: 4px 11px; }
+      .chips .chip button {
+        width: auto; min-width: 0; height: auto; margin: 0; padding: 0;
+        border: 0; background: transparent; box-shadow: none; border-radius: 0;
+        color: var(--muted); font-size: 16px; line-height: 1; cursor: pointer;
+        display: inline-flex; align-items: center; justify-content: center;
+      }
+      .chips .chip button::after { display: none; }
+      .chips .chip button:hover { background: transparent; box-shadow: none; transform: none; color: var(--accent-2); }
       .relv-val { color: var(--accent); font-weight: 700; }
-      .connect-row { display: flex; gap: 8px; align-items: stretch; }
-      .connect-row select { flex: 1; min-width: 0; margin: 0; }
-      .connect-row .button { width: auto; min-width: 0; margin: 0; padding: 8px 14px; white-space: nowrap; }
-      #connect-status.ok { color: var(--success); }
-      #connect-status.bad { color: var(--accent-2); }
       .req-tag { display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; color: #fff; background: var(--accent-2); border-radius: var(--r-sm); padding: 1px 5px; vertical-align: middle; }
+      .apify-on { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--success); background: rgba(47,138,82,.1); border: 1px solid var(--success); border-radius: var(--r-sm); padding: 7px 10px; margin: 2px 0 4px; }
+      .apify-off { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--accent-2); background: rgba(232,71,43,.08); border: 1px dashed var(--accent-2); border-radius: var(--r-sm); padding: 7px 10px; margin: 2px 0 4px; }
       input[type="range"] {
         -webkit-appearance: none; appearance: none; width: 100%; height: 8px; padding: 0; margin: 6px 0 2px;
         background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: 999px; box-shadow: none; cursor: pointer;
@@ -1118,6 +1172,44 @@ def app_script():
     return """
     <script>
       (function () {
+        window.toggleTheme = function () {
+          var dark = !document.documentElement.classList.contains("theme-dark");
+          document.documentElement.classList.toggle("theme-dark", dark);
+          try { localStorage.setItem("shortslab-theme", dark ? "dark" : "light"); } catch (e) {}
+        };
+        function termList() {
+          var hid = document.getElementById("scrape-terms");
+          if (!hid) return [];
+          return hid.value.split(",").map(function (t) { return t.trim(); }).filter(Boolean);
+        }
+        function setTerms(list) {
+          var hid = document.getElementById("scrape-terms"); if (!hid) return;
+          hid.value = list.join(", ");
+          renderTermChips();
+          if (typeof saveFormStateSoon === "function") saveFormStateSoon();
+        }
+        function renderTermChips() {
+          var box = document.getElementById("term-chips"); if (!box) return;
+          var list = termList();
+          box.innerHTML = list.map(function (t, i) {
+            var safe = t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            return '<span class="chip">' + safe + '<button type="button" onclick="removeTerm(' + i + ')" aria-label="Remove">&times;</button></span>';
+          }).join("");
+        }
+        window.renderTermChips = renderTermChips;
+        window.addTerm = function () {
+          var inp = document.getElementById("term-input"); if (!inp) return;
+          var val = inp.value.trim(); if (!val) return;
+          var list = termList();
+          val.split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (t) {
+            if (list.indexOf(t) === -1) list.push(t);
+          });
+          inp.value = "";
+          setTerms(list);
+        };
+        window.removeTerm = function (i) {
+          var list = termList(); list.splice(i, 1); setTerms(list);
+        };
         window.setProjectMode = function (mode) {
           var hidden = document.getElementById("loaded-project-mode");
           if (hidden) hidden.value = mode;
@@ -1444,25 +1536,25 @@ def app_script():
           }
           function syncClipSource() {
             var hid = document.getElementById("clip-source"); if (!hid) return;
-            // scraping is TikTok-only now; force the (hidden) platforms value clean
             var plat = document.querySelector('[name="scrape_platforms"]');
             if (plat) plat.value = "tiktok";
-            var src = hid.value === "scrape" ? "scrape" : "generate";
-            Array.prototype.forEach.call(document.querySelectorAll(".csrc-btn"), function (b) {
-              b.classList.toggle("csrc-active", b.getAttribute("data-src") === src);
-            });
+            var scrape = hid.value === "scrape";
+            var tog = document.getElementById("clip-source-toggle");
+            if (tog) tog.checked = scrape;
+            var gen = document.querySelector(".csrc-label.gen"), scr = document.querySelector(".csrc-label.scr");
+            if (gen) gen.classList.toggle("on", !scrape);
+            if (scr) scr.classList.toggle("on", scrape);
+            // AI model pickers only matter for Generate; hidden entirely in Scrape.
+            var ai = document.getElementById("ai-models");
+            if (ai) ai.style.display = scrape ? "none" : "grid";
             var box = document.getElementById("scrape-settings");
-            if (box) box.style.display = (src === "scrape") ? "block" : "none";
+            if (box) box.style.display = scrape ? "block" : "none";
+            // the script-relevancy slider lives in the Text script panel but only matters for scraping.
+            var relBlock = document.getElementById("script-relevancy-block");
+            if (relBlock) relBlock.style.display = scrape ? "block" : "none";
             var rv = document.getElementById("relv-val"); var rng = document.getElementById("script-relevancy");
             if (rv && rng) rv.textContent = rng.value + "%";
-            // Scraping uses real footage, so the AI video/image models and the AI-image
-            // outputs don't apply — disable + gray them out.
-            var scrape = (src === "scrape");
-            ["video_model", "image_model"].forEach(function (n) {
-              var f = document.querySelector('[name="' + n + '"]'); if (!f) return;
-              f.disabled = scrape;
-              var cell = f.closest(".cbar-cell"); if (cell) cell.classList.toggle("ctrl-disabled", scrape);
-            });
+            // AI-image outputs don't apply when scraping — disable + gray them out.
             ["out_web_images", "out_wikimedia", "out_gpt_images"].forEach(function (n) {
               var f = document.querySelector('[name="' + n + '"]'); if (!f) return;
               var lbl = f.closest(".otoggle");
@@ -1485,50 +1577,8 @@ def app_script():
             var state = collectFormState();
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
-          window.testConnection = function () {
-            var sel = document.getElementById("scrape-cookies");
-            var file = document.getElementById("scrape-cookies-file");
-            var st = document.getElementById("connect-status");
-            var btn = document.getElementById("connect-test-btn");
-            var cookies = (file && file.value.trim()) || (sel && sel.value) || "";
-            if (!cookies) { if (st) { st.className = "hint bad"; st.textContent = "Pick a browser you're signed in to, or give a cookies.txt path."; } return; }
-            if (st) { st.className = "hint"; st.textContent = "Testing connection (this can take ~15s)…"; }
-            if (btn) btn.disabled = true;
-            fetch("/test-connection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cookies: cookies }) })
-              .then(function (r) { return r.json(); })
-              .then(function (d) {
-                if (st) {
-                  st.className = "hint " + (d && d.ok ? "ok" : "bad");
-                  st.textContent = (d && d.message) || (d && d.ok ? "Connected." : "Connection failed.");
-                }
-              })
-              .catch(function () { if (st) { st.className = "hint bad"; st.textContent = "Connection test failed (network)."; } })
-              .finally(function () { if (btn) btn.disabled = false; });
-          };
-          window.applyTier = function (tier) {
-            var TIERS = {
-              cheap:  { video_model: "ltx-2.3",           image_model: "google/nano-banana-2/text-to-image", reasoning_model: "google/gemini-3.1-pro-preview", tts_model: "flash" },
-              medium: { video_model: "seedance-2.0-fast", image_model: "google/nano-banana-2/text-to-image", reasoning_model: "openai/gpt-5.5",            tts_model: "pro" },
-              best:   { video_model: "seedance-2.0",      image_model: "openai/gpt-image-2/text-to-image",   reasoning_model: "anthropic/claude-opus-4.8", tts_model: "pro" }
-            };
-            var preset = TIERS[tier];
-            var form = document.getElementById("short-form");
-            if (!preset || !form) return;
-            Object.keys(preset).forEach(function (name) {
-              var field = form.querySelector('[name="' + name + '"]');
-              if (field) field.value = preset[name];
-            });
-            Array.prototype.forEach.call(document.querySelectorAll(".tier-btn"), function (b) { b.classList.remove("tier-active"); });
-            var active = document.querySelector('.tier-btn[onclick*="' + tier + '"]');
-            if (active) active.classList.add("tier-active");
-            var state = collectFormState();
-            if (state) {
-              try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {}
-              sendFormState(state);
-            }
-            if (typeof setStatus === "function") setStatus(tier.charAt(0).toUpperCase() + tier.slice(1) + " preset loaded.");
-          };
-          var CUSTOM_PRESET_FIELDS = ["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","scrape_terms","script_relevancy","scrape_cookies","scrape_cookies_file"];
+          window.onClipToggle = function (cb) { window.setClipSource(cb.checked ? "scrape" : "generate"); };
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_terms"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -1889,21 +1939,16 @@ def app_script():
           setupJobPolling();
           if (typeof setupToggleSections === "function") setupToggleSections();
           if (typeof syncClipSource === "function") syncClipSource();
+          if (typeof renderTermChips === "function") renderTermChips();
           var sform = document.getElementById("short-form");
           if (sform) sform.addEventListener("submit", function (ev) {
             var cs = document.getElementById("clip-source");
             if (!cs || cs.value !== "scrape") return;
-            var sel = document.getElementById("scrape-cookies");
-            var file = document.getElementById("scrape-cookies-file");
-            var connected = (file && file.value.trim()) || (sel && sel.value);
-            if (!connected) {
-              ev.preventDefault();
-              var st = document.getElementById("connect-status");
-              if (st) { st.className = "hint bad"; st.textContent = "Connect TikTok before a scrape run — pick the browser you're signed in to, then click Test."; }
-              var panel = document.getElementById("scrape-settings");
-              if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
-              if (typeof setStatus === "function") setStatus("Scrape runs require a TikTok connection.");
-            }
+            if (window.APIFY_READY) return;  // Apify configured -> good to go
+            ev.preventDefault();
+            var panel = document.getElementById("scrape-settings");
+            if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
+            if (typeof setStatus === "function") setStatus("Scrape needs an Apify token — add APIFY_TOKEN to .env and restart.");
           });
         });
         setInterval(stickLogToBottom, 5000);
@@ -1927,8 +1972,10 @@ def page(title, body, refresh=None):
         '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
         'family=Press+Start+2P&family=Silkscreen:wght@400;700&family=Space+Mono:wght@400;700&display=swap">'
     )
+    theme_boot = ('<script>try{if(localStorage.getItem("shortslab-theme")==="dark")'
+                  'document.documentElement.classList.add("theme-dark");}catch(e){}</script>')
     return f"""<!doctype html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
+    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{theme_boot}{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
     <body><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
 
 
@@ -1984,6 +2031,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
     # "New project" starts from clean defaults; normal load restores last session.
     state = normalize_ui_state({}) if clear else load_ui_state()
     previous_project_options = project_options_html()
+    apify_ready = bool((os.environ.get("APIFY_TOKEN") or "").strip())
+    apify_ready_js = "true" if apify_ready else "false"
 
     voice_tones = {
         "Zephyr": "Bright", "Puck": "Upbeat", "Charon": "Informative",
@@ -2015,46 +2064,13 @@ def form_page(clear=False, open_load=False, load_slug=""):
       <input type="hidden" name="ui_form" value="1">
 
       <div class="create-bar panel">
-        <div class="cbar-row">
-          <div class="cbar-cell tiers">
-            <span class="cbar-cap">Preset {help_tip("Cheap/Medium/Best load model picks. Custom recalls your saved preset. Save stores the current speaker, models, speaker image, visual direction and all toggles as the Custom preset.")}
-              <button type="button" class="cbar-save-btn" onclick="saveCustomPreset()" title="Save current settings as the Custom preset" aria-label="Save Custom preset">&#128190;</button></span>
-            <div class="tier-btns">
-              <button type="button" class="tier-btn" onclick="applyTier('cheap')"><b>Cheap</b><small>~$0.50</small></button>
-              <button type="button" class="tier-btn" onclick="applyTier('medium')"><b>Medium</b><small>~$1.50</small></button>
-              <button type="button" class="tier-btn" onclick="applyTier('best')"><b>Best</b><small>~$3.50</small></button>
-              <button type="button" class="tier-btn" onclick="applyCustomPreset()"><b>Custom</b><small>recall</small></button>
-            </div>
+        <div class="cbar-row cbar-top">
+          <div class="cbar-cell preset-cell">
+            <span class="cbar-cap">Preset {help_tip("Save stores the current speaker, models, speaker image, visual direction and all toggles as a preset. Load opens your saved presets plus the built-in Japanese one. The agent decides automatically whether to do a full or a smart (fill-missing) run.")}
+              <button type="button" class="cbar-icon-btn" onclick="saveCustomPreset()" title="Save preset" aria-label="Save preset">&#128190;</button>
+              <button type="button" class="cbar-icon-btn" onclick="applyCustomPreset()" title="Load / recall preset" aria-label="Load preset">&#128194;</button></span>
           </div>
-          <div class="cbar-divider" aria-hidden="true"></div>
-          <div class="cbar-cell runtype">
-            <span class="cbar-cap">Run type {help_tip("Normal: full agent pass. Smart: checks what media already exists in the project and only generates what is missing.")}</span>
-            <input type="hidden" name="run_type" id="run-type" value="{esc(state.get('run_type') or 'normal')}">
-            <div class="tier-btns runtype-btns">
-              <button type="button" class="tier-btn" data-run="normal" onclick="setRunType('normal')"><b>Normal</b><small>full agent run</small></button>
-              <button type="button" class="tier-btn" data-run="audit" onclick="setRunType('audit')"><b>Smart</b><small>fill missing media</small></button>
-            </div>
-          </div>
-        </div>
-        <div class="cbar-row cbar-models">
-          <div class="cbar-cell">
-            <span class="cbar-cap">Video model</span>
-            <select name="video_model">
-              <option value="seedance-2.0"{' selected' if state.get("video_model", state.get("seedance_model", "seedance-2.0")) == "seedance-2.0" else ""}>Seedance 2.0 (Web Search + Audio)</option>
-              <option value="seedance-2.0-fast"{' selected' if state.get("video_model") == "seedance-2.0-fast" else ""}>Seedance 2.0 Fast (Web Search + Audio)</option>
-              <option value="seedance-v1.5-pro"{' selected' if state.get("video_model", state.get("seedance_model")) == "seedance-v1.5-pro" else ""}>Seedance 1.5 Pro</option>
-              <option value="ltx-2.3"{' selected' if state.get("video_model") == "ltx-2.3" else ""}>LTX-2.3 (cheap)</option>
-              <option value="happyhorse-1.1"{' selected' if state.get("video_model") == "happyhorse-1.1" else ""}>Happy Horse 1.1 (720p)</option>
-            </select>
-          </div>
-          <div class="cbar-cell">
-            <span class="cbar-cap">Image model</span>
-            <select name="image_model">
-              <option value="openai/gpt-image-2/text-to-image"{' selected' if state.get("image_model") == "openai/gpt-image-2/text-to-image" else ""}>GPT-Image-2 (best)</option>
-              <option value="google/nano-banana-2/text-to-image"{' selected' if state.get("image_model") == "google/nano-banana-2/text-to-image" else ""}>Nano-Banana-2 (cheap)</option>
-            </select>
-          </div>
-          <div class="cbar-cell">
+          <div class="cbar-cell reasoning-cell">
             <span class="cbar-cap">Reasoning model</span>
             <select name="reasoning_model">
               <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
@@ -2062,39 +2078,51 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
             </select>
           </div>
-          <button type="submit" class="create-short-btn">&#9889; Create Short</button>
-        </div>
-        <div class="cbar-row" style="align-items:center; gap:14px;">
-          <label class="cbar-halt"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</span></label>
         </div>
 
         <div class="cbar-sep" aria-hidden="true"></div>
         <div class="cbar-section" id="clipsource-panel">
           <span class="cbar-cap">Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok clips that match a visual style and cut them together. Scraping disables the AI video/image models and the AI-image outputs.")}</span>
           <input type="hidden" name="clip_source" id="clip-source" value="{esc(state.get('clip_source') or 'generate')}">
-          <div class="csrc-btns">
-            <button type="button" class="csrc-btn" data-src="generate" onclick="setClipSource('generate')"><b>Generate</b><small>AI video &amp; images</small></button>
-            <button type="button" class="csrc-btn" data-src="scrape" onclick="setClipSource('scrape')"><b>Scrape clips</b><small>real TikTok</small></button>
+          <div class="csrc-switch">
+            <span class="csrc-label gen">&#9881;&#65039; AI Generate</span>
+            <label class="bigswitch" title="Toggle AI Generate / Scrape TikTok">
+              <input type="checkbox" id="clip-source-toggle" onchange="onClipToggle(this)">
+              <span class="bigswitch-knob" aria-hidden="true"></span>
+            </label>
+            <span class="csrc-label scr">&#127916; Scrape TikTok</span>
+          </div>
+          <div id="ai-models" class="ai-models">
+            <div class="cbar-cell">
+              <span class="cbar-cap">Video model</span>
+              <select name="video_model">
+                <option value="seedance-2.0"{' selected' if state.get("video_model", state.get("seedance_model", "seedance-2.0")) == "seedance-2.0" else ""}>Seedance 2.0 (Web Search + Audio)</option>
+                <option value="seedance-2.0-fast"{' selected' if state.get("video_model") == "seedance-2.0-fast" else ""}>Seedance 2.0 Fast (Web Search + Audio)</option>
+                <option value="seedance-v1.5-pro"{' selected' if state.get("video_model", state.get("seedance_model")) == "seedance-v1.5-pro" else ""}>Seedance 1.5 Pro</option>
+                <option value="ltx-2.3"{' selected' if state.get("video_model") == "ltx-2.3" else ""}>LTX-2.3 (cheap)</option>
+                <option value="happyhorse-1.1"{' selected' if state.get("video_model") == "happyhorse-1.1" else ""}>Happy Horse 1.1 (720p)</option>
+              </select>
+            </div>
+            <div class="cbar-cell">
+              <span class="cbar-cap">Image model</span>
+              <select name="image_model">
+                <option value="openai/gpt-image-2/text-to-image"{' selected' if state.get("image_model") == "openai/gpt-image-2/text-to-image" else ""}>GPT-Image-2 (best)</option>
+                <option value="google/nano-banana-2/text-to-image"{' selected' if state.get("image_model") == "google/nano-banana-2/text-to-image" else ""}>Nano-Banana-2 (cheap)</option>
+              </select>
+            </div>
           </div>
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
             <input type="hidden" name="scrape_platforms" value="tiktok">
-            <label class="scrape-lbl">Visual style / search terms {help_tip("What kind of clips to look for, independent of the spoken script. Describe the look as TikTok-style hashtags/words (e.g. japan street style, tokyo at night, salaryman commute, kimono). The scraper turns these into TikTok hashtags and downloads matching clips.")}</label>
-            <textarea name="scrape_terms" class="scrape-terms" placeholder="e.g. japan street style, tokyo night, salaryman commute, kimono, neon alley">{esc(state.get("scrape_terms"))}</textarea>
-            <label class="scrape-lbl">Script relevancy <span id="relv-val" class="relv-val">{esc(state.get('script_relevancy') or '70')}%</span> {help_tip("How tightly downloaded clips must match the spoken script versus pure visual style. High = clips closely follow what's being said. Low = prioritize the look (more b-roll of the vibe), looser tie to the words.")}</label>
-            <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
-            <label class="scrape-lbl">Connect TikTok <span class="req-tag">required</span> {help_tip("Scrape runs pull real TikTok clips, which need your logged-in session. Pick the browser where you're signed in to TikTok — the app reads that browser's cookies so yt-dlp downloads as you. No password is handled. For Chrome/Edge, fully close the browser so its cookie file can be read. Note: repurposing creators' clips is against TikTok's ToS/copyright; use responsibly.")}</label>
-            <div class="connect-row">
-              <select name="scrape_cookies" id="scrape-cookies">
-                <option value=""{' selected' if not (state.get('scrape_cookies')) else ''}>Not connected</option>
-                <option value="chrome"{' selected' if state.get('scrape_cookies')=='chrome' else ''}>Chrome (signed in to TikTok)</option>
-                <option value="edge"{' selected' if state.get('scrape_cookies')=='edge' else ''}>Edge (signed in to TikTok)</option>
-                <option value="firefox"{' selected' if state.get('scrape_cookies')=='firefox' else ''}>Firefox (signed in to TikTok)</option>
-                <option value="brave"{' selected' if state.get('scrape_cookies')=='brave' else ''}>Brave (signed in to TikTok)</option>
-              </select>
-              <button type="button" class="button" id="connect-test-btn" onclick="testConnection()">Test</button>
+            <div class="scrape-auto-note">&#129504; Search terms are derived automatically by the agent from your voice script {help_tip("You don't have to enter search terms. The Reasoning Agent reads your voice script and intelligently picks the TikTok search queries per scene (English + Japanese); the opening hook is always an attractive Japanese woman in her early 20s. Use the Script-relevancy slider (in the Text script panel) to bias toward the words vs. the look.")}</div>
+            <label class="scrape-lbl">Add your own terms (optional) {help_tip("Extra search terms on top of what the agent derives — they are ALWAYS included. Add English or Japanese words/hashtags (e.g. 原宿 ファッション). Press + or Enter to add.")}</label>
+            <div class="chip-add">
+              <input type="text" id="term-input" placeholder="e.g. 原宿 ファッション, neon alley" onkeydown="if(event.key==='Enter'){{event.preventDefault();addTerm();}}">
+              <button type="button" class="button" onclick="addTerm()" title="Add term">+</button>
             </div>
-            <input type="text" name="scrape_cookies_file" id="scrape-cookies-file" placeholder="…or path to an exported TikTok cookies.txt (optional)" value="{esc(state.get('scrape_cookies_file'))}">
-            <div id="connect-status" class="hint" style="margin-top:6px;"></div>
+            <div class="chips" id="term-chips"></div>
+            <input type="hidden" name="scrape_terms" id="scrape-terms" value="{esc(state.get('scrape_terms'))}">
+            {'' if apify_ready else ('<div class="apify-off">&#9888; No clip source configured. Set APIFY_TOKEN in .env to enable real TikTok scraping. {tip}</div>'.replace('{tip}', help_tip("Add a line APIFY_TOKEN=... to the .env file (get a token from apify.com), then restart the app.")))}
+            <script>window.APIFY_READY = {apify_ready_js};</script>
           </div>
         </div>
 
@@ -2112,6 +2140,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <label class="otoggle"><span>Captions</span><input type="checkbox" name="out_captions"{checked("out_captions")}></label>
           </div>
         </div>
+
+        <button type="submit" class="create-short-btn create-short-big">&#9889; Create Short</button>
       </div>
 
       <section class="stack">
@@ -2127,6 +2157,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
             <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
             <span id="hook-indicator" class="hook-dot" hidden></span>
+          </div>
+          <div id="script-relevancy-block" style="display:none; margin-top:16px;">
+            <label class="scrape-lbl">Script relevancy <span id="relv-val" class="relv-val">{esc(state.get('script_relevancy') or '70')}%</span> {help_tip("Scrape mode only: how tightly the downloaded clips must match this spoken script versus pure visual style. High = clips closely follow what's being said. Low = prioritize the look (more b-roll of the vibe), looser tie to the words.")}</label>
+            <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
           </div>
         </div>
         <div class="panel toggle-panel" id="visual-panel">
@@ -2164,6 +2198,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <div class="checks">
             <label><input type="checkbox" name="mix_voice_in_final"{checked("mix_voice_in_final")}> Use generated voice as narration {help_tip("The generated voice becomes the final narration; music and SFX are ducked under it.")}</label>
+            <label><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}> Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</label>
           </div>
         </div>
         <div class="panel toggle-panel" id="speaker-panel">
@@ -2243,19 +2278,12 @@ def form_page(clear=False, open_load=False, load_slug=""):
         var h=document.getElementById('hook-text'); if(h){ h.value=sel; } ind();
       };
       window.clearHook=function(){ var h=document.getElementById('hook-text'); if(h){ h.value=''; } ind(); };
-      window.setRunType=function(mode){
-        var f=document.getElementById('run-type'); if(f) f.value=mode;
-        Array.prototype.forEach.call(document.querySelectorAll('.runtype-btns .tier-btn'), function(b){
-          b.classList.toggle('run-active', b.getAttribute('data-run')===mode);
-        });
-      };
       document.addEventListener('DOMContentLoaded', function(){
         var ta=document.getElementById('script-field');
         if(ta){
           ta.addEventListener('input', renderHighlight);
           ta.addEventListener('scroll', function(){ var hl=document.getElementById('script-highlight'); if(hl){ hl.scrollTop=ta.scrollTop; hl.scrollLeft=ta.scrollLeft; } });
         }
-        var rt=document.getElementById('run-type'); if(rt){ window.setRunType(rt.value||'normal'); }
         ind();
       });
       ind();
@@ -4431,19 +4459,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
-            return
-        if parsed.path == "/test-connection":
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length)
-            try:
-                payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
-            except Exception:
-                payload = {}
-            result = test_scrape_connection(str(payload.get("cookies", "") or "").strip())
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode("utf-8"))
             return
         if parsed.path == "/approve-speech":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]

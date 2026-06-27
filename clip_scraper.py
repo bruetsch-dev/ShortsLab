@@ -27,7 +27,10 @@ scrape_clips() never raises into the render; on failure it returns what it has.
 import os
 import re
 import subprocess
+import json
+import shutil
 import tempfile
+import urllib.request
 from pathlib import Path
 
 try:
@@ -177,6 +180,84 @@ def _ydl_opts(extra=None):
     if extra:
         opts.update(extra)
     return opts
+
+
+# ---- Apify TikTok scraper (real keyword search + watermark-free download) --------
+# yt-dlp can't search TikTok; Apify can. With shouldDownloadVideos the actor returns a
+# watermark-free mp4 on Apify storage (mediaUrls[0]) plus metadata (w/h/duration/caption)
+# we use to pre-filter before downloading. Token lives in APIFY_TOKEN (env / .env).
+APIFY_ACTOR = "clockworks~tiktok-scraper"
+
+
+def apify_token():
+    return (os.environ.get("APIFY_TOKEN", "") or "").strip()
+
+
+def apify_active():
+    return bool(apify_token())
+
+
+def apify_search(queries, results_per_query, status_cb=None):
+    """Run the Apify TikTok scraper for the given search queries. Returns dataset items
+    (each with videoMeta + mediaUrls). Watermark-free downloads via shouldDownloadVideos."""
+    tok = apify_token()
+    if not tok or not queries:
+        return []
+    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items?token={tok}"
+    body = {
+        "searchQueries": list(queries),
+        "resultsPerPage": max(1, int(results_per_query)),
+        "shouldDownloadVideos": True,
+        "shouldDownloadCovers": False,
+        "shouldDownloadSubtitles": False,
+        "proxyConfiguration": {"useApifyProxy": True},
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=290) as r:
+            items = json.loads(r.read().decode("utf-8"))
+        return items if isinstance(items, list) else []
+    except Exception as exc:  # noqa: BLE001
+        _status(status_cb, f"Apify: search failed ({exc.__class__.__name__}).")
+        return []
+
+
+def _apify_media_url(item):
+    mu = item.get("mediaUrls") if isinstance(item, dict) else None
+    if isinstance(mu, list) and mu and isinstance(mu[0], str) and mu[0].startswith("http"):
+        return mu[0]
+    return None
+
+
+def _apify_download(media_url, dest, status_cb=None):
+    tok = apify_token()
+    dl = media_url
+    if "api.apify.com" in media_url and tok and "token=" not in media_url:
+        dl = media_url + (("&" if "?" in media_url else "?") + f"token={tok}")
+    try:
+        req = urllib.request.Request(dl, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except Exception as exc:  # noqa: BLE001
+        _status(status_cb, f"Apify: download failed ({exc.__class__.__name__}).")
+        return None
+    return dest if dest.exists() and dest.stat().st_size > 4096 else None
+
+
+def _apify_item_portrait_hq(item):
+    vm = (item.get("videoMeta") or {}) if isinstance(item, dict) else {}
+    try:
+        w, h = int(vm.get("width") or 0), int(vm.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    if max(w, h) < MIN_LONG_SIDE:
+        return False
+    return h >= w * MIN_PORTRAIT_RATIO
 
 
 def _entries(info):
@@ -437,6 +518,83 @@ def _evaluate_url(url, raw_dir, ffmpeg, ffprobe, per_clip_seconds, status_cb):
 _evaluate_url._n = 0
 
 
+def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
+                      per_clip_seconds, lead_query, status_cb, cancel_check):
+    """Apify path: real TikTok keyword search + watermark-free download, then the same
+    vertical/HQ/no-text filters + normalize. Returns normalized clip Paths (hook first)."""
+    out_dir = Path(out_dir)
+    raw_dir = out_dir / "_raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg, ffprobe = _ffmpeg_tools()
+    if not ffmpeg:
+        _status(status_cb, "Scrape: ffmpeg not found, cannot prepare clips.")
+        return []
+    accepted = []   # raw paths, hook first
+    idx = [0]
+
+    def _take(items, need, hook=False):
+        # prefer portrait+HQ by metadata, then download watermark-free + filter text
+        ordered = sorted(items, key=lambda it: 0 if _apify_item_portrait_hq(it) else 1)
+        for it in ordered:
+            if cancel_check and cancel_check():
+                return
+            if len(accepted) >= need:
+                return
+            if _apify_item_portrait_hq(it) is False:
+                continue  # landscape / low-res by metadata
+            murl = _apify_media_url(it)
+            if not murl:
+                continue
+            raw = raw_dir / f"raw_{idx[0]:02d}.mp4"
+            idx[0] += 1
+            if not _apify_download(murl, raw, status_cb=status_cb):
+                continue
+            if not is_vertical_hq(raw, ffprobe):
+                try: raw.unlink()
+                except Exception: pass
+                continue
+            if has_burned_captions(raw, ffmpeg, seconds=per_clip_seconds, status_cb=status_cb):
+                _status(status_cb, "Scrape: skipped a clip (burned-in captions/text).")
+                try: raw.unlink()
+                except Exception: pass
+                continue
+            accepted.append(raw)
+            if hook:
+                return
+
+    # 1) Hook: a real woman via a dedicated search query.
+    if lead_query:
+        _status(status_cb, "Apify: searching TikTok for a hook clip (real influencer)...")
+        _take(apify_search([lead_query], 6, status_cb=status_cb), 1, hook=True)
+
+    # 2) The rest from per-style queries.
+    queries = build_queries(["tiktok"], terms, script_text, script_relevancy, count=max(count, 3))
+    _status(status_cb, f"Apify: searching TikTok for {len(queries)} style queries...")
+    per_q = max(2, (count // max(len(queries), 1)) + 2)
+    items = apify_search(queries, per_q, status_cb=status_cb)
+    if not items and not accepted:
+        _status(status_cb, "Apify: no clips returned for these queries. Try broader style terms.")
+        return []
+    _take(items, count + (1 if accepted else 0))
+
+    # 3) Normalize accepted raws into the seedance folder, hook first.
+    results = []
+    for raw in accepted[:count]:
+        final = normalize_clip(raw, out_dir / f"scraped_{len(results):02d}.mp4", ffmpeg,
+                               seconds=per_clip_seconds)
+        if final:
+            results.append(final)
+            _status(status_cb, f"Scrape: prepared clip {len(results)}.")
+    try:
+        for f in raw_dir.glob("*"):
+            f.unlink()
+        raw_dir.rmdir()
+    except Exception:
+        pass
+    _status(status_cb, f"Scrape: {len(results)} watermark-free TikTok clip(s) ready.")
+    return results
+
+
 def scrape_clips(
     out_dir,
     platforms,
@@ -462,11 +620,16 @@ def scrape_clips(
     raw_dir = out_dir / "_raw"
     out_dir.mkdir(parents=True, exist_ok=True)
     platforms = platforms or ["tiktok", "instagram"]
-    # TikTok-only, and a connection is mandatory (enforced upstream too). No YouTube
-    # fallback: random/AI YouTube clips were the whole problem we're removing.
+    # Apify is the preferred path when configured: real TikTok keyword search +
+    # watermark-free download. yt-dlp (cookies) is the fallback.
+    if apify_active():
+        _status(status_cb, "Scrape: using Apify TikTok search (watermark-free).")
+        return _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
+                                 per_clip_seconds, lead_query, status_cb, cancel_check)
+    # TikTok-only via yt-dlp; a cookie connection is mandatory for that path.
     if not cookies_active():
-        _status(status_cb, "Scrape: not connected to TikTok. Connect TikTok in the scrape settings "
-                           "(pick your signed-in browser) and try again.")
+        _status(status_cb, "Scrape: not connected. Set an Apify token, or connect TikTok "
+                           "(pick your signed-in browser) in the scrape settings, and try again.")
         return []
     _status(status_cb, "Scrape: connected — pulling real clips from TikTok hashtags.")
     ffmpeg, ffprobe = _ffmpeg_tools()

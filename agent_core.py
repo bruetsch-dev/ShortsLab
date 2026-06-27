@@ -2075,6 +2075,61 @@ def project_media_counts(project_dir):
     return counts
 
 
+SCRAPE_WOMAN_HOOK = "beautiful japanese woman early 20s, tokyo street style, fashionable, candid"
+
+
+def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None):
+    """Let the Reasoning Agent derive TikTok b-roll search queries straight from the
+    voice script (concrete places/objects/actions per scene), plus the scroll-stop hook
+    query (an attractive Japanese woman in her early 20s). The user no longer types
+    search terms — the agent reads the script and decides. Returns
+    {"hook_query": str, "queries": [str, ...]}; falls back to script keywords on failure."""
+    fallback = {"hook_query": SCRAPE_WOMAN_HOOK, "queries": []}
+    if not script or not os.environ.get("WAVESPEED_API_KEY"):
+        return fallback
+    rel = max(0, min(100, int(script_relevancy)))
+    prompt = (
+        "You plan REAL TikTok b-roll search queries for a vertical short cut entirely from found footage.\n"
+        "All footage is from JAPAN — every query must point at real Japan/Tokyo footage; never return "
+        "non-Japan locations.\n"
+        "Read the voice script and output concrete, searchable queries (places, objects, actions, scenery, "
+        "daily-life moments) that would surface matching real clips for the scenes — not abstract concepts. "
+        "Keep each query 2-5 words.\n"
+        "IMPORTANT: output a MIX of ENGLISH and JAPANESE queries/hashtags. Japanese TikTok footage is indexed "
+        "under Japanese terms, so include native Japanese words and hashtags in kanji/kana "
+        "(e.g. 東京 夜, 渋谷 スクランブル, 日本 交番, 夜 散歩, 原宿 ファッション, コンビニ 夜, #東京, #日本). "
+        "Aim for roughly half Japanese, half English.\n"
+        f"script_relevancy={rel} (0-100): high = closely follow what is literally said; low = looser, more "
+        "aesthetic b-roll of the overall vibe.\n"
+        "The opening HOOK is ALWAYS an attractive Japanese woman in her early 20s (street style / fashion, "
+        "vertical phone clip). Return a strong hook_query, preferably Japanese (e.g. 日本人 女性 ファッション 原宿).\n"
+        'Return STRICT JSON only: {"hook_query": "...", "queries": ["...", ...]} with 10-16 queries.\n\n'
+        f"Title: {title}\nVoice script:\n{script}\n"
+        + (f"Optional style note: {visual_script}\n" if visual_script else "")
+    )
+    payload = {
+        "model": reasoning_model or GPT55_MODEL,
+        "messages": [
+            {"role": "system", "content": "You turn a narration script into concrete TikTok footage search queries. Return JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        log(status_cb, "Scrape: Reasoning Agent deriving search terms from the voice script...")
+        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=120)
+        plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
+        queries = [str(q).strip() for q in (plan.get("queries") or []) if str(q).strip()]
+        hook = str(plan.get("hook_query") or "").strip() or SCRAPE_WOMAN_HOOK
+        if queries:
+            return {"hook_query": hook, "queries": queries[:16]}
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Scrape: term derivation skipped ({exc.__class__.__name__}); using script keywords.")
+    return fallback
+
+
 def llm_auto_director_plan(title, script, scenes, target_duration, media_counts, audio_present=False, reasoning_model=None, status_cb=None):
     if not os.environ.get("WAVESPEED_API_KEY"):
         log(status_cb, "Auto Director skipped; WAVESPEED_API_KEY is not set.")
@@ -2935,6 +2990,91 @@ def image_data_url(path):
     mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{data}"
+
+
+def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_model=None, status_cb=None):
+    """Autonomous, scene-targeted clip placement: the agent actually LOOKS at each
+    scraped clip (one poster frame each, on a numbered contact sheet) and assigns the
+    visually best-fitting clip to each scene, so footage matches the script instead of
+    being dropped in arbitrary order. Returns one clip Path per scene (repeats allowed).
+    Falls back to round-robin order if vision is unavailable or fails."""
+    clip_paths = [Path(p) for p in clip_paths if Path(p).exists()]
+    n = len(clip_paths)
+    if not n or not scenes:
+        return list(clip_paths)
+    fallback = [clip_paths[i % n] for i in range(len(scenes))]
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        return fallback
+    try:
+        ff = pipeline.find_ffmpeg()
+        frames_dir = project_dir / "review" / "_clip_match"
+        if frames_dir.exists():
+            for f in frames_dir.glob("*"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        frame_paths = []
+        for i, cp in enumerate(clip_paths):
+            fp = frames_dir / f"clip_{i:02d}.jpg"
+            if pipeline.extract_poster_frame(cp, fp, ffmpeg=ff, at=1.0):
+                frame_paths.append(fp)
+        if not frame_paths:
+            return fallback
+        sheet = create_media_contact_sheet(frame_paths, frames_dir / "_sheet.jpg",
+                                           title="Scraped clips (tiles labeled clip_NN)")
+        if not sheet:
+            return fallback
+        scene_lines = "\n".join(
+            f"scene {idx}: {(scene_text_for_planning(s) or s.get('script', ''))[:150]}"
+            for idx, s in enumerate(scenes)
+        )
+        prompt = (
+            "You are matching real found-footage clips to the scenes of a short vertical video about JAPAN.\n"
+            "The attached contact sheet shows the available clips; each tile is labeled clip_00, clip_01, ...\n"
+            "Analyze what is actually VISIBLE in each clip. For EACH scene below, choose the clip number whose "
+            "content best fits the scene's meaning (subject, place, action, mood).\n"
+            "Strongly prefer clips that authentically look like JAPAN (Japanese streets, signage, people, "
+            "settings); avoid clips that clearly are not Japan. A clip may be reused if it fits best; prefer "
+            "variety when several fit equally.\n\n"
+            f"Scenes:\n{scene_lines}\n\n"
+            'Return STRICT JSON: {"assignments": {"0": <clip_number>, "1": <clip_number>, ...}} '
+            "with exactly one clip number per scene index."
+        )
+        payload = {
+            "model": reasoning_model or GPT55_MODEL,
+            "messages": [
+                {"role": "system", "content": "You assign footage clips to script scenes by what is visible in each clip. Return JSON only."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
+                ]},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 700,
+            "response_format": {"type": "json_object"},
+        }
+        log(status_cb, "Scrape: matching clips to scenes with the Reasoning Agent (vision)...")
+        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
+        plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
+        amap = plan.get("assignments") if isinstance(plan, dict) else None
+        if not isinstance(amap, dict):
+            return fallback
+        ordered = []
+        for idx in range(len(scenes)):
+            try:
+                cn = int(amap.get(str(idx), idx % n))
+            except (TypeError, ValueError):
+                cn = idx % n
+            if cn < 0 or cn >= n:
+                cn = idx % n
+            ordered.append(clip_paths[cn])
+        log(status_cb, f"Scrape: agent matched {n} clip(s) across {len(scenes)} scene(s) by visual fit.")
+        return ordered
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Scrape: vision clip-matching skipped ({exc.__class__.__name__}); using order.")
+        return fallback
 
 
 def clamp_web_image_target(count):
@@ -4385,12 +4525,13 @@ def run_project(form, status_cb=None):
     # Enforce it up front so we don't burn voiceover/director work on a run that can't
     # source any clips.
     if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
+        # TikTok clips come from Apify (real keyword search + watermark-free download).
         _scrape_cookies = (str(form.get("scrape_cookies_file", "") or "").strip()
                            or str(form.get("scrape_cookies", "") or "").strip())
-        if not _scrape_cookies:
+        if not os.environ.get("APIFY_TOKEN", "").strip() and not _scrape_cookies:
             raise RuntimeError(
-                "Scrape runs require a TikTok connection. Open Clip source → Scrape clips, "
-                "connect TikTok (pick the browser you're signed in to), click Test, then run again."
+                "Scrape runs need an Apify token. Add APIFY_TOKEN=... to the .env file "
+                "(get one at apify.com), then restart the app and run again."
             )
 
     visual_script = clean_text(form.get("visual_script", ""))
@@ -4516,7 +4657,19 @@ def run_project(form, status_cb=None):
     use_llm_video_review = form_flag(form, "use_llm_video_review", True)
     background_music_enabled = form_flag(form, "background_music_enabled", False)
     autonomous_director = form_flag(form, "autonomous_director", True)
-    run_type = form_choice(form, "run_type", {"normal", "audit"}, "normal")
+    # Run mode is auto-determined now (the UI selector was removed): a "smart" fill-missing
+    # pass when the project already has media, otherwise a full run. An explicit form value
+    # (programmatic callers) still wins.
+    _run_type_in = str(form.get("run_type", "") or "").strip().lower()
+    if _run_type_in in ("normal", "audit"):
+        run_type = _run_type_in
+    else:
+        _has_media = bool(existing_seedance_clips(project_dir)) or any(
+            (project_dir / sub).exists() and any((project_dir / sub).glob("*"))
+            for sub in ("web images", "gpt images", "local media")
+        )
+        run_type = "audit" if _has_media else "normal"
+        log(status_cb, f"Run mode auto-selected: {'smart (fill missing media)' if run_type == 'audit' else 'full run'}.")
     loaded_project_mode = form_choice(
         form,
         "loaded_project_mode",
@@ -4759,11 +4912,17 @@ def run_project(form, status_cb=None):
             except Exception:
                 per_clip = 5.0
             seedance_target_dir = project_dir / "seedance 2.0"
-            # Hook = a woman when the style is women-forward (the reference channels
-            # always open on an attractive subject as the scroll-stop).
-            lead_query = None
-            if re.search(r"wom(a|e)n|girl|lad(y|ies)|female", scrape_terms or "", re.I):
-                lead_query = getattr(clip_scraper, "DEFAULT_WOMAN_LEAD", None)
+            # The agent derives the TikTok search terms from the voice script, plus the
+            # fixed scroll-stop hook (early-20s Japanese woman). Any custom terms the user
+            # added (chips) are always merged in on top.
+            _custom = (scrape_terms or "").strip()
+            _splan = llm_scrape_plan(script, title, visual_script, script_relevancy,
+                                     reasoning_model=reasoning_model, status_cb=status_cb)
+            lead_query = _splan.get("hook_query") or getattr(clip_scraper, "DEFAULT_WOMAN_LEAD", None)
+            _derived = ", ".join(_splan.get("queries") or [])
+            scrape_terms = ", ".join([t for t in (_custom, _derived) if t]) or scrape_terms
+            if scrape_terms:
+                log(status_cb, f"Scrape: search terms{' (incl. your custom)' if _custom else ''} — {scrape_terms[:160]}")
             already = existing_seedance_clips(project_dir)
             if already and recut_mode == "normal":
                 log(status_cb, f"Scrape: reusing {len(already)} clip(s) already in seedance 2.0.")
@@ -4785,25 +4944,51 @@ def run_project(form, status_cb=None):
                         cancel_check=lambda: bool(cancellation_event(form) and cancellation_event(form).is_set()),
                     )
             if scraped:
-                # Loop-fill: duplicate the downloaded pool (cycling through the unique
-                # clips) until there is one clip file per scene, so the planner can back
-                # every scene with footage instead of falling back to a blank card.
-                if len(scraped) < scene_total:
-                    import shutil as _shutil
-                    pool = list(scraped)
-                    fill_from = len(scraped)
-                    while len(scraped) < scene_total:
-                        src = pool[(len(scraped) - fill_from) % len(pool)]
-                        dst = seedance_target_dir / f"scraped_{len(scraped):02d}.mp4"
+                # Scene-targeted placement: the agent LOOKS at the pool and assigns the
+                # best-matching clip to each scene (one clip per scene, repeats allowed),
+                # so footage fits the script instead of being placed in arbitrary order.
+                ordered = assign_clips_to_scenes_by_vision(
+                    scenes_override, scraped, project_dir, reasoning_model=reasoning_model, status_cb=status_cb
+                ) or list(scraped)
+                import shutil as _shutil
+                tmp = seedance_target_dir / "_ordered"
+                if tmp.exists():
+                    for f in tmp.glob("*"):
                         try:
-                            _shutil.copyfile(src, dst)
-                            scraped.append(dst)
+                            f.unlink()
                         except Exception:
-                            break
-                    log(status_cb, f"Scrape: looped {len(pool)} unique clip(s) to cover all {scene_total} scenes.")
+                            pass
+                tmp.mkdir(parents=True, exist_ok=True)
+                staged = []
+                for i, src in enumerate(ordered):
+                    dst = tmp / f"scraped_{i:02d}.mp4"
+                    try:
+                        _shutil.copyfile(src, dst)
+                        staged.append(dst)
+                    except Exception:
+                        pass
+                if staged:
+                    for old in seedance_target_dir.glob("scraped_*.mp4"):
+                        try:
+                            old.unlink()
+                        except Exception:
+                            pass
+                    moved = []
+                    for f in staged:
+                        target = seedance_target_dir / f.name
+                        try:
+                            f.replace(target)
+                            moved.append(target)
+                        except Exception:
+                            pass
+                    scraped = moved or scraped
+                try:
+                    tmp.rmdir()
+                except Exception:
+                    pass
                 seedance_clip_count = len(scraped)
                 allow_seedance = True
-                log(status_cb, f"Scrape: {len(scraped)} clip(s) ready; backing all {scene_total} scene(s) with footage.")
+                log(status_cb, f"Scrape: {len(scraped)} clip(s) placed to best match each of the {scene_total} scene(s).")
             else:
                 allow_seedance = False
                 seedance_clip_count = 0
