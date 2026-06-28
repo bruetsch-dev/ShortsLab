@@ -648,6 +648,8 @@ def app_style():
       /* top row: preset symbols + reasoning model + halt */
       .cbar-top { display: grid; grid-template-columns: auto auto; justify-content: space-between; align-items: start; gap: 12px 28px; }
       .cbar-top .reasoning-cell select { width: 320px; max-width: 100%; }
+      .collab-toggle { display: flex; align-items: center; gap: 9px; margin-top: 9px; font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--ink); cursor: pointer; max-width: 320px; }
+      .collab-toggle input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
       .preset-actions { display: flex; align-items: center; gap: 18px; min-height: 42px; }
       @media (max-width: 600px) { .cbar-top { grid-template-columns: 1fr; justify-content: stretch; } .cbar-top .reasoning-cell select { width: 100%; } }
       /* borderless preset symbols (high specificity to beat the global button rule) */
@@ -676,6 +678,13 @@ def app_style():
       /* AI model pickers (generate mode only) */
       .ai-models { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; margin-top: 10px; }
       @media (max-width: 560px) { .ai-models { grid-template-columns: 1fr; } }
+      /* finished-render view: just the final video + open timeline editor */
+      .done-wrap { max-width: 720px; margin: 0 auto; text-align: center; padding: 8px 0 36px; }
+      .done-title { margin: 6px 0 20px; }
+      .done-stage { display: flex; justify-content: center; }
+      .done-video { width: min(380px, 86vw); height: auto; aspect-ratio: 9 / 16; background: #000; border: 3px solid var(--ink); border-radius: var(--r-lg); box-shadow: var(--sh-2); }
+      .done-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 24px; }
+      .done-actions .button { width: auto; min-width: 0; margin: 0; }
       /* ===== Onboarding wizard ===== */
       form#short-form { display: block; }                 /* single-column wizard flow */
       #wizard { max-width: 780px; margin: 0 auto; position: relative; }
@@ -1681,7 +1690,7 @@ def app_script():
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
           window.onClipToggle = function (cb) { window.setClipSource(cb.checked ? "scrape" : "generate"); };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_terms"];
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","collaborative_reasoning","clip_source","scrape_platforms","script_relevancy","scrape_terms"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -1956,6 +1965,9 @@ def app_script():
           root.setAttribute("data-status", data.status || "");
           // surface the speech-approval panel as soon as the run pauses for it
           if (data.status === "awaiting_approval" && !document.getElementById("speech-approval")) { location.reload(); return; }
+          // when the render finishes, reload so the server shows the clean "ready" view
+          // (just the final video + Open timeline editor) instead of the live detail view
+          if (data.status === "done" && !document.getElementById("done-stage")) { location.reload(); return; }
           var statusLabel = document.getElementById("job-status-label");
           if (statusLabel) {
             statusLabel.textContent = data.status || "";
@@ -2207,6 +2219,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
             </select>
+            <label class="collab-toggle">
+              <input type="checkbox" name="collaborative_reasoning"{' checked' if state.get('collaborative_reasoning', True) else ''}>
+              <span>&#129309; GPT-5.5 + Opus collaborate {help_tip("Two-model mode: GPT-5.5 drafts the edit map and the video review, then Claude Opus 4.8 critiques and corrects it. Higher quality, roughly 2x the reasoning cost/time. Uncheck to use the single model above.")}</span>
+            </label>
           </div>
         </div>
 
@@ -4249,10 +4265,47 @@ def timeline_page(slug):
     return page("Timeline Editor", body)
 
 
+def render_done_view(job, job_id):
+    """The finished-render screen: only the final video + an Open-timeline-editor button.
+    Returns None when there is no final video to show (so the caller keeps the detail view)."""
+    result = job.get("result") or {}
+    video = result.get("video") or result.get("video_no_sfx")
+    if not (video and Path(video).exists()):
+        return None
+    vurl = link_for(Path(video))
+    proj = job.get("project_dir")
+    tslug = Path(proj).name if proj and Path(proj).exists() else None
+    tl_btn = ""
+    if tslug and job.get("job_kind") != "sfx":
+        tl_btn = (f'<a class="button" href="/timeline?slug={urllib.parse.quote(tslug)}">'
+                  f'&#127902; Open timeline editor</a>')
+    return f"""
+    <div id="job-root" data-status="done" data-job-id="{esc(job_id)}">
+      <div class="done-wrap">
+        <h1 class="done-title">&#10003; Your Short is ready</h1>
+        <div class="done-stage" id="done-stage">
+          <video class="done-video" src="{vurl}" controls autoplay muted playsinline preload="metadata"></video>
+        </div>
+        <div class="done-actions">
+          {tl_btn}
+          <a class="button secondary" href="{vurl}" download>&#11015; Download</a>
+          <a class="button secondary" href="/">New project</a>
+        </div>
+      </div>
+    </div>
+    """
+
+
 def job_page(job_id):
     with JOB_LOCK:
         job = dict(JOBS.get(job_id, {"status": "missing", "logs": [], "result": None, "error": "Unknown job"}))
     status = job["status"]
+    # Finished render -> show ONLY the final video + Open timeline editor (no intermediate
+    # media dump, progress bars, or console). Detail view stays for running/error states.
+    if status == "done":
+        done_view = render_done_view(job, job_id)
+        if done_view:
+            return page("Job", done_view)
     klass = "done" if status == "done" else "error" if status == "error" else "cancelled" if status == "cancelled" else "cancelling" if status == "cancelling" else ""
     logs = job.get("logs", [])
     progress_html = render_progress(status, logs, job.get("created_at"), log_times=job.get("log_times"), job_kind=job.get("job_kind"))

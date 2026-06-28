@@ -157,6 +157,50 @@ def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
     return out_path
 
 
+def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
+                            ffmpeg=None, status_cb=None):
+    """Clean and (optionally) speed up a generated voiceover in place.
+
+    Gemini TTS output carries a faint constant noise floor ("Rauschen"); a gentle
+    high-pass + FFT denoise removes it without dulling the voice. `speed` time-stretches
+    via atempo (1.0 = unchanged, 1.10 = 10% faster) WITHOUT changing pitch, so the
+    narration feels punchier. Loudness is normalised last so every short sits at the
+    same level. Runs before forced alignment, so the word timing matches the new pace.
+    Returns the Path (unchanged on failure / no ffmpeg).
+    """
+    path = Path(path)
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg or not path.exists():
+        return path
+    try:
+        speed = float(speed or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(0.5, min(2.0, speed))
+    filters = []
+    if denoise:
+        filters.append("highpass=f=70")
+        filters.append("afftdn=nf=-25")
+    if abs(speed - 1.0) > 0.001:
+        filters.append(f"atempo={speed:.4f}")
+    filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    tmp = path.with_name(path.stem + "_pp" + path.suffix)
+    cmd = [ffmpeg, "-y", "-i", str(path), "-ar", str(sample_rate),
+           "-af", ",".join(filters), str(tmp)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        os.replace(str(tmp), str(path))
+        status_log(status_cb, f"Voice post-processed (speed {speed:.2f}x, denoise {'on' if denoise else 'off'}).")
+    except Exception as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        status_log(status_cb, f"Voice post-process skipped ({exc}).")
+    return path
+
+
 # --- Talking-head hook clip (InfiniteTalk on WaveSpeed) -----------------------
 # The opening "speaker hook" is now a lip-synced talking head driven by the
 # spoken hook audio + the speaker image -- not a Seedance I2V clip. Schema:
@@ -484,6 +528,7 @@ def draw_caption(img, text, y, width, height, font_size=None):
 CAPTION_ACCENT = (255, 219, 26)      # punchy yellow for the currently spoken word
 CAPTION_BODY = (255, 255, 255)       # already-spoken / idle words
 CAPTION_UPCOMING = (216, 220, 226)   # words not reached yet (slightly dimmed)
+CAPTION_HIGHLIGHT = (35, 209, 96)    # signature green box behind the active word (ref style)
 
 
 def _caption_word_weight(word):
@@ -570,6 +615,24 @@ def _draw_caption_word(draw, text, cx, cy, font, color, alpha, stroke):
               stroke_width=stroke, stroke_fill=(0, 0, 0, alpha))
 
 
+def _draw_caption_word_boxed(draw, text, cx, cy, font, box_rgb, text_rgb, alpha, stroke):
+    """Active-word treatment: a rounded coloured highlight box with the word on top -
+    the signature look of the reference 'dark facts' edits (green box, white word)."""
+    try:
+        fs = float(getattr(font, "size", 60))
+    except Exception:
+        fs = 60.0
+    bbox = draw.textbbox((cx, cy), text, font=font, anchor="mm", stroke_width=stroke)
+    padx, pady = int(fs * 0.18), int(fs * 0.10)
+    x0, y0, x1, y1 = bbox[0] - padx, bbox[1] - pady, bbox[2] + padx, bbox[3] + pady
+    r = max(6, int((y1 - y0) * 0.20))
+    draw.rounded_rectangle((x0, y0, x1, y1), radius=r,
+                           fill=(box_rgb[0], box_rgb[1], box_rgb[2], alpha))
+    draw.text((cx, cy), text, font=font, anchor="mm",
+              fill=(text_rgb[0], text_rgb[1], text_rgb[2], alpha),
+              stroke_width=max(2, stroke // 2), stroke_fill=(0, 0, 0, int(alpha * 0.8)))
+
+
 def draw_animated_caption(base, chunks, local, width, height, config, is_hook=False):
     """Render the active caption chunk with word-by-word karaoke highlighting."""
     if not chunks:
@@ -588,18 +651,21 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     stroke = max(5, base_size // 9)
     line_h = int(base_size * 1.16)
     max_text_width = width * 0.86
-    center_rel = float(config.get("caption_center_y", 0.50 if is_hook else 0.72))
+    center_rel = float(config.get("caption_center_y", 0.55 if is_hook else 0.60))
     center_y = int(height * center_rel)
 
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     space_w = draw.textlength(" ", font=font)
 
+    # Reference captions are bold UPPERCASE; uppercase once so wrap + draw widths agree.
+    chunk_words = [dict(w, text=str(w.get("text", "")).upper()) for w in chunk["words"]]
+
     # Wrap chunk words to fit the safe width.
     lines = []
     current = []
     current_w = 0.0
-    for word in chunk["words"]:
+    for word in chunk_words:
         ww = draw.textlength(word["text"], font=font)
         add = ww if not current else ww + space_w
         if current and current_w + add > max_text_width:
@@ -631,14 +697,20 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
             cx = x + ww / 2.0
             color = _caption_color_for(word, local)
             word_font = font
+            is_active = color is CAPTION_ACCENT
             # Active word "pop": briefly larger right after it becomes spoken.
-            if color is CAPTION_ACCENT:
+            if is_active:
                 pop_age = local - word["start"]
                 pop = 1.0 + 0.16 * max(0.0, 1.0 - pop_age / 0.18)
                 if pop > 1.01:
                     word_font = get_font(int(base_size * pop), True)
             a = int(255 * block_alpha * (1.0 if color is not CAPTION_UPCOMING else 0.82))
-            _draw_caption_word(draw, word["text"], int(cx), int(cy), word_font, color, a, stroke)
+            if is_active:
+                # signature green highlight box + white word
+                _draw_caption_word_boxed(draw, word["text"], int(cx), int(cy), word_font,
+                                         CAPTION_HIGHLIGHT, (255, 255, 255), a, stroke)
+            else:
+                _draw_caption_word(draw, word["text"], int(cx), int(cy), word_font, color, a, stroke)
             x += ww + space_w
 
     return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
@@ -1943,6 +2015,21 @@ def custom_sfx_segments(config):
     return out
 
 
+def ai_content_sfx_segments(config):
+    """Ambient sound beds planned + generated by plan_and_generate_ambient_sfx (agent_core).
+    These are the main content SFX for atmospheric scripts that match no keyword triggers."""
+    out = []
+    for cs in (config.get("ai_content_sfx") or []):
+        path = cs.get("path")
+        if not path or not Path(path).exists():
+            continue
+        out.append({"path": path, "start": round(float(cs.get("start", 0) or 0), 3),
+                    "duration": float(cs.get("duration") or 4.0),
+                    "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.1))),
+                    "category": "ambient", "id": str(cs.get("id") or "ambient")})
+    return out
+
+
 def build_sfx_segments(config, has_speech=False):
     if not bool(config.get("sfx_enabled", True)):
         return custom_sfx_segments(config)
@@ -1985,6 +2072,8 @@ def build_sfx_segments(config, has_speech=False):
     other_events = [e for e in events if e.get("category") != "analog_transitions"]
     allowed_other = max(0, max_events - len(transition_events))
     result = transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other]
+    if content_on:
+        result.extend(ai_content_sfx_segments(config))   # LLM-planned ambient beds
     result.extend(custom_sfx_segments(config))
     return sorted(result, key=lambda e: e["start"])
 
@@ -2105,31 +2194,35 @@ def background_music_text(config):
 
 
 def choose_background_music(config):
+    """Pick a music bed by matching the actual FILENAME to the mood the script calls for.
+    Crucially: if every available track is the wrong mood (e.g. only phonk/action tracks for a
+    somber documentary), return None - silence beats an annoying, tonally-wrong bed."""
     files = background_music_files(config)
     if not files:
         return None
     text = background_music_text(config)
-    mood_keywords = [
-        ("documentary_tension", {"war", "battle", "history", "mystery", "crime", "secret", "military", "soldier", "danger", "conflict", "dark"}),
-        ("cinematic_drive", {"chase", "race", "truck", "escape", "run", "fast", "attack", "action", "moving", "rush"}),
-        ("quirky_momentum", {"funny", "weird", "absurd", "pig", "emu", "meme", "strange", "fail", "failed", "comedy"}),
-        ("electro_pulse", {"ai", "future", "tech", "robot", "digital", "internet", "app", "screen", "computer"}),
-        ("warm_lofi", {"calm", "emotional", "soft", "nostalgia", "peace", "quiet", "ending", "story"}),
-        ("upbeat_short", {"win", "payoff", "reveal", "success", "surprise", "trend", "viral", "shorts", "tiktok", "youtube"}),
-    ]
+    dark = any(w in text for w in (
+        "dark", "stress", "pressure", "exhaust", "lonely", "alone", "sad", "quiet", "fear",
+        "scary", "death", "pain", "tired", "depress", "isolat", "suicide", "burnout", "demand"))
+    # words we want / never want in the music FILENAME
+    GOOD = {"dark", "tension", "suspense", "cinematic", "emotional", "sad", "melancholy", "ambient",
+            "lofi", "lo-fi", "chill", "calm", "dramatic", "documentary", "mystery", "slow", "piano",
+            "atmospher", "deep", "moody", "somber", "ethereal", "nostalg"}
+    BAD = {"phonk", "gym", "aura", "ego", "funk", "adrenaline", "assault", "intense", "action",
+           "gaming", "remix", "hype", "party", "trap", "drift", "sigma", "motivation", "workout",
+           "rage", "best tiktok", "epic", "fast-paced", "fast paced"}
     scored = []
     for path in files:
         name = path.stem.lower()
-        score = 0
-        for mood, words in mood_keywords:
-            if mood in name:
-                score += 4 * sum(1 for word in words if word in text)
-        if "short" in name or "pulse" in name or "drive" in name:
-            score += 1
-        digest = hashlib.sha1(f"{config.get('project_slug', '')}|{path.name}|{text[:120]}".encode("utf-8", errors="ignore")).hexdigest()
+        score = 3 * sum(1 for w in GOOD if w in name) - 4 * sum(1 for w in BAD if w in name)
+        if dark and any(w in name for w in ("dark", "sad", "emotional", "ambient", "piano",
+                                            "melancholy", "suspense", "tension", "slow", "moody", "documentary")):
+            score += 5
+        digest = hashlib.sha1(f"{config.get('project_slug', '')}|{path.name}".encode("utf-8", errors="ignore")).hexdigest()
         scored.append((score, int(digest[:8], 16), path))
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return scored[0][2]
+    best_score, _, best_path = scored[0]
+    return best_path if best_score > 0 else None    # no fitting track -> no music
 
 
 def build_background_music_segment(config, has_speech=False):
@@ -2420,13 +2513,17 @@ def render_video(config, basename=None):
                 mix_inputs = ["speech"] + labels
             else:
                 mix_inputs = labels
+            # Final master: loudness-normalize to a loud, consistent target (the reference
+            # edits sit ~-20 dB RMS / 0 dB peak). loudnorm hits the integrated target, then a
+            # limiter catches peaks - so every Short lands punchy and at the same level.
+            master_ln = "loudnorm=I=-15:TP=-1.0:LRA=11"
             if len(mix_inputs) == 1:
-                filters.append(f"[{mix_inputs[0]}]volume={master_gain:.3f},alimiter=limit=0.96,atrim=0:{duration:.3f}[aout]")
+                filters.append(f"[{mix_inputs[0]}]volume={master_gain:.3f},{master_ln},alimiter=limit=0.97,atrim=0:{duration:.3f}[aout]")
             else:
                 filters.append(
                     "".join(f"[{label}]" for label in mix_inputs)
                     + f"amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0:normalize=0,"
-                    + f"volume={master_gain:.3f},alimiter=limit=0.94,atrim=0:{duration:.3f}[aout]"
+                    + f"volume={master_gain:.3f},{master_ln},alimiter=limit=0.96,atrim=0:{duration:.3f}[aout]"
                 )
             cmd += [
                 "-filter_complex",

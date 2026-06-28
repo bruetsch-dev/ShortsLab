@@ -3,6 +3,7 @@ import contextlib
 import json
 import math
 import base64
+import hashlib
 import html
 import mimetypes
 import os
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -824,6 +826,13 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     hook_text = form.get("hook_text", "") if is_form else ""
     hook, body = split_hook_from_script(script, hook_text)
     ffmpeg = pipeline.find_ffmpeg()
+    # Punch up the delivery: speed the narration ~1.10x (pitch-preserving) and denoise
+    # the TTS hiss. Applied to each segment BEFORE concat + alignment, so the saved
+    # hook.wav (InfiniteTalk) and the word timing both match the final pace.
+    try:
+        voice_speed = float(form.get("voice_speed", 1.10) or 1.10) if is_form else 1.10
+    except (TypeError, ValueError):
+        voice_speed = 1.10
 
     try:
         if hook and body and ffmpeg:
@@ -834,6 +843,8 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
             body_path = pipeline.generate_speech_gemini(
                 body, input_dir / "body", speaker=speaker, voice=voice, model=model,
                 cancel_event=cancel_event, status_cb=status_cb)
+            pipeline.apply_voice_postprocess(hook_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
+            pipeline.apply_voice_postprocess(body_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
             pause_s = 0.45
             if is_form:
                 try:
@@ -853,6 +864,7 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
         path = pipeline.generate_speech_gemini(
             script, input_dir / "voiceover", speaker=speaker, voice=voice, model=model,
             cancel_event=cancel_event, status_cb=status_cb)
+        pipeline.apply_voice_postprocess(path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
         log(status_cb, f"Voiceover generated ({speaker} / {voice}): {path.name}")
         return path
     except pipeline.PipelineCancelled:
@@ -1347,7 +1359,106 @@ def llm_generate_project_title(script, reasoning_model=None, status_cb=None):
     except Exception as exc:
         log(status_cb, f"Failed to generate title: {exc}")
     return ""
-def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=None, status_cb=None):
+
+
+# ===== Collaborative reasoning: GPT-5.5 drafts, Opus 4.8 critiques & corrects =====
+DUAL_THINKER_MODEL = GPT55_MODEL                 # the proposer ("thinks")
+DUAL_CRITIC_MODEL = "anthropic/claude-opus-4.8"  # the critic ("criticises and corrects")
+
+
+def _post_llm_json(model, messages, max_tokens, temperature, timeout=180):
+    payload = {"model": model, "messages": messages, "temperature": temperature,
+               "max_tokens": max_tokens, "response_format": {"type": "json_object"}}
+    data = post_json_url(WAVESPEED_LLM_API, payload, timeout=timeout)
+    return extract_json_object(data["choices"][0]["message"]["content"])
+
+
+def collaborate_json(messages, max_tokens=1800, temperature=0.15, timeout=180,
+                     status_cb=None, label="reasoning",
+                     thinker=DUAL_THINKER_MODEL, critic=DUAL_CRITIC_MODEL):
+    """Two-model collaboration. The THINKER (GPT-5.5) drafts a JSON answer; the CRITIC
+    (Opus 4.8) then receives the exact same task plus that draft and returns a corrected,
+    stronger version in the same schema. Returns the critic's corrected JSON (or the draft
+    if the critic fails). `messages` is the chat list; the user content may be plain text
+    or a vision content list (text + image_url), so this works for reviews too."""
+    log(status_cb, f"Collaborative {label}: GPT-5.5 drafts -> Opus 4.8 critiques & corrects...")
+    proposal = None
+    try:
+        proposal = _post_llm_json(thinker, messages, max_tokens, temperature, timeout)
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Collaborative {label}: thinker failed ({exc.__class__.__name__}); critic solos.")
+    sys_msg = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
+    user_msg = next((m for m in messages if m.get("role") == "user"), {"content": ""})
+    crit_sys = (str(sys_msg) + "\n\nYou are now the SENIOR CRITIC reviewing another model's draft. "
+                "Find every flaw, omission, wrong call, weak hook, repetition, off-topic media, or missed "
+                "issue. Then return a corrected, stronger answer in the EXACT SAME JSON schema. Keep what is "
+                "genuinely good, fix what is weak, and be strict and honest. Return JSON only.")
+    draft_note = ("\n\n=== DRAFT FROM THE FIRST MODEL - critique it and return an improved version (same schema) ===\n"
+                  + (json.dumps(proposal, ensure_ascii=False)[:7000] if proposal
+                     else "(the first model produced nothing usable; do the task yourself)"))
+    uc = user_msg.get("content")
+    crit_content = (list(uc) + [{"type": "text", "text": draft_note}]) if isinstance(uc, list) else (str(uc) + draft_note)
+    crit_messages = [{"role": "system", "content": crit_sys},
+                     {"role": "user", "content": crit_content}]
+    try:
+        corrected = _post_llm_json(critic, crit_messages, max_tokens, temperature, timeout)
+        if corrected:
+            return corrected
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Collaborative {label}: critic failed ({exc.__class__.__name__}); using the draft.")
+    return proposal
+
+
+def comprehend_script(title, script, reasoning_model=None, collaborate=False, status_cb=None):
+    """Read the WHOLE script once and deeply understand what it is really about, so every
+    downstream agent (search terms, clip matching, emphasis) is grounded in the SAME
+    understanding instead of re-guessing from raw text. Returns
+    {topic, thesis, tone, setting, viewer_takeaway, visual_motifs[]}."""
+    if not (script or "").strip() or not os.environ.get("WAVESPEED_API_KEY"):
+        return {}
+    messages = [
+        {"role": "system", "content": "You deeply comprehend a short-video narration and explain what it is really about so an editor can pick matching footage. Return JSON only."},
+        {"role": "user", "content": (
+            "Read this entire narration and explain what it is FUNDAMENTALLY about - the real subject and message, "
+            "not a surface paraphrase. This understanding will steer footage search and clip selection, so be "
+            "concrete about what the viewer should SEE on screen.\n"
+            'Return STRICT JSON: {"topic": "<one sentence: what this video is about>", '
+            '"thesis": "<the core point it makes>", "tone": "<emotional tone, e.g. somber ominous documentary>", '
+            '"setting": "<where/what world it lives in, e.g. modern urban Japan>", '
+            '"viewer_takeaway": "<what the viewer should feel or realize>", '
+            '"visual_motifs": ["<6-9 concrete things a viewer should SEE that represent this video>"]}\n\n'
+            f"Title: {title}\n\nNarration:\n{script}"
+        )},
+    ]
+    try:
+        if collaborate:
+            data = collaborate_json(messages, max_tokens=900, temperature=0.2, status_cb=status_cb, label="script comprehension") or {}
+        else:
+            data = _post_llm_json(reasoning_model or GPT55_MODEL, messages, 900, 0.2) or {}
+        if isinstance(data, dict) and data.get("topic"):
+            log(status_cb, f"Script understood - topic: {str(data.get('topic'))[:140]}")
+            return data
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Script comprehension skipped ({exc.__class__.__name__}).")
+    return {}
+
+
+def understanding_brief(understanding):
+    """A compact grounding paragraph every clip agent gets, so they all share one understanding."""
+    u = understanding if isinstance(understanding, dict) else {}
+    if not u:
+        return ""
+    parts = []
+    if u.get("topic"):           parts.append(f"What this video is really about: {u['topic']}")
+    if u.get("thesis"):          parts.append(f"Core point: {u['thesis']}")
+    if u.get("setting"):         parts.append(f"Setting/world: {u['setting']}")
+    if u.get("tone"):            parts.append(f"Tone: {u['tone']}")
+    if isinstance(u.get("visual_motifs"), list) and u["visual_motifs"]:
+        parts.append("Things that visually represent it: " + ", ".join(str(m) for m in u["visual_motifs"][:9]))
+    return ("UNDERSTAND THE VIDEO FIRST (all choices must fit this):\n" + "\n".join(parts) + "\n\n") if parts else ""
+
+
+def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=None, status_cb=None, collaborate=False):
     if not os.environ.get("WAVESPEED_API_KEY"):
         return []
     prompt = (
@@ -1381,13 +1492,18 @@ def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scen
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.16,
-        "max_tokens": 4200,
+        "max_tokens": 16000,
         "response_format": {"type": "json_object"},
     }
     try:
-        log(status_cb, "Micro-Beat Planner: asking Reasoning Agent for exact voice-line edit map...")
-        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
-        plan = extract_json_object(data["choices"][0]["message"]["content"])
+        if collaborate:
+            plan = collaborate_json(payload["messages"], max_tokens=payload["max_tokens"],
+                                    temperature=payload["temperature"], status_cb=status_cb,
+                                    label="edit-map") or {}
+        else:
+            log(status_cb, "Micro-Beat Planner: asking Reasoning Agent for exact voice-line edit map...")
+            data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
+            plan = extract_json_object(data["choices"][0]["message"]["content"])
         beats = normalize_micro_beat_plan(plan.get("micro_beats", []), title, script, target_duration)
         if beats:
             log(status_cb, f"Micro-Beat Planner: created {len(beats)} beat(s).")
@@ -1397,12 +1513,28 @@ def llm_micro_beat_plan(title, script, visual_script, target_duration, base_scen
     return {"micro_beats": [], "visual_sections": []}
 
 
-def build_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=None, status_cb=None):
-    result = llm_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=reasoning_model, status_cb=status_cb)
+def build_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=None, status_cb=None, collaborate=False):
+    result = llm_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=reasoning_model, status_cb=status_cb, collaborate=collaborate)
     beats = result.get("micro_beats", [])
     if not beats:
         beats = fallback_micro_beat_plan(title, script, target_duration, base_scenes=base_scenes)
         log(status_cb, f"Micro-Beat Planner fallback: created {len(beats)} beat(s).")
+    else:
+        # COVERAGE GUARD: the reasoning model can hit its output-token cap and return a
+        # micro-beat plan that silently stops partway through the script. Rendering that
+        # plan cuts the video off mid-narration (a 57s voiceover became a 30s video).
+        # If the beats don't reach the end of the voiceover, extend them with deterministic
+        # fallback beats for the uncovered tail so every spoken second still gets a visual.
+        covered = max((float(b.get("end", 0.0)) for b in beats), default=0.0)
+        if covered < float(target_duration) - 1.0:
+            full = fallback_micro_beat_plan(title, script, target_duration, base_scenes=base_scenes)
+            tail = [b for b in full if float(b.get("start", 0.0)) >= covered - 0.25]
+            if tail:
+                log(status_cb,
+                    f"Micro-Beat coverage was only {covered:.1f}s of {target_duration:.1f}s "
+                    f"(reasoning model truncated its output); extending with {len(tail)} fallback "
+                    f"beat(s) so the full voiceover is covered.")
+                beats = beats + tail
     return {"micro_beats": beats or base_scenes, "visual_sections": result.get("visual_sections", [])}
 
 
@@ -1597,6 +1729,16 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
             "motion": scene_motion,
             "needs_gpt_asset": wants_gpt_asset,
         }
+        # SCRAPE-FIRST: the semantic matcher pre-assigned a specific scraped clip to this exact
+        # beat (only when it passed the script-match gate). Use it directly. Beats with no clip
+        # fall through and get an AI/generated fallback instead of random Japan b-roll.
+        if scene.get("clip"):
+            scene_data["seedance"] = True
+            scene_data["clip"] = Path(scene["clip"]).name
+            scene_data["needs_gpt_asset"] = False
+            scene_data["shots"] = [{"at": 0.0, "use_clip": True}]
+            config_scenes.append(scene_data)
+            continue
         if seedance and enough_existing_seedance:
             clip = None
             while existing_clip_cursor < len(existing_clips):
@@ -2075,10 +2217,16 @@ def project_media_counts(project_dir):
     return counts
 
 
-SCRAPE_WOMAN_HOOK = "beautiful japanese woman early 20s, tokyo street style, fashionable, candid"
+# Relatable real young-Japanese-woman creators (lifestyle / POV / candid, like @sakii_0405_),
+# NOT glam models or AI/stock. Native, varied terms surface many such creators.
+SCRAPE_WOMAN_HOOK = "日本 女の子 日常 vlog かわいい"
+# A scraped clip is only used for a scene if it semantically supports that exact narration line
+# at or above this score (0-10). Below it the scene falls back to a generated/other visual
+# instead of being filled with random Japan b-roll.
+MIN_SCRIPT_MATCH_SCORE = 7.0
 
 
-def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None):
+def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None, understanding=None):
     """Let the Reasoning Agent derive TikTok b-roll search queries straight from the
     voice script (concrete places/objects/actions per scene), plus the scroll-stop hook
     query (an attractive Japanese woman in her early 20s). The user no longer types
@@ -2089,21 +2237,35 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
         return fallback
     rel = max(0, min(100, int(script_relevancy)))
     prompt = (
-        "You plan REAL TikTok b-roll search queries for a vertical short cut entirely from found footage.\n"
-        "All footage is from JAPAN — every query must point at real Japan/Tokyo footage; never return "
-        "non-Japan locations.\n"
-        "Read the voice script and output concrete, searchable queries (places, objects, actions, scenery, "
-        "daily-life moments) that would surface matching real clips for the scenes — not abstract concepts. "
-        "Keep each query 2-5 words.\n"
-        "IMPORTANT: output a MIX of ENGLISH and JAPANESE queries/hashtags. Japanese TikTok footage is indexed "
-        "under Japanese terms, so include native Japanese words and hashtags in kanji/kana "
-        "(e.g. 東京 夜, 渋谷 スクランブル, 日本 交番, 夜 散歩, 原宿 ファッション, コンビニ 夜, #東京, #日本). "
-        "Aim for roughly half Japanese, half English.\n"
-        f"script_relevancy={rel} (0-100): high = closely follow what is literally said; low = looser, more "
-        "aesthetic b-roll of the overall vibe.\n"
-        "The opening HOOK is ALWAYS an attractive Japanese woman in her early 20s (street style / fashion, "
-        "vertical phone clip). Return a strong hook_query, preferably Japanese (e.g. 日本人 女性 ファッション 原宿).\n"
-        'Return STRICT JSON only: {"hook_query": "...", "queries": ["...", ...]} with 10-16 queries.\n\n'
+        understanding_brief(understanding) +
+        "You plan REAL TikTok search queries for a vertical short cut entirely from found footage about JAPAN.\n"
+        "Go LINE BY LINE through the voice script. For EACH line, write ONE query that would surface a clip that "
+        "literally DEPICTS what that line is about - the concrete subject, place, or action - not just 'Japan'.\n"
+        "Map meaning to footage, e.g.:\n"
+        "  'clean streets' -> 日本 綺麗な 街並み  /  tokyo clean street\n"
+        "  'stress / exhausted / weakness' -> 疲れた サラリーマン  /  日本 残業 疲れ  /  overworked japanese worker\n"
+        "  'crowded trains / commute' -> 満員電車 東京  /  通勤ラッシュ\n"
+        "  'keep bowing' -> 日本 お辞儀 ビジネス\n"
+        "  'sleep in cafes' -> ネットカフェ 寝る  /  カフェ 仮眠 日本\n"
+        "  'surrounded by millions, still alone' -> 渋谷 雑踏 一人  /  東京 孤独 夜\n"
+        "  'quiet pressure / scary perfect' -> 東京 夜 無人 街  /  静かな 日本 路地\n"
+        "FOCUS ON HUMAN EXPRESSION & EMOTION: prefer footage of real people's FACES and body language showing the "
+        "feeling of the line - a tired face, blank stare, forced/fake smile, sighing, looking down, crying - over "
+        "empty scenery. Use expression words: 表情, 疲れた顔, 無表情, ため息, 作り笑い, うつむく, 涙, 真顔, 困った顔. "
+        "An expressive face conveys the emotion far better than a skyline.\n"
+        "USE SYNONYMS & VARIATIONS: for each idea give a couple of DIFFERENT phrasings / synonyms / slang so the "
+        "search surfaces varied clips - e.g. 会社員 / サラリーマン / OL / ビジネスマン; 疲れた / 疲労 / ぐったり / くたくた; "
+        "孤独 / 一人 / ぼっち. Do not just repeat the same noun.\n"
+        "Use NATIVE, idiomatic Japanese exactly how a Japanese creator would tag it (kanji/kana + a hashtag), plus "
+        "one English variant. Keep each query 2-5 words. Japanese TikTok is indexed under Japanese terms, so most "
+        "queries MUST be Japanese.\n"
+        f"script_relevancy={rel} (0-100): high = the clip must literally show what the line says; low = looser vibe.\n"
+        "HOOK (first clip): a REAL, relatable young Japanese woman creator (candid lifestyle / POV / everyday vibe, "
+        "like @sakii_0405_) - NOT a glam model, NOT stock, NOT 'attractive japanese woman'. Search the way these "
+        "creators are actually tagged, with varied native terms/synonyms: 日本 女の子 日常, 女子 vlog, 一人暮らし 女子, "
+        "JK 日常, 主人公感, 自撮り 女の子, かわいい 日常, #日常 #女子 #一人暮らし #JK. Return one such native hook_query.\n"
+        'Return STRICT JSON only: {"hook_query": "...", "queries": ["...", ...]} - one strong query per script '
+        "line plus a few extra, 12-18 total, mostly Japanese.\n\n"
         f"Title: {title}\nVoice script:\n{script}\n"
         + (f"Optional style note: {visual_script}\n" if visual_script else "")
     )
@@ -2128,6 +2290,220 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Scrape: term derivation skipped ({exc.__class__.__name__}); using script keywords.")
     return fallback
+
+
+def llm_scene_scrape_queries(lines, understanding=None, reasoning_model=None, status_cb=None):
+    """Retry-round query generator: given only the narration lines that still have NO matching
+    clip, produce FRESH native TikTok queries that target each line's concrete subject/action,
+    so the next TikTok search finds closer footage (different angles than the obvious city b-roll)."""
+    lines = [str(l).strip() for l in (lines or []) if str(l).strip()]
+    if not lines or not os.environ.get("WAVESPEED_API_KEY"):
+        return []
+    prompt = (
+        understanding_brief(understanding) +
+        "These narration lines still have NO matching real TikTok clip. For EACH line write 2-3 NEW native "
+        "Japanese TikTok search queries (kanji/kana + a hashtag) that would surface footage which LITERALLY "
+        "depicts it - the specific person, action, object, or place - PLUS one English variant. Avoid the obvious "
+        "generic city/skyline b-roll; go for the concrete subject (a tired worker, a packed train, a person "
+        "asleep, a lone figure in a crowd). Keep each query 2-5 words.\n"
+        "FOCUS ON EXPRESSION: lean into real people's FACES/emotions that match the line - 疲れた顔, 無表情, "
+        "ため息, 作り笑い, うつむく, 涙, 困った顔 - an expressive face beats scenery.\n"
+        "VARY IT: use SYNONYMS, alternate phrasings and slang across the queries (会社員 / サラリーマン / OL / "
+        "ビジネスマン; 疲れた / 疲労 / ぐったり / くたくた; 孤独 / 一人 / ぼっち) so each round finds DIFFERENT clips "
+        "than before - do not reuse the same wording.\n\n"
+        "Lines:\n" + "\n".join(f"- {l}" for l in lines) + "\n\n"
+        'Return STRICT JSON: {"queries": ["...", ...]} (8-16 queries, mostly Japanese).'
+    )
+    try:
+        data = _post_llm_json(
+            reasoning_model or GPT55_MODEL,
+            [{"role": "system", "content": "You turn specific narration lines into concrete native TikTok footage queries. Return JSON only."},
+             {"role": "user", "content": prompt}],
+            700, 0.45) or {}
+        return [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()][:16]
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Scrape retry: query generation skipped ({exc.__class__.__name__}).")
+        return []
+
+
+# Japanese synonym map used to widen failing social searches (subject families -> variants).
+SOCIAL_SYNONYM_MAP = {
+    "romance": ["恋愛", "彼氏", "彼女", "カップル", "デート", "結婚", "婚活", "恋愛相談", "恋愛あるある"],
+    "single_lonely": ["独身", "おひとりさま", "ソロ活", "一人暮らし", "孤独", "ぼっち", "一人が好き", "ひとり時間"],
+    "work_exhaustion": ["仕事疲れた", "社会人しんどい", "残業", "サラリーマン", "会社員", "通勤", "終電", "ブラック企業", "社畜"],
+    "money_cost": ["お金ない", "節約", "高い", "出費", "生活費", "家賃", "給料", "奢り", "デート代", "コスパ"],
+    "tokyo_lifestyle": ["東京生活", "東京一人暮らし", "渋谷", "新宿", "池袋", "山手線", "コンビニ", "カフェ", "居酒屋", "夜の街"],
+}
+
+# Hook = a real young Japanese female influencer talking to camera (like the user's reference).
+HOOK_PRESENTER_QUERIES = {
+    "exact": ["日本人女性 インフルエンサー 話す", "顔出し 女性 話す", "カメラ目線 話す 女性",
+              "女子 ひとり語り", "日本人女性 vlog", "20代女子 vlog", "可愛い 女の子 話す"],
+    "social": ["女子あるある", "社会人女子の日常", "東京女子の日常", "ひとり暮らし女子", "雑談 女子",
+               "今日の話", "ちょっと聞いて", "ねえ聞いて", "恋愛 あるある 女子"],
+    "hashtag": ["#女子あるある", "#社会人女子", "#東京女子", "#20代女子", "#ひとり暮らし女子",
+                "#雑談", "#vlog", "#grwm", "#日本人女性"],
+    "english": ["Japanese girl talking to camera", "Japanese female influencer talking",
+                "Japanese woman selfie vlog", "Tokyo girl vlog", "Japanese woman storytelling TikTok"],
+}
+HOOK_PRESENTER_TARGET = "young adult Japanese female influencer, selfie/talking-head TikTok, direct-to-camera, expressive face, clean vertical frame, hook energy; NOT anime/CGI/screen-recording, not a child, not sexualized."
+MIN_HOOK_PRESENTER_SCORE = 7.5
+
+
+def build_social_search_plan(title, script, scenes, understanding=None, reasoning_model=None,
+                             collaborate=False, status_cb=None):
+    """Replace flat 'style queries' with a structured social-search plan: ~8-14 reusable VISUAL
+    BUCKETS (+ a dedicated hook-influencer bucket), each with TikTok-native tiered queries
+    (exact/semantic/broad/hashtag), must_show/not, search_intent, and the scene ids that use it.
+    Returns {"buckets":[...], "hook":{...}} or {} on failure."""
+    if not (script or "").strip() or not os.environ.get("WAVESPEED_API_KEY"):
+        return {}
+    numbered = "\n".join(
+        f"scene {i}: {(scene_text_for_planning(s) or s.get('script', ''))[:140]}"
+        for i, s in enumerate(scenes)
+    )
+    syn = "; ".join(f"{k}: {', '.join(v[:6])}" for k, v in SOCIAL_SYNONYM_MAP.items())
+    messages = [
+        {"role": "system", "content": "You are a TikTok footage researcher for Japanese social-topic shorts. You think in reusable visual buckets and native TikTok search terms (casual + あるある + hashtags), not documentary keywords. Return JSON only."},
+        {"role": "user", "content": (
+            understanding_brief(understanding) +
+            "Plan how to FIND real TikTok footage for this short. Do NOT make one narrow query per line.\n"
+            "GROUP the scenes into 8-14 reusable VISUAL BUCKETS (a bucket = a type of footage many beats can share, "
+            "e.g. 'lonely young people in Tokyo', 'expensive date / restaurant', 'tired salaryman / overwork', "
+            "'small apartment / alone at home', 'couples dating in Tokyo', 'single lifestyle / ohitorisama', "
+            "'city loneliness / night streets').\n"
+            "For EACH bucket give TikTok-native query TIERS (search casual Japanese the way creators tag it, not "
+            "documentary phrasing):\n"
+            "  exact  = on-topic literal queries\n"
+            "  semantic = lifestyle / feeling / behaviour queries\n"
+            "  broad  = broad TikTok-native queries\n"
+            "  hashtag = #hashtag social-discovery queries (e.g. #恋愛あるある #おひとりさま #社会人の日常)\n"
+            "Also add creator-discussion queries where useful (a creator TALKING about the topic), e.g. "
+            "恋愛について話す 女子, 仕事疲れた 話す.\n"
+            f"Useful synonym families to widen with: {syn}.\n"
+            "Each query 2-6 words, mostly Japanese kana/kanji, a few English backups. Reuse buckets across scenes "
+            "via used_by_scene_ids.\n\n"
+            f"Scenes:\n{numbered}\n\n"
+            'Return STRICT JSON: {"buckets": [{"bucket_id": "snake_case", "used_by_scene_ids": [int,...], '
+            '"visual_goal": "...", "primary_subject": "...", "action": "...", "location": "...", "mood": "...", '
+            '"search_intent": "specific_action|lifestyle_broll|emotion_broll|proof_like_social_clip", '
+            '"query_tiers": {"exact": [..], "semantic": [..], "broad": [..], "hashtag": [..]}, '
+            '"must_show": [..], "must_not_show": [..]}, ...]}'
+        )},
+    ]
+    try:
+        if collaborate:
+            plan = collaborate_json(messages, max_tokens=4000, temperature=0.3, status_cb=status_cb, label="social search plan") or {}
+        else:
+            plan = _post_llm_json(reasoning_model or GPT55_MODEL, messages, 4000, 0.3) or {}
+        buckets = plan.get("buckets") if isinstance(plan.get("buckets"), list) else []
+        buckets = [b for b in buckets if isinstance(b, dict) and b.get("query_tiers")]
+        if not buckets:
+            return {}
+        hook = {
+            "bucket_id": "hook_influencer",
+            "used_by_scene_ids": [0],
+            "visual_goal": HOOK_PRESENTER_TARGET,
+            "search_intent": "hook_influencer",
+            "query_tiers": {"exact": HOOK_PRESENTER_QUERIES["exact"],
+                            "semantic": HOOK_PRESENTER_QUERIES["social"],
+                            "broad": HOOK_PRESENTER_QUERIES["english"],
+                            "hashtag": HOOK_PRESENTER_QUERIES["hashtag"]},
+            "must_show": ["a real young Japanese woman's face talking/posing to camera", "clean vertical frame"],
+            "must_not_show": ["anime/CGI", "screen recording", "child/teen", "heavy text over the face", "sexualized bait"],
+        }
+        log(status_cb, f"Built {len(buckets)} social search bucket(s) + a hook-influencer bucket from the script:")
+        for b in buckets:
+            ex = ", ".join((b.get("query_tiers", {}).get("exact") or [])[:4])
+            tags = ", ".join((b.get("query_tiers", {}).get("hashtag") or [])[:3])
+            log(status_cb, f"   • {b.get('bucket_id')} (scenes {b.get('used_by_scene_ids')}): {ex}"
+                           + (f"  |  {tags}" if tags else ""))
+        log(status_cb, f"   • hook_influencer: {', '.join(HOOK_PRESENTER_QUERIES['exact'][:4])}")
+        return {"buckets": buckets, "hook": hook}
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Social search planning skipped ({exc.__class__.__name__}); using flat queries.")
+        return {}
+
+
+def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seconds, script_relevancy,
+                       cookies, cancel_check, status_cb=None, script_text=""):
+    """Tiered, widening per-bucket scrape with query-performance tracking. Searches each bucket
+    tier-by-tier (exact -> semantic -> broad -> hashtag), stopping once it has enough candidates,
+    and tags every downloaded clip with its bucket / query / tier. Returns
+    (pool, clip_meta, query_performance, scene_bucket, hook_pool)."""
+    cand_root = project_dir / "seedance 2.0" / "_candidates"
+    cand_root.mkdir(parents=True, exist_ok=True)
+    pool, hook_pool = [], []
+    clip_meta, query_perf = {}, []
+    seen = set()
+    TIERS = ["exact", "semantic", "broad", "hashtag"]
+
+    def _target(intent):
+        if intent == "hook_influencer":
+            return 16   # feeds the dedicated hook scorer; want a deep talking-head pool to pick from
+        if intent in ("specific_action", "proof_like_social_clip"):
+            return 9
+        return 6
+
+    MAX_POOL = 60   # bound total downloads (hook bucket runs first, so it always gets filled)
+    all_buckets = ([plan["hook"]] if plan.get("hook") else []) + (plan.get("buckets") or [])
+    for bi, bucket in enumerate(all_buckets):
+        if (cancel_check and cancel_check()) or len(pool) >= MAX_POOL:
+            break
+        bid = str(bucket.get("bucket_id", f"bucket_{bi:02d}"))
+        intent = bucket.get("search_intent", "lifestyle_broll")
+        is_hook = (intent == "hook_influencer")
+        target = _target(intent)
+        if is_hook:
+            log(status_cb, "Hook Finder: searching Japanese female talking-head influencer clips...")
+        got = 0
+        for tier in TIERS:
+            if got >= target or (cancel_check and cancel_check()):
+                break
+            qs = [str(q).strip() for q in (bucket.get("query_tiers", {}).get(tier) or []) if str(q).strip()]
+            if not qs:
+                continue
+            log(status_cb, f"  [{bid} · {tier}] searching TikTok: {' · '.join(qs[:6])}")
+            out_dir = cand_root / f"{bid}_{tier}"
+            try:
+                new = clip_scraper.scrape_clips(
+                    out_dir, platforms, ", ".join(qs[:6]), max(4, target - got),
+                    script_text=script_text, script_relevancy=script_relevancy,
+                    per_clip_seconds=per_clip_seconds, lead_query=None, cookies=cookies,
+                    status_cb=None, cancel_check=cancel_check) or []
+            except Exception as exc:  # noqa: BLE001
+                log(status_cb, f"Bucket {bid}: {tier} tier search failed ({exc.__class__.__name__}).")
+                new = []
+            added = 0
+            for p in new:
+                k = str(Path(p).resolve())
+                if k in seen:
+                    continue
+                seen.add(k)
+                pool.append(p)
+                if is_hook:
+                    hook_pool.append(p)
+                clip_meta[str(p)] = {"bucket_id": bid, "source_query": ", ".join(qs[:3])[:80],
+                                     "tier": tier, "search_intent": intent, "platform": "tiktok"}
+                added += 1
+            got += added
+            query_perf.append({"bucket_id": bid, "tier": tier, "queries": qs,
+                               "downloadable_count": len(new), "new_candidates": added})
+            if added == 0:
+                log(status_cb, f"Query tier failed: bucket {bid} {tier} returned 0 new downloadable clips, widening...")
+            else:
+                log(status_cb, f"Bucket {bid}: {tier} tier added {added} clip(s)"
+                               + ("" if got >= target else ", widening...") + ".")
+        log(status_cb, f"Bucket {bid}: final candidate pool {got} clip(s).")
+
+    scene_bucket = {}
+    for b in (plan.get("buckets") or []):
+        for sid in (b.get("used_by_scene_ids") or []):
+            try:
+                scene_bucket[int(sid)] = b.get("bucket_id")
+            except (TypeError, ValueError):
+                continue
+    return pool, clip_meta, query_perf, scene_bucket, hook_pool
 
 
 def llm_auto_director_plan(title, script, scenes, target_duration, media_counts, audio_present=False, reasoning_model=None, status_cb=None):
@@ -2992,89 +3368,576 @@ def image_data_url(path):
     return f"data:{mime};base64,{data}"
 
 
-def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_model=None, status_cb=None):
-    """Autonomous, scene-targeted clip placement: the agent actually LOOKS at each
-    scraped clip (one poster frame each, on a numbered contact sheet) and assigns the
-    visually best-fitting clip to each scene, so footage matches the script instead of
-    being dropped in arbitrary order. Returns one clip Path per scene (repeats allowed).
-    Falls back to round-robin order if vision is unavailable or fails."""
+_CLIP_FRAME_CACHE = {}   # str(resolved clip path) -> [frame Path, ...]; survives retry rounds
+
+
+def _clip_multiframe_strip(clip, frames_dir, idx, ffmpeg, n=4):
+    """Sample n frames ACROSS a clip (not just frame 1) and compose them into one horizontal
+    strip so the vision model judges what happens over the whole clip. Frame extraction is
+    cached by clip path (stable hash-named files) so retry rounds don't re-run ffmpeg."""
+    key = str(Path(clip).resolve())
+    frames = _CLIP_FRAME_CACHE.get(key)
+    if not (frames and all(Path(f).exists() for f in frames)):
+        try:
+            dur = float(probe_audio_duration(clip) or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur <= 0:
+            dur = 5.0
+        fracs = [0.12, 0.38, 0.62, 0.88][:max(2, n)]
+        h = hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:10]
+        frames = []
+        for j, fr in enumerate(fracs):
+            fp = frames_dir / f"f_{h}_{j}.jpg"
+            if pipeline.extract_poster_frame(clip, fp, ffmpeg=ffmpeg, at=max(0.1, dur * fr)):
+                frames.append(fp)
+        if frames:
+            _CLIP_FRAME_CACHE[key] = frames
+    if not frames:
+        return None
+    try:
+        from PIL import Image
+        H = 360
+        tiles = []
+        for f in frames:
+            im = Image.open(f).convert("RGB")
+            tiles.append(im.resize((max(1, int(im.width * H / max(1, im.height))), H)))
+        gap = 6
+        sheet = Image.new("RGB", (sum(t.width for t in tiles) + gap * (len(tiles) - 1), H), (18, 18, 18))
+        x = 0
+        for t in tiles:
+            sheet.paste(t, (x, 0)); x += t.width + gap
+        out = frames_dir / f"clip_{idx:02d}.jpg"
+        sheet.save(out, quality=88)
+        return out
+    except Exception:
+        return frames[0]
+
+
+def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_model=None,
+                                     status_cb=None, understanding=None, clip_meta=None,
+                                     scene_specs=None, collaborate=False):
+    """Semantic scene<->clip matcher (scrape-FIRST). For every scraped candidate it builds a
+    multi-frame strip, the vision model profiles the clip and scores how well it supports each
+    EXACT narration line (script_match 0-10 + style_match + acceptance test). A clip is only used
+    for a scene if script_match >= MIN_SCRIPT_MATCH_SCORE AND it passes the acceptance test; else
+    the scene is left for a fallback visual (clip=None) instead of random Japan b-roll.
+
+    Returns (scene_clips, decision_log): scene_clips[i] is a Path or None; decision_log[i] is a
+    dict (voice_text, chosen_clip, source_query, script_match_score, style_match_score,
+    passes_acceptance_test, reason, fallback_needed, fallback_type, rejected_candidate_count,
+    top_rejected_candidates)."""
     clip_paths = [Path(p) for p in clip_paths if Path(p).exists()]
     n = len(clip_paths)
-    if not n or not scenes:
-        return list(clip_paths)
-    fallback = [clip_paths[i % n] for i in range(len(scenes))]
-    if not os.environ.get("WAVESPEED_API_KEY"):
-        return fallback
+    blank_log = [{"voice_text": (scene_text_for_planning(s) or s.get("script", ""))[:200],
+                  "chosen_clip": None, "fallback_needed": True, "fallback_type": "ai_video",
+                  "script_match_score": 0, "passes_acceptance_test": False,
+                  "reason": "no scraped pool / vision unavailable"} for s in scenes]
+    if not n or not scenes or not os.environ.get("WAVESPEED_API_KEY"):
+        return ([None] * len(scenes), blank_log)
+    clip_meta = clip_meta or {}
+
+    # A big candidate pool produces a contact sheet too large for the vision API (HTTP 400).
+    # Score in batches and keep the best-scoring clip per scene across batches.
+    MATCH_BATCH = 26
+    if n > MATCH_BATCH:
+        merged_clips = [None] * len(scenes)
+        merged_log = list(blank_log)
+        best = [-1.0] * len(scenes)
+        nb = (n + MATCH_BATCH - 1) // MATCH_BATCH
+        log(status_cb, f"Scrape: scoring {n} candidate(s) in {nb} batch(es) of {MATCH_BATCH}...")
+        for b0 in range(0, n, MATCH_BATCH):
+            sub = clip_paths[b0:b0 + MATCH_BATCH]
+            sc, lg = assign_clips_to_scenes_by_vision(
+                scenes, sub, project_dir, reasoning_model=reasoning_model, status_cb=status_cb,
+                understanding=understanding, clip_meta=clip_meta, scene_specs=scene_specs,
+                collaborate=collaborate)
+            for i in range(len(scenes)):
+                c = sc[i] if i < len(sc) else None
+                d = lg[i] if i < len(lg) else {}
+                s = float(d.get("script_match_score") or 0)
+                if c and s > best[i]:
+                    best[i] = s; merged_clips[i] = c; merged_log[i] = d
+        # keep clips unique: if two scenes picked the same clip, the higher score keeps it.
+        by_clip = {}
+        for i, c in enumerate(merged_clips):
+            if not c:
+                continue
+            k = str(c)
+            if k not in by_clip:
+                by_clip[k] = i
+            elif best[i] > best[by_clip[k]]:
+                merged_clips[by_clip[k]] = None; by_clip[k] = i
+            else:
+                merged_clips[i] = None
+        log(status_cb, f"Scrape: {sum(1 for c in merged_clips if c)}/{len(scenes)} scene(s) matched across batches.")
+        return (merged_clips, merged_log)
+
     try:
         ff = pipeline.find_ffmpeg()
         frames_dir = project_dir / "review" / "_clip_match"
-        if frames_dir.exists():
-            for f in frames_dir.glob("*"):
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+        # NOTE: do not wipe this dir between retry rounds - cached frames (f_*.jpg) are reused.
         frames_dir.mkdir(parents=True, exist_ok=True)
-        frame_paths = []
+        strips, kept = [], []
         for i, cp in enumerate(clip_paths):
-            fp = frames_dir / f"clip_{i:02d}.jpg"
-            if pipeline.extract_poster_frame(cp, fp, ffmpeg=ff, at=1.0):
-                frame_paths.append(fp)
-        if not frame_paths:
-            return fallback
-        sheet = create_media_contact_sheet(frame_paths, frames_dir / "_sheet.jpg",
-                                           title="Scraped clips (tiles labeled clip_NN)")
+            strip = _clip_multiframe_strip(cp, frames_dir, i, ff, n=4)
+            if strip:
+                strips.append(strip); kept.append(i)
+        if not strips:
+            return ([None] * len(scenes), blank_log)
+        sheet = create_media_contact_sheet(strips, frames_dir / "_sheet.jpg",
+                                           title="Scraped clips - each tile = 4 frames across one clip (clip_NN)")
         if not sheet:
-            return fallback
-        scene_lines = "\n".join(
-            f"scene {idx}: {(scene_text_for_planning(s) or s.get('script', ''))[:150]}"
-            for idx, s in enumerate(scenes)
-        )
+            return ([None] * len(scenes), blank_log)
+
+        def _spec(idx):
+            sp = (scene_specs or {}).get(idx) if isinstance(scene_specs, dict) else None
+            return sp if isinstance(sp, dict) else {}
+        scene_lines = []
+        for idx, s in enumerate(scenes):
+            sp = _spec(idx)
+            txt = (scene_text_for_planning(s) or s.get("script", ""))[:160]
+            extra = ""
+            if sp.get("required_subject") or sp.get("must_show") or sp.get("visual_acceptance_test"):
+                extra = (f" | needs: {sp.get('required_subject','')} {sp.get('required_action','')}".rstrip()
+                         + (f" | must_show: {', '.join(sp.get('must_show') or [])}" if sp.get("must_show") else "")
+                         + (f" | must_not_show: {', '.join(sp.get('must_not_show') or [])}" if sp.get("must_not_show") else "")
+                         + (f" | accept_if: {sp.get('visual_acceptance_test')}" if sp.get("visual_acceptance_test") else ""))
+            scene_lines.append(f"scene {idx}: \"{txt}\"{extra}")
         prompt = (
-            "You are matching real found-footage clips to the scenes of a short vertical video about JAPAN.\n"
-            "The attached contact sheet shows the available clips; each tile is labeled clip_00, clip_01, ...\n"
-            "Analyze what is actually VISIBLE in each clip. For EACH scene below, choose the clip number whose "
-            "content best fits the scene's meaning (subject, place, action, mood).\n"
-            "Strongly prefer clips that authentically look like JAPAN (Japanese streets, signage, people, "
-            "settings); avoid clips that clearly are not Japan. A clip may be reused if it fits best; prefer "
-            "variety when several fit equally.\n\n"
-            f"Scenes:\n{scene_lines}\n\n"
-            'Return STRICT JSON: {"assignments": {"0": <clip_number>, "1": <clip_number>, ...}} '
-            "with exactly one clip number per scene index."
+            understanding_brief(understanding) +
+            "You are a STRICT footage editor for a vertical short about JAPAN, cut from real TikTok clips.\n"
+            "Each contact-sheet tile shows 4 frames sampled across ONE clip (labeled clip_00, clip_01, ...), so "
+            "judge the WHOLE clip, not one frame.\n\n"
+            "STEP 1 - PROFILE every clip: subjects, actions, location, mood, and quality flags. A clip is UNUSABLE "
+            "(never pick it for any scene) if it is: heavy burned-in Japanese text/captions covering the centre or "
+            "the subject's face, a screenshot / text post / quiz / diagnosis / chat-screen, a TikTok LIVE / "
+            "livestream / screen recording, a slideshow of stills, anime / VTuber / CGI, idol promo / audition, "
+            "horizontal with big black bars, or not actually Japan. Prefer CLEAN raw footage (real people, real "
+            "places, real actions, low text, good light) over a text-heavy clip even if its topic seems perfect.\n\n"
+            "STEP 2 - For EACH scene, pick the BEST clip and score it:\n"
+            "  script_match (0-10): does the clip literally DEPICT what the line says (subject + action + emotion), "
+            "not just 'somewhere in Japan'? A pretty neon skyline for a line about STRESS or CLEAN STREETS is a LOW "
+            "score. A tired worker for 'exhausted', a packed train for 'crowded trains', a lone figure in a crowd "
+            "for 'alone' = HIGH.\n"
+            "  raw_footage (0-10): how clean/real is it as raw footage (10 = clean real footage, no overlays/bars; "
+            "0 = screenshot/text-card/livestream).\n"
+            "  text_heavy (0-10): how much burned-in original text covers the frame (0 = none, 10 = text IS the clip; "
+            ">6 means reject).\n"
+            "  match_class: 'A_MATCH' = direct visual match (line about tired workers -> tired office worker / "
+            "commute / late-night office); 'B_MATCH' = strong social-context match (expensive love -> couple on a "
+            "date / paying a bill / shopping date / creator discussing dating money); 'C_MATCH' = "
+            "emotional/atmospheric match (loneliness -> person alone in Tokyo night / small apartment / solo meal); "
+            "'D_REJECTED' = generic Japan b-roll or only weakly related (random Shibuya street for a specific claim). "
+            "Specific factual/claim lines need A_MATCH or B_MATCH; abstract/emotional lines may use B or C; "
+            "D_REJECTED must NOT be used to fill a specific scene.\n"
+            "  style_match (0-10): visual quality/vibe fit.\n"
+            "  passes (bool): would a viewer understand WHY this clip plays during this sentence, AND is the clip "
+            "clean (not UNUSABLE)?\n"
+            "Be honest: if nothing in the pool truly fits a line, give a low script_match, match_class D_REJECTED "
+            "and passes=false - DO NOT inflate scores to fill the timeline.\n"
+            "Prefer a DIFFERENT clip per scene; only reuse if genuinely the best fit.\n\n"
+            f"Scenes:\n" + "\n".join(scene_lines) + "\n\n"
+            'Return STRICT JSON: {"scenes": {"0": {"clip": <clip_number or -1>, "script_match": <0-10>, '
+            '"raw_footage": <0-10>, "text_heavy": <0-10>, "match_class": "A_MATCH|B_MATCH|C_MATCH|D_REJECTED", '
+            '"style_match": <0-10>, "passes": true|false, "reason": "short why", '
+            '"fallback_type": "ai_video|speaker|proof_card|abstract_broll|reuse_previous", '
+            '"rejected": [{"clip": <n>, "why": "short reason incl. text-heavy/screenshot/livestream/black-bars/'
+            'generic if applicable"}]}, "1": {...}, ...}} - one entry per scene index.'
         )
-        payload = {
+        messages = [
+            {"role": "system", "content": "You are a strict footage QA + editor. You only let a clip play under a narration line when it genuinely DEPICTS that line; otherwise you mark it for a fallback. Return JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
+            ]},
+        ]
+        log(status_cb, "Scrape: semantic scene<->clip matching (multi-frame, scored)...")
+        if collaborate:
+            plan = collaborate_json(messages, max_tokens=6000, temperature=0.1, status_cb=status_cb, label="clip matching") or {}
+        else:
+            data = post_json_url(WAVESPEED_LLM_API, {
+                "model": reasoning_model or GPT55_MODEL, "messages": messages,
+                "temperature": 0.1, "max_tokens": 6000, "response_format": {"type": "json_object"}}, timeout=240)
+            plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
+        smap = plan.get("scenes") if isinstance(plan.get("scenes"), dict) else {}
+
+        scene_clips, decision_log, used = [], [], set()
+        for idx, s in enumerate(scenes):
+            d = smap.get(str(idx)) if isinstance(smap.get(str(idx)), dict) else {}
+            try:
+                cn = int(d.get("clip", -1))
+            except (TypeError, ValueError):
+                cn = -1
+            try:
+                sm = float(d.get("script_match", 0))
+            except (TypeError, ValueError):
+                sm = 0.0
+            try:
+                stm = float(d.get("style_match", 0))
+            except (TypeError, ValueError):
+                stm = 0.0
+            try:
+                raw_fs = float(d.get("raw_footage", 0))
+            except (TypeError, ValueError):
+                raw_fs = 0.0
+            try:
+                txt_hs = float(d.get("text_heavy", 0))
+            except (TypeError, ValueError):
+                txt_hs = 0.0
+            mclass = str(d.get("match_class", "") or "").strip().upper()
+            if mclass not in ("A_MATCH", "B_MATCH", "C_MATCH", "D_REJECTED"):
+                mclass = "D_REJECTED" if sm < MIN_SCRIPT_MATCH_SCORE else "B_MATCH"
+            passes = bool(d.get("passes", False))
+            valid = (0 <= cn < n) and (cn in kept) and (cn not in used)
+            # HARD gates: script must carry it; the clip must be clean raw footage (not a text-heavy
+            # screenshot/livestream); and a D_REJECTED clip can never fill a scene. Style can never
+            # rescue a bad script match.
+            clean = (txt_hs <= 6.0) and (raw_fs >= 4.0)
+            accept = (valid and passes and clean and mclass != "D_REJECTED"
+                      and sm >= MIN_SCRIPT_MATCH_SCORE)
+            chosen = None
+            if accept:
+                chosen = clip_paths[cn]; used.add(cn)
+            rejected = d.get("rejected") if isinstance(d.get("rejected"), list) else []
+            cmeta = clip_meta.get(str(clip_paths[cn])) if (0 <= cn < n) else {}
+            decision_log.append({
+                "scene": idx,
+                "voice_text": (scene_text_for_planning(s) or s.get("script", ""))[:200],
+                "chosen_clip": (clip_paths[cn].name if chosen else None),
+                "bucket_id": (cmeta or {}).get("bucket_id") if chosen else None,
+                "source_query": (cmeta or {}).get("source_query") if chosen else None,
+                "query_tier": (cmeta or {}).get("tier") if chosen else None,
+                "match_class": (mclass if chosen else "D_REJECTED"),
+                "script_match_score": round(sm, 1),
+                "style_match_score": round(stm, 1),
+                "raw_visual_footage_score": round(raw_fs, 1),
+                "text_heaviness_score": round(txt_hs, 1),
+                "final_score": round(sm * 0.75 + stm * 0.25, 2),
+                "passes_acceptance_test": passes,
+                "reason": str(d.get("reason", ""))[:300],
+                "fallback_needed": (chosen is None),
+                "fallback_type": (str(d.get("fallback_type", "ai_video")) if chosen is None else None),
+                "rejected_candidate_count": len(rejected),
+                "top_rejected_candidates": rejected[:4],
+            })
+            scene_clips.append(chosen)
+            line = (scene_text_for_planning(s) or s.get("script", ""))[:46]
+            if chosen:
+                src = (cmeta or {}).get("source_query") or (cmeta or {}).get("bucket_id") or ""
+                log(status_cb, f"   scene {idx} matched {mclass} \"{line}\" -> {clip_paths[cn].name} "
+                               f"(match {sm:.0f}/10{', from ' + src if src else ''})")
+            else:
+                why = "generic/D_REJECTED" if mclass == "D_REJECTED" else (
+                    "text-heavy/unclean" if not clean else f"best {sm:.0f}/10")
+                log(status_cb, f"   scene {idx} rejected \"{line}\" -> no clean clip ≥{MIN_SCRIPT_MATCH_SCORE:.0f} "
+                               f"({why}) -> re-search / fallback")
+        placed = sum(1 for c in scene_clips if c)
+        log(status_cb, f"Scrape: {placed}/{len(scenes)} scene(s) got a clip that passes the script-match gate "
+                       f"(>= {MIN_SCRIPT_MATCH_SCORE:.0f}); {len(scenes) - placed} scene(s) -> re-search / fallback.")
+        return (scene_clips, decision_log)
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Scrape: semantic matching ERROR ({exc.__class__.__name__}: {exc}).")
+        log(status_cb, "Scrape: traceback -> " + traceback.format_exc().replace("\n", " | ")[:900])
+        return ([None] * len(scenes), blank_log)
+
+
+def _tally_clip_quality_filters(decision_log):
+    """Approximate clip_quality_filters counts for agent_report by scanning the matcher's
+    rejection reasons (per-scene 'reason' + top_rejected_candidates 'why')."""
+    counts = {"rejected_text_heavy": 0, "rejected_screenshot": 0, "rejected_livestream": 0,
+              "rejected_black_bars": 0, "rejected_low_quality": 0, "rejected_generic_broll": 0}
+    if not isinstance(decision_log, list):
+        return counts
+    blobs = []
+    for d in decision_log:
+        if not isinstance(d, dict):
+            continue
+        if d.get("fallback_needed"):
+            blobs.append(str(d.get("reason", "")).lower())
+        for rj in (d.get("top_rejected_candidates") or []):
+            if isinstance(rj, dict):
+                blobs.append(str(rj.get("why", "")).lower())
+    for t in blobs:
+        if any(w in t for w in ("text-heavy", "text heavy", "caption", "subtitle", "burned-in", "burned in")):
+            counts["rejected_text_heavy"] += 1
+        if any(w in t for w in ("screenshot", "screen shot", "text post", "quiz", "diagnosis", "text card", "chat")):
+            counts["rejected_screenshot"] += 1
+        if any(w in t for w in ("livestream", "live stream", "screen recording", "tiktok live", " live")):
+            counts["rejected_livestream"] += 1
+        if any(w in t for w in ("black bar", "black-bar", "letterbox", "horizontal")):
+            counts["rejected_black_bars"] += 1
+        if any(w in t for w in ("low quality", "low-quality", "dark", "blurry", "low res", "low-res")):
+            counts["rejected_low_quality"] += 1
+        if any(w in t for w in ("generic", "d_rejected", "unrelated", "random", "street b-roll", "skyline")):
+            counts["rejected_generic_broll"] += 1
+    return counts
+
+
+def score_hook_candidates(hook_clips, project_dir, reasoning_model=None, status_cb=None, collaborate=False):
+    """Dedicated female-Japanese-influencer HOOK finder. The opening shot must be ONE real young
+    adult Japanese woman talking/posing directly to camera (selfie / talking-head / vlog), expressive
+    face, clean vertical frame, low burned-in text - NOT random pretty-girl b-roll. This scores every
+    hook-bucket candidate on presenter qualities and returns them ranked best-first.
+
+    Returns a list (best score first) of dicts:
+    [{"clip": Path, "hook_presenter_score": float, "passed": bool, "scores": {...}, "reason": str}].
+    A clip is only eligible for the opening shot when passed==True (hook_presenter_score >=
+    MIN_HOOK_PRESENTER_SCORE AND a clear single woman talking/posing to camera, none of the reject
+    flags). Mirrors the matcher's batching/strip approach so it never blows the vision payload."""
+    clips = [Path(p) for p in (hook_clips or []) if Path(p).exists()]
+    if not clips or not os.environ.get("WAVESPEED_API_KEY"):
+        return []
+    # bound the contact sheet exactly like the scene matcher (avoid the oversized-image HTTP 400)
+    HOOK_BATCH = 20
+    if len(clips) > HOOK_BATCH:
+        out = []
+        for b0 in range(0, len(clips), HOOK_BATCH):
+            out += score_hook_candidates(clips[b0:b0 + HOOK_BATCH], project_dir,
+                                         reasoning_model=reasoning_model, status_cb=status_cb,
+                                         collaborate=collaborate)
+        out.sort(key=lambda r: r.get("hook_presenter_score", 0), reverse=True)
+        return out
+    try:
+        ff = pipeline.find_ffmpeg()
+        frames_dir = project_dir / "review" / "_hook_match"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        strips, kept = [], []
+        for i, cp in enumerate(clips):
+            strip = _clip_multiframe_strip(cp, frames_dir, i, ff, n=4)
+            if strip:
+                strips.append(strip); kept.append(i)
+        if not strips:
+            return []
+        sheet = create_media_contact_sheet(
+            strips, frames_dir / "_hook_sheet.jpg",
+            title="Hook candidates - each tile = frames across one clip (clip_NN)")
+        if not sheet:
+            return []
+        prompt = (
+            "You are casting the OPENING HOOK shot of a vertical Japanese social short. The hook MUST be ONE "
+            "real young-adult Japanese woman talking or posing directly to the camera (selfie / talking-head / "
+            "vlog look), with an expressive face, hook energy, a clean vertical frame and low burned-in text. "
+            "Each contact-sheet tile shows several frames across ONE candidate clip (clip_00, clip_01, ...), so "
+            "judge the whole clip.\n"
+            "Score EACH clip 0-10 on: face_visibility, eye_contact, talking_to_camera, expression_energy, "
+            "clean_frame, low_original_text, vertical_quality, japanese_influencer_style, and "
+            "sexualized_or_body_bait_penalty (0 = wholesome / not body-focused, 10 = heavy thirst/body bait). "
+            "Then give an overall hook_presenter_score 0-10 that rewards a strong clean presenter and is dragged "
+            "DOWN by the bait penalty.\n"
+            "Set passed=false (no matter the score) if ANY of these are true: no clear single face, not a woman, "
+            "not talking/posing to camera, original text covers the face or centre, it is a livestream / screen "
+            "recording / slideshow / screenshot, anime / VTuber / CGI, the person looks underage, it is too "
+            "sexualized or body-focused, or it is horizontal with black bars.\n"
+            'Return STRICT JSON: {"clips": {"0": {"face_visibility":n, "eye_contact":n, "talking_to_camera":n, '
+            '"expression_energy":n, "clean_frame":n, "low_original_text":n, "vertical_quality":n, '
+            '"japanese_influencer_style":n, "sexualized_or_body_bait_penalty":n, "hook_presenter_score":n, '
+            '"passed":true|false, "reason":"short why"}, "1": {...}}}'
+        )
+        messages = [
+            {"role": "system", "content": "You are a strict casting director for short-form video hooks. You only pass a clip when it is clearly one real Japanese woman presenting to camera. Return JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
+            ]},
+        ]
+        log(status_cb, "Hook Finder: scoring female Japanese talking-head candidates (presenter score)...")
+        if collaborate:
+            plan = collaborate_json(messages, max_tokens=3000, temperature=0.1, status_cb=status_cb, label="hook casting") or {}
+        else:
+            data = post_json_url(WAVESPEED_LLM_API, {
+                "model": reasoning_model or GPT55_MODEL, "messages": messages,
+                "temperature": 0.1, "max_tokens": 3000, "response_format": {"type": "json_object"}}, timeout=180)
+            plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
+        cmap = plan.get("clips") if isinstance(plan.get("clips"), dict) else {}
+        score_keys = ("face_visibility", "eye_contact", "talking_to_camera", "expression_energy",
+                      "clean_frame", "low_original_text", "vertical_quality",
+                      "japanese_influencer_style", "sexualized_or_body_bait_penalty")
+        results = []
+        for i, cp in enumerate(clips):
+            if i not in kept:
+                continue
+            d = cmap.get(str(i)) if isinstance(cmap.get(str(i)), dict) else {}
+            try:
+                hp = float(d.get("hook_presenter_score", 0))
+            except (TypeError, ValueError):
+                hp = 0.0
+            passed = bool(d.get("passed", False)) and hp >= MIN_HOOK_PRESENTER_SCORE
+            results.append({
+                "clip": cp,
+                "hook_presenter_score": round(hp, 1),
+                "passed": passed,
+                "scores": {k: d.get(k) for k in score_keys},
+                "reason": str(d.get("reason", ""))[:220],
+            })
+        results.sort(key=lambda r: r["hook_presenter_score"], reverse=True)
+        npass = sum(1 for r in results if r["passed"])
+        log(status_cb, f"Hook Finder: {len(results)} candidate(s), {npass} passed "
+                       f"hook_presenter_score >= {MIN_HOOK_PRESENTER_SCORE:.1f}.")
+        if results:
+            top = results[0]
+            log(status_cb, f"   best hook: {Path(top['clip']).name} "
+                           f"({top['hook_presenter_score']:.1f}/10 - {top['reason'][:70]})")
+        return results
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Hook Finder: scoring failed ({exc.__class__.__name__}); using first hook clip.")
+        log(status_cb, "Hook Finder: traceback -> " + traceback.format_exc().replace("\n", " | ")[:600])
+        return [{"clip": c, "hook_presenter_score": 0.0, "passed": False, "scores": {}, "reason": "scorer error"}
+                for c in clips]
+
+
+def enforce_reference_pacing(scenes, max_s=2.4):
+    """Match the reference cut rate (~one fresh clip every ~2s). Any beat longer than max_s
+    is split into equal sub-beats so the edit cuts fast instead of holding one clip too long.
+    Captions are word-windowed per beat downstream, so splitting only adds visual cuts."""
+    out = []
+    for s in scenes:
+        try:
+            start = float(s.get("start", 0.0)); end = float(s.get("end", start))
+        except (TypeError, ValueError):
+            out.append(s); continue
+        dur = end - start
+        if dur <= max_s * 1.25:
+            out.append(s); continue
+        n = max(2, int(math.ceil(dur / max_s)))
+        step = dur / n
+        for i in range(n):
+            sub = dict(s)
+            sub["start"] = round(start + i * step, 3)
+            sub["end"] = round(end if i == n - 1 else start + (i + 1) * step, 3)
+            sub["micro_beat"] = True
+            out.append(sub)
+    return out
+
+
+def place_editor_sfx(config, reasoning_model=None, status_cb=None):
+    """Reference-style EDITED SFX (NOT a continuous ambient bed). Audio analysis of the example
+    edits showed: a music bed + speech + SHORT discrete hits (~<0.5s, mostly low-end impacts plus
+    a few whooshes) landing roughly ON THE CUTS. So we drop one or two SIGNATURE short library
+    sounds onto the beat changes: an impact on most cuts, a whoosh on the hook / emphasis beats.
+    Pulled straight from the SFX library - no Kling ambience. Returns how many hits were placed."""
+    if not bool(config.get("sfx_enabled", True)):
+        return 0
+    scenes = config.get("scenes", [])
+    if not scenes:
+        return 0
+    def _pick(categories, prefer_tokens, seed):
+        files = []
+        for cat in categories:
+            files += (pipeline.sfx_category_files(config, cat) or [])
+        files = [f for f in files if Path(f).suffix.lower() in pipeline.SFX_EXTS]
+        if not files:
+            return None
+        pref = [f for f in files if any(t in Path(f).stem.lower() for t in prefer_tokens)]
+        pool = pref or files
+        digest = hashlib.sha1(f"{config.get('project_slug', '')}|{seed}".encode("utf-8", "ignore")).hexdigest()
+        return pool[int(digest[:8], 16) % len(pool)]
+
+    # one or two signature short sounds, picked deterministically per project (a real edit reuses
+    # the same hit so the short feels designed, not random). Prefer punchy boom/whoosh names.
+    impact = _pick(["hits_impacts", "subtle_impacts"],
+                   ["impact", "boom", "hit", "bass", "sub", "thud", "deep", "punch", "cinematic", "braam"],
+                   "editor-impact")
+    whoosh = _pick(["motion_whoosh_like", "analog_transitions", "subtle_transitions"],
+                   ["whoosh", "swoosh", "swish", "woosh", "sweep", "transition", "whip"],
+                   "editor-whoosh")
+    if not impact and not whoosh:
+        log(status_cb, "Editor SFX: no library hits available; skipping.")
+        return 0
+    base = round(min(0.34, float(config.get("sfx_volume_with_speech", 0.08) or 0.08) * 4.0), 3)
+    events = []
+    prev = -9.0
+    for i, sc in enumerate(scenes):
+        try:
+            start = float(sc.get("start", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if start - prev < 0.45:        # don't stack hits on micro-beats tighter than ~0.45s
+            continue
+        prev = start
+        is_emph = bool(sc.get("overlays"))            # emphasis / arrow beat
+        snd = whoosh if (is_emph and whoosh) else (impact or whoosh)
+        if not snd:
+            continue
+        vol = base * (1.15 if (i == 0 or is_emph) else 1.0)
+        events.append({"path": str(snd), "start": round(max(0.0, start - 0.04), 3),
+                       "duration": 0.9, "volume": round(min(0.4, vol), 3),
+                       "category": "editor_sfx", "id": f"sfx-{i:02d}"})
+    if events:
+        config["ai_content_sfx"] = events
+        log(status_cb, f"Editor SFX: placed {len(events)} short library hit(s) on the cuts "
+                       "(impact + whoosh on emphasis), reference-style - no ambient drone.")
+    return len(events)
+
+
+def plan_visual_emphasis(config, reasoning_model=None, status_cb=None):
+    """Add the meme-style red ARROW / CIRCLE / stamped-word callouts the 'dark facts' edits
+    use. The renderer already draws scene['overlays'] (draw_smart_overlays) - this decides
+    which punchy lines get a callout, what it points at, and the word to stamp. One text-only
+    LLM call; returns how many scenes were annotated."""
+    scenes = config.get("scenes", [])
+    if not scenes or not os.environ.get("WAVESPEED_API_KEY"):
+        return 0
+    lines = "\n".join(
+        f"{i}: {(s.get('exact_voice_text') or s.get('script') or '')[:120]}"
+        for i, s in enumerate(scenes)
+    )
+    prompt = (
+        "This is a punchy 'dark facts' style vertical short over real found-footage. Add bold red callouts "
+        "(arrow / circle / stamped word) to the most impactful lines to drive the point home, like the viral "
+        "Japan-facts edits. Do NOT annotate every line - pick the ~40-60% that hit hardest (reveals, shocking "
+        "claims, the concrete subject of the sentence). Arrows/circles only - no extra text.\n\n"
+        f"Lines:\n{lines}\n\n"
+        'Return STRICT JSON: {"emph": [{"i": <line index>, "style": "arrow|circle|both", '
+        '"target": "center|face|left|right|lower"}, ...]}'
+    )
+    try:
+        data = post_json_url(WAVESPEED_LLM_API, {
             "model": reasoning_model or GPT55_MODEL,
             "messages": [
-                {"role": "system", "content": "You assign footage clips to script scenes by what is visible in each clip. Return JSON only."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
-                ]},
+                {"role": "system", "content": "You are a short-form motion editor adding bold red emphasis callouts. Return JSON only."},
+                {"role": "user", "content": prompt},
             ],
-            "temperature": 0.1,
-            "max_tokens": 700,
-            "response_format": {"type": "json_object"},
-        }
-        log(status_cb, "Scrape: matching clips to scenes with the Reasoning Agent (vision)...")
-        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
+            "temperature": 0.4, "max_tokens": 900, "response_format": {"type": "json_object"},
+        }, timeout=120)
         plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
-        amap = plan.get("assignments") if isinstance(plan, dict) else None
-        if not isinstance(amap, dict):
-            return fallback
-        ordered = []
-        for idx in range(len(scenes)):
-            try:
-                cn = int(amap.get(str(idx), idx % n))
-            except (TypeError, ValueError):
-                cn = idx % n
-            if cn < 0 or cn >= n:
-                cn = idx % n
-            ordered.append(clip_paths[cn])
-        log(status_cb, f"Scrape: agent matched {n} clip(s) across {len(scenes)} scene(s) by visual fit.")
-        return ordered
+        emph = plan.get("emph") or []
     except Exception as exc:  # noqa: BLE001
-        log(status_cb, f"Scrape: vision clip-matching skipped ({exc.__class__.__name__}); using order.")
-        return fallback
+        log(status_cb, f"Visual emphasis planning skipped ({exc.__class__.__name__}).")
+        return 0
+    targets = {"center": (0.5, 0.5), "face": (0.5, 0.36), "left": (0.34, 0.46),
+               "right": (0.66, 0.46), "lower": (0.5, 0.66)}
+    added = 0
+    for e in emph:
+        if not isinstance(e, dict):
+            continue
+        try:
+            i = int(e.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= i < len(scenes)):
+            continue
+        style = str(e.get("style", "arrow")).lower()
+        tx, ty = targets.get(str(e.get("target", "center")).lower(), (0.5, 0.5))
+        from_left = (i % 2 == 0)                     # alternate sides = pattern interrupt
+        ax0, ay0 = (0.12, 0.80) if from_left else (0.88, 0.80)
+        ax1 = (tx - 0.05) if from_left else (tx + 0.05)
+        ay1 = ty + 0.08
+        overlays = list(scenes[i].get("overlays") or [])
+        # A quick punch-in at the cut, then gone. NO stamped words - the green captions already
+        # carry the text; a second text layer just clutters the frame.
+        if style in ("arrow", "both"):
+            overlays.append({"type": "arrows", "items": [[ax0, ay0, ax1, ay1]],
+                             "start": 0.0, "end": 0.55, "shake": 2.5})
+        if style in ("circle", "both"):
+            overlays.append({"type": "highlight", "cx": tx, "cy": ty, "rx": 0.17, "ry": 0.12,
+                             "start": 0.0, "end": 0.55})
+        scenes[i]["overlays"] = overlays
+        added += 1
+    if added:
+        config["smart_overlays"] = True
+        log(status_cb, f"Added red emphasis callouts (arrows / circles / labels) to {added} scene(s).")
+    return added
 
 
 def clamp_web_image_target(count):
@@ -3802,7 +4665,7 @@ def render_mix_plan_for_output(config, video_path):
     return {}
 
 
-def llm_video_review(title, script, visual_script, config, video_path, scene_sheet, shot_sheet, reasoning_model=None, status_cb=None, pass_label="initial"):
+def llm_video_review(title, script, visual_script, config, video_path, scene_sheet, shot_sheet, reasoning_model=None, status_cb=None, pass_label="initial", collaborate=False):
     if not os.environ.get("WAVESPEED_API_KEY"):
         log(status_cb, "Reasoning Agent video review skipped; WAVESPEED_API_KEY is not set.")
         return {}
@@ -3823,6 +4686,7 @@ def llm_video_review(title, script, visual_script, config, video_path, scene_she
                 "The voice script is the edit map. For every scene, ask: does the visual answer the exact voice line at that timestamp, not just look cinematic?\n"
                 "Review each scene for these concrete checks: exact voice-line match, most important object visible within the first 0.3 seconds, 9:16 crop safety, visual difference from the previous scene, real motion versus fake zoom, Shorts pacing, SFX frequency/distraction, unwanted mouth movement or speech in generated clips, repetition, and whether the hook connects to the rest of the video.\n"
                 "Be very strict about wrong topic media: if a scene image does not match the spoken script, flag it as high severity even if it resembles the visual direction.\n"
+                "SCENE-TO-SCRIPT RELEVANCE (critical for scraped found-footage): for EVERY scene ask 'does this exact visual depict what THIS line says?'. Flag as HIGH severity any of: a clip that is merely generic Japan/travel/street b-roll under a specific claim; a pretty skyline/neon shot under a line about stress, exhaustion, cleanliness, crowds, or loneliness; the same footage reused for unrelated lines; a specific claim shown with a vague mood-only visual. The footage should feel chosen for the sentence, not just 'filmed in Japan'.\n"
                 "For audio, flag missing SFX on image switches, SFX too loud/too quiet, Seedance clip audio overpowering speech, or music/SFX fighting the narration. Speech audio may be absent; do not require it. Do not flag missing background music when background_music_enabled is false.\n"
                 "The uploaded speech audio is only a timing reference and must not be required or mixed into the final video.\n"
                 "Do not request edits to any scene marked speaker_hook=true; the opening speaker hook clip is locked once generated.\n"
@@ -3857,9 +4721,14 @@ def llm_video_review(title, script, visual_script, config, video_path, scene_she
         "response_format": {"type": "json_object"},
     }
     try:
-        log(status_cb, f"Reviewing video with Reasoning Agent ({pass_label})...")
-        data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
-        review = extract_json_object(data["choices"][0]["message"]["content"])
+        if collaborate:
+            review = collaborate_json(payload["messages"], max_tokens=payload["max_tokens"],
+                                      temperature=payload["temperature"], status_cb=status_cb,
+                                      label=f"video review ({pass_label})") or {}
+        else:
+            log(status_cb, f"Reviewing video with Reasoning Agent ({pass_label})...")
+            data = post_json_url(WAVESPEED_LLM_API, payload, timeout=180)
+            review = extract_json_object(data["choices"][0]["message"]["content"])
         if not isinstance(review, dict):
             return {}
         log(status_cb, f"Reasoning Agent review score ({pass_label}): {review.get('overall_score', 'n/a')}/10")
@@ -4499,7 +5368,12 @@ def run_project(form, status_cb=None):
     check_cancel(form)
     script = clean_text(form.get("script", ""))
     reasoning_model = form.get("reasoning_model", "openai/gpt-5.5")
-    
+    # Collaborative reasoning: GPT-5.5 drafts, Opus 4.8 critiques & corrects (edit map + review).
+    # Default False here so an unchecked box (absent) is honoured; the UI renders it on by default.
+    collaborate_reasoning = form_flag(form, "collaborative_reasoning", False)
+    if collaborate_reasoning:
+        log(status_cb, "Collaborative reasoning ON: GPT-5.5 drafts, Opus 4.8 critiques & corrects.")
+
     title = form.get("title", "").strip()
     if not title and script:
         title = llm_generate_project_title(script, status_cb=status_cb)
@@ -4614,6 +5488,17 @@ def run_project(form, status_cb=None):
     if visual_script:
         (project_dir / "input" / "visual_script.txt").write_text(visual_script, encoding="utf-8")
 
+    # COMPREHEND THE SCRIPT ONCE: a single deep understanding of what this video is about,
+    # shared by every clip agent (search terms + clip matching) so they stop guessing per-step.
+    script_understanding = comprehend_script(title, script, reasoning_model=reasoning_model,
+                                             collaborate=collaborate_reasoning, status_cb=status_cb)
+    if script_understanding:
+        try:
+            (project_dir / "input" / "script_understanding.json").write_text(
+                json.dumps(script_understanding, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
     from timeline.voice_timing import load_or_create_voice_timing
     timing_info = load_or_create_voice_timing(
         project_dir=project_dir,
@@ -4635,10 +5520,18 @@ def run_project(form, status_cb=None):
             for scene in base_scenes
         ]
         (project_dir / "input" / "audio_timed_script.txt").write_text("\n".join(timed_lines), encoding="utf-8")
-    micro_beat_result = build_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=reasoning_model, status_cb=status_cb)
+    micro_beat_result = build_micro_beat_plan(title, script, visual_script, target_duration, base_scenes, reasoning_model=reasoning_model, status_cb=status_cb, collaborate=collaborate_reasoning)
     micro_beat_scenes = micro_beat_result["micro_beats"]
     visual_sections = micro_beat_result["visual_sections"]
     scenes_override = apply_visual_script_to_scenes(micro_beat_scenes, visual_script, target_duration)
+    # Reference dark-facts edits cut every ~2s (measured: 23-27 cuts over 43-56s). Split any
+    # beat longer than that so the pacing matches instead of reading as a slow slideshow.
+    # (clip_source is read straight from the form here; its canonical local is assigned later.)
+    if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
+        before_n = len(scenes_override)
+        scenes_override = enforce_reference_pacing(scenes_override, max_s=2.4)
+        if len(scenes_override) != before_n:
+            log(status_cb, f"Pacing: split long beats for reference cut rate ({before_n} -> {len(scenes_override)} beats, ~1 cut/2s).")
     log(status_cb, f"Using {len(scenes_override)} micro-beat(s) as the edit map.")
     if visual_script:
         log(status_cb, "Visual Ablauf prompt applied to scene planning, image prompts, Seedance prompts, and review.")
@@ -4849,6 +5742,11 @@ def run_project(form, status_cb=None):
             log(status_cb, "Recut mode will generate fresh Seedance clips in the loaded project folder.")
         else:
             log(status_cb, f"Recut mode blocks new Seedance generation; existing Seedance clips available: {existing_seedance_count}.")
+    if auto_web_images and clip_source == "scrape":
+        # In a TikTok scrape run the video layer is real footage; web images are never used,
+        # so skip the (slow, ~20 min) web-image search entirely.
+        log(status_cb, "Scrape mode: skipping web-image search (footage comes from TikTok).")
+        auto_web_images = False
     if auto_web_images:
         original_web_image_count = web_image_count
         web_image_count = clamp_web_image_target(web_image_count)
@@ -4893,6 +5791,8 @@ def run_project(form, status_cb=None):
             reasoning_model=reasoning_model, status_cb=status_cb,
         )
     # ===== Scrape real clips into the seedance folder (clip_source == "scrape") =====
+    clip_decision_log = None   # per-scene clip choices/rejections for agent_report
+    social_search_report = None
     if clip_source == "scrape":
         try:
             import clip_scraper
@@ -4900,100 +5800,241 @@ def run_project(form, status_cb=None):
             clip_scraper = None
             log(status_cb, f"Scrape: clip_scraper unavailable ({exc.__class__.__name__}); skipping scrape.")
         if clip_scraper is not None:
-            # Found-footage style = EVERY scene is a real clip, not just a few. Scrape a
-            # pool sized to the whole edit (capped to bound cost), then loop-fill any
-            # shortfall so no scene falls back to a blank card.
             scene_total = len(scenes_override) if scenes_override else max(1, seedance_clip_count)
-            SCRAPE_CAP = 12
-            want = max(1, min(scene_total, SCRAPE_CAP))
-            # cover long beats without freezing: clips as long as the longest scene
+            SCRAPE_CAP = 34
+            MAX_SCRAPE_ROUNDS = int(form.get("scrape_rounds", 3) or 3) if isinstance(form, dict) else 3
+            MAX_SCRAPE_ROUNDS = max(1, min(5, MAX_SCRAPE_ROUNDS))
             try:
                 per_clip = min(8.0, max(4.0, max(float(s["end"]) - float(s["start"]) for s in scenes_override)))
             except Exception:
                 per_clip = 5.0
             seedance_target_dir = project_dir / "seedance 2.0"
-            # The agent derives the TikTok search terms from the voice script, plus the
-            # fixed scroll-stop hook (early-20s Japanese woman). Any custom terms the user
-            # added (chips) are always merged in on top.
-            _custom = (scrape_terms or "").strip()
-            _splan = llm_scrape_plan(script, title, visual_script, script_relevancy,
-                                     reasoning_model=reasoning_model, status_cb=status_cb)
-            lead_query = _splan.get("hook_query") or getattr(clip_scraper, "DEFAULT_WOMAN_LEAD", None)
-            _derived = ", ".join(_splan.get("queries") or [])
-            scrape_terms = ", ".join([t for t in (_custom, _derived) if t]) or scrape_terms
-            if scrape_terms:
-                log(status_cb, f"Scrape: search terms{' (incl. your custom)' if _custom else ''} — {scrape_terms[:160]}")
+            _cancel = lambda: bool(cancellation_event(form) and cancellation_event(form).is_set())
+            _cookies = (str(form.get("scrape_cookies_file", "") or "").strip()
+                        or str(form.get("scrape_cookies", "") or "").strip())
             already = existing_seedance_clips(project_dir)
-            if already and recut_mode == "normal":
-                log(status_cb, f"Scrape: reusing {len(already)} clip(s) already in seedance 2.0.")
-                scraped = list(already)
-            else:
-                with step_watchdog(form, "Clip scrape", limit_s=1200, status_cb=status_cb):
-                    scraped = clip_scraper.scrape_clips(
-                        seedance_target_dir,
-                        scrape_platforms,
-                        scrape_terms,
-                        want,
-                        script_text=script,
-                        script_relevancy=script_relevancy,
-                        per_clip_seconds=per_clip,
-                        lead_query=lead_query,
-                        cookies=(str(form.get("scrape_cookies_file", "") or "").strip()
-                                 or str(form.get("scrape_cookies", "") or "").strip()),
-                        status_cb=status_cb,
-                        cancel_check=lambda: bool(cancellation_event(form) and cancellation_event(form).is_set()),
-                    )
-            if scraped:
-                # Scene-targeted placement: the agent LOOKS at the pool and assigns the
-                # best-matching clip to each scene (one clip per scene, repeats allowed),
-                # so footage fits the script instead of being placed in arbitrary order.
-                ordered = assign_clips_to_scenes_by_vision(
-                    scenes_override, scraped, project_dir, reasoning_model=reasoning_model, status_cb=status_cb
-                ) or list(scraped)
-                import shutil as _shutil
-                tmp = seedance_target_dir / "_ordered"
-                if tmp.exists():
-                    for f in tmp.glob("*"):
-                        try:
-                            f.unlink()
-                        except Exception:
-                            pass
-                tmp.mkdir(parents=True, exist_ok=True)
-                staged = []
-                for i, src in enumerate(ordered):
-                    dst = tmp / f"scraped_{i:02d}.mp4"
-                    try:
-                        _shutil.copyfile(src, dst)
-                        staged.append(dst)
-                    except Exception:
-                        pass
-                if staged:
-                    for old in seedance_target_dir.glob("scraped_*.mp4"):
-                        try:
-                            old.unlink()
-                        except Exception:
-                            pass
-                    moved = []
-                    for f in staged:
-                        target = seedance_target_dir / f.name
-                        try:
-                            f.replace(target)
-                            moved.append(target)
-                        except Exception:
-                            pass
-                    scraped = moved or scraped
+
+            # Build a structured SOCIAL SEARCH PLAN: reusable visual buckets + a dedicated hook
+            # influencer bucket, each with TikTok-native tiered queries (exact->semantic->broad->
+            # hashtag). Scrape tier by tier, widening only when a bucket finds too few clips.
+            log(status_cb, "Building social search buckets from script...")
+            social_plan = build_social_search_plan(
+                title, script, scenes_override, understanding=script_understanding,
+                reasoning_model=reasoning_model, collaborate=collaborate_reasoning, status_cb=status_cb)
+            bucket_by_id = {b.get("bucket_id"): b for b in (social_plan.get("buckets") or [])}
+            scene_bucket, query_perf, hook_pool, clip_meta = {}, [], [], {}
+            pool = []
+            hook_results, best_hook = [], None     # dedicated hook finder output (reserves scene 0)
+            body_pool = []                         # pool minus hook clips (body scenes only)
+            scene_clips = [None] * scene_total
+            with step_watchdog(form, "Clip scrape", limit_s=2700, status_cb=status_cb):
+                if social_plan.get("buckets"):
+                    pool, clip_meta, query_perf, scene_bucket, hook_pool = scrape_social_plan(
+                        social_plan, project_dir, clip_scraper, scrape_platforms, per_clip,
+                        script_relevancy, _cookies, _cancel, status_cb=status_cb, script_text=script)
+                else:
+                    # back-compat: flat query fallback if bucket planning failed
+                    _splan = llm_scrape_plan(script, title, visual_script, script_relevancy,
+                                             reasoning_model=reasoning_model, status_cb=status_cb,
+                                             understanding=script_understanding)
+                    terms = ", ".join(_splan.get("queries") or []) or scrape_terms
+                    pool = clip_scraper.scrape_clips(
+                        seedance_target_dir, scrape_platforms, terms,
+                        max(10, min(int(scene_total * 1.6), SCRAPE_CAP)), script_text=script,
+                        script_relevancy=script_relevancy, per_clip_seconds=per_clip,
+                        lead_query=_splan.get("hook_query"), cookies=_cookies,
+                        status_cb=status_cb, cancel_check=_cancel) or []
+
+                # ---- Dedicated HOOK finder: score the talking-head candidates, reserve scene 0 ----
+                # The hook must be ONE strong female Japanese influencer/talking-head clip - it is
+                # NOT judged by the body matcher (a talking-head doesn't "depict" the hook line), and
+                # the hook-bucket clips are kept OUT of the body pool so the body never fills with
+                # random pretty-girl clips.
+                if hook_pool:
+                    hook_results = score_hook_candidates(
+                        hook_pool, project_dir, reasoning_model=reasoning_model,
+                        status_cb=status_cb, collaborate=collaborate_reasoning)
+                    best_hook = next((r["clip"] for r in hook_results if r.get("passed")), None)
+                    if best_hook is None and hook_results:
+                        best_hook = hook_results[0]["clip"]   # soft fallback: best-scoring talking-head
+                        log(status_cb, "Hook Finder: no candidate cleared the presenter bar; using the "
+                                       "best-scoring talking-head clip for the opening.")
+                hook_keys = {str(Path(p).resolve()) for p in hook_pool}
+                body_pool = [p for p in pool if str(Path(p).resolve()) not in hook_keys]
+
+                def _apply_hook(clips):
+                    # scene 0 is always the chosen hook clip when we have one
+                    if best_hook is not None and clips:
+                        clips[0] = best_hook
+                    return clips
+
+                # Per-scene specs from the bucket each scene belongs to (grounds the matcher).
+                scene_specs = {}
+                for i in range(scene_total):
+                    b = bucket_by_id.get(scene_bucket.get(i))
+                    if b:
+                        scene_specs[i] = {
+                            "required_subject": b.get("primary_subject", ""),
+                            "required_action": b.get("action", ""),
+                            "must_show": b.get("must_show", []),
+                            "must_not_show": b.get("must_not_show", []),
+                            "visual_acceptance_test": b.get("visual_goal", ""),
+                        }
+                if body_pool:
+                    scene_clips, clip_decision_log = assign_clips_to_scenes_by_vision(
+                        scenes_override, body_pool, project_dir, reasoning_model=reasoning_model,
+                        status_cb=status_cb, understanding=script_understanding,
+                        clip_meta=clip_meta, scene_specs=scene_specs, collaborate=collaborate_reasoning)
+                _apply_hook(scene_clips)
+
+                # Keep searching TikTok for any BODY scene still unmatched (targeted retry rounds).
+                # Scene 0 is the hook and is never re-searched here.
+                for rnd in range(1, MAX_SCRAPE_ROUNDS):
+                    if _cancel():
+                        break
+                    unmatched = [i for i, c in enumerate(scene_clips)
+                                 if c is None and not (i == 0 and best_hook is not None)]
+                    if not unmatched:
+                        break
+                    lines = [(scene_text_for_planning(scenes_override[i]) or scenes_override[i].get("script", ""))
+                             for i in unmatched]
+                    log(status_cb, f"Scrape round {rnd + 1}: re-searching TikTok for {len(unmatched)} "
+                                   f"scene(s) that still have no matching clip...")
+                    retry_terms = llm_scene_scrape_queries(lines, understanding=script_understanding,
+                                                           reasoning_model=reasoning_model, status_cb=status_cb)
+                    if not retry_terms:
+                        break
+                    log(status_cb, f"   retry search terms: {' · '.join(retry_terms[:8])}")
+                    new = clip_scraper.scrape_clips(
+                        seedance_target_dir / "_candidates" / f"retry_{rnd}", scrape_platforms,
+                        ", ".join(retry_terms), max(8, min(len(unmatched) * 3, SCRAPE_CAP)),
+                        script_text=script, script_relevancy=script_relevancy, per_clip_seconds=per_clip,
+                        lead_query=None, cookies=_cookies, status_cb=status_cb, cancel_check=_cancel) or []
+                    seen = {str(p) for p in pool}
+                    for p in new:
+                        if str(p) not in seen:
+                            pool.append(p)
+                            body_pool.append(p)
+                            clip_meta[str(p)] = {"bucket_id": "retry", "tier": "retry", "platform": "tiktok",
+                                                 "source_query": ", ".join(retry_terms[:3])[:80]}
+                    if not body_pool:
+                        continue
+                    scene_clips, clip_decision_log = assign_clips_to_scenes_by_vision(
+                        scenes_override, body_pool, project_dir, reasoning_model=reasoning_model,
+                        status_cb=status_cb, understanding=script_understanding,
+                        clip_meta=clip_meta, scene_specs=scene_specs, collaborate=collaborate_reasoning)
+                    _apply_hook(scene_clips)
+
+            # Make the per-scene decision log reflect the dedicated hook finder for scene 0 (the
+            # body matcher never scored the hook, so its scene-0 entry is meaningless).
+            if not isinstance(clip_decision_log, list):
+                clip_decision_log = [None] * scene_total
+            while len(clip_decision_log) < scene_total:
+                clip_decision_log.append(None)
+            hook_chosen = next((r for r in hook_results if best_hook is not None
+                                and str(Path(r["clip"]).resolve()) == str(Path(best_hook).resolve())), None)
+            if best_hook is not None and scenes_override:
+                clip_decision_log[0] = {
+                    "scene": 0,
+                    "voice_text": (scene_text_for_planning(scenes_override[0])
+                                   or scenes_override[0].get("script", ""))[:200],
+                    "chosen_clip": Path(best_hook).name,
+                    "bucket_id": "hook_influencer",
+                    "source_query": "hook_influencer (talking-head finder)",
+                    "query_tier": "hook",
+                    "match_class": "HOOK_MATCH",
+                    "script_match_score": None,
+                    "hook_presenter_score": (hook_chosen or {}).get("hook_presenter_score"),
+                    "passes_acceptance_test": bool((hook_chosen or {}).get("passed")),
+                    "reason": (hook_chosen or {}).get("reason", "best-scoring talking-head"),
+                    "fallback_needed": False,
+                    "fallback_type": None,
+                }
+
+            # social-search report for agent_report.json
+            hook_passed = sum(1 for r in hook_results if r.get("passed"))
+            social_search_report = {
+                "buckets": [{"bucket_id": b.get("bucket_id"), "visual_goal": b.get("visual_goal"),
+                             "used_by_scene_ids": b.get("used_by_scene_ids"),
+                             "queries_by_tier": b.get("query_tiers"), "search_intent": b.get("search_intent")}
+                            for b in (social_plan.get("buckets") or [])],
+                "hook_finder": {
+                    "enabled": True,
+                    "reference_used": False,
+                    "queries": HOOK_PRESENTER_QUERIES,
+                    "candidate_count": len(hook_pool),
+                    "passed_count": hook_passed,
+                    "chosen_clip_id": (Path(best_hook).name if best_hook is not None else None),
+                    "hook_presenter_score": (hook_chosen or {}).get("hook_presenter_score"),
+                    "reason": ((hook_chosen or {}).get("reason")
+                               if hook_chosen else
+                               ("no candidate cleared the bar; used best-scoring talking-head"
+                                if best_hook is not None else "no hook candidates found")),
+                    "target": social_plan.get("hook", {}).get("visual_goal", ""),
+                    "candidates": [{"clip_id": Path(r["clip"]).name,
+                                    "hook_presenter_score": r.get("hook_presenter_score"),
+                                    "passed": r.get("passed"), "scores": r.get("scores"),
+                                    "reason": r.get("reason")} for r in hook_results[:12]],
+                },
+                "query_performance": query_perf,
+                "candidate_pool_total": len(pool),
+                "clip_quality_filters": _tally_clip_quality_filters(clip_decision_log),
+                "scene_assignments": [
+                    {k: (d or {}).get(k) for k in
+                     ("scene", "voice_text", "bucket_id", "chosen_clip", "source_query", "query_tier",
+                      "match_class", "script_match_score", "raw_visual_footage_score",
+                      "text_heaviness_score", "hook_presenter_score", "reason")}
+                    for d in clip_decision_log if isinstance(d, dict)],
+            }
+
+            # Place matched clips. Any scene STILL unmatched after all search rounds gets the
+            # closest remaining REAL clip from the pool (last resort) - never GPT/AI.
+            import shutil as _shutil
+            for old in seedance_target_dir.glob("scraped_*.mp4"):
                 try:
-                    tmp.rmdir()
+                    old.unlink()
                 except Exception:
                     pass
-                seedance_clip_count = len(scraped)
-                allow_seedance = True
-                log(status_cb, f"Scrape: {len(scraped)} clip(s) placed to best match each of the {scene_total} scene(s).")
+            used_keys, placed, matched = set(), 0, 0
+            # last-resort fill never pulls from the hook pool (keeps talking-head clips out of body
+            # scenes); fall back to the full pool only if there is no body footage at all.
+            fill_pool = body_pool or pool
+            for i, sc in enumerate(scenes_override):
+                clip = scene_clips[i] if i < len(scene_clips) else None
+                is_match = clip is not None
+                if clip is None and fill_pool:
+                    clip = next((p for p in fill_pool if str(p) not in used_keys),
+                                fill_pool[i % len(fill_pool)])
+                if clip and Path(clip).exists():
+                    dst = seedance_target_dir / f"scraped_{i:02d}.mp4"
+                    try:
+                        _shutil.copyfile(clip, dst)
+                        sc["clip"] = dst.name
+                        sc["seedance"] = True
+                        used_keys.add(str(clip)); placed += 1
+                        if is_match:
+                            matched += 1
+                    except Exception:
+                        sc.pop("clip", None)
+                else:
+                    sc.pop("clip", None)
+            allow_gpt = False                         # scrape run = real TikTok footage only
+            allow_seedance = placed > 0
+            seedance_clip_count = len([s for s in scenes_override if s.get("clip")])
+            if placed:
+                log(status_cb, f"Scrape: {matched}/{scene_total} scene(s) got a matched clip (hook + "
+                               f"script-relevant, >= {MIN_SCRIPT_MATCH_SCORE:.0f}); {placed - matched} filled with "
+                               f"the closest real clip after {MAX_SCRAPE_ROUNDS} TikTok search round(s). No AI used.")
             else:
                 allow_seedance = False
                 seedance_clip_count = 0
-                log(status_cb, "Scrape: no clips obtained — this run will use still media only "
-                               "(captions/SFX/voice still apply). Add 'youtube' as a platform or paste clip URLs.")
+                log(status_cb, "Scrape: no usable TikTok clips found after all search rounds.")
+            # the chosen clips are already copied to scraped_NN.mp4 - drop the candidate pool so
+            # Project Media isn't cluttered with the dozens of unused candidates.
+            try:
+                shutil.rmtree(seedance_target_dir / "_candidates", ignore_errors=True)
+            except Exception:
+                pass
     max_seedance = seedance_clip_count
     wavespeed_key = os.environ.get("WAVESPEED_API_KEY", "")
 
@@ -5033,6 +6074,16 @@ def run_project(form, status_cb=None):
     config["sfx_enabled"] = bool(out_sfx or out_tr_sfx)
     config["sfx_content_enabled"] = bool(out_sfx)
     config["transition_sfx_enabled"] = bool(out_tr_sfx)
+    # Real video footage (scraped clips) is cut hard — a whoosh on every boundary looks
+    # cheap on found-footage. Force transition SFX off for video; keep content/ambient SFX.
+    # Also never use the TikTok clips' own audio (only narration + ambient SFX + music).
+    if clip_source == "scrape":
+        config["transition_sfx_enabled"] = False
+        config["sfx_enabled"] = bool(out_sfx)
+        config["seedance_audio_in_final"] = False
+        config["seedance_audio_volume"] = 0.0
+        config["seedance_audio_volume_with_speech"] = 0.0
+        config["caption_max_words"] = 1   # reference style: one big word at a time
     config["use_seedance_clips"] = bool(out_clips) and config.get("use_seedance_clips", True)
     config["render_captions"] = bool(out_caps)
     config["use_wikimedia"] = bool(out_wiki)
@@ -5225,8 +6276,26 @@ def run_project(form, status_cb=None):
 
     check_cancel(form)
     if config.get("sfx_generation_enabled"):
-        log(status_cb, "Generating any missing sound effects (Kling fallback)...")
+        log(status_cb, "Generating any keyword-triggered sound effects...")
         pipeline.ensure_generated_sfx(config, status_cb=status_cb)
+
+    # Meme-style red arrow / circle / label callouts on the punchiest lines (dark-facts look).
+    try:
+        plan_visual_emphasis(config, reasoning_model=reasoning_model, status_cb=status_cb)
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Visual emphasis step skipped ({exc.__class__.__name__}).")
+
+    # Reference-style short EDITED SFX placed ON THE CUTS (a punchy impact + a whoosh on the
+    # emphasis beats, pulled from the SFX library). NOT a continuous ambient drone. Runs after
+    # emphasis so it can land a whoosh on the arrow beats.
+    if config.get("sfx_content_enabled", True):
+        try:
+            place_editor_sfx(config, status_cb=status_cb)
+        except pipeline.PipelineCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Editor SFX step skipped ({exc.__class__.__name__}).")
+
     check_cancel(form)
     log(status_cb, "Rendering final 9:16 MP4...")
     output = pipeline.render_video(config)
@@ -5282,6 +6351,7 @@ def run_project(form, status_cb=None):
                 reasoning_model=reasoning_model,
                 status_cb=status_cb,
                 pass_label=review_round["label"],
+                collaborate=collaborate_reasoning,
             )
             if not review:
                 log(status_cb, f"Reasoning Agent review pass {review_round['number']}/2 did not return a usable review.")
@@ -5388,6 +6458,23 @@ def run_project(form, status_cb=None):
         },
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if clip_decision_log:
+        # Why every scene got the clip (or fallback) it did - script_match_score, acceptance,
+        # rejected candidates, fallback type. Inspect this to debug scrape relevance.
+        report["scrape_clip_decisions"] = clip_decision_log
+        try:
+            (project_dir / "review" / "clip_decisions.json").write_text(
+                json.dumps(clip_decision_log, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    if social_search_report:
+        # Full social-search debug: buckets, tiered queries, per-query result counts, hook finder.
+        report["social_search"] = social_search_report
+        try:
+            (project_dir / "review" / "social_search.json").write_text(
+                json.dumps(social_search_report, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
     if web_contact_sheet.exists():
         report["web_contact_sheet"] = str(web_contact_sheet)
     if gpt_contact_sheet.exists():

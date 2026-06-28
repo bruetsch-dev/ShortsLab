@@ -187,7 +187,12 @@ def _ydl_opts(extra=None):
 # yt-dlp can't search TikTok; Apify can. With shouldDownloadVideos the actor returns a
 # watermark-free mp4 on Apify storage (mediaUrls[0]) plus metadata (w/h/duration/caption)
 # we use to pre-filter before downloading. Token lives in APIFY_TOKEN (env / .env).
-APIFY_ACTOR = "clockworks~tiktok-scraper"
+# novi/tiktok-scraper-ultimate: ~10x cheaper than clockworks. It returns the RAW TikTok
+# objects (watermark-free CDN url at video.download_no_watermark_addr.url_list[0], dims at
+# video.width/height) instead of downloading to Apify storage - so we fetch the mp4 straight
+# from the TikTok CDN (needs a tiktok Referer header). _apify_* below handle both formats.
+APIFY_ACTOR = os.environ.get("APIFY_ACTOR", "novi~tiktok-scraper-ultimate").strip()
+APIFY_LOCATION = (os.environ.get("SCRAPE_LOCATION", "") or "").strip()
 
 
 def apify_token():
@@ -199,20 +204,33 @@ def apify_active():
 
 
 def apify_search(queries, results_per_query, status_cb=None):
-    """Run the Apify TikTok scraper for the given search queries. Returns dataset items
-    (each with videoMeta + mediaUrls). Watermark-free downloads via shouldDownloadVideos."""
+    """Run the Apify TikTok scraper for the given search keywords. Returns raw dataset items.
+    novi/tiktok-scraper-ultimate is the default actor (cheap, returns watermark-free CDN urls);
+    the clockworks schema is still produced if APIFY_ACTOR points back to it."""
     tok = apify_token()
     if not tok or not queries:
         return []
     url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items?token={tok}"
-    body = {
-        "searchQueries": list(queries),
-        "resultsPerPage": max(1, int(results_per_query)),
-        "shouldDownloadVideos": True,
-        "shouldDownloadCovers": False,
-        "shouldDownloadSubtitles": False,
-        "proxyConfiguration": {"useApifyProxy": True},
-    }
+    if "clockworks" in APIFY_ACTOR:
+        body = {
+            "searchQueries": list(queries),
+            "resultsPerPage": max(1, int(results_per_query)),
+            "shouldDownloadVideos": True,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSubtitles": False,
+            "proxyConfiguration": {"useApifyProxy": True},
+        }
+    else:
+        body = {
+            "keywords": list(queries),
+            "maxItems": min(40, max(8, int(results_per_query) * max(1, len(queries)))),
+            "sortType": "DEFAULT",
+            "dateRange": "DEFAULT",
+            "includeSearchKeywords": False,
+            "customMapFunction": "(object) => { return {...object} }",
+        }
+        if APIFY_LOCATION:
+            body["location"] = APIFY_LOCATION
     try:
         req = urllib.request.Request(
             url, data=json.dumps(body).encode("utf-8"),
@@ -236,9 +254,22 @@ def apify_search(queries, results_per_query, status_cb=None):
 
 
 def _apify_media_url(item):
-    mu = item.get("mediaUrls") if isinstance(item, dict) else None
+    if not isinstance(item, dict):
+        return None
+    # clockworks format: a ready Apify-storage url
+    mu = item.get("mediaUrls")
     if isinstance(mu, list) and mu and isinstance(mu[0], str) and mu[0].startswith("http"):
         return mu[0]
+    # novi raw-TikTok format: watermark-free CDN url nested in video.*
+    v = item.get("video") if isinstance(item.get("video"), dict) else {}
+    for field in ("download_no_watermark_addr", "play_addr_h264", "play_addr", "download_addr"):
+        addr = v.get(field)
+        if isinstance(addr, dict):
+            ul = addr.get("url_list")
+            if isinstance(ul, list) and ul and isinstance(ul[0], str) and ul[0].startswith("http"):
+                return ul[0]
+        elif isinstance(addr, str) and addr.startswith("http"):
+            return addr
     return None
 
 
@@ -247,8 +278,11 @@ def _apify_download(media_url, dest, status_cb=None):
     dl = media_url
     if "api.apify.com" in media_url and tok and "token=" not in media_url:
         dl = media_url + (("&" if "?" in media_url else "?") + f"token={tok}")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    if "tiktokcdn" in media_url or "tiktok.com" in media_url:
+        headers["Referer"] = "https://www.tiktok.com/"   # TikTok CDN rejects requests without it
     try:
-        req = urllib.request.Request(dl, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(dl, headers=headers)
         with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
             shutil.copyfileobj(r, f)
     except Exception as exc:  # noqa: BLE001
@@ -258,9 +292,13 @@ def _apify_download(media_url, dest, status_cb=None):
 
 
 def _apify_item_portrait_hq(item):
-    vm = (item.get("videoMeta") or {}) if isinstance(item, dict) else {}
+    if not isinstance(item, dict):
+        return None
+    vm = item.get("videoMeta") if isinstance(item.get("videoMeta"), dict) else {}
+    v = item.get("video") if isinstance(item.get("video"), dict) else {}
     try:
-        w, h = int(vm.get("width") or 0), int(vm.get("height") or 0)
+        w = int(vm.get("width") or v.get("width") or 0)
+        h = int(vm.get("height") or v.get("height") or 0)
     except (TypeError, ValueError):
         return None
     if w <= 0 or h <= 0:
@@ -563,11 +601,11 @@ def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
                 try: raw.unlink()
                 except Exception: pass
                 continue
-            if has_burned_captions(raw, ffmpeg, seconds=per_clip_seconds, status_cb=status_cb):
-                _status(status_cb, "Scrape: skipped a clip (burned-in captions/text).")
-                try: raw.unlink()
-                except Exception: pass
-                continue
+            # NOTE: the brightness-based burned-caption heuristic is intentionally NOT applied
+            # here. It false-positives on bright Tokyo neon/daylight footage and was rejecting
+            # ~every clip, starving the pool. The vision quality-gate in agent_core
+            # (assign_clips_to_scenes_by_vision) is the authoritative caption/AI/relevance
+            # filter now and reliably rejects captioned clips from the poster frames.
             accepted.append(raw)
             if hook:
                 return
