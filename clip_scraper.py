@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import json
+import hashlib
 import shutil
 import tempfile
 import urllib.request
@@ -192,7 +193,10 @@ def _ydl_opts(extra=None):
 # video.width/height) instead of downloading to Apify storage - so we fetch the mp4 straight
 # from the TikTok CDN (needs a tiktok Referer header). _apify_* below handle both formats.
 APIFY_ACTOR = os.environ.get("APIFY_ACTOR", "novi~tiktok-scraper-ultimate").strip()
-APIFY_LOCATION = (os.environ.get("SCRAPE_LOCATION", "") or "").strip()
+# This scraper path is specifically used for Japanese social-footage searches.  Novi's
+# actor otherwise defaults to a US search region, which makes native Japanese queries
+# return substantially less relevant results.
+APIFY_LOCATION = (os.environ.get("SCRAPE_LOCATION", "JP") or "JP").strip().upper()
 
 
 def apify_token():
@@ -203,7 +207,7 @@ def apify_active():
     return bool(apify_token())
 
 
-def apify_search(queries, results_per_query, status_cb=None):
+def apify_search(queries, results_per_query, status_cb=None, sort_type="MOST_LIKED"):
     """Run the Apify TikTok scraper for the given search keywords. Returns raw dataset items.
     novi/tiktok-scraper-ultimate is the default actor (cheap, returns watermark-free CDN urls);
     the clockworks schema is still produced if APIFY_ACTOR points back to it."""
@@ -221,12 +225,17 @@ def apify_search(queries, results_per_query, status_cb=None):
             "proxyConfiguration": {"useApifyProxy": True},
         }
     else:
+        # Novi currently enforces a minimum maxItems of 20.  Values below that make a
+        # perfectly valid keyword search return an actor input error/empty dataset.
+        sort_type = str(sort_type or "MOST_LIKED").strip().upper()
+        if sort_type not in {"RELEVANCE", "MOST_LIKED", "MOST_RECENT", "DEFAULT"}:
+            sort_type = "RELEVANCE"
         body = {
             "keywords": list(queries),
-            "maxItems": min(40, max(8, int(results_per_query) * max(1, len(queries)))),
-            "sortType": "DEFAULT",
+            "maxItems": min(100, max(20, int(results_per_query) * max(1, len(queries)))),
+            "sortType": sort_type,
             "dateRange": "DEFAULT",
-            "includeSearchKeywords": False,
+            "includeSearchKeywords": True,
             "customMapFunction": "(object) => { return {...object} }",
         }
         if APIFY_LOCATION:
@@ -414,6 +423,81 @@ def _probe_dims(path, ffprobe):
         return int(w), int(h)
     except Exception:
         return None
+
+
+def _probe_duration(path, ffprobe):
+    if not ffprobe:
+        return 0.0
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        return max(0.0, float(out))
+    except Exception:
+        return 0.0
+
+
+def hard_cut_times(path, ffmpeg, scan_seconds=24.0, threshold=0.30):
+    """Return hard-cut timestamps using ffmpeg's scene score (no OpenCV dependency)."""
+    if not ffmpeg:
+        return []
+    try:
+        cmd = [ffmpeg, "-hide_banner", "-nostats", "-i", str(path)]
+        if scan_seconds and float(scan_seconds) > 0:
+            cmd += ["-t", f"{float(scan_seconds):.3f}"]
+        cmd += ["-vf", f"select='gt(scene,{float(threshold):.3f})',showinfo",
+                "-an", "-f", "null", os.devnull]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        text = f"{result.stdout or ''}\n{result.stderr or ''}"
+        return sorted({
+            round(float(match), 3)
+            for match in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", text)
+            if float(match) > 0.08
+        })
+    except Exception:
+        return []
+
+
+def stable_segment_profile(path, ffmpeg, ffprobe, seconds=DEFAULT_CLIP_SECONDS):
+    """Pick the calmest source window and describe any internal edit jitter.
+
+    Finished TikToks often contain several edits inside the four seconds we reuse. When those
+    clips are cut again by our timeline, sub-second cut clusters result. Prefer a continuous
+    source window; if none exists, expose the cut count so the caller can reject the montage.
+    """
+    wanted = max(0.5, float(seconds or DEFAULT_CLIP_SECONDS))
+    duration = _probe_duration(path, ffprobe)
+    scan = min(duration or max(24.0, wanted * 4.0), max(24.0, wanted * 4.0))
+    cuts = hard_cut_times(path, ffmpeg, scan_seconds=scan)
+    latest_start = max(0.0, (duration or scan) - wanted)
+    starts = {0.0, latest_start}
+    for cut in cuts:
+        starts.add(max(0.0, min(latest_start, cut + 0.08)))
+        starts.add(max(0.0, min(latest_start, cut - wanted - 0.08)))
+
+    best = None
+    for start in sorted(starts):
+        end = start + wanted
+        inside = [cut for cut in cuts if start + 0.10 < cut < end - 0.10]
+        bounds = [start] + inside + [end]
+        gaps = [bounds[i] - bounds[i - 1] for i in range(1, len(bounds))]
+        rapid = sum(1 for gap in gaps if gap < 0.80)
+        # Fewer cuts wins first; then avoid tight clusters; then keep the earliest useful action.
+        rank = (len(inside), rapid, -min(gaps or [wanted]), start)
+        if best is None or rank < best[0]:
+            best = (rank, start, inside, gaps)
+    _, start, inside, gaps = best or ((0, 0, 0, 0), 0.0, [], [wanted])
+    return {
+        "start": round(start, 3),
+        "duration": round(wanted, 3),
+        "source_duration": round(duration, 3),
+        "internal_cut_count": len(inside),
+        "rapid_internal_cut_count": sum(1 for gap in gaps if gap < 0.80),
+        "min_shot_seconds": round(min(gaps or [wanted]), 3),
+        "cut_times": [round(cut - start, 3) for cut in inside],
+        "stable": len(inside) <= 1 and all(gap >= 0.80 for gap in gaps),
+    }
 
 
 def is_vertical_hq(path, ffprobe):
@@ -621,7 +705,7 @@ def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
     #    each sync run stays fast, one failing chunk can't wipe out the whole pool, and we
     #    stop early once enough clips are accepted.
     queries = build_queries(["tiktok"], terms, script_text, script_relevancy, count=max(count, 3))
-    _status(status_cb, f"Apify: searching TikTok for {len(queries)} style queries...")
+    _status(status_cb, f"Apify (legacy fallback path): searching TikTok for {len(queries)} flat queries...")
     per_q = max(2, (count // max(len(queries), 1)) + 2)
     need_total = count + (1 if accepted else 0)
     CHUNK = 3
@@ -641,8 +725,12 @@ def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
     # 3) Normalize accepted raws into the seedance folder, hook first.
     results = []
     for raw in accepted[:count]:
+        stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
+        if not stability["stable"]:
+            _status(status_cb, "Scrape: skipped a clip whose usable window is an internal rapid-cut montage.")
+            continue
         final = normalize_clip(raw, out_dir / f"scraped_{len(results):02d}.mp4", ffmpeg,
-                               seconds=per_clip_seconds)
+                               seconds=per_clip_seconds, start=stability["start"])
         if final:
             results.append(final)
             _status(status_cb, f"Scrape: prepared clip {len(results)}.")
@@ -654,6 +742,340 @@ def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
         pass
     _status(status_cb, f"Scrape: {len(results)} watermark-free TikTok clip(s) ready.")
     return results
+
+
+# ---- Metadata-driven pre-download filtering + post-download junk rejection -------
+# Reject obvious junk by metadata BEFORE spending a download, then reject fake-vertical /
+# black-bar / text-heavy clips AFTER download. The vision matcher in agent_core is still the
+# authoritative relevance gate; these gates just stop junk from entering the pool/media panel.
+_ANIME_GAME_TERMS = ("anime", "vtuber", "v-tuber", "アニメ", "vチューバー", "vtuver", "切り抜き",
+                     "ゲーム実況", "実況", "原神", "ガチャ", "mmd", "cosplay", "コスプレ",
+                     "fortnite", "フォートナイト", "apex", "valorant", "minecraft", "マイクラ", "cgi")
+_NEWS_QUIZ_TERMS = ("ニュース", " news", "診断", "心理テスト", "テスト", "quiz", "クイズ", "占い",
+                    "アンケート", "ランキング", "まとめ動画", "diagnosis", "personality test")
+_LIVE_SCREEN_TERMS = ("ライブ配信", "生配信", "live配信", "配信中", "screen recording", "画面録画",
+                      "実況プレイ", "live stream", "livestream")
+_IDOL_PROMO_TERMS = ("オーディション", "audition", "アイドル募集", "案件", "プロモ", "宣伝",
+                     "広告", "sponsored", "#pr", "#ad")
+
+
+def _item_meta(item):
+    """Normalize a raw scraper item (novi raw-TikTok OR clockworks) into a flat metadata dict."""
+    if not isinstance(item, dict):
+        return {}
+    m = {}
+    m["caption"] = str(item.get("desc") or item.get("text") or item.get("title") or "")
+    a = item.get("author") if isinstance(item.get("author"), dict) else (
+        item.get("authorMeta") if isinstance(item.get("authorMeta"), dict) else {})
+    m["author"] = str(a.get("uniqueId") or a.get("unique_id") or a.get("name") or "")
+    m["author_name"] = str(a.get("nickname") or a.get("nickName") or a.get("nick_name") or "")
+    m["author_sig"] = str(a.get("signature") or "")
+    v = item.get("video") if isinstance(item.get("video"), dict) else {}
+    vm = item.get("videoMeta") if isinstance(item.get("videoMeta"), dict) else {}
+    try:
+        m["w"] = int(v.get("width") or vm.get("width") or 0)
+    except (TypeError, ValueError):
+        m["w"] = 0
+    try:
+        m["h"] = int(v.get("height") or vm.get("height") or 0)
+    except (TypeError, ValueError):
+        m["h"] = 0
+    try:
+        raw_duration = float(v.get("duration") or vm.get("duration") or 0)
+        # Novi returns TikTok's raw `video.duration` in milliseconds, while Clockworks'
+        # `videoMeta.duration` is normally seconds.  Treat four/five-digit raw-video values
+        # as milliseconds; otherwise every normal 10-60 second TikTok is rejected as >10 min.
+        if v.get("duration") is not None and raw_duration >= 1000:
+            raw_duration /= 1000.0
+        m["duration"] = raw_duration
+    except (TypeError, ValueError):
+        m["duration"] = 0.0
+    tags = []
+    for t in (item.get("textExtra") or []):
+        if isinstance(t, dict) and t.get("hashtagName"):
+            tags.append(str(t["hashtagName"]))
+    for t in (item.get("challenges") or []):
+        if isinstance(t, dict) and t.get("title"):
+            tags.append(str(t["title"]))
+    for t in (item.get("hashtags") or []):
+        if isinstance(t, dict) and t.get("name"):
+            tags.append(str(t["name"]))
+    m["hashtags"] = [h.lower() for h in tags]
+    mu = item.get("music") if isinstance(item.get("music"), dict) else {}
+    m["music"] = str(mu.get("title") or mu.get("musicName") or "")
+    m["is_image_post"] = bool(item.get("imagePost") or item.get("imagePostInfo")
+                              or item.get("image_post_info"))
+    m["has_text_stickers"] = bool(item.get("stickersOnItem") or item.get("stickers"))
+    m["id"] = str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
+    m["url"] = str(item.get("webVideoUrl") or item.get("shareUrl") or item.get("url") or "")
+    m["cover"] = str(v.get("cover") or v.get("originCover") or vm.get("coverUrl") or "")
+    stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
+        item.get("stats") if isinstance(item.get("stats"), dict) else {})
+    try:
+        m["likes"] = int(float(
+            item.get("diggCount") or item.get("digg_count") or item.get("likeCount")
+            or stats.get("diggCount") or stats.get("digg_count") or stats.get("likeCount") or 0
+        ))
+    except (TypeError, ValueError):
+        m["likes"] = 0
+    return m
+
+
+def pre_download_candidate_filter(item, bucket_terms="", seen_ids=None, min_likes=0):
+    """Decide BEFORE download whether a candidate is worth fetching, from metadata only.
+    Returns (accept: bool, reason: str, meta: dict). Rejects format junk (slideshow / live /
+    screen-recording / anime / news / quiz / idol-promo / non-vertical / low-res / duplicate)."""
+    m = _item_meta(item)
+    seen_ids = seen_ids if seen_ids is not None else set()
+    blob = " ".join([m.get("caption", ""), " ".join(m.get("hashtags", [])),
+                     m.get("author_name", ""), m.get("author_sig", ""), m.get("music", "")]).lower()
+    vid = m.get("id") or m.get("url")
+    if vid and vid in seen_ids:
+        return False, "duplicate video id/url", m
+    if m.get("is_image_post"):
+        return False, "slideshow/image post", m
+    w, h = m.get("w", 0), m.get("h", 0)
+    if w and h:
+        if h < w * MIN_PORTRAIT_RATIO:
+            return False, "non-vertical source (metadata aspect ratio)", m
+        if max(w, h) < 600:
+            return False, "too low resolution", m
+    dur = m.get("duration", 0.0)
+    if dur and (dur < 1.5 or dur > 600):
+        return False, "duration out of range", m
+    try:
+        min_likes = max(0, int(min_likes or 0))
+    except (TypeError, ValueError):
+        min_likes = 0
+    if min_likes and int(m.get("likes") or 0) < min_likes:
+        likes = int(m.get("likes") or 0)
+        reason = f"likes below {min_likes:,} ({likes:,})" if likes else f"like count missing/below {min_likes:,}"
+        return False, reason, m
+    if any(t in blob for t in _ANIME_GAME_TERMS):
+        return False, "anime/vtuber/game/cgi content", m
+    if any(t in blob for t in _NEWS_QUIZ_TERMS):
+        return False, "news/quiz/diagnosis/textpost", m
+    if any(t in blob for t in _LIVE_SCREEN_TERMS):
+        return False, "livestream/screen recording", m
+    if any(t in blob for t in _IDOL_PROMO_TERMS):
+        return False, "idol/audition/promo content", m
+    return True, "passed metadata pre-filter", m
+
+
+def detect_fake_vertical_or_black_bars(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS):
+    """Detect horizontal footage padded into a 9:16 canvas (letterbox/pillarbox) by measuring
+    contiguous all-black borders across sampled frames. Returns
+    {is_fake_vertical, black_bar_score 0-10, content_aspect_ratio_estimate, reason}."""
+    out = {"is_fake_vertical": False, "black_bar_score": 0.0,
+           "content_aspect_ratio_estimate": "unknown", "reason": "no frames / cv unavailable"}
+    if cv2 is None or np is None:
+        return out
+    frames = _sample_gray_frames(path, ffmpeg, 5, seconds)
+    if not frames:
+        return out
+    tops, bots, lefts, rights = [], [], [], []
+    for g in frames:
+        h, w = g.shape
+        dark = g < 20
+        row_black = dark.mean(axis=1) > 0.97
+        col_black = dark.mean(axis=0) > 0.97
+
+        def _lead(mask):
+            c = 0
+            for v in mask:
+                if v:
+                    c += 1
+                else:
+                    break
+            return c
+        t = _lead(row_black); b = _lead(row_black[::-1])
+        l = _lead(col_black); r = _lead(col_black[::-1])
+        tops.append(t / h); bots.append(b / h); lefts.append(l / w); rights.append(r / w)
+    med = lambda xs: sorted(xs)[len(xs) // 2]
+    tb = med(tops) + med(bots)
+    lr = med(lefts) + med(rights)
+    h0, w0 = frames[0].shape
+    content_h = h0 * max(0.0, 1 - tb)
+    content_w = w0 * max(0.0, 1 - lr)
+    car = content_h / max(1.0, content_w)            # content height/width (portrait >> 1.0)
+    is_fake = (tb > 0.12) or (car < 1.15)
+    score = round(min(10.0, max(tb, lr) * 22.0), 1)
+    if tb > 0.12:
+        reason = f"letterbox: {tb*100:.0f}% black top/bottom (horizontal source padded to 9:16)"
+    elif lr > 0.12:
+        reason = f"pillarbox: {lr*100:.0f}% black sides"
+    elif car < 1.15:
+        reason = f"content ~16:9 inside vertical frame (h/w={car:.2f})"
+    else:
+        reason = "clean vertical"
+    out.update({"is_fake_vertical": bool(is_fake), "black_bar_score": float(score),
+                "content_aspect_ratio_estimate": f"{content_w:.0f}x{content_h:.0f} (h/w={car:.2f})",
+                "reason": reason})
+    return out
+
+
+def text_heaviness_score(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS):
+    """0-10 estimate of burned-in caption/text load across 5 frames (10%/30%/50%/70%/90%-ish).
+    Uses the centre-band bright-text heuristic; tuned to ignore signage/neon."""
+    if cv2 is None or np is None:
+        return 0.0
+    frames = _sample_gray_frames(path, ffmpeg, 5, seconds)
+    if not frames:
+        return 0.0
+    counts = [_frame_caption_lines(g) for g in frames]
+    frac = sum(1 for c in counts if c >= 1) / len(counts)
+    avg = sum(counts) / len(counts)
+    return round(min(10.0, frac * 6.0 + avg * 2.0), 1)
+
+
+def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_terms="",
+                  per_clip_seconds=DEFAULT_CLIP_SECONDS, status_cb=None, cancel_check=None,
+                  seen_ids=None, query_perf=None, candidate_statuses=None, min_likes=0,
+                  search_sort="MOST_LIKED"):
+    """Search the EXACT given bucket queries (NO script-derived expansion via build_queries),
+    pre-filter by metadata, download, then reject fake-vertical/black-bar and text-heavy clips.
+    Returns accepted dicts: {path, meta, query, tier, clip_id, black_bar_score, text_heaviness,
+    is_fake_vertical}. Records per-query stats in query_perf and per-candidate status rows in
+    candidate_statuses (lists, if provided). Apify only (the bucket system needs real search)."""
+    queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
+    if not apify_active() or not queries:
+        return []
+    out_dir = Path(out_dir)
+    raw_dir = out_dir / "_raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg, ffprobe = _ffmpeg_tools()
+    if not ffmpeg:
+        _status(status_cb, "Scrape: ffmpeg not found, cannot prepare clips.")
+        return []
+    seen_ids = seen_ids if seen_ids is not None else set()
+    accepted = []
+    # Do not let the first query monopolize the whole pool.  Search at least three
+    # variants (when available), taking a bounded number from each before widening.
+    diversity_slots = min(3, len(queries), max(1, int(want)))
+    per_query_quota = max(1, (int(want) + diversity_slots - 1) // diversity_slots)
+
+    def _reject(raw):
+        try:
+            raw.unlink()
+        except Exception:
+            pass
+
+    def _cstat(cid, status, reason, extra=None):
+        if candidate_statuses is not None:
+            row = {"clip_id": cid, "bucket_id": bucket_id, "source_query": q, "tier": tier,
+                   "status": status, "shown_in_media_panel": False, "reason": reason}
+            if extra:
+                row.update(extra)
+            candidate_statuses.append(row)
+
+    for q in queries:
+        if (cancel_check and cancel_check()) or len(accepted) >= want:
+            break
+        query_stop = min(int(want), len(accepted) + per_query_quota)
+        items = apify_search([q], max(4, want + 2), status_cb=None,
+                             sort_type=search_sort) or []
+        raw_n = len(items)
+        meta_rej = dl = vert = clean = acc = 0
+        meta_reasons = {}
+        for it in items:
+            if (cancel_check and cancel_check()) or len(accepted) >= query_stop:
+                break
+            ok, reason, m = pre_download_candidate_filter(
+                it, bucket_terms, seen_ids, min_likes=min_likes)
+            cid = m.get("id") or m.get("url") or f"{bucket_id}:{q}:{raw_n}:{dl}"
+            if not ok:
+                meta_rej += 1
+                meta_reasons[reason] = meta_reasons.get(reason, 0) + 1
+                _cstat(cid, "pre_download_rejected", reason)
+                continue
+            murl = _apify_media_url(it)
+            if not murl:
+                _cstat(cid, "pre_download_rejected", "no downloadable url")
+                continue
+            raw = raw_dir / f"raw_{len(accepted)}_{dl}.mp4"
+            dl += 1
+            if not _apify_download(murl, raw, status_cb=None):
+                _cstat(cid, "download_failed", "download failed")
+                continue
+            if cid:
+                seen_ids.add(cid)
+            if not is_vertical_hq(raw, ffprobe):
+                _reject(raw)
+                _cstat(cid, "rejected_quality", "low-res / landscape file")
+                continue
+            vert += 1
+            fv = detect_fake_vertical_or_black_bars(raw, ffmpeg, per_clip_seconds)
+            if fv["is_fake_vertical"] or fv["black_bar_score"] > 4.0:
+                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): fake vertical / black bars "
+                                   f"({fv['reason']})")
+                _reject(raw)
+                _cstat(cid, "rejected_black_bars", fv["reason"],
+                       {"black_bar_score": fv["black_bar_score"], "is_fake_vertical": fv["is_fake_vertical"]})
+                continue
+            th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
+            if th > 4.0:
+                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): text-heavy TikTok captions ({th}/10)")
+                _reject(raw)
+                _cstat(cid, "rejected_text_heavy", f"burned-in text {th}/10",
+                       {"text_heaviness_score": th})
+                continue
+            stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
+            if not stability["stable"]:
+                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): rapid internal edit montage "
+                                   f"({stability['internal_cut_count']} cuts; shortest hold "
+                                   f"{stability['min_shot_seconds']:.2f}s)")
+                _reject(raw)
+                _cstat(cid, "rejected_rapid_cuts", "source contains rapid internal edit cuts",
+                       stability)
+                continue
+            # Tier calls share out_dir.  A simple 00/01 counter overwrote clips from an
+            # earlier tier/round while the matcher still referenced those paths, making
+            # the selected footage differ from what vision reviewed.  Use a stable unique
+            # name tied to the TikTok item instead.
+            file_key = hashlib.sha1(str(cid or murl).encode("utf-8", "ignore")).hexdigest()[:12]
+            safe_bucket = re.sub(r"[^A-Za-z0-9_-]+", "_", str(bucket_id or "bucket"))[:36]
+            safe_tier = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tier or "tier"))[:20]
+            final = normalize_clip(raw, out_dir / f"cand_{safe_bucket}_{safe_tier}_{file_key}.mp4",
+                                   ffmpeg, seconds=per_clip_seconds, start=stability["start"])
+            _reject(raw)
+            if not final:
+                _cstat(cid, "rejected_quality", "normalize failed")
+                continue
+            clean += 1
+            acc += 1
+            accepted.append({"path": final, "meta": m, "query": q, "tier": tier, "clip_id": cid,
+                             "likes": m.get("likes", 0),
+                             "black_bar_score": fv["black_bar_score"], "text_heaviness": th,
+                             "is_fake_vertical": False,
+                             "internal_cut_count": stability["internal_cut_count"],
+                             "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
+                             "min_shot_seconds": stability["min_shot_seconds"]})
+            _status(status_cb, f"Downloaded accepted candidate {len(accepted)} for bucket {bucket_id} (query {q})")
+            _cstat(cid, "downloaded_pending_review", "passed pre-filters",
+                   {"likes": m.get("likes", 0), "black_bar_score": fv["black_bar_score"],
+                    "text_heaviness_score": th,
+                    "internal_cut_count": stability["internal_cut_count"],
+                    "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
+                    "min_shot_seconds": stability["min_shot_seconds"]})
+        if query_perf is not None:
+            query_perf.append({"query": q, "bucket_id": bucket_id, "tier": tier,
+                               "sort": str(search_sort or "MOST_LIKED").upper(),
+                               "raw_results": raw_n, "metadata_rejected": meta_rej,
+                               "downloadable": dl, "vertical_hq": vert, "text_clean": clean,
+                               "accepted": acc, "metadata_rejection_reasons": meta_reasons})
+        if meta_rej:
+            summary = ", ".join(f"{reason}: {count}" for reason, count in
+                                sorted(meta_reasons.items(), key=lambda row: row[1], reverse=True))
+            _status(status_cb, f"Metadata filter ({bucket_id}/{q}): rejected {meta_rej}/{raw_n} "
+                               f"candidate(s) ({summary}).")
+    try:
+        if raw_dir.exists():
+            for f in raw_dir.glob("*"):
+                f.unlink()
+            raw_dir.rmdir()
+    except Exception:
+        pass
+    return accepted
 
 
 def scrape_clips(
@@ -765,8 +1187,12 @@ def scrape_clips(
     # 3) Normalize the accepted raws into the seedance folder, hook first.
     results = []
     for raw in ordered[:count]:
+        stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
+        if not stability["stable"]:
+            _status(status_cb, "Scrape: skipped a clip whose usable window is an internal rapid-cut montage.")
+            continue
         final = normalize_clip(raw, out_dir / f"scraped_{len(results):02d}.mp4", ffmpeg,
-                               seconds=per_clip_seconds)
+                               seconds=per_clip_seconds, start=stability["start"])
         if final:
             results.append(final)
             _status(status_cb, f"Scrape: prepared clip {len(results)}.")

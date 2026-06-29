@@ -158,15 +158,21 @@ def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
 
 
 def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
-                            ffmpeg=None, status_cb=None):
-    """Clean and (optionally) speed up a generated voiceover in place.
+                            ffmpeg=None, status_cb=None, style="punchy"):
+    """Clean, shape and speed up a generated voiceover in place.
 
-    Gemini TTS output carries a faint constant noise floor ("Rauschen"); a gentle
-    high-pass + FFT denoise removes it without dulling the voice. `speed` time-stretches
-    via atempo (1.0 = unchanged, 1.10 = 10% faster) WITHOUT changing pitch, so the
-    narration feels punchier. Loudness is normalised last so every short sits at the
-    same level. Runs before forced alignment, so the word timing matches the new pace.
-    Returns the Path (unchanged on failure / no ffmpeg).
+    style="punchy" (default) targets the viral listicle/documentary voice:
+      young female · bright · high energy · STRONG compression · bright presence EQ ·
+      breathing almost removed · ~1.20x · very loud. The chain (in order):
+        highpass + FFT denoise   -> kill the TTS noise floor ("Rauschen")
+        agate                    -> push breaths/quiet gaps DOWN (breathing almost removed)
+        acompressor (strong)     -> even, dense, "compressed and loud" body
+        presence + air EQ        -> bright presence boost, clear hard consonants
+        atempo                   -> 1.15-1.25x pace without changing pitch
+        loudnorm + alimiter      -> hot, consistent final level
+    style="clean" keeps the old gentle chain (denoise + speed + loudnorm only).
+    Runs before forced alignment, so word timing matches the new pace. Returns the Path
+    (unchanged on failure / no ffmpeg).
     """
     path = Path(path)
     ffmpeg = ffmpeg or find_ffmpeg()
@@ -179,18 +185,33 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
     speed = max(0.5, min(2.0, speed))
     filters = []
     if denoise:
-        filters.append("highpass=f=70")
-        filters.append("afftdn=nf=-25")
+        filters.append("highpass=f=90")          # tighter low end = cleaner/sharper
+        filters.append("afftdn=nf=-25")           # remove the constant hiss
+    if style == "punchy":
+        # breathing almost removed: a gentle downward gate that ducks low-level breath/room
+        # ~12 dB without chopping speech (smooth attack/release).
+        filters.append("agate=threshold=0.015:ratio=1.6:attack=6:release=160:knee=4:range=0.25")
+        # strong compression -> dense, even, loud body
+        filters.append("acompressor=threshold=-20dB:ratio=4:attack=5:release=120:makeup=4:knee=4")
+        # bright presence boost + air; small low-mid scoop keeps it clean, not boomy
+        filters.append("equalizer=f=300:width_type=q:w=1.0:g=-2")
+        filters.append("equalizer=f=4200:width_type=q:w=1.1:g=4.5")   # presence / consonants
+        filters.append("treble=g=3:f=8500")                            # air / brightness
     if abs(speed - 1.0) > 0.001:
         filters.append(f"atempo={speed:.4f}")
-    filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    if style == "punchy":
+        filters.append("loudnorm=I=-14:TP=-1.0:LRA=9")   # hotter than clean
+        filters.append("alimiter=limit=0.96")            # catch peaks, glue
+    else:
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
     tmp = path.with_name(path.stem + "_pp" + path.suffix)
     cmd = [ffmpeg, "-y", "-i", str(path), "-ar", str(sample_rate),
            "-af", ",".join(filters), str(tmp)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         os.replace(str(tmp), str(path))
-        status_log(status_cb, f"Voice post-processed (speed {speed:.2f}x, denoise {'on' if denoise else 'off'}).")
+        status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}' "
+                              f"(denoise {'on' if denoise else 'off'}).")
     except Exception as exc:
         try:
             if tmp.exists():
@@ -705,7 +726,7 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
                 if pop > 1.01:
                     word_font = get_font(int(base_size * pop), True)
             a = int(255 * block_alpha * (1.0 if color is not CAPTION_UPCOMING else 0.82))
-            if is_active:
+            if is_active and bool(config.get("caption_active_box", True)):
                 # signature green highlight box + white word
                 _draw_caption_word_boxed(draw, word["text"], int(cx), int(cy), word_font,
                                          CAPTION_HIGHLIGHT, (255, 255, 255), a, stroke)
@@ -827,6 +848,22 @@ def opening_punch_zoom(config, t, local, is_first_scene):
         if hook_amount > 0 and hold > 0 and t < hold:
             extra += hook_amount * (1.0 - ease_in_out(clamp(t / hold, 0.0, 1.0)))
     return extra
+
+
+def apply_cut_transition(img, ttype, local, fps, frame_no):
+    """Short viral transition applied at the very start of a clip. flash = white pop (~3 frames),
+    glitch = RGB channel split (~4 frames). swipe/whoosh/clean fall through (whoosh = SFX only)."""
+    n = int(local * max(1, fps))
+    if ttype == "flash" and n < 3:
+        a = 0.85 * (1.0 - n / 3.0)
+        return Image.blend(img.convert("RGB"), Image.new("RGB", img.size, (255, 255, 255)), a)
+    if ttype == "glitch" and n < 4:
+        arr = np.array(img.convert("RGB"))
+        shift = int(7 * (1.0 - n / 4.0)) + 2
+        arr[:, :, 0] = np.roll(arr[:, :, 0], shift, axis=1)
+        arr[:, :, 2] = np.roll(arr[:, :, 2], -shift, axis=1)
+        return Image.fromarray(arr)
+    return img
 
 
 def draw_arrow(draw, start, end, fill, width=8):
@@ -1007,6 +1044,56 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
                     (225, 32, 25, int(220 * hit)),
                     width=7,
                 )
+        elif kind == "callout":
+            # target-based red TikTok callout (planned by agent_core.plan_visual_fx): pop-in +
+            # slight bounce, quick fade-out. `local` is 0..1 within the callout's on-screen window.
+            shape = spec.get("shape")
+            a_in = clamp(local / 0.16, 0.0, 1.0)
+            a_out = clamp((1.0 - local) / 0.22, 0.0, 1.0)
+            alpha = a_in * a_out
+            if alpha <= 0.02:
+                continue
+            grow = clamp(local / 0.22, 0.0, 1.0)
+            pop = 0.6 + 0.4 * (1.0 - (1.0 - grow) ** 2) + 0.06 * math.sin(grow * math.pi)
+            red = (228, 30, 24, int(235 * alpha))
+            sh = (0, 0, 0, int(120 * alpha))
+            if shape == "circle":
+                cx = width * float(spec.get("cx", 0.5)); cy = height * float(spec.get("cy", 0.5))
+                rx = max(28, width * float(spec.get("rx", 0.13)) * pop)
+                ry = max(28, height * float(spec.get("ry", 0.10)) * pop)
+                draw.ellipse((cx - rx - 3, cy - ry - 3, cx + rx + 3, cy + ry + 3), outline=sh, width=13)
+                draw_ring(draw, int(cx), int(cy), int(rx), int(ry), red, width=11, dash=0)
+            elif shape == "arrow":
+                tx = width * float(spec.get("cx", 0.5)); ty = height * float(spec.get("cy", 0.5))
+                from_left = spec.get("from", "left") == "left"
+                slide = (2.0 - pop)                       # slides in from the side
+                if from_left:
+                    sx = tx - width * 0.20 * slide; ex = tx - width * 0.05
+                else:
+                    sx = tx + width * 0.20 * slide; ex = tx + width * 0.05
+                sy = ty + height * 0.05; ey = ty
+                draw.line((sx + 3, sy + 4, ex + 3, ey + 4), fill=sh, width=15)
+                draw_arrow(draw, (sx, sy), (ex, ey), red, width=13)
+            elif shape == "stamp":
+                font = get_font(int(width * 0.072), True)
+                text = str(spec.get("text", "")).upper()
+                x = int(width * float(spec.get("x", 0.12)))
+                y = int(height * float(spec.get("y", 0.16)))
+                bb = draw.textbbox((0, 0), text, font=font, stroke_width=4)
+                pad = 22
+                box = (x, y, x + (bb[2] - bb[0]) + pad * 2, y + (bb[3] - bb[1]) + pad * 2)
+                stamp = Image.new("RGBA", (max(2, box[2] - box[0]), max(2, box[3] - box[1])), (0, 0, 0, 0))
+                sd = ImageDraw.Draw(stamp)
+                sd.rectangle((0, 0, stamp.width - 1, stamp.height - 1), outline=(228, 30, 24, int(235 * alpha)), width=7)
+                sd.text((pad, pad - 4), text, font=font, fill=(228, 30, 24, int(240 * alpha)),
+                        stroke_width=3, stroke_fill=(255, 255, 255, int(160 * alpha)))
+                stamp = stamp.rotate(float(spec.get("rotate", -7)), resample=Image.Resampling.BICUBIC, expand=True)
+                # tiny pop on the stamp
+                if pop < 0.999:
+                    sw, shh = int(stamp.width * pop), int(stamp.height * pop)
+                    if sw > 2 and shh > 2:
+                        stamp = stamp.resize((sw, shh), Image.Resampling.BICUBIC)
+                overlay.alpha_composite(stamp, (box[0], box[1]))
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -1681,9 +1768,16 @@ class SceneClip:
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.duration = self.frame_count / self.fps if self.frame_count and self.fps else 0.0
 
-    def frame(self, t):
+    def frame(self, t, hold_last=False):
         if self.duration > 0:
-            t = t % self.duration
+            if hold_last:
+                # FREEZE on the last frame instead of looping back to the start. Used for real
+                # found-footage (scrape): when a clip is held longer than its length, a hard
+                # loop-to-start reads as a glitch; holding the final frame reads as an intentional
+                # pause and removes the annoying mid-shot loop.
+                t = clamp(float(t), 0.0, max(0.0, self.duration - 1.0 / max(self.fps, 1.0)))
+            else:
+                t = t % self.duration
         frame_index = int(clamp(round(t * self.fps), 0, max(0, self.frame_count - 1)))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, frame = self.cap.read()
@@ -1694,12 +1788,16 @@ class SceneClip:
             raise RuntimeError(f"Could not read frame from video clip: {self.path}")
         return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    def frame_trimmed(self, t, start_trim=0.0):
+    def frame_trimmed(self, t, start_trim=0.0, hold_last=False):
         if self.duration > 0 and start_trim > 0:
             start_trim = min(float(start_trim), max(0.0, self.duration - (1.0 / max(self.fps, 1.0))))
             usable = max(1.0 / max(self.fps, 1.0), self.duration - start_trim)
-            t = start_trim + (float(t) % usable)
-        return self.frame(t)
+            if hold_last:
+                t = start_trim + clamp(float(t), 0.0, max(0.0, usable - 1.0 / max(self.fps, 1.0)))
+            else:
+                t = start_trim + (float(t) % usable)
+            return self.frame(t)   # already inside [start_trim, start_trim+usable]
+        return self.frame(t, hold_last=hold_last)
 
     def release(self):
         self.cap.release()
@@ -1896,6 +1994,125 @@ def ensure_builtin_transition_sfx(root):
         write_mono_wav(folder / name, samples, sample_rate=sample_rate)
 
 
+# The 12 canonical short-SFX types of the TikTok-documentary editing style, synthesized clean
+# (no model generation). Variant count per type. Used by ensure_editor_sfx_pack below and by
+# agent_core.place_editor_sfx, which distributes them ~70% whoosh / 20% accent / 10% impact.
+EDITOR_PACK_VARIANTS = {
+    "whoosh_transition": 3, "reverse_whoosh": 2, "bass_impact": 3, "sub_boom": 2,
+    "caption_pop": 3, "ui_click": 3, "glitch_zap": 2, "camera_shutter": 2,
+    "notification_ding": 2, "short_riser": 2, "downer": 2, "whoosh_hit_combo": 3,
+}
+
+
+def ensure_editor_sfx_pack(root, force=False):
+    """Generate soundeffects/shorts_ready/editor_pack/<type>_NN.wav if missing. These are the
+    reference-style editor hits (whoosh/swipe/impact/pop/click/ding/riser...) the bundled CC0
+    library lacks. Pure numpy+scipy synthesis - never a model. No-op if scipy is unavailable
+    (place_editor_sfx then falls back to library tokens). Returns the folder Path."""
+    folder = Path(root) / "shorts_ready" / "editor_pack"
+    needed = sum(EDITOR_PACK_VARIANTS.values())
+    if not force and folder.exists():
+        have = sum(1 for p in folder.glob("*.wav"))
+        if have >= needed:
+            return folder
+    try:
+        from scipy.signal import butter, sosfilt
+    except Exception:
+        return folder
+    sr = 48000
+
+    def _t(d):
+        return np.linspace(0, d, int(sr * d), endpoint=False)
+
+    def _noise(n, seed):
+        return np.random.default_rng(seed).standard_normal(n)
+
+    def _band(x, lo, hi):
+        lo = max(20.0, min(lo, sr / 2 - 200)); hi = max(lo + 50.0, min(hi, sr / 2 - 100))
+        return sosfilt(butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos"), x)
+
+    def _hp(x, fc):
+        return sosfilt(butter(2, max(20.0, min(fc, sr / 2 - 100)) / (sr / 2), btype="high", output="sos"), x)
+
+    def _lp(x, fc):
+        return sosfilt(butter(4, max(40.0, min(fc, sr / 2 - 100)) / (sr / 2), btype="low", output="sos"), x)
+
+    def _swept(x, f0, fm, f1, width=0.6):
+        n = len(x); half = n // 2
+        centre = np.concatenate([np.linspace(f0, fm, half), np.linspace(fm, f1, n - half)])
+        bands = np.unique(np.clip(np.linspace(f0, f1, 6), 60, sr / 2 - 300).astype(int))
+        out = np.zeros(n)
+        for b in bands:
+            out += _band(x, b * (1 - width / 2), b * (1 + width / 2)) * np.exp(-((centre - b) ** 2) / (2 * (b * 0.4) ** 2))
+        return out
+
+    def whoosh_transition(s, d=0.34):
+        t = _t(d); return _swept(_noise(len(t), s), 350, 2600, 700) * np.sin(np.pi * np.linspace(0, 1, len(t))) ** 1.4
+
+    def reverse_whoosh(s, d=0.42):
+        t = _t(d); o = _swept(_noise(len(t), s), 500, 1800, 4200) * np.linspace(0, 1, len(t)) ** 2.2
+        o[-int(sr * 0.012):] *= np.linspace(1, 0, int(sr * 0.012)); return o
+
+    def bass_impact(s, d=0.36):
+        t = _t(d); body = np.tanh((np.sin(2 * np.pi * 62 * t) + 0.6 * np.sin(2 * np.pi * 95 * t)) * 1.5)
+        click = _hp(_noise(len(t), s), 1500) * np.exp(-t * 240); return body * np.exp(-t * 16) + 0.35 * click
+
+    def sub_boom(s, d=0.72):
+        t = _t(d); f = np.linspace(112, 44, len(t)); return _lp(np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t * 7.5), 220)
+
+    def caption_pop(s, d=0.11):
+        t = _t(d); f = np.linspace(520, 940, len(t))
+        return np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t * 55) + 0.25 * _hp(_noise(len(t), s), 2500) * np.exp(-t * 400)
+
+    def ui_click(s, d=0.05):
+        t = _t(d); return _hp(_noise(len(t), s), 2200) * np.exp(-t * 520) + 0.5 * np.sin(2 * np.pi * 1700 * t) * np.exp(-t * 300)
+
+    def glitch_zap(s, d=0.2):
+        t = _t(d); lfo = np.sign(np.sin(2 * np.pi * 130 * t)) * 0.5 + 0.5; f = np.linspace(2600, 500, len(t))
+        mix = _band(_noise(len(t), s), 800, 6000) * lfo + 0.6 * np.sin(2 * np.pi * np.cumsum(f) / sr) * lfo
+        return (np.round(mix * 6) / 6) * np.exp(-t * 9)
+
+    def camera_shutter(s, d=0.13):
+        t = _t(d); out = np.zeros(len(t))
+        for at, g in ((0.0, 1.0), (0.055, 0.8)):
+            i = int(at * sr); seg = _band(_noise(len(t) - i, s + int(at * 1000)), 1200, 6000)
+            out[i:] += g * seg * np.exp(-_t(d - at) * 130)
+        return out
+
+    def notification_ding(s, d=0.46):
+        t = _t(d); return (np.sin(2 * np.pi * 880 * t) + 0.5 * np.sin(2 * np.pi * 1320 * t) + 0.25 * np.sin(2 * np.pi * 2490 * t)) * np.exp(-t * 9)
+
+    def short_riser(s, d=0.62):
+        t = _t(d); f = np.linspace(220, 1300, len(t))
+        o = (0.7 * _hp(_noise(len(t), s), 600) + 0.6 * np.sin(2 * np.pi * np.cumsum(f) / sr)) * np.linspace(0, 1, len(t)) ** 2.4
+        o[-int(sr * 0.02):] *= np.linspace(1, 0, int(sr * 0.02)); return o
+
+    def downer(s, d=0.5):
+        t = _t(d); f = np.linspace(620, 120, len(t)); vib = 1 + 0.02 * np.sin(2 * np.pi * 6 * t)
+        return _lp(np.sin(2 * np.pi * np.cumsum(f * vib) / sr) * np.exp(-t * 5.5), 1800)
+
+    def whoosh_hit_combo(s, d=0.56):
+        t = _t(d); out = np.zeros(len(t)); w = whoosh_transition(s, 0.3); out[:len(w)] += 0.85 * w
+        i = int(0.27 * sr); h = bass_impact(s + 7, d - 0.27); out[i:i + len(h)] += h; return out
+
+    builders = {
+        "whoosh_transition": whoosh_transition, "reverse_whoosh": reverse_whoosh,
+        "bass_impact": bass_impact, "sub_boom": sub_boom, "caption_pop": caption_pop,
+        "ui_click": ui_click, "glitch_zap": glitch_zap, "camera_shutter": camera_shutter,
+        "notification_ding": notification_ding, "short_riser": short_riser,
+        "downer": downer, "whoosh_hit_combo": whoosh_hit_combo,
+    }
+    for name, fn in builders.items():
+        for k in range(1, EDITOR_PACK_VARIANTS[name] + 1):
+            x = np.asarray(fn(hash(name) % 9999 + k * 13), dtype=np.float64)
+            ni, no = int(sr * 0.004), int(sr * 0.008)
+            if len(x) > ni + no:
+                x[:ni] *= np.linspace(0, 1, ni); x[-no:] *= np.linspace(1, 0, no)
+            x = x / (np.max(np.abs(x)) or 1.0) * 0.89
+            write_mono_wav(folder / f"{name}_{k:02d}.wav", x, sample_rate=sr)
+    return folder
+
+
 def default_sfx_root():
     root = ROOT / "soundeffects"
     (root / "shorts_ready").mkdir(parents=True, exist_ok=True)
@@ -1906,6 +2123,8 @@ def sfx_category_files(config, category):
     root = sfx_library_root(config) or default_sfx_root()
     if category in {"analog_transitions", "subtle_transitions"}:
         ensure_builtin_transition_sfx(root)
+    if category == "editor_pack":
+        ensure_editor_sfx_pack(root)
     files = []
     for folder_name in SFX_CATEGORY_ALIASES.get(category, [category]):
         folder = root / "shorts_ready" / folder_name
@@ -2026,14 +2245,18 @@ def ai_content_sfx_segments(config):
         out.append({"path": path, "start": round(float(cs.get("start", 0) or 0), 3),
                     "duration": float(cs.get("duration") or 4.0),
                     "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.1))),
-                    "category": "ambient", "id": str(cs.get("id") or "ambient")})
+                    "category": str(cs.get("category") or "ambient"),
+                    "id": str(cs.get("id") or "ambient")})
     return out
 
 
 def build_sfx_segments(config, has_speech=False):
     if not bool(config.get("sfx_enabled", True)):
         return custom_sfx_segments(config)
-    if not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False)):
+    # Proceed if there is a library root, OR generation is on, OR place_editor_sfx already planned
+    # local SFX (config['ai_content_sfx']) - the latter is the provided-local-assets scrape path.
+    if (not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False))
+            and not config.get("ai_content_sfx")):
         return custom_sfx_segments(config)
     if not config.get("scenes"):
         return custom_sfx_segments(config)
@@ -2042,7 +2265,11 @@ def build_sfx_segments(config, has_speech=False):
     content_on = config.get("sfx_content_enabled", config.get("sfx_enabled", True))
     transition_on = config.get("transition_sfx_enabled", config.get("sfx_enabled", True))
     events = []
-    for ev in plan_sfx_events(config, has_speech):
+    # Scrape mode uses ONLY the user's classified local SFX placed by place_editor_sfx
+    # (config['ai_content_sfx']). Skip the keyword/library/synth path entirely so no generated or
+    # unrelated placeholder SFX can enter the mix.
+    is_scrape = config.get("clip_source") == "scrape"
+    for ev in ([] if is_scrape else plan_sfx_events(config, has_speech)):
         is_transition = bool(ev.get("transition"))
         if is_transition and not transition_on:
             continue
@@ -2073,7 +2300,15 @@ def build_sfx_segments(config, has_speech=False):
     allowed_other = max(0, max_events - len(transition_events))
     result = transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other]
     if content_on:
-        result.extend(ai_content_sfx_segments(config))   # LLM-planned ambient beds
+        content_segments = ai_content_sfx_segments(config)
+        if config.get("clip_source") == "scrape" or config.get("allow_ambient_sfx") is False:
+            # Found-footage edits get the discrete local SFX hits only (any classified category);
+            # never a stale generated room tone/drone. Cap each at ~2s so nothing long sneaks in.
+            content_segments = [
+                segment for segment in content_segments
+                if float(segment.get("duration") or 0) <= 2.1
+            ]
+        result.extend(content_segments)
     result.extend(custom_sfx_segments(config))
     return sorted(result, key=lambda e: e["start"])
 
@@ -2298,14 +2533,31 @@ def render_video(config, basename=None):
                         shot_assets[key] = source.convert("RGB")
     use_clips = bool(config.get("use_seedance_clips", True))
     clips = {}
+    clip_continuity_offsets = {}
     if use_clips:
         manifest_map = seedance_manifest_map(clip_dir)
+        previous_identity = None
+        previous_offset = 0.0
+        previous_duration = 0.0
         for i, scene in enumerate(config["scenes"], 1):
             if not scene_uses_seedance(config, scene):
+                previous_identity = None
                 continue
             path = scene_clip_path(config, scene, i, clip_dir=clip_dir, manifest_map=manifest_map)
             if path and path.exists():
-                clips[scene.get("id", str(i))] = SceneClip(path)
+                scene_id = scene.get("id", str(i))
+                clips[scene_id] = SceneClip(path)
+                identity = str(scene.get("scrape_clip_id") or path.resolve())
+                if config.get("clip_source") == "scrape" and identity == previous_identity:
+                    offset = previous_offset + previous_duration
+                else:
+                    offset = 0.0
+                clip_continuity_offsets[scene_id] = offset
+                previous_identity = identity
+                previous_offset = offset
+                previous_duration = max(0.0, float(scene.get("end", 0)) - float(scene.get("start", 0)))
+            else:
+                previous_identity = None
 
     writer = cv2.VideoWriter(str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():
@@ -2339,7 +2591,30 @@ def render_video(config, basename=None):
             extra_zoom = opening_punch_zoom(config, t, local, scene_id == first_scene_id)
             use_clip_frame = scene_id in clips and (shot is None or bool(shot.get("use_clip", True)))
             if use_clip_frame:
-                img = image_fit_cover(clips[scene_id].frame_trimmed(local, seedance_clip_start_trim(config, scene)), (width, height), zoom=1.0 + extra_zoom, offset=(0, 0))
+                fx = scene.get("fx") or {}
+                source_time = local + clip_continuity_offsets.get(scene_id, 0.0)
+                # freeze-frame emphasis: briefly hold the scene's first frame on a reveal beat
+                if fx.get("freeze_frame") and local < min(0.4, scene_duration * 0.3):
+                    source_time = clip_continuity_offsets.get(scene_id, 0.0)
+                _hold_last = config.get("clip_source") == "scrape"
+                # target-anchored punch-in zoom + smart reframe (keeps the proof subject in frame)
+                punch = fx.get("punch_in") if isinstance(fx.get("punch_in"), dict) else None
+                if punch and punch.get("enabled", True):
+                    ss = float(punch.get("start_scale", 1.0)); es = float(punch.get("end_scale", 1.08))
+                    zoom_c = ss + (es - ss) * ease_in_out(clamp(local / scene_duration, 0.0, 1.0))
+                else:
+                    zoom_c = 1.0 + extra_zoom
+                acx = float(fx.get("anchor_cx", 0.5)); acy = float(fx.get("anchor_cy", 0.45))
+                ox = int((acx - 0.5) * width * 1.1)
+                oy = int((acy - 0.45) * height * 0.9)
+                # impact shake: tiny jitter for the first ~6 frames of a reveal/shock beat
+                if fx.get("impact_shake"):
+                    fno = int(local * fps)
+                    if fno < 6:
+                        amp = 11.0 * (1.0 - fno / 6.0)
+                        ox += int(amp * math.sin(frame_no * 2.3)); oy += int(amp * math.cos(frame_no * 1.9))
+                img = image_fit_cover(clips[scene_id].frame_trimmed(source_time, seedance_clip_start_trim(config, scene), hold_last=_hold_last), (width, height), zoom=zoom_c, offset=(ox, oy))
+                img = apply_cut_transition(img, fx.get("transition", "clean_cut"), local, fps, frame_no)
             else:
                 motion = dict(scene.get("motion", {}))
                 if shot and shot.get("motion"):
@@ -2516,7 +2791,8 @@ def render_video(config, basename=None):
             # Final master: loudness-normalize to a loud, consistent target (the reference
             # edits sit ~-20 dB RMS / 0 dB peak). loudnorm hits the integrated target, then a
             # limiter catches peaks - so every Short lands punchy and at the same level.
-            master_ln = "loudnorm=I=-15:TP=-1.0:LRA=11"
+            final_loudness = max(-20.0, min(-14.0, float(config.get("final_loudness_lufs", -15.0))))
+            master_ln = f"loudnorm=I={final_loudness:.1f}:TP=-1.0:LRA=11"
             if len(mix_inputs) == 1:
                 filters.append(f"[{mix_inputs[0]}]volume={master_gain:.3f},{master_ln},alimiter=limit=0.97,atrim=0:{duration:.3f}[aout]")
             else:

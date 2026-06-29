@@ -20,6 +20,13 @@ background music/
 soundeffects/
 speaker/
 
+# --- Runtime-generated working assets (trimmed SFX + caches, regenerated on demand) ---
+generated_assets/
+
+# --- Scratch run dumps + ad-hoc analysis output ---
+_runresult_*.json
+analysis/
+
 # --- Logs ---
 *.log
 launch_app.log

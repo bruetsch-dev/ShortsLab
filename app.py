@@ -13,6 +13,7 @@ from pathlib import Path
 import agent_core
 import pipeline
 import sfx_agent
+import caption_agent
 
 
 ROOT = Path(__file__).resolve().parent
@@ -110,6 +111,7 @@ def top_nav():
         f'<a class="button" href="/?new=1">{ICON_NEW}<span>New project</span></a>'
         f'<a class="button secondary" href="/assets">{ICON_GRID}<span>Assets</span></a>'
         f'<a class="button secondary nav-sfx" href="/sfx">{ICON_SFX}<span>SFX master</span></a>'
+        f'<a class="button secondary nav-captions" href="/captions">{ICON_SFX}<span>Caption master</span></a>'
         '<span class="nav-sep" aria-hidden="true"></span>'
         '<button type="button" class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">'
         '<span class="tt-knob"><span class="tt-sun">&#9728;</span><span class="tt-moon">&#9789;</span></span></button>'
@@ -349,6 +351,9 @@ def project_title_from_files(project_dir):
     config = read_json_file(project_dir / "config" / "project.json")
     if config.get("title"):
         return str(config["title"])
+    run_form = read_json_file(project_dir / "input" / "run_form.json")
+    if run_form.get("title"):
+        return str(run_form["title"])
     return project_dir.name.replace("_", " ").strip().title()
 
 
@@ -358,12 +363,22 @@ def project_options_html():
         created = time.strftime("%Y-%m-%d %H:%M", time.localtime(project_dir.stat().st_mtime))
         title = project_title_from_files(project_dir)
         slug = project_dir.name
-        items.append(f'<div class="project-list-item" style="padding: 13px 15px; border: 1px solid var(--line); border-radius: var(--r-md); cursor: pointer; background: var(--bg-input); color: var(--text); transition: background .16s, border-color .16s;" onmouseover="this.style.background=\'var(--bg-overlay)\';this.style.borderColor=\'var(--accent)\'" onmouseout="this.style.background=\'var(--bg-input)\';this.style.borderColor=\'var(--line)\'" onclick="window.loadProject(\'{esc(slug)}\')"><div style="font-weight: 600; margin-bottom: 4px;">{esc(title)}</div><div style="font-size: 12px; color: var(--faint);">{esc(slug)} &bull; {esc(created)}</div></div>')
+        report = read_json_file(project_dir / "review" / "agent_report.json")
+        failed = not any((project_dir / "renders").glob("*.mp4")) if (project_dir / "renders").exists() else True
+        failed = failed or bool(report.get("needs_media_recut"))
+        status = " &bull; failed/incomplete — load to rerun" if failed else ""
+        items.append(f'<div class="project-list-item" style="padding: 13px 15px; border: 1px solid var(--line); border-radius: var(--r-md); cursor: pointer; background: var(--bg-input); color: var(--text); transition: background .16s, border-color .16s;" onmouseover="this.style.background=\'var(--bg-overlay)\';this.style.borderColor=\'var(--accent)\'" onmouseout="this.style.background=\'var(--bg-input)\';this.style.borderColor=\'var(--line)\'" onclick="window.loadProject(\'{esc(slug)}\')"><div style="font-weight: 600; margin-bottom: 4px;">{esc(title)}</div><div style="font-size: 12px; color: var(--faint);">{esc(slug)} &bull; {esc(created)}{status}</div></div>')
     return "".join(items)
 
 
 def project_form_state(project_dir):
     state = load_ui_state()
+    saved_run = read_json_file(project_dir / "input" / "run_form.json")
+    if saved_run:
+        normalized_saved = normalize_ui_state(saved_run)
+        for key in (*UI_TEXT_DEFAULTS.keys(), *UI_CHECKBOX_DEFAULTS.keys()):
+            if key in saved_run:
+                state[key] = normalized_saved[key]
     config = read_json_file(project_dir / "config" / "project.json")
     report = read_json_file(project_dir / "review" / "agent_report.json")
     script = read_text_file(project_dir / "input" / "script.txt")
@@ -404,10 +419,21 @@ def project_form_state(project_dir):
     state["auto_web_images"] = True
     if wavespeed.get("video_model") is None and not state["allow_seedance"]:
         state["seedance_clip_count"] = "0"
-    state["loaded_project_mode"] = "recut_existing_only"
+    # Incomplete/failed projects have no final config: rerun their original workflow in the same
+    # folder. Completed projects retain the media-only recut default.
+    rerun_failed = not any((project_dir / "renders").glob("*.mp4")) if (project_dir / "renders").exists() else True
+    rerun_failed = rerun_failed or bool(report.get("needs_media_recut"))
+    state["loaded_project_mode"] = "normal" if rerun_failed else "recut_existing_only"
+    if rerun_failed and any((project_dir / "seedance 2.0").glob("scraped_*.mp4")):
+        state["clip_source"] = "scrape"
+        state["out_video_clips"] = True
+        state["out_web_images"] = False
+        state["out_wikimedia"] = False
+        state["out_gpt_images"] = False
     normalized = normalize_ui_state(state)
     normalized["slug"] = project_dir.name
-    normalized["loaded_project_mode"] = "recut_existing_only"
+    normalized["loaded_project_mode"] = "normal" if rerun_failed else "recut_existing_only"
+    normalized["rerun_failed_project"] = rerun_failed
     return normalized
 
 
@@ -2216,6 +2242,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <span class="cbar-cap">Reasoning model</span>
             <select name="reasoning_model">
               <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
+              <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best quality)</option>
             </select>
@@ -2463,6 +2490,7 @@ def sfx_page():
           <select name="reasoning_model">
             <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
             <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
+            <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
           </select>
           <div class="hint">The agent detects scene changes, reads the timed transcript, and chooses sound effects from your local <code>soundeffects/</code> library.</div>
         </div>
@@ -2484,6 +2512,54 @@ def sfx_page():
     </form>
     """
     return page("AI Sound-Effect Pass", body)
+
+
+def caption_page():
+    body = f"""
+    {brand_header()}
+    <form method="post" action="/captions-run" enctype="multipart/form-data">
+      <section class="stack">
+        <div class="panel accent">
+          <label>Video to caption</label>
+          <label class="filepick" for="cap-video-file"><span class="filepick-btn">&#128193; Choose video file</span><span class="filepick-name" id="cap-video-name">No file chosen</span></label>
+          <input type="file" name="video_file" id="cap-video-file" class="filepick-input" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required onchange="var n=document.getElementById('cap-video-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
+          <div class="hint">Any MP4 / MOV / WebM with speech. The exact same word-by-word green-box captions are burned on. Picture is re-encoded once at high quality; the original audio is kept.</div>
+        </div>
+        <div class="panel">
+          <label>Words per caption</label>
+          <select name="caption_max_words">
+            <option value="1" selected>1 word at a time (viral karaoke)</option>
+            <option value="2">2 words</option>
+            <option value="3">3 words</option>
+          </select>
+          <div class="hint">1 word is the reference "dark facts" look. Transcription runs fully locally (faster-whisper) &mdash; no API keys needed.</div>
+        </div>
+        <div class="panel">
+          <label>Caption height</label>
+          <select name="caption_center_y">
+            <option value="0.60" selected>Lower-middle (default)</option>
+            <option value="0.50">Center</option>
+            <option value="0.72">Lower third</option>
+          </select>
+        </div>
+        <button type="submit">Add captions</button>
+      </section>
+
+      <section class="stack">
+        <div class="loaded-media-panel">
+          <h2 style="margin-bottom: 12px;">How it works</h2>
+          <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
+            <li><strong>Audio extract</strong> &mdash; ffmpeg pulls the speech track.</li>
+            <li><strong>Local transcription</strong> &mdash; faster-whisper times every word on your machine (no API).</li>
+            <li><strong>Same captions</strong> &mdash; the identical animated green-box word-by-word captions used in a normal render.</li>
+            <li><strong>One clean encode</strong> &mdash; frames are piped straight to H.264 and your original audio is muxed back.</li>
+          </ol>
+          <div class="hint" style="margin-top: 16px;">Output lands in <code>projects/_captioned/</code>.</div>
+        </div>
+      </section>
+    </form>
+    """
+    return page("Caption master", body)
 
 
 def save_upload(file_info, job_id):
@@ -2680,6 +2756,74 @@ def start_sfx_job(fields, files):
             status_cb("Started.")
             result = sfx_agent.enhance_video_with_sfx(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb
+            )
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_caption_job(fields, files):
+    job_id = str(int(time.time() * 1000))
+    fields = dict(fields)
+    video_path = save_upload(files.get("video_file"), job_id)
+    try:
+        max_words = int(fields.get("caption_max_words", 1) or 1)
+    except (TypeError, ValueError):
+        max_words = 1
+    try:
+        center_y = float(fields.get("caption_center_y", 0.60) or 0.60)
+    except (TypeError, ValueError):
+        center_y = 0.60
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "caption",
+        }
+    if not video_path:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "No video uploaded."
+            JOBS[job_id]["logs"].append("Error: no video uploaded.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            status_cb("Started.")
+            result = caption_agent.caption_video(
+                video_path, max_words=max_words, caption_center_y=center_y,
+                status_cb=status_cb, cancel_event=cancel_event,
             )
             with JOB_LOCK:
                 if cancel_event.is_set():
@@ -2959,6 +3103,13 @@ SFX_STEPS = [
     ("Finish", ("SFX enhancement complete",)),
 ]
 
+CAPTION_STEPS = [
+    ("Load video", ("Started", "Extracting audio")),
+    ("Transcribe", ("Transcrib",)),
+    ("Render captions", ("Rendering captions", "Captioning:")),
+    ("Finish", ("Captioned video saved", "Done.")),
+]
+
 
 def _match_step_index(text, steps):
     for index, (_name, markers) in enumerate(steps):
@@ -2973,7 +3124,8 @@ def compute_step_view(status, logs, log_times=None, job_kind=None):
     state is one of done / active / stopped / pending. elapsed (seconds) is the
     real per-step duration (from log timestamps) for started steps.
     """
-    steps = SFX_STEPS if job_kind == "sfx" else RUN_STEPS
+    steps = (SFX_STEPS if job_kind == "sfx"
+             else CAPTION_STEPS if job_kind == "caption" else RUN_STEPS)
     log_times = log_times or []
     start_times = [None] * len(steps)
     active = -1
@@ -3402,8 +3554,9 @@ def project_summary(project_dir):
     created_at = report.get("created_at")
     if not created_at:
         created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(project_dir.stat().st_mtime))
+    failed = not bool(video)
     return {
-        "title": report.get("title") or project_dir.name.replace("_", " ").strip().title(),
+        "title": report.get("title") or project_title_from_files(project_dir),
         "slug": project_dir.name,
         "created_at": created_at,
         "project_dir": project_dir,
@@ -3418,6 +3571,7 @@ def project_summary(project_dir):
         "gpt_images": count_media(project_dir / "gpt images", {".jpg", ".jpeg", ".png", ".webp"}),
         "web_images": count_media(project_dir / "web images", {".jpg", ".jpeg", ".png", ".webp"}),
         "seedance": count_media(project_dir / "seedance 2.0", {".mp4", ".webm", ".mov", ".m4v"}),
+        "failed": failed,
     }
 
 
@@ -3437,6 +3591,11 @@ def asset_card(summary):
     slug = summary["slug"]
     # "Check results" opens the final video if it exists, otherwise the project folder.
     results_href = view_for(summary["video"], "assets") if has_video else view_for(summary["project_dir"], "assets")
+    if has_video:
+        secondary_action = f'<a class="button secondary asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Edit</a>'
+    else:
+        label = "Rerun failed" if summary.get("failed") else "Open"
+        secondary_action = f'<a class="button secondary" href="/?project={esc(slug)}">&#8635; {label}</a>'
     return f"""
     <article class="panel asset-card">
       {thumb_html}
@@ -3451,7 +3610,7 @@ def asset_card(summary):
       </div>
       <div class="asset-primary">
         <a class="button asset-go" href="{results_href}">&#9654; Check results</a>
-        {f'<a class="button secondary asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Edit</a>' if has_video else '<a class="button secondary" href="/?project={esc(slug)}">&#128194; Open</a>'}
+        {secondary_action}
       </div>
     </article>
     """
@@ -4534,6 +4693,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(assets_page())
         elif parsed.path == "/sfx":
             self.send_bytes(sfx_page())
+        elif parsed.path == "/captions":
+            self.send_bytes(caption_page())
         elif parsed.path == "/timeline":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             self.send_bytes(timeline_page(slug))
@@ -4844,6 +5005,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fields, files = {}, {}
             job_id = start_sfx_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
+            self.end_headers()
+            return
+        if parsed.path == "/captions-run":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                fields, files = parse_multipart(content_type, body)
+            else:
+                fields, files = {}, {}
+            job_id = start_caption_job(fields, files)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()
