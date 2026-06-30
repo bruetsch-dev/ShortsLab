@@ -47,6 +47,11 @@ except Exception:  # pragma: no cover - CV filters degrade gracefully
     cv2 = None
     np = None
 
+try:
+    import tiktok_login              # logged-in TikTok search backend (Apify replacement)
+except Exception:  # pragma: no cover - optional; falls back to Apify if token present
+    tiktok_login = None
+
 
 TARGET_W, TARGET_H = 1080, 1920
 DEFAULT_CLIP_SECONDS = 4.0
@@ -203,6 +208,15 @@ def apify_token():
     return (os.environ.get("APIFY_TOKEN", "") or "").strip()
 
 
+# Set once apify_search hits an HTTP 402 / "not-enough-usage" so the run can stop and report a
+# clear "out of credits" message instead of silently returning 0 clips for every query.
+_APIFY_OUT_OF_CREDITS = [False]
+
+
+def apify_out_of_credits():
+    return _APIFY_OUT_OF_CREDITS[0]
+
+
 def apify_active():
     return bool(apify_token())
 
@@ -254,6 +268,17 @@ def apify_search(queries, results_per_query, status_cb=None, sort_type="MOST_LIK
             detail = exc.read().decode("utf-8", "replace").strip()[:180]
         except Exception:
             pass
+        # Out of Apify credits / billing blocked -> a clear, actionable message (and a flag so the
+        # scrape stops hammering the API instead of silently returning 0 clips for every query).
+        if exc.code == 402 or "not-enough-usage" in detail or "exceed your remaining usage" in detail:
+            _APIFY_OUT_OF_CREDITS[0] = True
+            _status(status_cb, "Apify: OUT OF CREDITS - the account has no paid usage left to run the "
+                               "TikTok scraper. Top up at apify.com (or set a different APIFY_TOKEN). "
+                               "No clips can be scraped until then.")
+            return []
+        if exc.code in (401, 403):
+            _status(status_cb, f"Apify: auth failed (HTTP {exc.code}) - check APIFY_TOKEN in .env.")
+            return []
         hint = " (run-sync timed out; fewer queries per call needed)" if exc.code in (408, 504) else ""
         _status(status_cb, f"Apify: search failed (HTTP {exc.code}{': ' + detail if detail else ''}){hint}.")
         return []
@@ -315,6 +340,123 @@ def _apify_item_portrait_hq(item):
     if max(w, h) < MIN_LONG_SIDE:
         return False
     return h >= w * MIN_PORTRAIT_RATIO
+
+
+# ---- Search/download BACKEND switch (TikTok login preferred, Apify dormant fallback) ----
+# The default, no-API-key path is a logged-in TikTok session driven by Playwright
+# (tiktok_login.py): it runs the real keyword search and returns native TikTok item objects
+# that _item_meta already understands, then yt-dlp downloads the (watermark-free) mp4 using
+# cookies exported from that same session. Apify is only used if its token is set AND no
+# TikTok login exists, so existing setups keep working without it.
+
+def tiktok_backend_ready():
+    return bool(tiktok_login is not None and tiktok_login.is_ready())
+
+
+def _apify_opt_in():
+    """Apify is OFF by default now - the login backend replaced it. It only runs when the
+    user explicitly sets SCRAPE_BACKEND=apify in the environment (legacy escape hatch)."""
+    return os.environ.get("SCRAPE_BACKEND", "").strip().lower() == "apify"
+
+
+def apify_enabled():
+    return bool(apify_active() and _apify_opt_in())
+
+
+def backend_active():
+    """True if a search backend can run. Default path = a saved TikTok login (no API key).
+    Apify only counts when explicitly opted in via SCRAPE_BACKEND=apify."""
+    return bool(tiktok_backend_ready() or apify_enabled())
+
+
+def backend_name():
+    if tiktok_backend_ready():
+        return "tiktok_login"
+    if apify_enabled():
+        return "apify"
+    return "none"
+
+
+def _ensure_tiktok_cookies(status_cb=None):
+    """Open (lazily) the shared logged-in session and point yt-dlp at its cookies."""
+    sess = tiktok_login.get_session(status_cb=status_cb)
+    if sess is None:
+        return None
+    ck = tiktok_login.export_cookies_txt()
+    if ck:
+        set_cookies(ck)            # yt-dlp downloads authenticated as the logged-in user
+    return sess
+
+
+def backend_search(query, want, status_cb=None, sort="MOST_LIKED"):
+    """Run one keyword search through the active backend. Returns raw item dicts."""
+    if tiktok_backend_ready():
+        sess = _ensure_tiktok_cookies(status_cb)
+        if sess is not None:
+            try:
+                return sess.search(query, want=int(want), status_cb=status_cb, sort=sort) or []
+            except Exception as exc:  # noqa: BLE001
+                _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
+                return []
+    if apify_enabled():
+        return apify_search([query], int(want), status_cb=status_cb, sort_type=sort) or []
+    return []
+
+
+def _ytdlp_fetch(url, dest, status_cb=None, max_seconds=16.0):
+    """Download the first ~max_seconds of a TikTok video URL to an exact path (clean mp4)."""
+    if yt_dlp is None or not url:
+        return None
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmpl = str(dest.with_suffix("")) + ".%(ext)s"
+    fmt = ("bestvideo[height>=600][height<=1920]+bestaudio/"
+           "best[height>=600][height<=1920]/best[height<=1920]/best")
+    opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "outtmpl": tmpl, "format": fmt, "merge_output_format": "mp4",
+        "max_filesize": 80 * 1024 * 1024, "ignoreerrors": True,
+    }
+    try:
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(0.0, float(max_seconds))])
+        opts["force_keyframes_at_cuts"] = True
+    except Exception:
+        pass
+    _apply_cookies(opts)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:  # noqa: BLE001
+        _status(status_cb, f"TikTok download failed ({exc.__class__.__name__}).")
+        return None
+    for cand in sorted(dest.parent.glob(dest.stem + ".*")):
+        if cand.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm") and cand.stat().st_size > 4096:
+            if cand != dest:
+                try:
+                    cand.replace(dest)
+                    return dest
+                except Exception:
+                    return cand
+            return dest
+    return None
+
+
+def backend_download(item, dest, status_cb=None):
+    """Download a candidate item to dest via the right mechanism for its source backend."""
+    if isinstance(item, dict) and item.get("_source") == "tiktok_login":
+        url = item.get("webVideoUrl") or item.get("url") or ""
+        return _ytdlp_fetch(url, dest, status_cb=status_cb) if url else None
+    murl = _apify_media_url(item)
+    return _apify_download(murl, dest, status_cb=status_cb) if murl else None
+
+
+def close_backend():
+    """Tear down the shared TikTok session at the end of a run."""
+    if tiktok_login is not None:
+        try:
+            tiktok_login.close_session()
+        except Exception:
+            pass
 
 
 def _entries(info):
@@ -936,9 +1078,10 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     pre-filter by metadata, download, then reject fake-vertical/black-bar and text-heavy clips.
     Returns accepted dicts: {path, meta, query, tier, clip_id, black_bar_score, text_heaviness,
     is_fake_vertical}. Records per-query stats in query_perf and per-candidate status rows in
-    candidate_statuses (lists, if provided). Apify only (the bucket system needs real search)."""
+    candidate_statuses (lists, if provided). Uses the active search backend (a logged-in TikTok
+    session by default, Apify only as a fallback when its token is set)."""
     queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
-    if not apify_active() or not queries:
+    if not backend_active() or not queries:
         return []
     out_dir = Path(out_dir)
     raw_dir = out_dir / "_raw"
@@ -972,8 +1115,10 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         if (cancel_check and cancel_check()) or len(accepted) >= want:
             break
         query_stop = min(int(want), len(accepted) + per_query_quota)
-        items = apify_search([q], max(4, want + 2), status_cb=None,
-                             sort_type=search_sort) or []
+        items = backend_search(q, max(4, want + 2), status_cb=status_cb,
+                               sort=search_sort) or []
+        if _APIFY_OUT_OF_CREDITS[0]:        # apify fallback: stop hammering a billing-blocked account
+            break
         raw_n = len(items)
         meta_rej = dl = vert = clean = acc = 0
         meta_reasons = {}
@@ -988,13 +1133,9 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                 meta_reasons[reason] = meta_reasons.get(reason, 0) + 1
                 _cstat(cid, "pre_download_rejected", reason)
                 continue
-            murl = _apify_media_url(it)
-            if not murl:
-                _cstat(cid, "pre_download_rejected", "no downloadable url")
-                continue
             raw = raw_dir / f"raw_{len(accepted)}_{dl}.mp4"
             dl += 1
-            if not _apify_download(murl, raw, status_cb=None):
+            if not backend_download(it, raw, status_cb=None):
                 _cstat(cid, "download_failed", "download failed")
                 continue
             if cid:
@@ -1032,7 +1173,9 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             # earlier tier/round while the matcher still referenced those paths, making
             # the selected footage differ from what vision reviewed.  Use a stable unique
             # name tied to the TikTok item instead.
-            file_key = hashlib.sha1(str(cid or murl).encode("utf-8", "ignore")).hexdigest()[:12]
+            file_key = hashlib.sha1(
+                str(cid or it.get("webVideoUrl") or it.get("id") or raw.name).encode("utf-8", "ignore")
+            ).hexdigest()[:12]
             safe_bucket = re.sub(r"[^A-Za-z0-9_-]+", "_", str(bucket_id or "bucket"))[:36]
             safe_tier = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tier or "tier"))[:20]
             final = normalize_clip(raw, out_dir / f"cand_{safe_bucket}_{safe_tier}_{file_key}.mp4",

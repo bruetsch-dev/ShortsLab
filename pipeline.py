@@ -183,25 +183,37 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
     except (TypeError, ValueError):
         speed = 1.0
     speed = max(0.5, min(2.0, speed))
+    # The Gemini TTS output carries a CONSTANT broadband noise floor (~-45 dB) - the "Rauschen".
+    # A mild denoise alone never removes it because the downstream compressor + loudnorm LIFT that
+    # floor right back up in the gaps, so it reads as a continuous "bed" under the whole voice.
+    # The fix is two-fold: (1) a stronger spectral denoise up front, and (2) a real gate placed
+    # AFTER loudnorm, so whatever floor loudnorm raises in the silent gaps is gated to true silence.
+    # Verified on real TTS: continuous -45 dB floor -> -inf in gaps, speech still ~-15 dB RMS.
     filters = []
     if denoise:
-        filters.append("highpass=f=90")          # tighter low end = cleaner/sharper
-        filters.append("afftdn=nf=-25")           # remove the constant hiss
-    if style == "punchy":
-        # breathing almost removed: a gentle downward gate that ducks low-level breath/room
-        # ~12 dB without chopping speech (smooth attack/release).
-        filters.append("agate=threshold=0.015:ratio=1.6:attack=6:release=160:knee=4:range=0.25")
-        # strong compression -> dense, even, loud body
-        filters.append("acompressor=threshold=-20dB:ratio=4:attack=5:release=120:makeup=4:knee=4")
-        # bright presence boost + air; small low-mid scoop keeps it clean, not boomy
-        filters.append("equalizer=f=300:width_type=q:w=1.0:g=-2")
-        filters.append("equalizer=f=4200:width_type=q:w=1.1:g=4.5")   # presence / consonants
-        filters.append("treble=g=3:f=8500")                            # air / brightness
+        filters.append("highpass=f=85")
+        filters.append("afftdn=nr=20:nf=-30")      # STRONG broadband denoise (kills the TTS hiss floor)
+    if style in ("punchy", "dehiss"):
+        # Clarity over warmth: cut low-mid MUD, BOOST presence + a little air, then de-ess. No
+        # broad treble boost (hiss) and NO heavy low-pass (that was making the voice dumpf/muffled).
+        filters.append("equalizer=f=300:width_type=q:w=1.0:g=-3")            # cut low-mid mud (200-500Hz)
+        if style == "punchy":
+            filters.append("acompressor=threshold=-18dB:ratio=3:attack=6:release=140:makeup=3:knee=4")
+        filters.append("equalizer=f=4000:width_type=q:w=1.0:g=4")            # PRESENCE / clarity (3-5kHz)
+        filters.append("highshelf=f=9000:g=2")                              # light AIR (8-10kHz)
+        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-2.5")        # de-ess AFTER presence
+        filters.append("lowpass=f=16500")                                   # trim only ultra-high hiss (transparent)
     if abs(speed - 1.0) > 0.001:
         filters.append(f"atempo={speed:.4f}")
     if style == "punchy":
-        filters.append("loudnorm=I=-14:TP=-1.0:LRA=9")   # hotter than clean
-        filters.append("alimiter=limit=0.96")            # catch peaks, glue
+        filters.append("loudnorm=I=-15:TP=-1.0:LRA=10")
+        # FINAL gate: silence the gaps so the noise floor never reads as a background bed.
+        filters.append("agate=threshold=0.02:ratio=2.5:range=0.04:attack=8:release=160:knee=3")
+        filters.append("alimiter=limit=0.97")
+    elif style == "dehiss":
+        filters.append("loudnorm=I=-15:TP=-1.0:LRA=11")
+        filters.append("agate=threshold=0.02:ratio=2.5:range=0.04:attack=8:release=160:knee=3")
+        filters.append("alimiter=limit=0.97")
     else:
         filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
     tmp = path.with_name(path.stem + "_pp" + path.suffix)
@@ -210,8 +222,13 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         os.replace(str(tmp), str(path))
-        status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}' "
-                              f"(denoise {'on' if denoise else 'off'}).")
+        status_log(status_cb, f"Voice chain: speed {speed:.2f}x.")
+        if style in ("punchy", "dehiss"):
+            status_log(status_cb, "Voice EQ: highpass 85 Hz, STRONG denoise (afftdn nr=20) to kill the "
+                                  "TTS hiss, low-mid cut, presence + light air, de-esser; loudnorm -15 "
+                                  "LUFS; final noise gate silences the gaps (no background bed).")
+        else:
+            status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}'.")
     except Exception as exc:
         try:
             if tmp.exists():
@@ -418,6 +435,11 @@ def find_font(names):
 
 FONT_BOLD = find_font(["impact.ttf", "arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"])
 FONT_REGULAR = find_font(["arial.ttf", "DejaVuSans.ttf"])
+# A real, designed arrow glyph (not hand-drawn geometry). Segoe UI Symbol / Noto carry the heavy
+# dingbat arrows; DejaVu carries the plain one as a fallback.
+ARROW_FONT = find_font(["seguisym.ttf", "Segoe UI Symbol.ttf", "NotoSansSymbols2-Regular.ttf",
+                        "DejaVuSans.ttf", "arial.ttf"])
+ARROW_GLYPH = "➜"   # heavy round-tipped rightwards arrow (points right)
 FONT_CACHE = {}
 
 
@@ -878,6 +900,71 @@ def draw_arrow(draw, start, end, fill, width=8):
     draw.polygon((end, p1, p2), fill=fill)
 
 
+# The ONE reusable callout arrow: "default_thick_red_arrow". A single clean filled arrow -
+# bold shaft + a proper triangular head (head ~2.3x shaft wide, ~2.2x shaft long). No scribble /
+# sketch / back-swept / multi-part geometry.
+DEFAULT_THICK_RED_ARROW = (228, 30, 24)
+
+
+def draw_thick_arrow(draw, start, end, fill, shaft_w=22, shadow_fill=None):
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    ang = math.atan2(ey - sy, ex - sx)
+    head_len = shaft_w * 2.2
+    head_hw = shaft_w * 1.15                       # half-width of the triangular head base
+    bx = ex - head_len * math.cos(ang)             # where the shaft meets the head
+    by = ey - head_len * math.sin(ang)
+    perp = ang + math.pi / 2.0
+    c1 = (bx + head_hw * math.cos(perp), by + head_hw * math.sin(perp))
+    c2 = (bx - head_hw * math.cos(perp), by - head_hw * math.sin(perp))
+    r = shaft_w / 2.0
+    if shadow_fill is not None:
+        o = max(3, int(shaft_w * 0.18))
+        draw.line((sx + o, sy + o, bx + o, by + o), fill=shadow_fill, width=shaft_w)
+        draw.ellipse((sx - r + o, sy - r + o, sx + r + o, sy + r + o), fill=shadow_fill)
+        draw.polygon(((ex + o, ey + o), (c1[0] + o, c1[1] + o), (c2[0] + o, c2[1] + o)), fill=shadow_fill)
+    draw.line((sx, sy, bx, by), fill=fill, width=shaft_w)   # thick shaft
+    draw.ellipse((sx - r, sy - r, sx + r, sy + r), fill=fill)   # round the tail
+    draw.polygon((end, c1, c2), fill=fill)                  # triangular head
+
+
+def render_callout_arrow(spec, width, height, alpha, pop):
+    """Render ONE real designed arrow glyph (default_thick_red_arrow) in red, pointing at the
+    target from the side. Returns (RGBA tile, (x, y) paste position) or None. The arrow is a font
+    glyph, not hand-drawn geometry."""
+    if not ARROW_FONT:
+        return None
+    cx = width * float(spec.get("cx", 0.5)); cy = height * float(spec.get("cy", 0.5))
+    from_left = spec.get("from", "left") == "left"
+    size = max(40, int(height * 0.085 * max(0.55, pop)))     # glyph point size, scales on pop-in
+    try:
+        f = ImageFont.truetype(ARROW_FONT, size)
+    except Exception:
+        return None
+    red = DEFAULT_THICK_RED_ARROW + (int(245 * alpha),)
+    sh = (0, 0, 0, int(120 * alpha))
+    pad = max(8, size // 3)
+    tile = Image.new("RGBA", (size * 2 + pad, int(size * 1.7) + pad), (0, 0, 0, 0))
+    td = ImageDraw.Draw(tile)
+    off = max(3, size // 22)
+    td.text((pad // 2 + off, pad // 2 + off), ARROW_GLYPH, font=f, fill=sh)   # drop shadow
+    td.text((pad // 2, pad // 2), ARROW_GLYPH, font=f, fill=red)              # red arrow glyph
+    bbox = tile.getbbox()
+    if not bbox:
+        return None
+    tile = tile.crop(bbox)
+    if not from_left:
+        tile = tile.transpose(Image.FLIP_LEFT_RIGHT)          # point LEFT instead of right
+    tw, th = tile.size
+    gap = int(width * 0.025)
+    if from_left:                                             # tip at right edge -> sit just left of target
+        x = int(cx) - gap - tw
+    else:                                                     # tip at left edge -> sit just right of target
+        x = int(cx) + gap
+    y = int(cy - th / 2)
+    return tile, (x, y)
+
+
 def draw_ring(draw, cx, cy, rx, ry, fill, width=8, dash=26):
     if dash <= 0:
         draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), outline=fill, width=width)
@@ -1045,55 +1132,20 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
                     width=7,
                 )
         elif kind == "callout":
-            # target-based red TikTok callout (planned by agent_core.plan_visual_fx): pop-in +
-            # slight bounce, quick fade-out. `local` is 0..1 within the callout's on-screen window.
-            shape = spec.get("shape")
+            # ARROWS ONLY: a single clean thick red arrow (default_thick_red_arrow). Circles and
+            # stamps are disabled - any non-arrow callout shape is ignored here as a safety net.
+            if spec.get("shape") != "arrow":
+                continue
             a_in = clamp(local / 0.16, 0.0, 1.0)
             a_out = clamp((1.0 - local) / 0.22, 0.0, 1.0)
             alpha = a_in * a_out
             if alpha <= 0.02:
                 continue
             grow = clamp(local / 0.22, 0.0, 1.0)
-            pop = 0.6 + 0.4 * (1.0 - (1.0 - grow) ** 2) + 0.06 * math.sin(grow * math.pi)
-            red = (228, 30, 24, int(235 * alpha))
-            sh = (0, 0, 0, int(120 * alpha))
-            if shape == "circle":
-                cx = width * float(spec.get("cx", 0.5)); cy = height * float(spec.get("cy", 0.5))
-                rx = max(28, width * float(spec.get("rx", 0.13)) * pop)
-                ry = max(28, height * float(spec.get("ry", 0.10)) * pop)
-                draw.ellipse((cx - rx - 3, cy - ry - 3, cx + rx + 3, cy + ry + 3), outline=sh, width=13)
-                draw_ring(draw, int(cx), int(cy), int(rx), int(ry), red, width=11, dash=0)
-            elif shape == "arrow":
-                tx = width * float(spec.get("cx", 0.5)); ty = height * float(spec.get("cy", 0.5))
-                from_left = spec.get("from", "left") == "left"
-                slide = (2.0 - pop)                       # slides in from the side
-                if from_left:
-                    sx = tx - width * 0.20 * slide; ex = tx - width * 0.05
-                else:
-                    sx = tx + width * 0.20 * slide; ex = tx + width * 0.05
-                sy = ty + height * 0.05; ey = ty
-                draw.line((sx + 3, sy + 4, ex + 3, ey + 4), fill=sh, width=15)
-                draw_arrow(draw, (sx, sy), (ex, ey), red, width=13)
-            elif shape == "stamp":
-                font = get_font(int(width * 0.072), True)
-                text = str(spec.get("text", "")).upper()
-                x = int(width * float(spec.get("x", 0.12)))
-                y = int(height * float(spec.get("y", 0.16)))
-                bb = draw.textbbox((0, 0), text, font=font, stroke_width=4)
-                pad = 22
-                box = (x, y, x + (bb[2] - bb[0]) + pad * 2, y + (bb[3] - bb[1]) + pad * 2)
-                stamp = Image.new("RGBA", (max(2, box[2] - box[0]), max(2, box[3] - box[1])), (0, 0, 0, 0))
-                sd = ImageDraw.Draw(stamp)
-                sd.rectangle((0, 0, stamp.width - 1, stamp.height - 1), outline=(228, 30, 24, int(235 * alpha)), width=7)
-                sd.text((pad, pad - 4), text, font=font, fill=(228, 30, 24, int(240 * alpha)),
-                        stroke_width=3, stroke_fill=(255, 255, 255, int(160 * alpha)))
-                stamp = stamp.rotate(float(spec.get("rotate", -7)), resample=Image.Resampling.BICUBIC, expand=True)
-                # tiny pop on the stamp
-                if pop < 0.999:
-                    sw, shh = int(stamp.width * pop), int(stamp.height * pop)
-                    if sw > 2 and shh > 2:
-                        stamp = stamp.resize((sw, shh), Image.Resampling.BICUBIC)
-                overlay.alpha_composite(stamp, (box[0], box[1]))
+            pop = 0.6 + 0.4 * (1.0 - (1.0 - grow) ** 2) + 0.06 * math.sin(grow * math.pi)   # quick pop-in
+            tile = render_callout_arrow(spec, width, height, alpha, pop)
+            if tile is not None:
+                overlay.alpha_composite(tile[0], tile[1])
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -2244,7 +2296,7 @@ def ai_content_sfx_segments(config):
             continue
         out.append({"path": path, "start": round(float(cs.get("start", 0) or 0), 3),
                     "duration": float(cs.get("duration") or 4.0),
-                    "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.1))),
+                    "volume": max(0.0, min(0.9, float(cs.get("volume") or 0.1))),
                     "category": str(cs.get("category") or "ambient"),
                     "id": str(cs.get("id") or "ambient")})
     return out
@@ -2737,7 +2789,7 @@ def render_video(config, basename=None):
             str(config.get("crf", 18)),
         ]
         if audio_path and not seedance_segments and not sfx_segments and not background_music:
-            cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest"]
         elif seedance_segments or sfx_segments or background_music:
             filters = []
             labels = []
@@ -2811,7 +2863,11 @@ def render_video(config, basename=None):
                 "-c:a",
                 "aac",
                 "-b:a",
-                "128k",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
                 "-shortest",
             ]
         cmd += ["-movflags", "+faststart", str(output)]

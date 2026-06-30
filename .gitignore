@@ -20,6 +20,11 @@ background music/
 soundeffects/
 speaker/
 
+# --- TikTok login session (Playwright persistent Chromium profile; holds the account
+#     session - this is how scraping works without an API key. Never commit it.) ---
+tiktok-profile/
+tiktok-profile-*/
+
 # --- Runtime-generated working assets (trimmed SFX + caches, regenerated on demand) ---
 generated_assets/
 

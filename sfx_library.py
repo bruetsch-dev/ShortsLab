@@ -77,11 +77,14 @@ CAT_MAXLEN = {
     "payment_ding": 1.2, "message_sent": 1.0,
 }
 # default mixing volume per category, in dBFS (midpoint of the user's ranges)
+# Per-category mix level in dB below the speech. Bumped ~+6 dB (2026-06): the editor SFX were
+# coming through far too quietly under the loud voice (whooshes/impacts barely audible). These now
+# sit clearly present like the reference TikTok edits while still under the narration.
 CAT_DB = {
-    "bright_whoosh": -14, "swipe_whoosh": -13, "whoosh_hit_combo": -12, "impact_hit": -10,
-    "low_impact": -13, "caption_pop": -18, "ui_click": -21, "notification_ding": -18,
-    "idea_reveal": -18, "camera_flash": -15, "flash_blink": -17, "school_bell": -19,
-    "payment_ding": -19, "message_sent": -19,
+    "bright_whoosh": -8, "swipe_whoosh": -7, "whoosh_hit_combo": -6, "impact_hit": -5,
+    "low_impact": -8, "caption_pop": -12, "ui_click": -15, "notification_ding": -12,
+    "idea_reveal": -12, "camera_flash": -9, "flash_blink": -11, "school_bell": -13,
+    "payment_ding": -13, "message_sent": -13,
 }
 
 

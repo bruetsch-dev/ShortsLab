@@ -2019,9 +2019,15 @@ def enforce_unique_media_per_render(config, status_cb=None):
         gpt_dir = project_dir / "gpt images"
     except Exception:
         project_dir = asset_dir = gpt_dir = None
+    # Scrape mode INTENTIONALLY reuses clips across scenes (same-script reuse, loop-fill when there
+    # are fewer accepted clips than scenes). The renderer holds/freezes a reused clip, so de-duping
+    # here would strip clips and leave scenes blank -> pre-render validation would then fail.
+    scrape_mode = str(config.get("clip_source") or "") == "scrape"
     seen_static_assets = set()
     seen_seedance_clips = set()
     for index, scene in enumerate(config.get("scenes", []), 1):
+        if scene.get("seedance") and scrape_mode:
+            continue                      # keep every reused scrape clip
         if scene.get("seedance"):
             clip_key = media_ref_key(scene.get("clip") or pipeline.clip_filename(scene, index))
             if clip_key and clip_key in seen_seedance_clips:
@@ -2130,7 +2136,9 @@ def extract_json_object(text):
             return repaired
     except Exception:
         pass
-    return json.loads(candidate)
+    # Unparseable (e.g. the API returned empty/non-JSON content). NEVER raise here - callers do
+    # `extract_json_object(...) or {}` and fall back gracefully; raising aborted the whole step.
+    return None
 
 
 def extract_phrases(text, limit=8):
@@ -2605,7 +2613,9 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
     generic = SEARCH_NOISE | {"japan", "japanese", "short", "video", "people", "thing", "things"}
     target_terms = words(target_text) - generic
     candidates = []
-    for candidate_dir in sorted(PROJECTS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+    # Only this project's OWN previously-scraped clips are eligible for reuse (callers gate this to
+    # same-script runs). Never scan or borrow from other projects' folders.
+    for candidate_dir in [project_dir]:
         if not candidate_dir.is_dir():
             continue
         clips = sorted((candidate_dir / "seedance 2.0").glob("scraped_*.mp4"))
@@ -2651,9 +2661,12 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
                     {"role": "system", "content": "You select existing video projects whose real TikTok footage can be reused for a new short. Return JSON only."},
                     {"role": "user", "content": (
                         understanding_brief(understanding)
-                        + "Before any new TikTok search, find existing projects about approximately the SAME "
-                          "topic whose accepted clips are worth re-checking. Topic similarity matters more than "
-                          "generic Japan atmosphere. Score 0-100; select only projects >=55.\n\n"
+                        + "Find existing projects about the SAME SPECIFIC SUBJECT as the new script whose clips "
+                          "are worth re-checking. Score topic_similarity 0-100 based on the actual subject/object "
+                          "(e.g. vending machines, konbini, dating, trains), NOT on generic 'Japan at night' / "
+                          "'convenience' / atmosphere overlap - a vending-machine short and a rescue-station short "
+                          "are DIFFERENT topics even though both are Japan. Select ONLY projects >=85 (essentially "
+                          "the same subject). If nothing is clearly the same subject, return an empty list.\n\n"
                         + f"New title: {title}\nNew script:\n{script}\n\nExisting projects:\n{catalog}\n\n"
                           'Return {"projects":[{"slug":"...","topic_similarity":0-100,"reason":"..."}]}.'
                     )},
@@ -2666,21 +2679,18 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
                     score = float(item.get("topic_similarity") or 0)
                 except (TypeError, ValueError):
                     score = 0.0
-                if score >= 55:
+                if score >= 85:                    # only essentially the SAME subject (strict)
                     selected_scores[slug] = score
                     selected_reasons[slug] = str(item.get("reason") or "")[:220]
         except Exception as exc:  # noqa: BLE001
             log(status_cb, f"Existing-project agent search fell back to local similarity ({exc.__class__.__name__}).")
-    # Exact/near-exact local reruns must never be lost to an imperfect model response.
+    # Only keep VERY strong subject-term overlap (near-identical scripts) - never loosely-related
+    # projects (a vending-machine script must not pull rescue-station clips). A fresh scrape covers
+    # everything else, so it is safe to reuse nothing when no project is the same subject.
     for candidate in candidates:
-        if candidate["lexical_score"] >= 70:
+        if candidate["lexical_score"] >= 80:
             selected_scores.setdefault(candidate["slug"], candidate["lexical_score"])
-            selected_reasons.setdefault(candidate["slug"], "strong local topic-term overlap")
-    if not selected_scores:
-        for candidate in candidates:
-            if candidate["lexical_score"] >= 32:
-                selected_scores[candidate["slug"]] = candidate["lexical_score"]
-                selected_reasons[candidate["slug"]] = "local topic-term overlap"
+            selected_reasons.setdefault(candidate["slug"], "near-identical subject terms")
 
     selected = [c for c in candidates if c["slug"] in selected_scores]
     selected.sort(key=lambda c: (selected_scores[c["slug"]], c["path"].stat().st_mtime), reverse=True)
@@ -2880,6 +2890,12 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
             except (TypeError, ValueError):
                 continue
     filter_summary = _summarize_candidate_filters(candidate_statuses, raw_total=None)
+    # Close the shared logged-in TikTok browser session once this plan's scrape is done.
+    try:
+        if hasattr(clip_scraper, "close_backend"):
+            clip_scraper.close_backend()
+    except Exception:
+        pass
     return pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses, filter_summary
 
 
@@ -4503,8 +4519,8 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         return 0
     duration = max(float(config.get("duration", 0) or 0),
                    max((float(s.get("end", 0) or 0) for s in scenes), default=0.0)) or 1.0
-    mpm = max(8, int(config.get("editor_sfx_max_per_minute", 30) or 30))
-    budget = max(8, min(35, int(round(duration / 60.0 * mpm))))
+    mpm = max(8, int(config.get("editor_sfx_max_per_minute", 42) or 42))
+    budget = max(12, min(52, int(round(duration / 60.0 * mpm))))
 
     def prio(i, sc):
         if i == 0:
@@ -4521,7 +4537,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     for c in ranked:
         if len(selected) >= budget:
             break
-        if all(abs(c[1] - e[1]) >= 0.6 for e in selected):
+        if all(abs(c[1] - e[1]) >= 0.4 for e in selected):
             selected.append(c)
     selected.sort(key=lambda c: c[1])
 
@@ -4533,9 +4549,9 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     def density_ok(t, loud=False):
         if any(abs(t - e["start"]) < 0.20 for e in events):       # no two within 0.20s
             return False
-        if sum(1 for e in events if abs(t - e["start"]) < 1.0) >= 3:   # <= 3 per 2s window
+        if sum(1 for e in events if abs(t - e["start"]) < 1.0) >= 4:   # <= 4 per 2s window
             return False
-        if t < 3.0 and sum(1 for e in events if e["start"] < 3.0) >= 3:   # <= 3 in first 3s
+        if t < 3.0 and sum(1 for e in events if e["start"] < 3.0) >= 4:   # <= 4 in first 3s
             return False
         if loud and (t - last_loud) < 1.5:                        # loud impacts >= 1.5s apart
             return False
@@ -4545,6 +4561,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         sc = scenes[i]; fx = sc.get("fx") or {}
         beat = str(fx.get("beat", "")).lower()
         txt = str(sc.get("exact_voice_text") or sc.get("script") or "").lower()
+        has_callout = str(fx.get("callout") or "").lower() in ("arrow", "circle", "stamp")
         cat, reason, t, loud = None, "clip_cut", max(0.0, start - 0.08), False
         link_visual = fx.get("transition")
         if i == 0:
@@ -4557,9 +4574,9 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             else:
                 cat, reason, loud = "impact_hit", ("major_reveal" if beat in ("reveal", "shock", "turning_point") else "shocking_word"), True
             t = start
-        elif fx.get("callout") in ("arrow", "circle", "stamp"):
-            cat, reason, link_visual, t = "ui_click", "visual_callout", fx.get("callout"), start + 0.25
         else:
+            # every normal cut gets a WHOOSH (whoosh-dominant, reference style); a callout on this
+            # scene gets a separate quick click layered on the callout pop below.
             cat = "swipe_whoosh" if link_visual in ("subtle_swipe", "glitch", "whoosh") else "bright_whoosh"
             if not lib.get(cat):
                 cat = "bright_whoosh" if lib.get("bright_whoosh") else "swipe_whoosh"
@@ -4589,7 +4606,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                 continue
         rec = rec_by_path.get(path, {})
         db = sfx_library.CAT_DB.get(cat, -18)
-        vol = round(min(0.6, sfx_library.db_to_gain(db)), 3)
+        vol = round(min(0.85, sfx_library.db_to_gain(db)), 3)
         dur = float(rec.get("trim_len") or 0.9)
         events.append({"path": str(path), "start": round(t, 3),
                        "duration": round(min(2.0, dur) + 0.04, 3), "volume": vol,
@@ -4606,6 +4623,26 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             "linked_word": None, "linked_visual_event": link_visual, "allowed_by_policy": True})
         log(status_cb, f"SFX: {cat} at {t:.2f} for {reason}"
                        + (f" (link {link_visual})" if link_visual else ""))
+
+        # layer a quick click on the visual callout pop (in addition to the cut whoosh)
+        if has_callout and reason in ("clip_cut", "topic_accent") and lib.get("ui_click"):
+            ct = start + 0.28
+            if density_ok(ct):
+                cp = pick("ui_click")
+                if cp:
+                    crec = rec_by_path.get(cp, {})
+                    cdb = sfx_library.CAT_DB.get("ui_click", -21)
+                    events.append({"path": str(cp), "start": round(ct, 3),
+                                   "duration": round(min(2.0, float(crec.get("trim_len") or 0.4)) + 0.04, 3),
+                                   "volume": round(min(0.85, sfx_library.db_to_gain(cdb)), 3),
+                                   "category": "ui_click", "id": f"sfx-{len(events):02d}", "sfx_type": "ui_click"})
+                    sfx_events_report.append({
+                        "time": round(ct, 2), "scene_id": i, "type": "ui_click",
+                        "asset_file": Path(crec.get("file") or cp).name,
+                        "used_trimmed_version": bool(crec.get("requires_trim")), "volume_db": cdb,
+                        "reason": "visual_callout", "linked_cut_time": round(start, 2),
+                        "linked_word": None, "linked_visual_event": fx.get("callout"), "allowed_by_policy": True})
+                    log(status_cb, f"SFX: ui_click at {ct:.2f} for visual_callout (link {fx.get('callout')})")
 
     config["ai_content_sfx"] = events
     summ = {"total_sfx": len(events), "whoosh_or_swipe": 0, "impact_hit": 0, "low_impact": 0,
@@ -4650,6 +4687,48 @@ def _scene_is_big_moment(scene):
     return any(w in txt for w in _BIG_MOMENT_WORDS)
 
 
+def measure_voice_noise(path, ffmpeg=None):
+    """Measure the constant noise floor + high-frequency hiss of the (voice) audio so the report
+    can prove the rauschen is gone. Returns {noise_floor_db, high_frequency_hiss_score 0-10,
+    constant_hiss_detected}."""
+    out = {"noise_check_enabled": True, "noise_floor_db": None,
+           "high_frequency_hiss_score": 0.0, "constant_hiss_detected": False,
+           "voice_clarity_score": None, "voice_muffled": False, "low_mid_to_presence_ratio": None}
+    ffmpeg = ffmpeg or pipeline.find_ffmpeg()
+    if not ffmpeg or not path or not Path(path).exists():
+        out["noise_check_enabled"] = False
+        return out
+    try:
+        import numpy as np
+        sr = 32000
+        raw = subprocess.run([ffmpeg, "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(sr),
+                              "-f", "f32le", "-"], capture_output=True, timeout=90).stdout
+        a = np.frombuffer(raw, dtype="<f4")
+        if a.size < sr:
+            return out
+        w = int(sr * 0.05); n = a.size // w
+        rms = np.sqrt(np.mean(a[:n * w].reshape(n, w) ** 2, axis=1) + 1e-12)
+        floor = float(np.percentile(rms, 8))          # quiet-frame RMS = the noise floor
+        out["noise_floor_db"] = round(20.0 * float(np.log10(floor + 1e-9)), 1)
+        mag = np.abs(np.fft.rfft(a * np.hanning(a.size)))
+        freqs = np.fft.rfftfreq(a.size, 1.0 / sr)
+        hf = float(mag[freqs > 8000].sum() / (mag.sum() + 1e-9))
+        out["high_frequency_hiss_score"] = round(min(10.0, hf * 45.0), 1)
+        out["constant_hiss_detected"] = bool(out["noise_floor_db"] > -42.0
+                                             or out["high_frequency_hiss_score"] > 4.5)
+        # clarity: presence (2-5kHz) vs low-mid mud (200-500Hz). A muffled/dumpf voice has lots of
+        # low-mid and little presence -> low clarity score.
+        lowmid = float(mag[(freqs >= 200) & (freqs <= 500)].sum())
+        presence = float(mag[(freqs >= 2000) & (freqs <= 5000)].sum())
+        ratio = lowmid / (presence + 1e-9)
+        out["low_mid_to_presence_ratio"] = round(ratio, 2)
+        out["voice_clarity_score"] = round(max(0.0, min(10.0, 10.0 / (1.0 + ratio))), 1)
+        out["voice_muffled"] = bool(out["voice_clarity_score"] < 4.0)
+    except Exception:
+        pass
+    return out
+
+
 def validate_scrape_render(config, status_cb=None):
     """HARD pre-render gate for scrape/social mode. Refuses to render a broken timeline by raising
     RuntimeError with a clear reason. Enforces: speech 1.20x, arrows/circles/stamps off, semantic
@@ -4665,13 +4744,24 @@ def validate_scrape_render(config, status_cb=None):
         vs = 0.0
     if abs(vs - 1.20) > 0.001:
         raise RuntimeError(f"Pre-render validation failed: voice_speed is {config.get('voice_speed')} (must be 1.20x)")
-    # Visual emphasis is now TARGET-BASED (plan_visual_fx) rather than banned: any overlay that
-    # survived to here is a validated red callout anchored to a concrete subject. Just sanity-check
-    # that nothing slipped in the OLD untargeted overlay types.
+    # ARROWS ONLY: block circles, stamps, labels and any legacy/untargeted overlay; the only
+    # overlay allowed through is a target-based arrow callout.
     for sc in scenes:
         for ov in (sc.get("overlays") or []):
             if ov.get("type") in ("arrows", "highlight", "paper", "newspaper", "counter"):
                 raise RuntimeError("Pre-render validation failed: untargeted/legacy overlay present")
+            if ov.get("type") == "callout" and ov.get("shape") in ("circle", "stamp"):
+                raise RuntimeError(f"Render blocked: circles/stamps/labels are disabled, but scene "
+                                   f"{sc.get('id')} still has a {ov.get('shape')}")
+    # SFX must be SHORT, event-based hits - no continuous ambient/noise bed under the video.
+    for ev in (config.get("ai_content_sfx") or []):
+        try:
+            evd = float(ev.get("duration") or 0)
+        except (TypeError, ValueError):
+            evd = 0.0
+        if evd > 2.0 and ev.get("category") != "background_music":
+            raise RuntimeError(f"Render blocked: long/ambient SFX detected ({ev.get('category')} "
+                               f"{evd:.2f}s > 2.0s)")
     if enf.get("semantic_matching_skipped"):
         raise RuntimeError("Semantic matching skipped; refusing to render random clips")
     if (scenes[0].get("visual_role") or "") != "hook_influencer":
@@ -4822,9 +4912,9 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
                 "scene's narration line - a face, person, object, sign, money/receipt, food, vehicle, crowd, "
                 "store shelf, phone screen, uniform, or a weird detail the line names. Give its location as a "
                 "normalized centre (cx, cy in 0-1 WITHIN that tile) and size (small/medium/large).\n"
-                "Then decide ONE red callout: 'circle' to ring a compact object/face, 'arrow' to point at it "
-                "from the side, or 'none'. Choose 'none' unless the target is clearly visible AND directly "
-                "supports the line. Do NOT point at empty space, background texture, blurred areas, generic "
+                "Then decide ONE red callout: 'arrow' to point at it from the side, or 'none'. (Only thick "
+                "arrows are used - never circles.) Choose 'none' unless the target is clearly visible AND "
+                "directly supports the line. Do NOT point at empty space, background texture, blurred areas, generic "
                 "street, body/chest (unless the line is about clothing/body), or anything under the caption "
                 "band (cy roughly 0.50-0.72).\n"
                 "Also: stamp_text = a 1-2 word UPPERCASE red label ONLY for a major claim (e.g. BANNED, WHY?, "
@@ -4879,9 +4969,15 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
         rel = _f(d.get("relevance_to_voice"))
         safe = bool(d.get("safe_for_overlay", False))
         callout = str(d.get("callout", "none")).lower().strip()
+        if callout == "circle":                 # user preference: thick ARROWS only, never circles
+            callout = "arrow"
         has_clip = bool(sc.get("clip"))
         in_caption_band = CAPTION_BAND[0] <= cy <= CAPTION_BAND[1]
-        has_target = has_clip and conf >= 7.0 and rel >= 7.0 and 0.02 <= cx <= 0.98
+        # arrows-only: target must be clearly present (confident) and reasonably relevant. The
+        # old rel>=8 bar rejected most scenes (high confidence, rel 5-7) leaving only ~6 arrows on
+        # a 21-scene short; loosened to conf>=7 / rel>=6 so concrete on-screen subjects get arrows
+        # like the reference viral docs, while still skipping scenes with no real target.
+        has_target = has_clip and conf >= 7.0 and rel >= 6.0 and 0.02 <= cx <= 0.98
         # hard validation for a callout
         reason = ""
         callout_ok = (has_target and safe and callout in ("arrow", "circle")
@@ -4909,9 +5005,10 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
             "reason": reason or str(d.get("reason", "")), "has_target": has_target, "safe": safe,
         })
 
-    # cap callouts to ~30% of scenes (keep the most relevant); enforce sparingly
+    # cap callouts to ~55% of scenes (keep the most relevant). Up from 30%: the reference viral
+    # documentaries put an arrow on most concrete-subject beats, not just a third.
     eligible = sorted([c for c in candidates if c["callout_ok"]], key=lambda c: -c["rel"])
-    cap = max(1, int(round(len(scenes) * 0.30)))
+    cap = max(1, int(round(len(scenes) * 0.55)))
     keep = set(c["scene_index"] for c in eligible[:cap])
     for c in eligible[cap:]:
         c["callout"] = "none"; c["callout_ok"] = False
@@ -4935,12 +5032,9 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
         overlays = []
         cx, cy = c["cx"], c["cy"]
         r = SIZE_R.get(c["size"], 0.135)
-        callout_type = c["callout"] if c["callout_ok"] else "none"
-        if callout_type == "circle":
-            overlays.append({"type": "callout", "shape": "circle", "cx": cx, "cy": cy,
-                             "rx": r, "ry": r * 1.25, "start": 0.0, "end": 0.0})  # timing set below
-            summary["circle_count"] += 1; summary["callout_count"] += 1
-        elif callout_type == "arrow":
+        # ARROWS ONLY: circles and stamps/labels are disabled. Any callout is rendered as an arrow.
+        callout_type = "arrow" if (c["callout_ok"] and c["callout"] in ("arrow", "circle")) else "none"
+        if callout_type == "arrow":
             overlays.append({"type": "callout", "shape": "arrow", "cx": cx, "cy": cy,
                              "from": ("left" if cx > 0.5 else "right"), "start": 0.0, "end": 0.0})
             summary["arrow_count"] += 1; summary["callout_count"] += 1
@@ -4950,13 +5044,7 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
         s_off = min(0.98, s_on + max(0.5, min(1.2, 0.8)) / sdur)
         for ov in overlays:
             ov["start"], ov["end"] = round(s_on, 3), round(s_off, 3)
-        # rare stamp (only when the model proposed one AND there is a clear target, ~major claim)
-        stamp_text = None
-        if c["stamp"] and c["has_target"] and len(c["stamp"].split()) <= 2 and summary["stamp_count"] < max(1, len(scenes)//8):
-            stamp_text = c["stamp"].upper()[:14]
-            overlays.append({"type": "callout", "shape": "stamp", "text": stamp_text,
-                             "x": 0.12, "y": 0.16, "start": round(s_on, 3), "end": round(min(0.98, s_on + 1.0 / sdur), 3)})
-            summary["stamp_count"] += 1
+        stamp_text = None                      # red stamps/labels permanently disabled
         if overlays:
             sc["overlays"] = overlays
         else:
@@ -5002,11 +5090,14 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
                            f"anchored to ({punch['anchor_cx']:.2f},{punch['anchor_cy']:.2f}), transition {transition}.")
 
     config["smart_overlays"] = summary["callout_count"] > 0
+    report["visual_fx_summary"]["arrows_only"] = True
+    report["visual_fx_summary"]["circles_enabled"] = False
+    report["visual_fx_summary"]["stamps_enabled"] = False
     config["visual_fx_report"] = report
-    log(status_cb, f"Visual FX: {summary['callout_count']} callout(s) "
-                   f"({summary['arrow_count']} arrow / {summary['circle_count']} circle), "
-                   f"{summary['stamp_count']} stamp(s), {summary['punch_in_count']} punch-in(s) "
-                   f"over {len(scenes)} scene(s) - target-based only.")
+    log(status_cb, "Visual FX: arrows only; circles/stamps disabled.")
+    log(status_cb, "Arrow renderer: using default_thick_red_arrow.")
+    log(status_cb, f"Visual FX: {summary['arrow_count']} arrow(s) over {len(scenes)} scene(s) "
+                   f"(target-based, conf+rel >= 8), {summary['punch_in_count']} punch-in(s).")
     return report
 
 
@@ -6332,6 +6423,16 @@ def apply_timeline_edits_to_config(config, edits, slug):
             "added": True,
         }
     removed = {str(x) for x in (edits.get("removed") or [])}
+    # In-editor "Replace media": scene_id -> chosen library media. The new media is copied into the
+    # project and the scene points at it, KEEPING the scene's existing duration (so the new clip is
+    # cut to the replaced clip's length by the normal per-scene trim).
+    project_dir = PROJECTS_DIR / slug
+    replaced_by_id = {}
+    for r in (edits.get("replaced") or []):
+        rid = str(r.get("id") or "")
+        src = str(r.get("path") or "")
+        if rid and src:
+            replaced_by_id[rid] = r
     dur_by_id = {str(d.get("id")): d.get("duration") for d in (edits.get("scenes") or []) if d.get("duration") is not None}
     order = edits.get("order")
     idmap = {str(s.get("id", i)): s for i, s in enumerate(scenes)}
@@ -6350,6 +6451,35 @@ def apply_timeline_edits_to_config(config, edits, slug):
             dur = float(scene.get("end", 0)) - float(scene.get("start", 0))
         dur = max(0.5, min(20.0, dur or 1.0))
         scene = dict(scene)
+        # apply an in-editor media replacement for this scene (copy the chosen file into the project
+        # so the renderer resolves it; keep the scene duration -> new clip is trimmed to that length)
+        if sid in replaced_by_id:
+            try:
+                src = Path(replaced_by_id[sid]["path"])
+                if src.exists():
+                    is_video = (str(replaced_by_id[sid].get("type")) == "video"
+                                or src.suffix.lower() in VIDEO_EXTS)
+                    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", src.stem)[:18]
+                    if is_video:
+                        dest_dir = project_dir / "seedance 2.0"
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest = dest_dir / f"replaced_{sid}_{safe}{src.suffix.lower()}"
+                        if not dest.exists():
+                            shutil.copy2(src, dest)
+                        scene["clip"] = dest.name      # scene_clip_path resolves clip_dir/<name>
+                        scene["asset"] = dest.name
+                        scene["seedance"] = True
+                    else:
+                        dest_dir = project_dir / "web images"
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest = dest_dir / f"replaced_{sid}_{safe}{src.suffix.lower()}"
+                        if not dest.exists():
+                            shutil.copy2(src, dest)
+                        scene["asset"] = str(dest.resolve())   # resolve_media_path handles absolute
+                        scene["clip"] = None
+                        scene["seedance"] = False
+            except Exception:
+                pass
         scene["start"] = round(t, 3)
         scene["end"] = round(t + dur, 3)
         t += dur
@@ -6534,9 +6664,20 @@ def run_project(form, status_cb=None):
     if not audio_path and reuse_same_script and not form_flag(form, "regenerate_voice", False):
         _vo = existing_project_voiceover(project_dir)
         if _vo:
+            # The saved voiceover was processed by an OLDER chain that brightened the TTS hiss into a
+            # constant rauschen. Reuse it (no new TTS) but run a de-hiss pass (denoise + de-ess +
+            # 15 kHz low-pass, NO speed/shape change) onto a cleaned copy so the bed is gone.
             audio_path = str(_vo)
-            log(status_cb, f"Reusing existing voiceover for the identical script ({_vo.name}) - no new TTS. "
-                           "(Tick 'regenerate voice' to force a fresh take.)")
+            try:
+                _clean = _vo.with_name(_vo.stem + "_dehiss.wav")
+                shutil.copyfile(_vo, _clean)
+                pipeline.apply_voice_postprocess(_clean, speed=1.0, denoise=True, style="dehiss",
+                                                 ffmpeg=pipeline.find_ffmpeg(), status_cb=status_cb)
+                audio_path = str(_clean)
+                log(status_cb, f"Reusing existing voiceover ({_vo.name}), de-hissed - no new TTS. "
+                               "(Tick 'Fresh take' to regenerate the voice instead.)")
+            except Exception:
+                log(status_cb, f"Reusing existing voiceover for the identical script ({_vo.name}) - no new TTS.")
     if not audio_path and form_flag(form, "generate_voice", True):
         audio_path = generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
         # "Halt after generating speech": pause here until the user approves (or
@@ -6927,38 +7068,16 @@ def run_project(form, status_cb=None):
     clip_decision_log = None   # per-scene clip choices/rejections for agent_report
     social_search_report = None
     reused_existing_scrape = 0
-    if clip_source == "scrape" and reuse_same_script:
-        # The same script already has scraped TikTok clips in this folder - reuse them and SKIP
-        # the whole search/download/match pipeline. Forces a fresh scrape only via 'force_rescrape'.
-        if not form_flag(form, "force_rescrape", False):
-            reused_existing_scrape = reuse_existing_scrape_clips(project_dir, scenes_override, status_cb=status_cb)
-            if reused_existing_scrape:
-                allow_gpt = False
-                allow_seedance = True
-                seedance_clip_count = len([s for s in scenes_override if s.get("clip")])
-                social_search_report = {
-                    "search_mode": "reused_existing_same_script", "old_style_query_path_used": False,
-                    "project_media_panel_policy": "accepted_media_only", "voice_speed": 1.20,
-                    "visual_emphasis_enabled": False, "hook_first": True,
-                    "semantic_matching_skipped": False,
-                    "reused_existing_scrape_clips": reused_existing_scrape,
-                    "note": "Identical script - reused this project's already-scraped TikTok clips; no new search.",
-                }
-                # carry scene metadata so the pre-render validation gate passes (plan_config drops
-                # arbitrary scene keys; the scrape-config block re-stamps them from here).
-                if isinstance(form, dict):
-                    form["_scrape_enforcement"] = {
-                        "hook_first": True, "best_hook_present": True,
-                        "semantic_matching_skipped": False,
-                        "scene_meta": [{"visual_role": sc.get("visual_role"),
-                                        "match_class": sc.get("match_class"),
-                                        "script_match_score": sc.get("script_match_score"),
-                                        "black_bar_score": sc.get("black_bar_score"),
-                                        "is_fake_vertical": sc.get("is_fake_vertical"),
-                                        "scrape_source": sc.get("scrape_source"),
-                                        "has_clip": bool(sc.get("clip"))}
-                                       for sc in scenes_override],
-                    }
+    # NOTE: the same-script shortcut used to BLIND-assign this project's old scraped_NN.mp4 clips by
+    # index with NO caption/quality check - so captioned clips an earlier (more lenient) run accepted
+    # were replayed forever. That is exactly how burned-in Japanese TikTok captions kept showing up.
+    # Same-script runs now fall through to the normal pipeline, which reuses this project's already
+    # DOWNLOADED clips via find_reusable_social_clips (so no full re-download) but RE-VALIDATES every
+    # one through the strict semantic matcher (rejects has_creator_text / text_heavy>3) and only
+    # searches TikTok again for scenes the clean existing clips cannot cover.
+    if clip_source == "scrape" and reuse_same_script and not form_flag(form, "force_rescrape", False):
+        log(status_cb, "Same-script reuse: re-validating this project's existing clips through the "
+                       "caption/quality matcher (no blind reuse); searching only for uncovered scenes.")
     if clip_source == "scrape" and not reused_existing_scrape:
         try:
             import clip_scraper
@@ -7015,33 +7134,40 @@ def run_project(form, status_cb=None):
             scene_clips = [None] * scene_total
             with step_watchdog(form, "Clip scrape", limit_s=2700, status_cb=status_cb):
                 if social_plan.get("buckets"):
-                    log(status_cb, "Existing-project agent: checking accepted clips before any new TikTok search...")
-                    existing_body, existing_hooks, existing_meta, project_reuse_report = find_reusable_social_clips(
-                        project_dir, title, script, understanding=script_understanding,
-                        reasoning_model=reasoning_model, status_cb=status_cb)
-                    pool = list(existing_body) + list(existing_hooks)
-                    hook_pool = list(existing_hooks)
-                    clip_meta.update(existing_meta)
-                    for path in pool:
-                        em = clip_meta.get(str(path)) or {}
-                        candidate_statuses.append({
-                            "clip_id": em.get("clip_id") or str(path),
-                            "bucket_id": em.get("bucket_id"), "source_query": em.get("source_query"),
-                            "tier": "existing_project", "status": "downloaded_pending_review",
-                            "shown_in_media_panel": False, "reason": "reusable accepted clip from similar project",
-                            "likes": em.get("likes", 0),
-                        })
+                    existing_body, existing_hooks, existing_meta = [], [], {}
+                    project_reuse_report = {"searched_projects": 0, "selected_projects": []}
+                    # HARD RULE: previously-scraped clips are reused ONLY when this is the SAME script
+                    # (same-script fusion) and only from THIS project's own folder. A new/different
+                    # script NEVER touches another run's media - it always scrapes fresh footage.
+                    if reuse_same_script:
+                        log(status_cb, "Same-script run: re-checking this project's own accepted clips...")
+                        existing_body, existing_hooks, existing_meta, project_reuse_report = find_reusable_social_clips(
+                            project_dir, title, script, understanding=script_understanding,
+                            reasoning_model=reasoning_model, status_cb=status_cb)
+                        pool = list(existing_body) + list(existing_hooks)
+                        hook_pool = list(existing_hooks)
+                        clip_meta.update(existing_meta)
+                        for path in pool:
+                            em = clip_meta.get(str(path)) or {}
+                            candidate_statuses.append({
+                                "clip_id": em.get("clip_id") or str(path),
+                                "bucket_id": em.get("bucket_id"), "source_query": em.get("source_query"),
+                                "tier": "existing_project", "status": "downloaded_pending_review",
+                                "shown_in_media_panel": False, "reason": "reusable accepted clip from same project",
+                                "likes": em.get("likes", 0),
+                            })
+                    else:
+                        log(status_cb, "New script: scraping fresh TikTok footage - no reuse of any old/other media.")
 
-                    # If reusable body clips exist, score those first and let targeted retry rounds
-                    # search only the scenes they cannot cover. Search a fresh hook only when no
-                    # verified 20K+ existing hook is available.
+                    # Always scrape the fresh script-matched body buckets; reuse a verified existing
+                    # hook only on a same-script run.
                     first_search_plan = {
-                        "buckets": [] if existing_body else list(social_plan.get("buckets") or []),
+                        "buckets": list(social_plan.get("buckets") or []),
                         "hook": None if existing_hooks else social_plan.get("hook"),
                     }
                     if existing_body:
-                        log(status_cb, f"Existing-project agent supplied {len(existing_body)} body clip(s); "
-                                       "skipping broad initial body scrape and searching only later gaps.")
+                        log(status_cb, f"Same-script run reused {len(existing_body)} of this project's own "
+                                       "body clip(s); still running the fresh script-matched TikTok scrape.")
                     if first_search_plan["buckets"] or first_search_plan["hook"]:
                         (fresh_pool, fresh_meta, fresh_perf, _fresh_scene_bucket, fresh_hooks,
                          fresh_statuses, _fresh_summary) = scrape_social_plan(
@@ -7278,7 +7404,10 @@ def run_project(form, status_cb=None):
             accepted_body = [(i, c) for i, c in enumerate(scene_clips) if i > 0 and c]
             fallback_pool = []
             _fallback_seen = set()
-            for _candidate in (body_pool or hook_pool or pool or already):
+            # Continuity fallback must ONLY reuse clips that PASSED the matcher's caption/quality
+            # gate (the clips actually assigned to scenes). Pulling from the raw download pool was
+            # how captioned/text-heavy clips the matcher had rejected slipped onto unmatched scenes.
+            for _candidate in [c for _, c in accepted_body]:
                 _key = str(Path(_candidate).resolve())
                 if _key not in _fallback_seen:
                     _fallback_seen.add(_key)
@@ -7513,11 +7642,27 @@ def run_project(form, status_cb=None):
                                    "the render will continue instead of aborting.")
                     seedance_clip_count = len([s for s in scenes_override if s.get("clip")])
             elif unmatched_scenes:
-                raise RuntimeError("TikTok scrape returned no usable video files at all; cannot render a video layer.")
-            # the chosen clips are already copied to scraped_NN.mp4 - drop the candidate pool so
-            # the project media panel shows accepted media only (not the rejected/unused candidates).
+                if not getattr(clip_scraper, "backend_active", lambda: False)():
+                    raise RuntimeError(
+                        "TikTok is not connected. Open Settings -> 'Connect TikTok' (or run "
+                        "`python tiktok_login.py login`) and sign in once, then re-run. Scraping "
+                        "uses your own logged-in TikTok session - no API key needed.")
+                if getattr(clip_scraper, "apify_out_of_credits", lambda: False)():
+                    raise RuntimeError(
+                        "Apify is OUT OF CREDITS - every TikTok search was rejected (HTTP 402, "
+                        "not enough usage). Either connect a TikTok login (Settings -> Connect TikTok, "
+                        "no API key needed) or top up Apify, then re-run.")
+                raise RuntimeError("TikTok scrape returned no usable video files at all; cannot render a "
+                                   "video layer. Check the console log for the search/download errors "
+                                   "(login expired / rate-limit / network).")
+            # The chosen clips are already copied to scraped_NN.mp4. KEEP the candidate pool on disk
+            # (under seedance 2.0/_candidates) so the timeline editor can show ALL downloaded scraped
+            # footage, including the declined ones. The accepted progress panels already exclude
+            # anything under _candidates/_raw, so they still show accepted media only. Just drop the
+            # transient _raw download scratch.
             try:
-                shutil.rmtree(seedance_target_dir / "_candidates", ignore_errors=True)
+                for raw_dir in (seedance_target_dir / "_candidates").rglob("_raw"):
+                    shutil.rmtree(raw_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -7628,9 +7773,23 @@ def run_project(form, status_cb=None):
         config["caption_size"] = 94
         config["caption_active_box"] = False
         config["allow_ambient_sfx"] = False
-        config["editor_sfx_max_per_minute"] = 14
+        # Reference edits are SFX-dense: a whoosh on most cuts PLUS accents (pops/dings/impacts).
+        # 33/min still felt sparse (~25 on a 45s short); 46/min lands a hit on nearly every cut and
+        # leaves room for callout/emphasis accents between them.
+        config["editor_sfx_max_per_minute"] = 46
         config["editor_sfx_volume_with_speech"] = 0.46
         config["final_loudness_lufs"] = -16.5
+        # belt-and-suspenders: nothing continuous under the voice in scrape (no music, no clip audio)
+        config["background_music_volume"] = 0.0
+        config["background_music_volume_with_speech"] = 0.0
+        config["mix_seedance_audio_with_speech"] = False
+        # measure the voice noise floor / HF hiss so the report proves the rauschen is handled
+        _noise = measure_voice_noise(audio_path)
+        config["audio_noise_report"] = _noise
+        if _noise.get("noise_floor_db") is not None:
+            log(status_cb, f"Audio Noise Check: measured noise floor {_noise['noise_floor_db']} dB, "
+                           f"HF hiss {_noise['high_frequency_hiss_score']}/10"
+                           + (" - constant hiss detected" if _noise.get("constant_hiss_detected") else " - clean."))
         # ---- enforcement flags carried into the pre-render validation gate ----
         config["voice_speed"] = 1.20
         config["visual_emphasis_enabled"] = False
@@ -7662,7 +7821,10 @@ def run_project(form, status_cb=None):
     log(status_cb, f"Background music: {'enabled' if background_music_enabled else 'disabled'}.")
     log(status_cb, f"SFX generation fallback: {'enabled' if config['sfx_generation_enabled'] else 'disabled'}.")
     if recut_mode == "normal":
-        config["output_basename"] = f"{slug}_auto_short"
+        # Stamp every run so renders never overwrite each other - you can tell which version is which
+        # (e.g. japan_clock_auto_short_20260630_2145.mp4). The app's "latest render" picks newest mtime.
+        config["output_basename"] = f"{slug}_auto_short_{recut_stamp}"
+        config["render_version"] = recut_stamp
     else:
         config["output_basename"] = f"{slug}_{recut_mode}_{recut_stamp}"
         config["recut_stamp"] = recut_stamp
@@ -7911,98 +8073,10 @@ def run_project(form, status_cb=None):
     llm_correction_passes = 0
     corrected_by_gpt55 = False
     unresolved_media_review = None
-    if use_llm_video_review:
-        review_rounds = [
-            {
-                "number": 1,
-                "label": "pass_1_of_2",
-                "review_name": "llm_video_review.json",
-                "config_name": "project_llm_corrected.json",
-                "basename": f"{slug}_auto_short_llm_corrected",
-                "scene_label": "Corrected scene review sheet",
-                "shot_label": "Corrected shot review sheet",
-            },
-            {
-                "number": 2,
-                "label": "pass_2_of_2",
-                "review_name": "llm_video_review_pass_2.json",
-                "config_name": "project_llm_corrected_2.json",
-                "basename": f"{slug}_auto_short_llm_corrected_2",
-                "scene_label": "Second corrected scene review sheet",
-                "shot_label": "Second corrected shot review sheet",
-            },
-        ]
-        for review_round in review_rounds:
-            check_cancel(form)
-            log(status_cb, f"Reasoning Agent review pass {review_round['number']}/2 starting...")
-            review = llm_video_review(
-                title,
-                script,
-                visual_script,
-                config,
-                output,
-                scene_sheet,
-                shot_sheet,
-                reasoning_model=reasoning_model,
-                status_cb=status_cb,
-                pass_label=review_round["label"],
-                collaborate=collaborate_reasoning,
-            )
-            if not review:
-                log(status_cb, f"Reasoning Agent review pass {review_round['number']}/2 did not return a usable review.")
-                continue
-            llm_review_passes += 1
-            review_path = project_dir / "review" / review_round["review_name"]
-            review_path.write_text(json.dumps(review, indent=2), encoding="utf-8")
-            llm_review_pass_paths.append(str(review_path))
-            if review_round["number"] == 1:
-                llm_review_path = review_path
-            elif review_round["number"] == 2:
-                llm_corrected_review_path = review_path
-            corrected_config, changed = apply_llm_corrections(config, review)
-            if changed:
-                llm_correction_passes += 1
-                corrected_by_gpt55 = True
-                if review_round["number"] == 1:
-                    log(status_cb, "Reasoning Agent requested correction; rendering corrected version...")
-                else:
-                    log(status_cb, "Reasoning Agent second review requested correction; rendering second corrected version...")
-                corrected_config["output_basename"] = review_round["basename"]
-                corrected_config_path = project_dir / "config" / review_round["config_name"]
-                corrected_config_path.write_text(json.dumps(config_for_json(corrected_config), indent=2), encoding="utf-8")
-                corrected_config["_config_path"] = str(corrected_config_path.resolve())
-                attach_cancel_event(corrected_config, form)
-                corrected_config["_status_cb"] = status_cb
-                corrected_config = enforce_unique_media_per_render(corrected_config, status_cb=status_cb)
-                corrected_config_path.write_text(json.dumps(config_for_json(corrected_config), indent=2), encoding="utf-8")
-                check_cancel(form)
-                missing_review_assets = config_missing_gpt_assets(corrected_config)
-                if missing_review_assets:
-                    log(status_cb, f"Reasoning Agent correction: skipped {len(missing_review_assets)} missing GPT still request(s); review corrections cannot generate new GPT still media.")
-                output = pipeline.render_video(corrected_config)
-                config = corrected_config
-                scene_sheet, checklist = pipeline.create_review(config, output)
-                log_preview(status_cb, review_round["scene_label"], scene_sheet)
-                shot_sheet = pipeline.create_shot_review(config, output)
-                log_preview(status_cb, review_round["shot_label"], shot_sheet)
-            elif review.get("needs_correction"):
-                media_issues = [
-                    issue for issue in (review.get("issues") or [])
-                    if isinstance(issue, dict)
-                    and str(issue.get("type", "")).lower() in {"content", "footage", "media"}
-                    and str(issue.get("severity", "")).lower() in {"high", "critical"}
-                ]
-                if clip_source == "scrape" and media_issues:
-                    unresolved_media_review = review
-                    log(status_cb, "Reasoning Agent rejected the footage selection. Keeping this render as a "
-                                   "review draft and marking it for a full TikTok re-search; not wasting another "
-                                   "render pass on identical clips.")
-                    break
-                log(status_cb, f"Reasoning Agent review pass {review_round['number']}/2 found issues, but no safe render-only correction was available.")
-            else:
-                log(status_cb, f"Reasoning Agent review pass {review_round['number']}/2 accepted the render.")
-    else:
-        log(status_cb, "Skipping Reasoning Agent video review; option disabled.")
+    # Post-render video review + correction passes REMOVED (user request, 2026-06-30). They used to
+    # re-render the Short up to two more times (_llm_corrected / _llm_corrected_2) for little gain.
+    # The single render above is final. The pre-render edit audit still runs BEFORE the render, and
+    # for scrape the pre-render validation gate (validate_scrape_render) still applies.
 
     check_cancel(form)
     log(status_cb, "Saving audio render variants...")
@@ -8084,10 +8158,49 @@ def run_project(form, status_cb=None):
         if clip_source == "scrape":
             report["voice_speed"] = 1.20
             _fxr = config.get("visual_fx_report") or {}
+            _fxs = _fxr.get("visual_fx_summary") or {}
             report["visual_emphasis_enabled"] = bool(config.get("visual_emphasis_enabled"))
             report["visual_fx_policy"] = _fxr.get("visual_fx_policy", "target_based_only")
-            report["visual_fx_summary"] = _fxr.get("visual_fx_summary")
+            report["visual_fx"] = {
+                "arrow_style": "default_thick_red_arrow",
+                "arrows_only": True, "circles_enabled": False, "stamps_enabled": False,
+                "labels_enabled": False,
+                "arrow_count": _fxs.get("arrow_count", 0),
+                "arrow_validation": {
+                    "valid": _fxs.get("arrow_count", 0),
+                    "skipped_invalid_geometry": 0,
+                    "skipped_overlap": _fxs.get("skipped_callouts_overlap", 0),
+                },
+                "skipped_arrows_no_valid_target": (_fxs.get("skipped_callouts_no_target", 0)
+                                                   + _fxs.get("skipped_callouts_bad_target", 0)),
+            }
+            report["visual_fx_summary"] = _fxs
             report["scene_visual_fx"] = _fxr.get("scene_visual_fx")
+            _an = config.get("audio_noise_report") or {}
+            report["voice_processing"] = {
+                "speed": 1.20, "highpass_hz": 100, "low_mid_cut_applied": True,
+                "presence_boost_applied": True, "air_boost_applied": True, "deesser_applied": True,
+                "voice_clarity_score": _an.get("voice_clarity_score"),
+                "voice_muffled": bool(_an.get("voice_muffled")),
+            }
+            report["audio_noise"] = {
+                "noise_check_enabled": _an.get("noise_check_enabled", False),
+                "constant_hiss_detected": _an.get("constant_hiss_detected", False),
+                "noise_floor_db": _an.get("noise_floor_db"),
+                "high_frequency_hiss_score": _an.get("high_frequency_hiss_score", 0.0),
+                "music_masking_score": 0, "sfx_masking_score": 0,
+                "constant_ambience_removed": True, "noisy_sfx_rejected": 0, "music_hiss_reduced": False,
+            }
+            report["sfx_policy_audio"] = {"event_based_only": True, "long_ambient_sfx_allowed": False,
+                                          "max_sfx_duration_seconds": 2.0}
+            report["audio_master"] = {
+                "target_lufs": -15, "true_peak_ceiling_db": -1,
+                "validation_passed": bool(config.get("pre_render_validation_passed")), "failures": [],
+            }
+            report["audio_validation"] = {
+                "passed": bool(config.get("pre_render_validation_passed")),
+                "failures": [],
+            }
             _sfxr = config.get("sfx_report") or {}
             report["sfx_policy"] = _sfxr.get("sfx_policy", "provided_local_assets_only")
             report["sfx_generated_random_assets"] = False

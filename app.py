@@ -23,6 +23,10 @@ SPEAKER_GALLERY_DIR.mkdir(exist_ok=True)
 SPEAKER_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 JOBS = {}
 JOB_LOCK = threading.Lock()
+# TikTok login (Apify-free clip source): a single headed login at a time. busy = a login
+# window is open and we're waiting for the user to sign in.
+TIKTOK_LOGIN = {"busy": False, "thread": None}
+TIKTOK_LOCK = threading.Lock()
 STATIC_DIR = ROOT / "static"
 UI_STATE_PATH = ROOT / "ui_state.json"
 UI_TEXT_DEFAULTS = {
@@ -845,6 +849,14 @@ def app_style():
       .req-tag { display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; color: #fff; background: var(--accent-2); border-radius: var(--r-sm); padding: 1px 5px; vertical-align: middle; }
       .apify-on { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--success); background: rgba(47,138,82,.1); border: 1px solid var(--success); border-radius: var(--r-sm); padding: 7px 10px; margin: 2px 0 4px; }
       .apify-off { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--accent-2); background: rgba(232,71,43,.08); border: 1px dashed var(--accent-2); border-radius: var(--r-sm); padding: 7px 10px; margin: 2px 0 4px; }
+      .tiktok-connect { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--ink); background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 10px; margin: 6px 0 4px; }
+      .tt-status { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
+      .tt-status.on { background: #1fbf6b; }
+      .tt-status.off { background: var(--accent-2); }
+      .tt-status.busy { background: #f0a500; animation: ttpulse 1s ease-in-out infinite; }
+      @keyframes ttpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+      .tt-btn { margin-left: auto; }
+      .tt-btn:disabled { opacity: .55; cursor: default; }
       input[type="range"] {
         -webkit-appearance: none; appearance: none; width: 100%; height: 8px; padding: 0; margin: 6px 0 2px;
         background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: 999px; box-shadow: none; cursor: pointer;
@@ -1287,7 +1299,13 @@ def app_script():
           var sf = document.getElementById("script-field");
           var loaded = (document.getElementById("loaded-project-source") || {}).value;
           var hasScript = sf && sf.value && sf.value.trim();
-          if (hasScript || loaded) { wizGoto(4); return; }
+          // Show the "What are we creating today" intro on a FRESH app launch (even if a draft
+          // script was restored), but skip it on a mid-session reload so it isn't repetitive.
+          // sessionStorage clears when the app window closes, so each launch = a fresh session.
+          var seen = false;
+          try { seen = sessionStorage.getItem("shortslab-wiz-seen") === "1"; } catch (e) {}
+          if (loaded || (hasScript && seen)) { wizGoto(4); return; }
+          try { sessionStorage.setItem("shortslab-wiz-seen", "1"); } catch (e) {}
           // fresh start: show the headline, type it, then reveal the script step below it
           var hl = document.getElementById("wiz-headline"); if (hl) hl.style.display = "";
           Array.prototype.forEach.call(document.querySelectorAll("[data-step]"), function (el) { el.style.display = "none"; });
@@ -1462,6 +1480,47 @@ def app_script():
           function setStatus(text) {
             if (status) status.textContent = text || "";
           }
+          var ttPollTimer = null;
+          function ttRender(st) {
+            var dot = document.getElementById("tt-status-dot");
+            var txt = document.getElementById("tt-status-text");
+            var btn = document.getElementById("tt-login-btn");
+            if (st && st.ready) {
+              window.APIFY_READY = true; window.TIKTOK_READY = true;
+              if (dot) dot.className = "tt-status on";
+              if (txt) txt.textContent = "TikTok connected — scraping uses your logged-in session.";
+              if (btn) { btn.innerHTML = "Reconnect"; btn.disabled = false; }
+            } else {
+              if (dot) dot.className = "tt-status off" + (st && st.busy ? " busy" : "");
+              if (txt) txt.textContent = st && st.busy
+                ? "Waiting for you to log in to TikTok in the opened window…"
+                : (st && st.error ? ("Login failed: " + st.error) : "TikTok not connected.");
+              if (btn) { btn.disabled = !!(st && st.busy); }
+            }
+          }
+          function ttPoll() {
+            fetch("/tiktok-status").then(function (r) { return r.json(); }).then(function (st) {
+              ttRender(st);
+              if (st && st.busy) { ttPollTimer = setTimeout(ttPoll, 2000); }
+              else if (ttPollTimer) { clearTimeout(ttPollTimer); ttPollTimer = null; }
+            }).catch(function () {});
+          }
+          function connectTikTok() {
+            if (window.TIKTOK_AVAIL === false) {
+              setStatus("Browser engine missing — run: pip install playwright && playwright install chromium");
+              return;
+            }
+            var btn = document.getElementById("tt-login-btn");
+            if (btn) btn.disabled = true;
+            setStatus("Opening a browser window — log in to TikTok in it (one time).");
+            fetch("/tiktok-login", { method: "POST" }).then(function (r) { return r.json(); })
+              .then(function () { ttPoll(); })
+              .catch(function () { if (btn) btn.disabled = false; });
+          }
+          // onclick="" attributes run in GLOBAL scope, so these closures must be exposed on window.
+          window.connectTikTok = connectTikTok;
+          window.ttPoll = ttPoll;
+          window.ttRender = ttRender;
           function clearProjectMedia() {
             if (mediaBox) mediaBox.innerHTML = "";
             var mediaHint = document.getElementById("project-media-hint");
@@ -2103,11 +2162,11 @@ def app_script():
           if (sform) sform.addEventListener("submit", function (ev) {
             var cs = document.getElementById("clip-source");
             if (!cs || cs.value !== "scrape") return;
-            if (window.APIFY_READY) return;  // Apify configured -> good to go
+            if (window.APIFY_READY) return;  // a clip source (TikTok login or Apify) is ready
             ev.preventDefault();
             var panel = document.getElementById("scrape-settings");
             if (panel) panel.scrollIntoView({ behavior: "smooth", block: "center" });
-            if (typeof setStatus === "function") setStatus("Scrape needs an Apify token — add APIFY_TOKEN to .env and restart.");
+            if (typeof window.connectTikTok === "function") window.connectTikTok();
           });
         });
         setInterval(stickLogToBottom, 5000);
@@ -2190,8 +2249,21 @@ def form_page(clear=False, open_load=False, load_slug=""):
     # "New project" starts from clean defaults; normal load restores last session.
     state = normalize_ui_state({}) if clear else load_ui_state()
     previous_project_options = project_options_html()
-    apify_ready = bool((os.environ.get("APIFY_TOKEN") or "").strip())
+    # Scraping is "ready" when a TikTok login is saved (primary, no API key) OR an Apify token
+    # exists (legacy fallback). tiktok_ready drives the Connect-TikTok control below.
+    try:
+        import tiktok_login
+        tiktok_avail = tiktok_login.available()
+        tiktok_ready = tiktok_login.is_ready()
+    except Exception:
+        tiktok_avail = tiktok_ready = False
+    try:
+        import clip_scraper
+        apify_ready = bool(clip_scraper.backend_active())    # any working clip source (TikTok or opted-in Apify)
+    except Exception:
+        apify_ready = tiktok_ready
     apify_ready_js = "true" if apify_ready else "false"
+    tiktok_ready_js = "true" if tiktok_ready else "false"
 
     voice_tones = {
         "Zephyr": "Bright", "Puck": "Upbeat", "Charon": "Informative",
@@ -2291,8 +2363,14 @@ def form_page(clear=False, open_load=False, load_slug=""):
             </div>
             <div class="chips" id="term-chips"></div>
             <input type="hidden" name="scrape_terms" id="scrape-terms" value="{esc(state.get('scrape_terms'))}">
-            {'' if apify_ready else ('<div class="apify-off">&#9888; No clip source configured. Set APIFY_TOKEN in .env to enable real TikTok scraping. {tip}</div>'.replace('{tip}', help_tip("Add a line APIFY_TOKEN=... to the .env file (get a token from apify.com), then restart the app.")))}
-            <script>window.APIFY_READY = {apify_ready_js};</script>
+            <div class="tiktok-connect" id="tiktok-connect">
+              <span class="tt-status {'on' if tiktok_ready else 'off'}" id="tt-status-dot"></span>
+              <span id="tt-status-text">{'TikTok connected — scraping uses your logged-in session.' if tiktok_ready else 'TikTok not connected.'}</span>
+              <button type="button" class="button secondary tt-btn" id="tt-login-btn" onclick="connectTikTok()">{'Reconnect' if tiktok_ready else '&#128279; Connect TikTok'}</button>
+              {help_tip("Scraping downloads real TikTok clips using YOUR own logged-in TikTok account - no API key. Click Connect, a browser window opens, log in to TikTok once, and the session is saved for future runs. Modern Chrome encrypts its cookies (DPAPI), so this dedicated login is required.")}
+            </div>
+            {('' if tiktok_avail else '<div class="apify-off">&#9888; Browser engine missing. Run: pip install playwright &amp;&amp; playwright install chromium</div>')}
+            <script>window.APIFY_READY = {apify_ready_js}; window.TIKTOK_READY = {tiktok_ready_js}; window.TIKTOK_AVAIL = {'true' if tiktok_avail else 'false'};</script>
           </div>
         </div>
 
@@ -2366,6 +2444,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <input type="hidden" name="mix_voice_in_final" value="on">
           <div class="checks" style="margin-top:18px;">
             <label><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}> Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</label>
+            <label><input type="checkbox" name="force_regenerate"{checked("force_regenerate")}> Fresh take (re-voice + re-scrape) {help_tip("For a script you have already made: ignore the saved voiceover and scraped clips, and run a brand-new voiceover + fresh TikTok search (new hook). Use this when a re-run reused old/wrong clips or the old voice.")}</label>
           </div>
         </div>
         <div class="panel toggle-panel" id="speaker-panel" data-step="3">
@@ -3296,6 +3375,14 @@ def project_media_files(project_dir):
         for path in sorted(folder.rglob("*"), key=lambda item: item.stat().st_mtime if item.exists() and item.is_file() else 0, reverse=True):
             if not path.is_file() or path.suffix.lower() not in suffixes:
                 continue
+            # scrape candidate / declined pool is shown only in the timeline library, never in the
+            # accepted project media panels.
+            lower_parts = {p.lower() for p in path.parts}
+            if "_candidates" in lower_parts or "_raw" in lower_parts:
+                continue
+            # derived poster thumbnails (clip.poster.jpg) are not real draggable media
+            if path.name.lower().endswith(".poster.jpg"):
+                continue
             items.append((media_kind_for_path(project_dir, path, manifest), path))
     return items
 
@@ -3831,7 +3918,22 @@ TIMELINE_ASSETS = """
   .tl-lib-item .tl-lib-name { padding:4px 7px; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .tl-lib-sound { display:flex; align-items:center; gap:8px; padding:9px 11px; }
   .tl-lib-sound .tl-lib-ico { flex:0 0 auto; color:var(--accent); }
+  .tl-lib-vidwrap { position:relative; }
+  .tl-lib-play { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:34px; height:34px; min-width:0; padding:0; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; color:#fff; background:rgba(0,0,0,.55); border:1.5px solid #fff; box-shadow:none; cursor:pointer; z-index:2; }
+  .tl-lib-play::after { display:none; }
+  .tl-lib-play:hover { background:var(--accent); }
+  .tl-lib-play.playing { background:var(--accent); }
+  .tl-snd-play { position:static; transform:none; flex:0 0 auto; width:30px; height:30px; font-size:12px; background:var(--accent-subtle); border:1px solid var(--accent); color:var(--text); }
+  .tl-snd-play.playing { background:var(--accent); color:#fff; }
   .tl-track.drop-ok { outline:2px dashed var(--accent); outline-offset:-2px; background:var(--accent-subtle); }
+  .tl-ctxmenu { position:fixed; z-index:9999; min-width:170px; background:var(--bg-raised); border:1px solid var(--line-strong); border-radius:var(--r-md); box-shadow:0 8px 28px rgba(0,0,0,.45); padding:5px; }
+  .tl-ctxitem { display:block; width:100%; text-align:left; padding:8px 12px; font-size:13px; font-weight:600; color:var(--text); background:transparent; border:0; border-radius:var(--r-sm); box-shadow:none; cursor:pointer; }
+  .tl-ctxitem::after { display:none; }
+  .tl-ctxitem:hover { background:var(--accent-subtle); }
+  .tl-replace-banner { display:none; margin:0 0 12px; padding:9px 12px; background:var(--accent-subtle); border:1px solid var(--accent); border-radius:var(--r-md); font-size:12.5px; font-weight:600; color:var(--text); }
+  .tl-replace-banner button { width:auto; min-width:0; margin-left:10px; padding:4px 12px; font-size:11.5px; background:var(--bg-input); border:1px solid var(--line-strong); color:var(--text); box-shadow:none; }
+  .tl-replace-banner button::after { display:none; }
+  .tl-library.replace-arming .tl-lib-item { outline:1px dashed var(--accent); cursor:pointer; }
   @media (max-width:760px){ .tl-grid{ grid-template-columns:1fr; } .tl-stage-view{ height:auto; width:100%; max-width:300px; } }
 </style>
 <script>
@@ -3846,9 +3948,12 @@ TIMELINE_ASSETS = """
   var sfx = (model.sfx||[]).map(function(s){ return Object.assign({}, s); });
   var volumes = Object.assign({voice:1, music:0}, model.volumes||{});
   var captionsOn = !!model.captions;
+  var renderUrl = model.render_url || '';   // the actual last render (captions+voice+SFX baked in)
   var SCALE = 70;
   var sel = null;
   var markedReplace = {};   // scene id -> true when its media is marked for agent replacement
+  var replacedMap = {};     // scene id -> {path,type,name} chosen via right-click Replace
+  var replacePickId = null; // scene id awaiting a library pick for in-editor replace
   var dirty = false;        // unsaved edits
   function markDirty(){ dirty = true; var b=document.getElementById('tl-save'); if(b){ b.classList.add('tl-unsaved'); } }
 
@@ -3884,6 +3989,8 @@ TIMELINE_ASSETS = """
       (function(scn){ b.querySelector('.tl-clip-mark').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); ev.preventDefault(); if(markedReplace[scn.id]) delete markedReplace[scn.id]; else markedReplace[scn.id]=true; layout(); markDirty(); }); })(s);
       b.querySelector('.tl-handle').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startResize(ev, s); });
       b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')||ev.target.classList.contains('tl-clip-mark')) return; startClipDrag(ev, s, b); });
+      (function(scn){ b.addEventListener('contextmenu', function(ev){ ev.preventDefault(); ev.stopPropagation(); openClipMenu(ev.clientX, ev.clientY, scn); }); })(s);
+      if(replacedMap[s.id]){ var rt=document.createElement('span'); rt.className='tl-replace-tag'; rt.style.background='var(--accent)'; rt.textContent='REPLACED'; b.appendChild(rt); }
       clipsEl.appendChild(b);
       if(i>0){ var seam=document.createElement('div'); seam.className='tl-seam'; seam.style.left=x+'px'; clipsEl.appendChild(seam); }
       x+=w;
@@ -3993,6 +4100,9 @@ TIMELINE_ASSETS = """
 
   var pimg=document.getElementById('tl-pimg'), pvid=document.getElementById('tl-pvid'), pempty=document.getElementById('tl-stage-empty');
   var playing=false, clock=0, lastTs=0, curIdx=-1;
+  // RENDER MODE: when a finished render exists, the preview plays THAT exact file (captions, voice
+  // and SFX all baked in) so it matches the last render 1:1 - not a silent scene reconstruction.
+  var RENDER_MODE = !!renderUrl;
   function sceneAt(t){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(t < acc+vis[i].dur){ return {scene:vis[i], idx:i}; } acc+=vis[i].dur; } return vis.length? {scene:vis[vis.length-1], idx:vis.length-1} : null; }
   function showScene(info){
     if(!info){ pimg.style.display='none'; pvid.style.display='none'; pempty.style.display='block'; return; }
@@ -4002,24 +4112,39 @@ TIMELINE_ASSETS = """
     if(s.clip){ pimg.style.display='none'; pvid.style.display='block'; try{ pvid.src=s.clip; pvid.currentTime=0; if(playing) pvid.play().catch(function(){}); }catch(e){} }
     else { pvid.pause(); pvid.style.display='none'; pimg.style.display='block'; pimg.src=s.poster||''; }
   }
-  function updatePlayhead(){ playhead.style.left=(clock*SCALE)+'px'; document.getElementById('tl-playtime').textContent=fmt(clock)+' / '+fmt(totalDur()); }
+  function updatePlayhead(){ playhead.style.left=(clock*SCALE)+'px'; document.getElementById('tl-playtime').textContent=fmt(clock)+' / '+fmt(RENDER_MODE&&pvid.duration?pvid.duration:totalDur()); }
+  var PLAY_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+  var PAUSE_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+  function setPlayIcon(p){ var el=document.getElementById('tl-play-ico'); if(el) el.innerHTML=p?PAUSE_ICO:PLAY_ICO; }
   function tick(ts){
-    if(!playing) return;
+    if(!playing||RENDER_MODE) return;
     var dt=(ts-lastTs)/1000; lastTs=ts; clock+=dt;
     var total=totalDur();
     if(clock>=total){ clock=total; updatePlayhead(); stop(); return; }
     showScene(sceneAt(clock)); updatePlayhead(); requestAnimationFrame(tick);
   }
-  var PLAY_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
-  var PAUSE_ICO='<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
-  function setPlayIcon(p){ var el=document.getElementById('tl-play-ico'); if(el) el.innerHTML=p?PAUSE_ICO:PLAY_ICO; }
-  function play(){ if(playing) return; if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); setPlayIcon(true); showScene(sceneAt(clock)); requestAnimationFrame(tick); }
+  function play(){
+    if(playing) return;
+    if(RENDER_MODE){ playing=true; setPlayIcon(true); pvid.play().catch(function(){}); return; }
+    if(clock>=totalDur()-0.05){ clock=0; curIdx=-1; } playing=true; lastTs=performance.now(); setPlayIcon(true); showScene(sceneAt(clock)); requestAnimationFrame(tick);
+  }
   function stop(){ playing=false; pvid.pause(); setPlayIcon(false); }
-  function seekBy(d){ clock=Math.max(0,Math.min(totalDur(), clock+d)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); }
+  function seekBy(d){
+    if(RENDER_MODE){ pvid.currentTime=Math.max(0,Math.min(pvid.duration||0, (pvid.currentTime||0)+d)); return; }
+    clock=Math.max(0,Math.min(totalDur(), clock+d)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead();
+  }
+  if(RENDER_MODE){
+    // play the real rendered video, unmuted, with audio - this IS the last render
+    pvid.src=renderUrl; pvid.muted=false; pvid.removeAttribute('muted'); pvid.controls=true; pvid.setAttribute('playsinline',''); pvid.style.display='block'; pempty.style.display='none';
+    pvid.addEventListener('timeupdate', function(){ clock=pvid.currentTime||0; updatePlayhead(); });
+    pvid.addEventListener('play', function(){ playing=true; setPlayIcon(true); });
+    pvid.addEventListener('pause', function(){ playing=false; setPlayIcon(false); });
+    pvid.addEventListener('ended', function(){ playing=false; setPlayIcon(false); });
+  }
   document.getElementById('tl-play').addEventListener('click', function(){ if(playing) stop(); else play(); });
   document.getElementById('tl-back').addEventListener('click', function(){ seekBy(-5); });
   document.getElementById('tl-fwd').addEventListener('click', function(){ seekBy(5); });
-  ruler.addEventListener('pointerdown', function(e){ var rect=ruler.getBoundingClientRect(); clock=Math.max(0,Math.min(totalDur(),(e.clientX-rect.left+ruler.scrollLeft)/SCALE)); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); });
+  ruler.addEventListener('pointerdown', function(e){ var rect=ruler.getBoundingClientRect(); var t=Math.max(0,(e.clientX-rect.left+ruler.scrollLeft)/SCALE); if(RENDER_MODE){ pvid.currentTime=Math.min(pvid.duration||t, t); } else { clock=Math.min(totalDur(),t); curIdx=-1; showScene(sceneAt(clock)); updatePlayhead(); } });
 
   function bindVol(id, key, out){
     var el=document.getElementById(id), o=document.getElementById(out);
@@ -4040,6 +4165,7 @@ TIMELINE_ASSETS = """
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
       added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
       replace: Object.keys(markedReplace),
+      replaced: Object.keys(replacedMap).map(function(id){ return {id:id, path:replacedMap[id].path, type:replacedMap[id].type}; }),
       volumes: volumes,
       captions: captionsOn,
       transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:t.enabled};}),
@@ -4075,6 +4201,44 @@ TIMELINE_ASSETS = """
       .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert('Could not start rework.'); });
   });
 
+  // ---- Right-click a clip -> Replace media (pick from the library, cut to this clip's length) ----
+  var clipMenuEl=null;
+  function closeClipMenu(){ if(clipMenuEl){ clipMenuEl.remove(); clipMenuEl=null; } }
+  function openClipMenu(x, y, scn){
+    closeClipMenu();
+    clipMenuEl=document.createElement('div'); clipMenuEl.className='tl-ctxmenu';
+    var items=[['Replace media\\u2026', function(){ startReplacePick(scn); }],
+               ['Remove clip', function(){ scn.removed=true; if(sel&&sel.id===scn.id){ sel=null; showPane(null);} layout(); markDirty(); }]];
+    if(replacedMap[scn.id]) items.push(['Undo replace', function(){ delete replacedMap[scn.id]; layout(); markDirty(); }]);
+    items.forEach(function(it){ var b=document.createElement('button'); b.type='button'; b.className='tl-ctxitem'; b.textContent=it[0]; b.addEventListener('click', function(){ closeClipMenu(); it[1](); }); clipMenuEl.appendChild(b); });
+    document.body.appendChild(clipMenuEl);
+    var w=clipMenuEl.offsetWidth||180, h=clipMenuEl.offsetHeight||80;
+    clipMenuEl.style.left=Math.min(x, window.innerWidth-w-8)+'px';
+    clipMenuEl.style.top=Math.min(y, window.innerHeight-h-8)+'px';
+  }
+  document.addEventListener('pointerdown', function(e){ if(clipMenuEl && !clipMenuEl.contains(e.target)) closeClipMenu(); });
+  function startReplacePick(scn){
+    replacePickId=scn.id;
+    var lib=document.querySelector('.tl-library'); if(lib){ lib.scrollIntoView({behavior:'smooth', block:'nearest'}); lib.classList.add('replace-arming'); }
+    // make sure the media tab is showing
+    var mtab=rootEl.querySelector('.tl-lib-tab[data-lib="media"]'); if(mtab) mtab.click();
+    var banner=document.getElementById('tl-replace-banner');
+    if(!banner){ banner=document.createElement('div'); banner.id='tl-replace-banner'; banner.className='tl-replace-banner'; document.querySelector('.tl-library').insertBefore(banner, document.querySelector('.tl-library').firstChild.nextSibling); }
+    banner.innerHTML='Pick a media below to replace the selected clip (it will be cut to '+(scenes.filter(function(x){return x.id===scn.id;})[0]||{dur:0}).dur.toFixed(1)+'s). <button type="button" id="tl-replace-cancel">Cancel</button>';
+    banner.style.display='block';
+    document.getElementById('tl-replace-cancel').addEventListener('click', cancelReplacePick);
+    selectClip(scn.id);
+  }
+  function cancelReplacePick(){ replacePickId=null; var b=document.getElementById('tl-replace-banner'); if(b) b.style.display='none'; var lib=document.querySelector('.tl-library'); if(lib) lib.classList.remove('replace-arming'); }
+  function applyReplace(it){
+    var id=replacePickId; if(id===null) return;
+    var s=scenes.filter(function(x){return x.id===id;})[0]; if(!s){ cancelReplacePick(); return; }
+    replacedMap[id]={path:it.path, type:it.type, name:it.name};
+    s.poster=(it.type==='video')?(it.poster||it.url):it.url;
+    s.clip=(it.type==='video')?it.url:''; s.path=it.path; s.kind=(it.type==='video')?'clip':'image';
+    cancelReplacePick(); layout(); markDirty(); selectClip(id);
+  }
+
   // ---- Library (drag media / sfx onto the timeline) ----
   function setupLibrary(){
     var tabs=rootEl.querySelectorAll('.tl-lib-tab');
@@ -4095,14 +4259,42 @@ TIMELINE_ASSETS = """
       document.getElementById('tl-lib-sfx').innerHTML='<div class="tl-lib-loading">Could not load sounds.</div>';
     });
   }
+  // one shared audio player so previewing a sound stops the previous one
+  var libAudio=null;
+  function playSound(url, btn){
+    try{
+      if(libAudio){ libAudio.pause(); }
+      if(libAudio && libAudio._btn){ libAudio._btn.classList.remove('playing'); }
+      libAudio=new Audio(url); libAudio._btn=btn||null;
+      if(btn) btn.classList.add('playing');
+      libAudio.play().catch(function(){});
+      libAudio.addEventListener('ended', function(){ if(btn) btn.classList.remove('playing'); });
+    }catch(e){}
+  }
   function libItemEl(it, kind){
     var el=document.createElement('div'); el.className='tl-lib-item'; el.draggable=true;
     if(kind==='media'){
-      var media = it.type==='video' ? '<video src="'+esc(it.url)+'" muted preload="metadata"></video>' : '<img src="'+esc(it.url)+'" alt="">';
-      el.innerHTML=media+'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+      if(it.type==='video'){
+        el.innerHTML='<div class="tl-lib-vidwrap"><video src="'+esc(it.url)+'" muted preload="metadata" playsinline></video>'
+          +'<button type="button" class="tl-lib-play" title="Preview">\\u25B6</button></div>'
+          +'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+        var vid=el.querySelector('video'), pb=el.querySelector('.tl-lib-play');
+        pb.addEventListener('click', function(ev){ ev.stopPropagation();
+          if(vid.paused){ vid.muted=false; vid.currentTime=0; vid.play().catch(function(){}); pb.classList.add('playing'); pb.textContent='\\u275A\\u275A'; }
+          else { vid.pause(); pb.classList.remove('playing'); pb.textContent='\\u25B6'; } });
+        vid.addEventListener('ended', function(){ pb.classList.remove('playing'); pb.textContent='\\u25B6'; });
+      } else {
+        el.innerHTML='<img src="'+esc(it.url)+'" alt="">'+'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+      }
     } else {
       el.classList.add('tl-lib-sound');
-      el.innerHTML='<span class="tl-lib-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg></span><div class="tl-lib-name">'+esc(it.name)+'</div>';
+      el.innerHTML='<button type="button" class="tl-lib-play tl-snd-play" title="Play sound">\\u25B6</button>'
+        +'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+      var sb=el.querySelector('.tl-snd-play');
+      sb.addEventListener('click', function(ev){ ev.stopPropagation(); playSound(it.url, sb); });
+    }
+    if(kind==='media'){
+      el.addEventListener('click', function(ev){ if(replacePickId!==null && !ev.target.closest('.tl-lib-play')){ ev.preventDefault(); applyReplace(it); } });
     }
     el.addEventListener('dragstart', function(e){ el.classList.add('dragging'); e.dataTransfer.setData('text/plain', JSON.stringify({kind:kind, item:it})); e.dataTransfer.effectAllowed='copy'; });
     el.addEventListener('dragend', function(){ el.classList.remove('dragging'); });
@@ -4111,18 +4303,23 @@ TIMELINE_ASSETS = """
   function renderMediaLib(box, items){
     if(!box) return;
     if(!items.length){ box.innerHTML='<div class="tl-lib-loading">No project media.</div>'; return; }
-    var groups={}, order=['web','wikimedia','gpt source','seedance','speaker','local','media'];
-    var labelMap={'web':'Web images','wikimedia':'Wikimedia','gpt source':'GPT','seedance':'Clips','speaker':'Speaker','local':'Local','media':'Other'};
-    items.forEach(function(it){ var k=it.kind||'media'; (groups[k]=groups[k]||[]).push(it); });
-    var keys=order.filter(function(k){return groups[k];}).concat(Object.keys(groups).filter(function(k){return order.indexOf(k)===-1;}));
+    // Primary tabs by TYPE: Videos (mp4), Images (pictures), Declined (passed-over scraped clips).
+    var groups={videos:[], images:[], declined:[]};
+    items.forEach(function(it){
+      if(it.kind==='declined'){ groups.declined.push(it); }
+      else if(it.type==='video'){ groups.videos.push(it); }
+      else { groups.images.push(it); }
+    });
+    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['declined','\\uD83D\\uDEAB Declined']];
+    var keys=defs.filter(function(d){ return groups[d[0]].length; });
     box.innerHTML='<div class="tl-sublib-tabs"></div><div class="tl-sublib-grid"></div>';
     var tabsEl=box.querySelector('.tl-sublib-tabs'), gridEl=box.querySelector('.tl-sublib-grid');
     function show(k){
       Array.prototype.forEach.call(tabsEl.children,function(t){ t.classList.toggle('active', t.getAttribute('data-k')===k); });
       gridEl.innerHTML=''; (groups[k]||[]).forEach(function(it){ gridEl.appendChild(libItemEl(it,'media')); });
     }
-    keys.forEach(function(k,i){ var t=document.createElement('button'); t.type='button'; t.className='tl-sublib-tab'+(i?'':' active'); t.setAttribute('data-k',k); t.textContent=(labelMap[k]||k)+' ('+groups[k].length+')'; t.addEventListener('click',function(){show(k);}); tabsEl.appendChild(t); });
-    show(keys[0]);
+    keys.forEach(function(d,i){ var k=d[0]; var t=document.createElement('button'); t.type='button'; t.className='tl-sublib-tab'+(i?'':' active'); t.setAttribute('data-k',k); t.textContent=d[1]+' ('+groups[k].length+')'; t.addEventListener('click',function(){show(k);}); tabsEl.appendChild(t); });
+    if(keys.length) show(keys[0][0]);
   }
   function renderSfxLib(box, items){
     if(!box) return;
@@ -4287,14 +4484,36 @@ def global_sfx_library():
 def timeline_library_payload(slug):
     project_dir = safe_project_dir(slug)
     media = []
+    seen = set()
     if project_dir:
         for kind, path in project_media_files(project_dir):
             if kind in {"render", "review"}:
                 continue
             if is_image_path(path) or is_video_path(path):
+                key = str(path.resolve())
+                seen.add(key)
                 media.append({
-                    "kind": kind, "name": path.name, "path": str(path.resolve()),
+                    "kind": kind, "name": path.name, "path": key,
                     "url": link_for(path), "type": "video" if is_video_path(path) else "image",
+                })
+        # ALL downloaded scraped footage, including the DECLINED candidates (kept under
+        # seedance 2.0/_candidates). These never appear in the accepted panels, but the timeline
+        # library shows them so you can drag a passed-over clip back in.
+        cand_root = project_dir / "seedance 2.0" / "_candidates"
+        if cand_root.exists():
+            for path in sorted(cand_root.rglob("*"),
+                               key=lambda p: p.stat().st_mtime if p.is_file() else 0, reverse=True):
+                if not path.is_file() or not is_video_path(path):
+                    continue
+                if "_raw" in {p.lower() for p in path.parts}:
+                    continue
+                key = str(path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                media.append({
+                    "kind": "declined", "name": path.name, "path": key,
+                    "url": link_for(path), "type": "video",
                 })
     return {"media": media, "sfx": global_sfx_library()}
 
@@ -4348,6 +4567,18 @@ def timeline_model(slug):
         "voice": float(config.get("audio_master_gain", 1.0) or 1.0),
         "music": float(config.get("background_music_volume", 0.0) or 0.0),
     }
+    # The actual last render (captions + voice + SFX all baked in) so the preview is EXACTLY what
+    # was rendered, not a silent scene-by-scene reconstruction.
+    render_url = ""
+    try:
+        report = read_project_report(project_dir)
+        rendered = existing_report_path(report, "video")
+    except Exception:
+        rendered = None
+    if not rendered:
+        rendered = latest_media(project_dir / "renders", {".mp4", ".webm"})
+    if rendered and Path(rendered).exists():
+        render_url = link_for(Path(rendered))
     return {
         "slug": slug,
         "title": config.get("title", slug),
@@ -4357,6 +4588,7 @@ def timeline_model(slug):
         "sfx": content,
         "captions": captions_on,
         "volumes": volumes,
+        "render_url": render_url,
     }
 
 
@@ -4561,6 +4793,59 @@ def job_status_payload(job_id):
     return json.dumps(payload).encode("utf-8")
 
 
+def tiktok_status_payload():
+    """JSON status for the Connect-TikTok control: available / ready / busy."""
+    try:
+        import tiktok_login
+        avail = tiktok_login.available()
+        ready = tiktok_login.is_ready()
+    except Exception:
+        avail = ready = False
+    with TIKTOK_LOCK:
+        busy = bool(TIKTOK_LOGIN.get("busy"))
+        err = TIKTOK_LOGIN.get("error") or ""
+    return json.dumps({"available": avail, "ready": ready, "busy": busy, "error": err}).encode("utf-8")
+
+
+def start_tiktok_login():
+    """Open the headed TikTok login window in a background thread (one at a time)."""
+    try:
+        import tiktok_login
+    except Exception:
+        return
+    if not tiktok_login.available():
+        return
+    with TIKTOK_LOCK:
+        if TIKTOK_LOGIN.get("busy"):
+            return
+        TIKTOK_LOGIN["busy"] = True
+        TIKTOK_LOGIN["error"] = ""
+
+    def _run():
+        err = ""
+        try:
+            ok = tiktok_login.login(status_cb=lambda m: print("[tiktok-login]", m), timeout_s=300)
+            if not ok:
+                err = "Login window closed or timed out before sign-in completed."
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            err = f"{exc.__class__.__name__}: {exc}"
+            print("[tiktok-login] error:", err)
+        finally:
+            with TIKTOK_LOCK:
+                TIKTOK_LOGIN["busy"] = False
+                TIKTOK_LOGIN["thread"] = None
+                TIKTOK_LOGIN["error"] = err
+
+    print("[tiktok-login] launching login browser window...")
+
+    th = threading.Thread(target=_run, daemon=True)
+    with TIKTOK_LOCK:
+        TIKTOK_LOGIN["thread"] = th
+    th.start()
+
+
 def content_type_for(path):
     suffix = Path(path).suffix.lower()
     if suffix == ".ico":
@@ -4639,6 +4924,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def serve_file_ranged(self, path, content_type=None):
+        """Serve a file with HTTP Range support so the browser <video>/<audio> element can
+        actually stream and SEEK it. Without 206 partial-content responses, Chrome refuses to
+        play many MP4s inline (the renders/media looked 'not playable')."""
+        path = Path(path)
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            self.send_error(404)
+            return
+        ctype = content_type or content_type_for(path)
+        range_header = self.headers.get("Range")
+        start, end = 0, file_size - 1
+        is_partial = False
+        if range_header and range_header.strip().lower().startswith("bytes="):
+            try:
+                spec = range_header.split("=", 1)[1].split(",")[0].strip()
+                s, _, e = spec.partition("-")
+                if s.strip() == "":                      # suffix range: bytes=-N (last N bytes)
+                    n = int(e)
+                    start = max(0, file_size - n)
+                    end = file_size - 1
+                else:
+                    start = int(s)
+                    end = int(e) if e.strip() else file_size - 1
+                end = min(end, file_size - 1)
+                if start > end or start >= file_size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                is_partial = True
+            except (ValueError, IndexError):
+                start, end = 0, file_size - 1
+                is_partial = False
+        length = end - start + 1
+        self.send_response(206 if is_partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if is_partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass        # the player closed the connection mid-stream (normal when seeking)
+
     def send_static_asset(self, name):
         allowed = {
             "app_icon.ico": "image/x-icon",
@@ -4654,6 +4998,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_bytes(path.read_bytes(), allowed[name])
+
+    def do_HEAD(self):
+        # Players probe video/audio with HEAD before streaming; answer /file with real headers.
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/file":
+            resolved = safe_requested_path(urllib.parse.parse_qs(parsed.query).get("path", [""])[0])
+            if not resolved or resolved.is_dir():
+                self.send_error(404)
+                return
+            self.serve_file_ranged(resolved)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -4728,6 +5086,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.send_bytes(json.dumps(timeline_library_payload(slug)).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/tiktok-status":
+            self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/job":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
             self.send_bytes(job_page(job_id))
@@ -4742,7 +5102,8 @@ class Handler(BaseHTTPRequestHandler):
             if resolved.is_dir():
                 self.send_error(404)
                 return
-            self.send_bytes(resolved.read_bytes(), content_type_for(resolved))
+            # Range-capable streaming so videos/audio play and seek in the browser.
+            self.serve_file_ranged(resolved)
         elif parsed.path == "/view":
             query = urllib.parse.parse_qs(parsed.query)
             resolved = safe_requested_path(query.get("path", [""])[0])
@@ -4755,6 +5116,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/tiktok-login":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            start_tiktok_login()
+            self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
+            return
         if parsed.path == "/ui-state":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
