@@ -14,6 +14,7 @@ import agent_core
 import pipeline
 import sfx_agent
 import caption_agent
+import visual_agent
 try:
     from reddit_story_mode import story_generator as reddit_stories
     from reddit_story_mode import orchestrator as reddit_orchestrator
@@ -752,13 +753,14 @@ def app_style():
          (button:not(.preview-button) is 0,1,1 and was forcing display:block -> the icon/title/desc
          spans rendered inline and collided with the title's underline). */
       .modemenu-cards .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 150px; padding: 18px 22px 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
-      .modemenu-cards .modemenu-card .mm-title, .modemenu-cards .modemenu-card .mm-desc, .modemenu-cards .modemenu-card .mm-ico { display: block; }
+      .modemenu-cards .modemenu-card .mm-desc { display: block; }
+      /* ICON sits NEXT TO the title on one row; the dashed rule separates that head from the subtitle */
+      .modemenu-cards .modemenu-card .mm-head { display: flex; align-items: center; gap: 10px; width: 100%; margin: 2px 0 14px; padding-bottom: 14px; border-bottom: 2px dashed var(--line-strong); }
       .modemenu-card::after { display: none; }
       .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
       .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
-      .modemenu-card .mm-ico { font-size: 30px; line-height: 1; margin-bottom: 2px; }
-      /* TITLE on ONE line, clearly SEPARATED from the subtitle by a dashed rule + generous spacing */
-      .modemenu-card .mm-title { font-family: var(--display); font-size: 15px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; width: 100%; margin: 2px 0 18px; padding-bottom: 16px; border-bottom: 2px dashed var(--line-strong); }
+      .modemenu-card .mm-ico { font-size: 28px; line-height: 1; flex: 0 0 auto; }
+      .modemenu-card .mm-title { font-family: var(--display); font-size: 14px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; }
       .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.5; }
       @media (max-width: 640px) { .modemenu-cards { grid-template-columns: 1fr; } }
       @media (max-width: 1120px) {
@@ -1345,6 +1347,7 @@ def app_script():
           if (mode === "reddit") { window.location.href = "/reddit"; return; }
           if (mode === "sfx") { window.location.href = "/sfx"; return; }
           if (mode === "captions") { window.location.href = "/captions"; return; }
+          if (mode === "visual") { window.location.href = "/visual"; return; }
           wizGoto(1);   // Visuals From Script -> existing script workflow
         };
         function wizTypeIntro(cb) {
@@ -2318,7 +2321,7 @@ def page(title, body, refresh=None):
     theme_boot = ('<script>try{if(localStorage.getItem("shortslab-theme")==="dark")'
                   'document.documentElement.classList.add("theme-dark");}catch(e){}</script>')
     return f"""<!doctype html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{theme_boot}{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
+    <html lang="en" translate="no"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google" content="notranslate">{theme_boot}{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
     <body><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
 
 
@@ -2429,24 +2432,24 @@ def form_page(clear=False, open_load=False, load_slug=""):
       <div class="wiz-modemenu" id="wiz-modemenu" data-step="0" style="display:none;">
         <div class="modemenu-cards">
           <button type="button" class="modemenu-card" onclick="selectMode('visuals')">
-            <span class="mm-ico">&#127916;</span>
-            <span class="mm-title">Visuals From Script</span>
+            <span class="mm-head"><span class="mm-ico">&#127916;</span><span class="mm-title">Visuals From Script</span></span>
             <span class="mm-desc">Create a full visual video from a voice script using the existing app pipeline.</span>
           </button>
           <button type="button" class="modemenu-card" onclick="selectMode('reddit')">
-            <span class="mm-ico">&#128172;</span>
-            <span class="mm-title">Reddit Story Mode</span>
+            <span class="mm-head"><span class="mm-ico">&#128172;</span><span class="mm-title">Reddit Story Mode</span></span>
             <span class="mm-desc">Generate a Reddit-style story video with Minecraft parkour background and AI voiceover.</span>
           </button>
           <button type="button" class="modemenu-card" onclick="selectMode('sfx')">
-            <span class="mm-ico">&#128266;</span>
-            <span class="mm-title">SFX Master</span>
+            <span class="mm-head"><span class="mm-ico">&#128266;</span><span class="mm-title">SFX Master</span></span>
             <span class="mm-desc">Upload a finished Short and add editor sound effects with the local SFX library.</span>
           </button>
           <button type="button" class="modemenu-card" onclick="selectMode('captions')">
-            <span class="mm-ico">&#128172;&#65039;</span>
-            <span class="mm-title">Caption Master</span>
+            <span class="mm-head"><span class="mm-ico">&#128172;&#65039;</span><span class="mm-title">Caption Master</span></span>
             <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
+          </button>
+          <button type="button" class="modemenu-card" onclick="selectMode('visual')">
+            <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">Visual Master</span></span>
+            <span class="mm-desc">Upload a Short and Opus 4.8 adds intelligent animated red arrows + fitting SFX.</span>
           </button>
         </div>
       </div>
@@ -2757,6 +2760,50 @@ def sfx_page():
     return page("AI Sound-Effect Pass", body)
 
 
+def visual_page():
+    body = f"""
+    {brand_header()}
+    <form method="post" action="/visual-run" enctype="multipart/form-data">
+      <section class="stack">
+        <div class="panel accent">
+          <label>Finished Short (video)</label>
+          <label class="filepick" for="vis-video-file"><span class="filepick-btn">&#128193; Choose video file</span><span class="filepick-name" id="vis-video-name">No file chosen</span></label>
+          <input type="file" name="video_file" id="vis-video-file" class="filepick-input" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required onchange="var n=document.getElementById('vis-video-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
+          <div class="hint">Rendered vertical MP4 / MOV / WebM. Opus&nbsp;4.8 DIRECTS a dense visual pass: thick red arrows fly in and point at the subject of each punchy line, plus cute neko reactions &mdash; each with its own animation and a fitting click/ding.</div>
+        </div>
+        <div class="panel">
+          <label>Analysis agent</label>
+          <select name="reasoning_model">
+            <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
+            <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
+            <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
+          </select>
+          <div class="hint">The agent looks at real frames + the timed transcript, finds the concrete on-screen target per punchy moment, and only then places an arrow at it.</div>
+        </div>
+        <div class="panel">
+          <label class="otoggle" style="margin:0;"><input type="checkbox" name="add_characters" value="on" checked><span>Add kawaii neko reactions (AI-directed)</span></label>
+          <div class="hint">Optional. The same AI also bounces a cute pixel cat (shocked, laughing, love, angry, crying&hellip;) into a corner when a moment&rsquo;s mood calls for a reaction &mdash; matched to the spoken line.</div>
+        </div>
+        <button type="submit">&#10132; Add intelligent arrows</button>
+      </section>
+
+      <section class="stack">
+        <div class="loaded-media-panel">
+          <h2 style="margin-bottom: 12px;">How the agent works</h2>
+          <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
+            <li><strong>Scene detection + transcription</strong> &mdash; ffmpeg finds cuts; the speech is transcribed with timing.</li>
+            <li><strong>Opus&nbsp;4.8 directs</strong> &mdash; for each punchy moment it looks at the real frame and decides whether a <strong>red arrow</strong> should point at the concrete subject, plus an optional kawaii neko reaction. Dense, like the reference edits.</li>
+            <li><strong>Animated overlays</strong> &mdash; arrows FLY IN straight and nudge-point at the target, nekos bounce in.</li>
+            <li><strong>Fitting SFX</strong> &mdash; a click/ding/impact from your local library fires exactly when each overlay appears.</li>
+          </ol>
+          <div class="hint" style="margin-top: 16px;">You get the enhanced video plus the original and a JSON plan of every effect, its target and confidence.</div>
+        </div>
+      </section>
+    </form>
+    """
+    return page("AI Visual-Arrow Pass", body)
+
+
 def caption_page():
     body = f"""
     {brand_header()}
@@ -3000,6 +3047,61 @@ def start_sfx_job(fields, files):
             result = sfx_agent.enhance_video_with_sfx(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb
             )
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_visual_job(fields, files):
+    job_id = str(int(time.time() * 1000))
+    fields = dict(fields)
+    video_path = save_upload(files.get("video_file"), job_id)
+    reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
+    add_characters = str(fields.get("add_characters", "")).lower() in ("on", "true", "1", "yes")
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Queued."], "log_times": [time.time()],
+            "result": None, "error": None, "cancel_event": cancel_event,
+            "project_dir": None, "created_at": time.time(), "job_kind": "visual",
+        }
+    if not video_path:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "No video uploaded."
+            JOBS[job_id]["logs"].append("Error: no video uploaded.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            status_cb("Started.")
+            result = visual_agent.enhance_video_with_arrows(
+                video_path, reasoning_model=reasoning_model, status_cb=status_cb,
+                add_characters=add_characters)
             with JOB_LOCK:
                 if cancel_event.is_set():
                     JOBS[job_id]["status"] = "cancelled"
@@ -5408,6 +5510,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(assets_page())
         elif parsed.path == "/sfx":
             self.send_bytes(sfx_page())
+        elif parsed.path == "/visual":
+            self.send_bytes(visual_page())
         elif parsed.path == "/captions":
             self.send_bytes(caption_page())
         elif parsed.path == "/timeline":
@@ -5777,6 +5881,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fields, files = {}, {}
             job_id = start_sfx_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
+            self.end_headers()
+            return
+        if parsed.path == "/visual-run":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                fields, files = parse_multipart(content_type, body)
+            else:
+                fields, files = {}, {}
+            job_id = start_visual_job(fields, files)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()

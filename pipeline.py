@@ -946,7 +946,7 @@ def apply_cut_transition(img, ttype, local, fps, frame_no):
     return img
 
 
-def draw_arrow(draw, start, end, fill, width=8):
+def draw_arrow(draw, start, end, fill, width=12):
     sx, sy = start
     ex, ey = end
     draw.line((sx, sy, ex, ey), fill=fill, width=width)
@@ -986,40 +986,96 @@ def draw_thick_arrow(draw, start, end, fill, shaft_w=22, shadow_fill=None):
     draw.polygon((end, c1, c2), fill=fill)                  # triangular head
 
 
+def build_arrow_sprite(length, shaft, angle_rad, curve=0.14, alpha=1.0):
+    """The ONE styled red callout arrow ('viral sticker' look): a TAPERED, gently CURVED shaft
+    into a big triangular head, with a cream outline, a top highlight + bottom shade bevel, and
+    the signature hard ink offset shadow - so it pops on any footage and matches the app's
+    stamps/characters. Points along `angle_rad`. Returns (RGBA sprite, (tip_x, tip_y) in sprite
+    coords) or None."""
+    length = max(40.0, float(length))
+    shaft = max(8.0, float(shaft))
+    head_len = shaft * 2.4
+    head_hw = shaft * 1.35
+    out_w = max(3, int(round(shaft * 0.28)))            # cream outline thickness
+    sh_off = max(4, int(round(shaft * 0.30)))           # hard shadow offset
+    pad = int(head_hw + out_w + sh_off + shaft)
+    dx, dy = math.cos(angle_rad), math.sin(angle_rad)
+    px, py = -dy, dx                                    # perpendicular
+    # sprite bounds: tail..tip along direction + bow
+    bow = length * curve
+    size_x = int(abs(dx) * length + abs(px) * (bow + head_hw) * 2) + pad * 2
+    size_y = int(abs(dy) * length + abs(py) * (bow + head_hw) * 2) + pad * 2
+    cx0, cy0 = size_x / 2.0, size_y / 2.0
+    tail = (cx0 - dx * length / 2, cy0 - dy * length / 2)
+    tip = (cx0 + dx * length / 2, cy0 + dy * length / 2)
+    base = (tip[0] - dx * head_len, tip[1] - dy * head_len)
+    ctrl = ((tail[0] + base[0]) / 2 + px * bow, (tail[1] + base[1]) / 2 + py * bow)
+
+    # tapered polygon along the quadratic bezier tail -> head base
+    N = 22
+    left_side, right_side = [], []
+    for i in range(N + 1):
+        t = i / N
+        bx = (1 - t) ** 2 * tail[0] + 2 * (1 - t) * t * ctrl[0] + t * t * base[0]
+        by = (1 - t) ** 2 * tail[1] + 2 * (1 - t) * t * ctrl[1] + t * t * base[1]
+        txv = 2 * (1 - t) * (ctrl[0] - tail[0]) + 2 * t * (base[0] - ctrl[0])
+        tyv = 2 * (1 - t) * (ctrl[1] - tail[1]) + 2 * t * (base[1] - ctrl[1])
+        tl = math.hypot(txv, tyv) or 1.0
+        nx, ny = -tyv / tl, txv / tl
+        w = shaft * (0.55 + 0.45 * t) / 2.0             # taper: slim tail -> full width at head
+        left_side.append((bx + nx * w, by + ny * w))
+        right_side.append((bx - nx * w, by - ny * w))
+    poly = left_side + right_side[::-1]
+
+    shape = Image.new("L", (size_x, size_y), 0)
+    sd = ImageDraw.Draw(shape)
+    sd.polygon(poly, fill=255)
+    r0 = shaft * 0.55 / 2.0
+    sd.ellipse((tail[0] - r0, tail[1] - r0, tail[0] + r0, tail[1] + r0), fill=255)  # round tail
+    c1 = (base[0] + px * head_hw, base[1] + py * head_hw)
+    c2 = (base[0] - px * head_hw, base[1] - py * head_hw)
+    sd.polygon((tip, c1, c2), fill=255)                 # triangular head
+
+    mask = np.array(shape) > 127
+    grown = mask.copy()
+    for _ in range(out_w):                              # dilate for the cream outline
+        g = grown
+        grown = g | np.roll(g, 1, 0) | np.roll(g, -1, 0) | np.roll(g, 1, 1) | np.roll(g, -1, 1)
+    outline = grown & ~mask
+    silhouette = grown
+    shadow = np.roll(np.roll(silhouette, sh_off, 0), sh_off, 1) & ~silhouette
+    d = max(2, int(shaft * 0.16))
+    hi = mask & ~np.roll(mask, d, 0)                    # top inner edge -> highlight
+    lo = mask & ~np.roll(mask, -d, 0)                   # bottom inner edge -> shade
+
+    a = int(245 * max(0.0, min(1.0, alpha)))
+    out = np.zeros((size_y, size_x, 4), dtype=np.uint8)
+    out[shadow] = (12, 10, 8, int(a * 0.45))
+    out[outline] = (251, 247, 238, a)                   # cream sticker outline
+    out[mask] = DEFAULT_THICK_RED_ARROW + (a,)
+    out[hi] = (255, 96, 74, a)                          # bevel highlight
+    out[lo] = (172, 18, 14, a)                          # bevel shade
+    return Image.fromarray(out), (tip[0], tip[1])
+
+
 def render_callout_arrow(spec, width, height, alpha, pop):
-    """Render ONE real designed arrow glyph (default_thick_red_arrow) in red, pointing at the
-    target from the side. Returns (RGBA tile, (x, y) paste position) or None. The arrow is a font
-    glyph, not hand-drawn geometry."""
-    if not ARROW_FONT:
-        return None
+    """Render the styled red callout arrow pointing at the target from the side.
+    Returns (RGBA tile, (x, y) paste position) or None."""
     cx = width * float(spec.get("cx", 0.5)); cy = height * float(spec.get("cy", 0.5))
     from_left = spec.get("from", "left") == "left"
-    size = max(40, int(height * 0.085 * max(0.55, pop)))     # glyph point size, scales on pop-in
-    try:
-        f = ImageFont.truetype(ARROW_FONT, size)
-    except Exception:
+    shaft = max(12, int(height * 0.017 * max(0.55, pop)))
+    length = shaft * 7.2
+    angle = 0.0 if from_left else math.pi                 # points right / left
+    built = build_arrow_sprite(length, shaft, angle, curve=0.0, alpha=alpha)   # STRAIGHT arrow
+    if not built:
         return None
-    red = DEFAULT_THICK_RED_ARROW + (int(245 * alpha),)
-    sh = (0, 0, 0, int(120 * alpha))
-    pad = max(8, size // 3)
-    tile = Image.new("RGBA", (size * 2 + pad, int(size * 1.7) + pad), (0, 0, 0, 0))
-    td = ImageDraw.Draw(tile)
-    off = max(3, size // 22)
-    td.text((pad // 2 + off, pad // 2 + off), ARROW_GLYPH, font=f, fill=sh)   # drop shadow
-    td.text((pad // 2, pad // 2), ARROW_GLYPH, font=f, fill=red)              # red arrow glyph
-    bbox = tile.getbbox()
-    if not bbox:
-        return None
-    tile = tile.crop(bbox)
-    if not from_left:
-        tile = tile.transpose(Image.FLIP_LEFT_RIGHT)          # point LEFT instead of right
-    tw, th = tile.size
-    gap = int(width * 0.025)
-    if from_left:                                             # tip at right edge -> sit just left of target
-        x = int(cx) - gap - tw
-    else:                                                     # tip at left edge -> sit just right of target
-        x = int(cx) + gap
-    y = int(cy - th / 2)
+    tile, (tip_x, tip_y) = built
+    gap = int(width * 0.02)
+    if from_left:                                         # tip sits just left of the target
+        x = int(cx - gap - tip_x)
+    else:
+        x = int(cx + gap - tip_x)
+    y = int(cy - tip_y)
     return tile, (x, y)
 
 
@@ -1187,7 +1243,7 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
                     (int(width * item[0]), int(height * item[1])),
                     (int(width * item[2]), int(height * item[3])),
                     (225, 32, 25, int(220 * hit)),
-                    width=7,
+                    width=11,
                 )
         elif kind == "callout":
             # ARROWS ONLY: a single clean thick red arrow (default_thick_red_arrow). Circles and

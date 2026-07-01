@@ -4547,9 +4547,10 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     # VARIETY: normal cuts must NOT all be the same whoosh. Build a rotation across every cut-worthy
     # category the user's library actually has (whooshes weighted higher, but pops/dings/flashes/
     # clicks interleaved) so consecutive cuts sound different even when a category has one file.
+    # ding + mouse-click weighted UP (user likes those crisp accents), whooshes eased down a touch.
     _CUT_WEIGHTS = [("swipe_whoosh", 2), ("bright_whoosh", 2), ("whoosh_hit_combo", 1),
-                    ("caption_pop", 2), ("notification_ding", 1), ("camera_flash", 1),
-                    ("idea_reveal", 1), ("flash_blink", 1), ("ui_click", 1)]
+                    ("caption_pop", 2), ("notification_ding", 3), ("camera_flash", 1),
+                    ("idea_reveal", 1), ("flash_blink", 1), ("ui_click", 3)]
     cut_rotation = []
     for _cat, _w in _CUT_WEIGHTS:
         if lib.get(_cat):

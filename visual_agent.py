@@ -1,0 +1,522 @@
+"""AI visual-emphasis post-production for an already-finished Short - "Visual Master".
+
+Upload a rendered vertical video and this module:
+  1. detects visual cuts + transcribes the speech with timing (reuses sfx_agent),
+  2. samples one frame per punchy moment and asks an Opus 4.8 VISION agent to DIRECT the edit:
+     for each moment it decides whether a thick red ARROW should point at the concrete subject
+     the line is about, plus (optionally) a kawaii pixel NEKO reaction matching the mood.
+     ARROWS AND NEKOS ONLY - no text stamps, no circles.
+  3. renders every effect as an ANIMATED transparent overlay: arrows FLY IN straight from their
+     side with an overshoot and then nudge-point at the target; nekos bounce in with a springy
+     overshoot,
+  4. adds a fitting click/ding/whoosh/impact from the local SFX library exactly when each
+     overlay appears.
+
+This edit style is deliberately DENSE (an effect every few seconds), matching the loud viral
+'dark facts' look. A moment with no clear target simply gets nothing. Mirrors sfx_agent (the
+SFX Master) but for visuals.
+"""
+
+import json
+import math
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import agent_core
+import pipeline
+import sfx_agent
+
+ROOT = Path(__file__).resolve().parent
+VISUAL_OUTPUT_DIR = ROOT / "projects" / "_visual_enhanced"
+EMOTION_DIR = ROOT / "static" / "emotions"
+
+ARROW_RED = (225, 32, 25)
+
+# direction the arrow POINTS (tail -> tip), keyed by the side it comes IN from
+_DIRS = {
+    "left": (1.0, 0.0), "right": (-1.0, 0.0), "top": (0.0, 1.0), "bottom": (0.0, -1.0),
+    "top-left": (0.707, 0.707), "top-right": (-0.707, 0.707),
+    "bottom-left": (0.707, -0.707), "bottom-right": (-0.707, -0.707),
+}
+
+
+def available_emotions():
+    """The kawaii neko emotion characters on disk (auto-generate them once if missing)."""
+    if not EMOTION_DIR.exists() or not any(EMOTION_DIR.glob("*.png")):
+        try:
+            subprocess.run(["python", str(ROOT / "scripts" / "make_emotion_chars.py")], timeout=90)
+        except Exception:
+            pass
+    return sorted(p.stem for p in EMOTION_DIR.glob("*.png")) if EMOTION_DIR.exists() else []
+
+
+def log(status_cb, message):
+    if status_cb:
+        status_cb(message)
+
+
+def _run(cmd, timeout=None):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _video_props(path, ffprobe):
+    """Return (width, height, fps, duration) for the uploaded video."""
+    w = h = 0
+    fps = 30.0
+    dur = 0.0
+    if not ffprobe:
+        return 1080, 1920, 30.0, 0.0
+    try:
+        r = _run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                  "stream=width,height,r_frame_rate", "-show_entries", "format=duration",
+                  "-of", "json", str(path)], timeout=30)
+        data = json.loads(r.stdout or "{}")
+        st = (data.get("streams") or [{}])[0]
+        w = int(st.get("width") or 0)
+        h = int(st.get("height") or 0)
+        rate = str(st.get("r_frame_rate") or "30/1")
+        if "/" in rate:
+            num, den = rate.split("/")
+            fps = float(num) / float(den) if float(den) else 30.0
+        else:
+            fps = float(rate)
+        dur = float((data.get("format") or {}).get("duration") or 0.0)
+    except Exception:
+        pass
+    return (w or 1080), (h or 1920), (fps if 1 < fps < 121 else 30.0), dur
+
+
+def _candidate_times(cuts, phrases, duration, min_gap=1.8, cap=18):
+    """Punchy moments worth directing: each visual cut + each phrase start. DENSE - the reference
+    style wants an effect every few seconds, so we check many moments and let the AI pick."""
+    times = sorted(set(
+        [round(float(t), 2) for t in (cuts or []) if 0.3 < float(t) < duration - 0.4]
+        + [round(float(p.get("start", 0.0)) + 0.15, 2) for p in (phrases or [])
+           if 0.3 < float(p.get("start", 0.0)) < duration - 0.4]))
+    spaced = []
+    for t in times:
+        if not spaced or t - spaced[-1] >= min_gap:
+            spaced.append(t)
+    if not spaced and duration > 3:
+        spaced = [round(duration * f, 2) for f in (0.2, 0.4, 0.6, 0.8)]
+    return spaced[:cap]
+
+
+def _phrase_at(phrases, t):
+    for p in (phrases or []):
+        if float(p.get("start", 0)) - 0.3 <= t <= float(p.get("end", 0)) + 0.3:
+            return str(p.get("text", ""))
+    return ""
+
+
+def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, status_cb=None,
+                    emotions=None):
+    """One frame per candidate moment -> contact sheet -> the vision agent DIRECTS the edit.
+    Returns (effect_events, char_events):
+      effects  = {time, type: arrow, cx, cy, from, target, confidence}
+      characters = {time, emotion, cx, cy}."""
+    emotions = list(emotions or [])
+    if not os.environ.get("WAVESPEED_API_KEY") or not times:
+        return ([], [])
+    work = Path(video_path).parent / "_visual_frames"
+    work.mkdir(parents=True, exist_ok=True)
+    frames, kept_times = [], []
+    for k, t in enumerate(times):
+        fp = work / f"cand_{k:02d}.jpg"
+        if pipeline.extract_poster_frame(video_path, fp, ffmpeg=ffmpeg, at=t):
+            frames.append(fp); kept_times.append(t)
+    if not frames:
+        return ([], [])
+
+    effects, char_events = [], []
+    emo_line = ""
+    if emotions:
+        emo_line = (
+            "INDEPENDENTLY of the effect, a moment whose MOOD clearly calls for a reaction can ALSO get "
+            "ONE kawaii pixel cat reaction ('emotion'): pick from EXACTLY this list: "
+            f"{', '.join(emotions)}. Match the feeling of the line (shocking->shocked, funny->laughing, "
+            "sad->sad/crying, love/romance->love, confident->cool, creepy->scared, confusing->confused, "
+            "opinionated->angry, curious->thinking). Use it on the strongest ~1 in 3 moments, else "
+            "'none'. Give char_cx, char_cy (0-1) in an EMPTY corner away from the subject and the "
+            "caption band.\n")
+    BATCH = 12
+    for b0 in range(0, len(frames), BATCH):
+        sub_f = frames[b0:b0 + BATCH]
+        sub_t = kept_times[b0:b0 + BATCH]
+        sheet = agent_core.create_media_contact_sheet(
+            sub_f, work / f"_sheet_{b0}.jpg",
+            title="One frame per moment (tile index = moment). Coordinates are 0-1 WITHIN each tile.")
+        if not sheet:
+            continue
+        lines = "\n".join(
+            f"tile {j}: t={sub_t[j]:.1f}s | said: \"{_phrase_at(phrases, sub_t[j])[:110]}\""
+            for j in range(len(sub_t)))
+        prompt = (
+            "You are the motion-graphics DIRECTOR for a loud, viral 'dark facts' documentary Short. Each "
+            "tile is one frame at a punchy moment, with the words spoken then. This editing style is DENSE "
+            "and energetic: give MOST moments (roughly 2 out of 3) a red arrow when a concrete target "
+            "exists, and only skip a moment when there is genuinely nothing concrete on screen.\n"
+            "'effect' = 'arrow': a thick red arrow flies in and POINTS at the concrete subject that proves "
+            "the line (face, person, object, sign, money, food, vehicle, crowd, shelf, screen, uniform, odd "
+            "detail). Give the target centre cx, cy (0-1 within the tile) and 'from' = the side with empty "
+            "space it should fly in from: left|right|top|bottom|top-left|top-right|bottom-left|bottom-right. "
+            "'effect' = 'none' when nothing concrete is visible.\n"
+            "NEVER aim an arrow at empty space, blur, generic background, or the caption band "
+            "(cy roughly 0.50-0.72).\n"
+            + emo_line + "\n"
+            f"Moments:\n{lines}\n\n"
+            'Return STRICT JSON: {"tiles": {"<tile_index>": {"effect": "arrow|none", '
+            '"cx": 0-1, "cy": 0-1, "from": "left|right|top|bottom|top-left|top-right|bottom-left|bottom-right", '
+            '"target": "short desc", "confidence": 0-10'
+            + (', "emotion": "none|<from the list>", "char_cx": 0-1, "char_cy": 0-1' if emotions else '')
+            + '}, ...}}')
+        messages = [
+            {"role": "system", "content": "You direct dense, punchy visual emphasis; every effect must aim at something concrete and visible. Return JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": agent_core.image_data_url(sheet)}},
+            ]},
+        ]
+        payload = {"model": reasoning_model or "anthropic/claude-opus-4.8", "messages": messages,
+                   "temperature": 0.35, "max_tokens": 1800, "response_format": {"type": "json_object"}}
+        try:
+            log(status_cb, f"Vision agent directing {len(sub_f)} moment(s) (arrows + nekos)...")
+            data = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, payload, timeout=180)
+            plan = agent_core.extract_json_object(data["choices"][0]["message"]["content"]) or {}
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Vision direction failed ({exc.__class__.__name__}); skipping this batch.")
+            continue
+        tiles = plan.get("tiles") if isinstance(plan.get("tiles"), dict) else {}
+        for key, d in tiles.items():
+            try:
+                j = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= j < len(sub_t)) or not isinstance(d, dict):
+                continue
+            t_here = round(float(sub_t[j]), 2)
+            # --- optional neko reaction ---
+            emo = str(d.get("emotion", "none") or "none").lower().strip()
+            if emotions and emo in emotions:
+                try:
+                    ccx = min(0.9, max(0.1, float(d.get("char_cx", 0.82))))
+                    ccy = min(0.9, max(0.1, float(d.get("char_cy", 0.20))))
+                except (TypeError, ValueError):
+                    ccx, ccy = 0.82, 0.20
+                if 0.46 <= ccy <= 0.78:              # keep clear of the caption band
+                    ccy = 0.18
+                char_events.append({"time": t_here, "emotion": emo, "cx": ccx, "cy": ccy})
+            # --- effect (ARROWS ONLY - no stamps, no circles) ---
+            etype = str(d.get("effect", "none") or "none").lower().strip()
+            if etype != "arrow":
+                continue
+            try:
+                conf = float(d.get("confidence", 0))
+                cx = min(0.94, max(0.06, float(d.get("cx", 0.5))))
+                cy = min(0.94, max(0.06, float(d.get("cy", 0.5))))
+            except (TypeError, ValueError):
+                continue
+            if conf < 6.0:
+                continue
+            if 0.50 <= cy <= 0.72:                                    # target under captions -> skip
+                continue
+            side = str(d.get("from", "")).lower().strip().replace("_", "-")
+            if side not in _DIRS:
+                side = "left" if cx >= 0.5 else "right"
+            effects.append({"time": t_here, "type": "arrow", "cx": cx, "cy": cy, "from": side,
+                            "target": str(d.get("target", ""))[:80],
+                            "confidence": round(conf, 1)})
+
+    def _space(evs, gap):
+        evs.sort(key=lambda e: e["time"])
+        out = []
+        for e in evs:
+            if not out or e["time"] - out[-1]["time"] >= gap:
+                out.append(e)
+        return out
+    return (_space(effects, 1.15), _space(char_events, 2.0))
+
+
+# --------------------------------------------------------------------- overlay renderers
+
+def _ease_out_back(u, s=1.70158):
+    u = min(1.0, max(0.0, u))
+    return 1.0 + (s + 1) * (u - 1) ** 3 + s * (u - 1) ** 2
+
+
+def _mov_from_frames(frame_dir, fps, out_path, ffmpeg):
+    _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-framerate", f"{fps:.4f}",
+          "-i", str(frame_dir / "f_%03d.png"), "-c:v", "qtrle", "-pix_fmt", "argb", str(out_path)],
+         timeout=240)
+    return out_path if out_path.exists() else None
+
+
+def render_arrow_clip(event, w, h, fps, out_dir, idx, ffmpeg, hold=1.35):
+    """The STYLED red sticker arrow (tapered curved shaft, cream outline, bevel, hard shadow -
+    pipeline.build_arrow_sprite) that FLIES IN from its side with an overshoot + settle, then
+    NUDGE-POINTS at the target 3x with a tiny wobble, then fades out. Any of 8 directions.
+    Transparent qtrle .mov. Returns (clip_path, start_s, end_s) or None."""
+    from PIL import Image
+    dx, dy = _DIRS.get(event.get("from", "left"), (1.0, 0.0))
+    angle = math.atan2(dy, dx)
+    tx, ty = event["cx"] * w, event["cy"] * h
+    gap = h * 0.016                               # tip stops just short of the target
+    length = h * 0.15
+    shaft = max(16, int(h * 0.019))               # THICK
+    built = pipeline.build_arrow_sprite(length, shaft, angle, curve=0.0, alpha=1.0)   # STRAIGHT arrow
+    if not built:
+        return None
+    sprite, (tip_sx, tip_sy) = built
+    tip_x, tip_y = tx - dx * gap, ty - dy * gap
+    # keep the whole sprite inside the frame: shift back along its own axis if needed
+    sx0, sy0 = tip_x - tip_sx, tip_y - tip_sy     # sprite paste origin
+    shift = 0.0
+    if sx0 < 0:
+        shift = max(shift, -sx0 / (abs(dx) or 1e6))
+    if sy0 < 0:
+        shift = max(shift, -sy0 / (abs(dy) or 1e6))
+    if sx0 + sprite.width > w:
+        shift = max(shift, (sx0 + sprite.width - w) / (abs(dx) or 1e6))
+    if sy0 + sprite.height > h:
+        shift = max(shift, (sy0 + sprite.height - h) / (abs(dy) or 1e6))
+    if shift:                                     # move the arrow back along -direction
+        tip_x = tx - dx * (gap + shift)
+        tip_y = ty - dy * (gap + shift)
+
+    frame_dir = out_dir / f"arrow_{idx:02d}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    n = max(10, int(round(hold * fps)))
+    fly_dist = h * 0.10                           # how far back it starts
+    for i in range(n):
+        local = i / float(n - 1) if n > 1 else 1.0
+        rot = 0.0
+        if local < 0.24:                          # fly in with overshoot (past target, settle back)
+            u = local / 0.24
+            p = _ease_out_back(u, s=2.0)
+            off = -(1.0 - p) * fly_dist
+            alpha = min(1.0, u * 2.6)
+            rot = (1.0 - u) * -7.0                # slight tilt that settles on arrival
+        elif local > 0.86:                        # quick fade + slight retreat
+            u = (local - 0.86) / 0.14
+            off = -u * h * 0.02
+            alpha = 1.0 - u
+        else:                                     # pointing nudge: 3 pulses toward the target
+            u = (local - 0.24) / 0.62
+            off = math.sin(u * math.pi * 3.0) * h * 0.012 * (1.0 - 0.25 * u)
+            alpha = 1.0
+            rot = math.sin(u * math.pi * 3.0) * 2.2   # tiny wobble synced with the pulses
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        if alpha > 0.03:
+            spr = sprite
+            if abs(rot) > 0.2:
+                spr = sprite.rotate(rot, resample=Image.Resampling.BICUBIC,
+                                    center=(tip_sx, tip_sy))
+            if alpha < 0.999:
+                spr = spr.copy()
+                spr.putalpha(spr.split()[3].point(lambda p_: int(p_ * alpha)))
+            canvas.alpha_composite(spr, (int(tip_x + dx * off - tip_sx),
+                                         int(tip_y + dy * off - tip_sy)))
+        canvas.save(frame_dir / f"f_{i:03d}.png")
+    clip = _mov_from_frames(frame_dir, fps, out_dir / f"arrow_{idx:02d}.mov", ffmpeg)
+    if not clip:
+        return None
+    start = max(0.0, float(event["time"]) - 0.05)
+    return clip, round(start, 3), round(start + n / fps, 3)
+
+
+def render_char_clip(event, w, h, fps, out_dir, idx, ffmpeg, hold=1.5):
+    """A kawaii neko reaction with a springy BOUNCE-IN (overshoot + fade), a gentle bob, then a
+    quick pop-out. Transparent qtrle .mov."""
+    from PIL import Image
+    png = EMOTION_DIR / f"{event['emotion']}.png"
+    if not png.exists():
+        return None
+    base = Image.open(png).convert("RGBA")
+    target = int(h * 0.17)
+    base = base.resize((target, target), Image.NEAREST)
+    frame_dir = out_dir / f"char_{idx:02d}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    cx = int(min(w - target * 0.55, max(target * 0.55, event["cx"] * w)))
+    cy = int(min(h - target * 0.55, max(target * 0.55, event["cy"] * h)))
+    n = max(8, int(round(hold * fps)))
+    for i in range(n):
+        local = i / float(n - 1) if n > 1 else 1.0
+        if local < 0.30:
+            u = local / 0.30
+            scale = max(0.0, _ease_out_back(u))
+            alpha = min(1.0, u * 1.6)
+            bob = 0.0
+        elif local > 0.88:
+            u = (local - 0.88) / 0.12
+            scale = max(0.0, 1.0 - u)
+            alpha = max(0.0, 1.0 - u)
+            bob = 0.0
+        else:
+            scale = 1.0
+            alpha = 1.0
+            bob = math.sin((local - 0.30) * math.pi * 3) * h * 0.006
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        if scale > 0.02 and alpha > 0.03:
+            sz = max(2, int(target * scale))
+            spr = base.resize((sz, sz), Image.NEAREST)
+            if alpha < 0.999:
+                spr.putalpha(spr.split()[3].point(lambda p: int(p * alpha)))
+            canvas.alpha_composite(spr, (int(cx - sz / 2), int(cy - sz / 2 + bob)))
+        canvas.save(frame_dir / f"f_{i:03d}.png")
+    clip = _mov_from_frames(frame_dir, fps, out_dir / f"char_{idx:02d}.mov", ffmpeg)
+    if not clip:
+        return None
+    start = max(0.0, float(event["time"]) - 0.05)
+    return clip, round(start, 3), round(start + n / fps, 3)
+
+
+def composite_overlays(video_path, overlay_clips, out_path, ffmpeg, status_cb=None):
+    """Overlay each transparent clip onto the base video during its time window (audio copied)."""
+    if not overlay_clips:
+        return None
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-i", str(video_path)]
+    for clip, s, _e in overlay_clips:
+        # -itsoffset shifts this overlay's frame 0 to the event time on the base timeline, so the
+        # animation plays AT the event (not already finished by the time `enable` turns on).
+        cmd += ["-itsoffset", f"{s:.3f}", "-i", str(clip)]
+    parts, cur = [], "0:v"
+    for k, (_clip, s, e) in enumerate(overlay_clips):
+        nxt = f"o{k}"
+        parts.append(f"[{cur}][{k + 1}:v]overlay=0:0:enable='between(t,{s:.3f},{e:.3f})':eof_action=pass[{nxt}]")
+        cur = nxt
+    fc = ";".join(parts)
+    cmd += ["-filter_complex", fc, "-map", f"[{cur}]"]
+    cmd += ["-map", "0:a?", "-c:a", "copy", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "18", "-preset", "veryfast", "-movflags", "+faststart", str(out_path)]
+    log(status_cb, f"Compositing {len(overlay_clips)} animated overlay(s) onto the video...")
+    r = _run(cmd, timeout=900)
+    if not out_path.exists():
+        raise RuntimeError(f"ffmpeg overlay composite failed: {(r.stderr or '')[-500:]}")
+    return out_path
+
+
+# alias kept for compatibility with older callers/tests
+composite_arrows = composite_overlays
+
+
+def _overlay_sfx_segments(events, ffprobe, status_cb=None):
+    """A fitting local SFX exactly when each overlay appears. Dings + mouse clicks are favored;
+    nekos get a pop."""
+    try:
+        import sfx_library
+        data = sfx_library.build_library(status_cb=None)
+        lib = data["library"]
+    except Exception:
+        return []
+    by_type = {
+        "char": ["caption_pop", "notification_ding", "ui_click"],
+        "arrow": ["ui_click", "notification_ding", "swipe_whoosh", "bright_whoosh"],
+    }
+    rotation = ["ui_click", "notification_ding", "ui_click", "notification_ding",
+                "swipe_whoosh", "caption_pop", "bright_whoosh", "impact_hit"]
+    per_cat = {}
+    segs = []
+    for k, e in enumerate(events):
+        etype = e.get("type") or ("char" if e.get("emotion") else "arrow")
+        prefs = by_type.get(etype, []) + [rotation[k % len(rotation)]]
+        cat = next((c for c in prefs if lib.get(c)), None)
+        if not cat:
+            continue
+        files = lib.get(cat) or []
+        j = per_cat.get(cat, 0); per_cat[cat] = j + 1
+        path = files[j % len(files)]
+        db = sfx_library.CAT_DB.get(cat, -12)
+        vol = round(min(0.9, sfx_library.db_to_gain(db)), 3)
+        dur = min(0.55, float(next((r["trim_len"] for r in data["records"]
+                                    if r["use_path"] == path), 0.4) or 0.4))
+        segs.append({"path": Path(path), "start": round(max(0.0, float(e["time"]) - 0.06), 3),
+                     "duration": round(dur + 0.02, 3), "volume": vol,
+                     "category": cat, "reason": f"{etype}_appear"})
+    return segs
+
+
+def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, out_dir=None,
+                              add_characters=True):
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise RuntimeError("Uploaded video not found.")
+    if video_path.suffix.lower() not in sfx_agent.VIDEO_EXTS:
+        raise RuntimeError(f"Unsupported video type: {video_path.suffix}")
+    ffmpeg = pipeline.find_ffmpeg()
+    ffprobe = pipeline.find_ffprobe(ffmpeg)
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found; cannot process video.")
+
+    out_dir = Path(out_dir) if out_dir else VISUAL_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{video_path.stem}_visual_{stamp}.mp4"
+
+    w, h, fps, duration = _video_props(video_path, ffprobe)
+    if duration <= 0:
+        duration = sfx_agent.media_duration(video_path, ffprobe)
+    log(status_cb, f"Loaded video: {w}x{h} @ {fps:.1f}fps, {duration:.1f}s.")
+
+    log(status_cb, "Detecting scene changes...")
+    cuts = sfx_agent.detect_scene_cuts(video_path, ffmpeg)
+    phrases = sfx_agent.transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
+    times = _candidate_times(cuts, phrases, duration)
+    log(status_cb, f"Directing {len(times)} punchy moment(s)...")
+
+    emotions = available_emotions() if add_characters else []
+    effects, char_events = analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model,
+                                           status_cb=status_cb, emotions=emotions)
+    n_arrow = len(effects)
+    log(status_cb, f"Direction: {n_arrow} arrow(s)"
+                   + (f", {len(char_events)} neko(s)." if emotions else "."))
+    if not effects and not char_events:
+        raise RuntimeError("The director found nothing concrete to emphasise in this video. "
+                           "Try a video with visible subjects/objects.")
+
+    tmp = out_dir / f"_visualtmp_{stamp}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    overlay_clips = []
+    for i, ce in enumerate(char_events):          # nekos first (effects layer on top)
+        clip = render_char_clip(ce, w, h, fps, tmp, i, ffmpeg)
+        if clip:
+            overlay_clips.append(clip)
+            log(status_cb, f"Neko '{ce['emotion']}' at {ce['time']:.1f}s")
+    for i, e in enumerate(effects):
+        clip = render_arrow_clip(e, w, h, fps, tmp, i, ffmpeg)
+        if clip:
+            overlay_clips.append(clip)
+            log(status_cb, f"Arrow at {e['time']:.1f}s -> {(e.get('target') or '')[:40]}")
+    if not overlay_clips:
+        raise RuntimeError("Overlay rendering failed (no clips produced).")
+
+    overlaid = out_dir / f"_overlaid_{stamp}.mp4"
+    composite_overlays(video_path, overlay_clips, overlaid, ffmpeg, status_cb=status_cb)
+
+    segments = _overlay_sfx_segments(effects + char_events, ffprobe, status_cb=status_cb)
+    if segments:
+        log(status_cb, f"Adding {len(segments)} click/ding/impact(s)...")
+        sfx_agent.mix_into_video(overlaid, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
+        try:
+            overlaid.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        overlaid.replace(out_path)
+    log(status_cb, "Visual enhancement complete.")
+
+    plan_path = out_path.with_name(out_path.stem + "_plan.json")
+    plan_path.write_text(json.dumps({
+        "source_video": str(video_path), "duration": round(duration, 2),
+        "effect_counts": {"arrow": n_arrow, "neko": len(char_events)},
+        "arrows": [{"time": e["time"], "cx": e["cx"], "cy": e["cy"],
+                    "from": e.get("from"), "target": e.get("target", ""),
+                    "confidence": e.get("confidence")}
+                   for e in effects],
+        "characters": [{"time": c["time"], "emotion": c["emotion"], "cx": c["cx"], "cy": c["cy"]}
+                       for c in char_events],
+    }, indent=2), encoding="utf-8")
+
+    return {"video": str(out_path), "original_video": str(video_path), "visual_plan": str(plan_path),
+            "arrow_count": n_arrow, "character_count": len(char_events), "plan_source": "opus_vision"}
