@@ -1154,7 +1154,10 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                        {"black_bar_score": fv["black_bar_score"], "is_fake_vertical": fv["is_fake_vertical"]})
                 continue
             th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
-            if th > 4.0:
+            # 4.0 was too lax (it let clips with captions in 2 of 5 sampled frames through). 2.8
+            # rejects anything with burned-in text on more than one frame, keeping only clips that
+            # are essentially text-free (incidental signage still scores ~1.6 and is allowed).
+            if th > 2.8:
                 _status(status_cb, f"Rejected clip ({bucket_id}/{q}): text-heavy TikTok captions ({th}/10)")
                 _reject(raw)
                 _cstat(cid, "rejected_text_heavy", f"burned-in text {th}/10",

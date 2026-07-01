@@ -12,6 +12,11 @@ venv/
 projects/
 uploads/
 renders/
+outputs/
+
+# --- Reddit Story Mode: approved parkour clips (large binaries); keep the folder + README ---
+/assets/parkour_pool/*
+!/assets/parkour_pool/README.txt
 
 # --- Runtime / asset folders (large binaries, keep on disk only) ---
 browser-profile/

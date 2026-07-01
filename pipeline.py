@@ -70,7 +70,11 @@ GEMINI_TTS_MODELS = {
     "flash": "google/gemini-2.5-flash/text-to-speech",
     "pro": "google/gemini-2.5-pro/text-to-speech",
 }
-DEFAULT_TTS_MODEL = "flash"
+# THE hiss fix (measured): the Flash TTS model generates noise-like HF grain (spectral flatness
+# ~0.205, near white noise) that reads as a constant hiss riding on the voice - no EQ/denoise
+# removes it because it's baked into the generation. Pro is ~2.6x cleaner (flatness ~0.079). Pro
+# is the default so voiceovers are clean; set tts_model=flash to trade quality for cost.
+DEFAULT_TTS_MODEL = "pro"
 DEFAULT_TTS_LANGUAGE = "English (United States)"
 DEFAULT_TTS_SPEAKER = "Narrator"
 DEFAULT_TTS_VOICE = "Achernar"
@@ -141,18 +145,53 @@ def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pause_s = max(0.0, float(pause_s))
-    fmt = f"aformat=sample_rates={sample_rate}:channel_layouts=stereo"
-    cmd = [
-        ffmpeg, "-y",
-        "-i", str(first_path),
-        "-i", str(second_path),
-        "-f", "lavfi", "-t", f"{pause_s:.3f}",
-        "-i", f"anullsrc=r={sample_rate}:cl=stereo",
-        "-filter_complex",
-        f"[0:a]{fmt}[a];[2:a]{fmt}[s];[1:a]{fmt}[b];[a][s][b]concat=n=3:v=0:a=1[out]",
-        "-map", "[out]",
-        str(out_path),
-    ]
+
+    # BUG FIX (measured): the old `aformat=sample_rates=..:channel_layouts=stereo` filter re-runs a
+    # resampler EVEN WHEN the rate already matches, and that injects a ~-85 dB broadband noise floor
+    # into the whole voiceover - the continuous hiss the user heard. hook.wav/body.wav (which skip
+    # this) measure ~-118 dB; the concat output measured ~-85 dB. When both clips already share a
+    # format (they do - both come from apply_voice_postprocess), concat them RAW: floor stays ~-120 dB.
+    def _fmt(path):
+        try:
+            ffprobe = find_ffprobe(ffmpeg)
+            if not ffprobe:
+                return None
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0:s=x", str(path)],
+                capture_output=True, text=True, timeout=20).stdout.strip()
+            rate, ch = out.split("x")[:2]
+            return int(rate), int(ch)
+        except Exception:
+            return None
+
+    f1, f2 = _fmt(first_path), _fmt(second_path)
+    if f1 and f2 and f1 == f2:
+        rate, ch = f1
+        cl = "mono" if ch == 1 else ("stereo" if ch == 2 else "stereo")
+        # raw concat, no resampling filter -> keeps the source noise floor
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(first_path),
+            "-i", str(second_path),
+            "-f", "lavfi", "-t", f"{pause_s:.3f}", "-i", f"anullsrc=r={rate}:cl={cl}",
+            "-filter_complex", "[0:a][2:a][1:a]concat=n=3:v=0:a=1[out]",
+            "-map", "[out]", "-ar", str(rate),
+            str(out_path),
+        ]
+    else:
+        # rare: clips differ in rate/channels -> normalize (accept its tiny noise for this edge case)
+        fmt = f"aformat=sample_rates={sample_rate}:channel_layouts=stereo"
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(first_path),
+            "-i", str(second_path),
+            "-f", "lavfi", "-t", f"{pause_s:.3f}", "-i", f"anullsrc=r={sample_rate}:cl=stereo",
+            "-filter_complex",
+            f"[0:a]{fmt}[a];[2:a]{fmt}[s];[1:a]{fmt}[b];[a][s][b]concat=n=3:v=0:a=1[out]",
+            "-map", "[out]",
+            str(out_path),
+        ]
     subprocess.run(cmd, check=True, capture_output=True)
     return out_path
 
@@ -161,15 +200,14 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
                             ffmpeg=None, status_cb=None, style="punchy"):
     """Clean, shape and speed up a generated voiceover in place.
 
-    style="punchy" (default) targets the viral listicle/documentary voice:
-      young female · bright · high energy · STRONG compression · bright presence EQ ·
-      breathing almost removed · ~1.20x · very loud. The chain (in order):
+    style="punchy" (default) targets the viral listicle/documentary voice, tuned WARM to match
+    the reference channel (warm low-mid body, moderate presence, gentle high rolloff - NOT harsh):
         highpass + FFT denoise   -> kill the TTS noise floor ("Rauschen")
-        agate                    -> push breaths/quiet gaps DOWN (breathing almost removed)
-        acompressor (strong)     -> even, dense, "compressed and loud" body
-        presence + air EQ        -> bright presence boost, clear hard consonants
+        low-mid warmth EQ        -> full, warm body (250-800 Hz)
+        acompressor (moderate)   -> even, consistent level (not over-squashed)
+        light presence + de-ess  -> clarity without brightness/sibilance
         atempo                   -> 1.15-1.25x pace without changing pitch
-        loudnorm + alimiter      -> hot, consistent final level
+        loudnorm + gate + limiter-> hot, consistent, silent gaps
     style="clean" keeps the old gentle chain (denoise + speed + loudnorm only).
     Runs before forced alignment, so word timing matches the new pace. Returns the Path
     (unchanged on failure / no ffmpeg).
@@ -191,18 +229,19 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
     # Verified on real TTS: continuous -45 dB floor -> -inf in gaps, speech still ~-15 dB RMS.
     filters = []
     if denoise:
-        filters.append("highpass=f=85")
+        filters.append("highpass=f=80")
         filters.append("afftdn=nr=20:nf=-30")      # STRONG broadband denoise (kills the TTS hiss floor)
     if style in ("punchy", "dehiss"):
-        # Clarity over warmth: cut low-mid MUD, BOOST presence + a little air, then de-ess. No
-        # broad treble boost (hiss) and NO heavy low-pass (that was making the voice dumpf/muffled).
-        filters.append("equalizer=f=300:width_type=q:w=1.0:g=-3")            # cut low-mid mud (200-500Hz)
+        # WARM profile (tuned to the user's reference video's tonal balance: warm low-mid peak at
+        # 250-800 Hz, moderate presence, gentle high rolloff). The old chain cut low-mid and BOOSTED
+        # presence +4 + air, which was too bright/harsh and emphasized TTS grain. Now: gentle low-mid
+        # warmth, only a touch of presence, strong de-ess, no air boost.
+        filters.append("equalizer=f=400:width_type=q:w=1.1:g=1.5")           # low-mid WARMTH (body)
         if style == "punchy":
-            filters.append("acompressor=threshold=-18dB:ratio=3:attack=6:release=140:makeup=3:knee=4")
-        filters.append("equalizer=f=4000:width_type=q:w=1.0:g=4")            # PRESENCE / clarity (3-5kHz)
-        filters.append("highshelf=f=9000:g=2")                              # light AIR (8-10kHz)
-        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-2.5")        # de-ess AFTER presence
-        filters.append("lowpass=f=16500")                                   # trim only ultra-high hiss (transparent)
+            filters.append("acompressor=threshold=-17dB:ratio=2.6:attack=8:release=150:makeup=2:knee=4")
+        filters.append("equalizer=f=4000:width_type=q:w=1.0:g=1.5")          # light presence for clarity (was +4)
+        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-3.5")         # de-ess (tames sibilance/hiss)
+        filters.append("lowpass=f=15500")                                   # trim ultra-high hiss
     if abs(speed - 1.0) > 0.001:
         filters.append(f"atempo={speed:.4f}")
     if style == "punchy":
@@ -224,9 +263,9 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
         os.replace(str(tmp), str(path))
         status_log(status_cb, f"Voice chain: speed {speed:.2f}x.")
         if style in ("punchy", "dehiss"):
-            status_log(status_cb, "Voice EQ: highpass 85 Hz, STRONG denoise (afftdn nr=20) to kill the "
-                                  "TTS hiss, low-mid cut, presence + light air, de-esser; loudnorm -15 "
-                                  "LUFS; final noise gate silences the gaps (no background bed).")
+            status_log(status_cb, "Voice EQ: WARM profile (matched to reference) - denoise, low-mid "
+                                  "warmth, light presence, strong de-ess, gentle high rolloff; "
+                                  "loudnorm -15 LUFS; final gate silences the gaps.")
         else:
             status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}'.")
     except Exception as exc:
@@ -2487,6 +2526,12 @@ def choose_background_music(config):
     files = background_music_files(config)
     if not files:
         return None
+    # An explicit user pick from the music picker wins over auto-selection.
+    chosen = str(config.get("background_music_file") or "").strip()
+    if chosen and chosen.lower() not in ("auto", "none", ""):
+        for path in files:
+            if chosen in (path.name, path.stem, str(path)):
+                return path
     text = background_music_text(config)
     dark = any(w in text for w in (
         "dark", "stress", "pressure", "exhaust", "lonely", "alone", "sad", "quiet", "fear",

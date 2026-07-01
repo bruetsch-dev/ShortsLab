@@ -14,6 +14,12 @@ import agent_core
 import pipeline
 import sfx_agent
 import caption_agent
+try:
+    from reddit_story_mode import story_generator as reddit_stories
+    from reddit_story_mode import orchestrator as reddit_orchestrator
+except Exception:  # keep the main app working even if the optional mode fails to import
+    reddit_stories = None
+    reddit_orchestrator = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -52,6 +58,7 @@ UI_TEXT_DEFAULTS = {
     "clip_source": "generate",
     "scrape_platforms": "tiktok",
     "scrape_terms": "",
+    "background_music_choice": "none",
     "script_relevancy": "70",
     "scrape_cookies": "",
     "scrape_cookies_file": "",
@@ -735,6 +742,17 @@ def app_style():
       #wiz-back-btn { right: 100%; margin-right: 16px; }   /* just left of the menu column, top corner */
       #wiz-cont-btn { left: 100%; margin-left: 16px; }     /* just right of it, top corner */
       .wiz-topnav .wiz-back-btn[data-hidden="1"] { visibility: hidden; }
+      /* ===== Mode-selection menu (step 0) ===== */
+      .wiz-modemenu { max-width: 720px; margin: 8px auto 0; }
+      .modemenu-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; text-align: left; width: 100%; min-height: 150px; padding: 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
+      .modemenu-card::after { display: none; }
+      .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
+      .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
+      .modemenu-card .mm-ico { font-size: 28px; line-height: 1; }
+      .modemenu-card .mm-title { font-family: var(--display); font-size: 15px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; }
+      .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.5; }
+      @media (max-width: 640px) { .modemenu-cards { grid-template-columns: 1fr; } }
       @media (max-width: 1120px) {
         /* not enough side room: pin to the bottom corners instead */
         .wiz-topnav .button { position: fixed; top: auto; bottom: 16px; transform: none; }
@@ -857,6 +875,12 @@ def app_style():
       @keyframes ttpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
       .tt-btn { margin-left: auto; }
       .tt-btn:disabled { opacity: .55; cursor: default; }
+      .bgm-pick { margin: 8px 0 4px; }
+      .bgm-row { display: flex; align-items: center; gap: 8px; }
+      .bgm-row select { flex: 1; min-width: 0; }
+      .bgm-play { width: 26px; height: 26px; min-width: 26px; padding: 0; flex: 0 0 auto; font-size: 10px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+      .bgm-play::after { display: none; }
+      .bgm-play:disabled { opacity: .5; cursor: default; }
       input[type="range"] {
         -webkit-appearance: none; appearance: none; width: 100%; height: 8px; padding: 0; margin: 6px 0 2px;
         background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: 999px; box-shadow: none; cursor: pointer;
@@ -1045,7 +1069,7 @@ def app_style():
       .progress-current { color: rgba(255,255,255,.78); font-weight: 600; font-size: 13px; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .job-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; margin-top: 16px; }
       .job-layout > .panel, .job-layout > aside { min-height: min(76vh, 860px); min-width: 0; }
-      .log-box { height: calc(min(78vh, 900px) - 70px); max-height: none; overflow: auto; font-size: 13px; }
+      .log-box { height: calc(min(78vh, 900px) - 70px); max-height: none; overflow: auto; font-size: 13px; color: var(--text); }
       .preview-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
       .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); transition: transform .18s ease, filter .18s ease; }
       .preview:hover img { transform: scale(1.012); filter: contrast(1.04) saturate(1.02); }
@@ -1263,9 +1287,12 @@ def app_script():
         // ===== Onboarding wizard: headline types, then script -> visual -> voice+speaker -> main =====
         var WIZ_INTRO = "What are we creating today\\u2026?";
         var wizCur = null;
+        // Step 0 = mode menu. Visuals-From-Script flow SKIPS the Visual Direction step (2):
+        // script (1) -> voice/speaker (3) -> create (4). The voice script is the visual authority.
+        var WIZ_STEPS = [1, 3, 4];
         function wizGoto(step) {
           var hl = document.getElementById("wiz-headline");
-          if (hl) hl.style.display = (step === 1) ? "" : "none";   // headline only over the script step
+          if (hl) hl.style.display = (step === 0) ? "" : "none";   // "What are we creating today?" sits over the mode menu
           Array.prototype.forEach.call(document.querySelectorAll("[data-step]"), function (el) {
             var s = parseInt(el.getAttribute("data-step"), 10);
             if (s === step) { el.style.display = ""; el.classList.remove("wiz-anim"); void el.offsetWidth; el.classList.add("wiz-anim"); }
@@ -1275,14 +1302,20 @@ def app_script():
           var tn = document.getElementById("wiz-topnav");
           var bb = document.getElementById("wiz-back-btn");
           var cc = document.getElementById("wiz-cont-btn");
-          if (tn) tn.style.display = (step >= 1 && step <= 4) ? "block" : "none";   // Back also shows on the main create step
-          if (bb) bb.setAttribute("data-hidden", step <= 1 ? "1" : "0");            // no Back on the first step
-          if (cc) cc.style.display = (step >= 4) ? "none" : "";                     // no Continue on the main create step
+          var inFlow = WIZ_STEPS.indexOf(step) !== -1;
+          if (tn) tn.style.display = inFlow ? "block" : "none";                       // no topnav on the mode menu
+          if (bb) bb.setAttribute("data-hidden", "0");                               // Back always available (first step -> mode menu)
+          if (cc) cc.style.display = (step === WIZ_STEPS[WIZ_STEPS.length - 1]) ? "none" : "";  // no Continue on the create step
           try { if (typeof playClick === "function") playClick(); } catch (e) {}
           try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) { window.scrollTo(0, 0); }
         }
-        window.wizNext = function () { wizGoto((wizCur == null ? 1 : wizCur) + 1); };
-        window.wizBack = function () { wizGoto(Math.max(1, (wizCur == null ? 1 : wizCur) - 1)); };
+        window.wizNext = function () { var i = WIZ_STEPS.indexOf(wizCur); if (i === -1) i = 0; wizGoto(WIZ_STEPS[Math.min(WIZ_STEPS.length - 1, i + 1)]); };
+        window.wizBack = function () { var i = WIZ_STEPS.indexOf(wizCur); if (i <= 0) { wizGoto(0); return; } wizGoto(WIZ_STEPS[i - 1]); };
+        window.selectMode = function (mode) {
+          try { if (typeof playClick === "function") playClick(); } catch (e) {}
+          if (mode === "reddit") { window.location.href = "/reddit"; return; }
+          wizGoto(1);   // Visuals From Script -> existing script workflow
+        };
         function wizTypeIntro(cb) {
           var el = document.getElementById("wiz-type"); if (!el) { if (cb) cb(); return; }
           var i = 0; el.textContent = "";
@@ -1319,7 +1352,7 @@ def app_script():
             if (started) return; started = true;
             EVT.forEach(function (e) { window.removeEventListener(e, startIntro, true); });
             try { uiCtx(); } catch (e) {}
-            wizTypeIntro(function () { setTimeout(function () { wizGoto(1); }, 500); });
+            wizTypeIntro(function () { setTimeout(function () { wizGoto(0); }, 500); });   // -> mode menu
           }
           EVT.forEach(function (e) { window.addEventListener(e, startIntro, true); });
           setTimeout(startIntro, 4000);
@@ -1521,6 +1554,41 @@ def app_script():
           window.connectTikTok = connectTikTok;
           window.ttPoll = ttPoll;
           window.ttRender = ttRender;
+          // ---- Background music picker + preview ----
+          window.bgmInit = function () {
+            var sel = document.getElementById("bgm-select");
+            if (!sel) return;
+            fetch("/music-list").then(function (r) { return r.json(); }).then(function (d) {
+              (d && d.tracks || []).forEach(function (t) {
+                var o = document.createElement("option");
+                o.value = t.file; o.textContent = t.name; o.setAttribute("data-url", t.url);
+                sel.appendChild(o);
+              });
+              if (window.BGM_SAVED && window.BGM_SAVED !== "none") { sel.value = window.BGM_SAVED; }
+              window.bgmOnChange();
+            }).catch(function () {});
+          };
+          window.bgmOnChange = function () {
+            var sel = document.getElementById("bgm-select"), play = document.getElementById("bgm-play"),
+                au = document.getElementById("bgm-audio");
+            if (!sel) return;
+            var opt = sel.options[sel.selectedIndex];
+            var url = opt ? opt.getAttribute("data-url") : null;
+            if (play) play.disabled = !url;
+            if (au) { au.pause(); }
+            if (play) play.innerHTML = "\\u25B6";
+          };
+          window.bgmPreview = function () {
+            var sel = document.getElementById("bgm-select"), play = document.getElementById("bgm-play"),
+                au = document.getElementById("bgm-audio");
+            var opt = sel.options[sel.selectedIndex];
+            var url = opt ? opt.getAttribute("data-url") : null;
+            if (!url || !au) return;
+            if (au.paused) {
+              au.src = url; au.play().catch(function () {}); if (play) play.innerHTML = "\\u275A\\u275A";
+              au.onended = function () { if (play) play.innerHTML = "\\u25B6"; };
+            } else { au.pause(); if (play) play.innerHTML = "\\u25B6"; }
+          };
           function clearProjectMedia() {
             if (mediaBox) mediaBox.innerHTML = "";
             var mediaHint = document.getElementById("project-media-hint");
@@ -1775,7 +1843,7 @@ def app_script():
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
           window.onClipToggle = function (cb) { window.setClipSource(cb.checked ? "scrape" : "generate"); };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","collaborative_reasoning","clip_source","scrape_platforms","script_relevancy","scrape_terms"];
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","collaborative_reasoning","clip_source","scrape_platforms","script_relevancy","scrape_terms","background_music_choice"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -2149,6 +2217,7 @@ def app_script():
           stickLogToBottom();
           setupFormAutosave();
           setupProjectLoader();
+          if (typeof window.bgmInit === "function") window.bgmInit();
           setupMediaTabs(document);
           setupReplacementForms(document);
           setupUiSounds();
@@ -2301,6 +2370,21 @@ def form_page(clear=False, open_load=False, load_slug=""):
         </div>
         <div id="wiz-headline" class="wiz-headline"><span class="wiz-type" id="wiz-type" aria-live="polite"></span></div>
 
+      <div class="wiz-modemenu" id="wiz-modemenu" data-step="0" style="display:none;">
+        <div class="modemenu-cards">
+          <button type="button" class="modemenu-card" onclick="selectMode('visuals')">
+            <span class="mm-ico">&#127916;</span>
+            <span class="mm-title">Visuals From Script</span>
+            <span class="mm-desc">Create a full visual video from a voice script using the existing app pipeline.</span>
+          </button>
+          <button type="button" class="modemenu-card" onclick="selectMode('reddit')">
+            <span class="mm-ico">&#128172;</span>
+            <span class="mm-title">Reddit Story Mode</span>
+            <span class="mm-desc">Generate a Reddit-style story video with Minecraft parkour background and AI voiceover.</span>
+          </button>
+        </div>
+      </div>
+
       <div class="create-bar panel" data-step="4">
         <div class="cbar-row cbar-top">
           <div class="cbar-cell preset-cell">
@@ -2370,7 +2454,17 @@ def form_page(clear=False, open_load=False, load_slug=""):
               {help_tip("Scraping downloads real TikTok clips using YOUR own logged-in TikTok account - no API key. Click Connect, a browser window opens, log in to TikTok once, and the session is saved for future runs. Modern Chrome encrypts its cookies (DPAPI), so this dedicated login is required.")}
             </div>
             {('' if tiktok_avail else '<div class="apify-off">&#9888; Browser engine missing. Run: pip install playwright &amp;&amp; playwright install chromium</div>')}
-            <script>window.APIFY_READY = {apify_ready_js}; window.TIKTOK_READY = {tiktok_ready_js}; window.TIKTOK_AVAIL = {'true' if tiktok_avail else 'false'};</script>
+            <div class="bgm-pick" id="bgm-pick">
+              <label class="scrape-lbl">Background music {help_tip("Optional. Pick a track to play as a soft bed under the voice (like the reference channel). Press the play button to preview it before you generate. Leave on 'None' for voice + SFX only.")}</label>
+              <div class="bgm-row">
+                <select name="background_music_choice" id="bgm-select" onchange="bgmOnChange()">
+                  <option value="none">None (voice + SFX only)</option>
+                </select>
+                <button type="button" class="button secondary bgm-play" id="bgm-play" onclick="bgmPreview()" title="Preview" disabled>&#9654;</button>
+              </div>
+              <audio id="bgm-audio" preload="none"></audio>
+            </div>
+            <script>window.APIFY_READY = {apify_ready_js}; window.TIKTOK_READY = {tiktok_ready_js}; window.TIKTOK_AVAIL = {'true' if tiktok_avail else 'false'}; window.BGM_SAVED = {json.dumps(esc(state.get('background_music_choice') or 'none'))};</script>
           </div>
         </div>
 
@@ -4636,6 +4730,158 @@ def start_timeline_job(slug, edits):
     return job_id
 
 
+# ============================ Reddit Story Mode ============================
+REDDIT_STORY_DIR = ROOT / "outputs" / "reddit_story"
+REDDIT_SESSION_FILE = REDDIT_STORY_DIR / "session_stories.json"
+
+REDDIT_PAGE_HTML = """
+<style>
+  .rs-wrap { max-width: 900px; margin: 0 auto; }
+  .rs-hero { text-align:center; padding: 10px 6px 4px; }
+  .rs-hero h1 { margin: 0 0 6px; }
+  .rs-hero p { color: var(--muted); font-weight:600; margin: 0 0 16px; }
+  .rs-find { width:auto; min-width:0; padding:12px 26px; font-size:15px; }
+  .rs-status { text-align:center; color:var(--muted); font-weight:600; margin:12px 0; min-height:20px; }
+  .rs-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:16px; margin-top:14px; }
+  .rs-card { display:flex; flex-direction:column; gap:8px; padding:16px; background:var(--bg-raised); border:1px solid var(--line-strong); border-radius:var(--r-md); box-shadow:var(--sh-1); }
+  .rs-card h3 { margin:0; font-size:16px; color:var(--text); }
+  .rs-hook { font-weight:700; color:var(--accent); font-size:13px; }
+  .rs-summary { color:var(--muted); font-size:12.5px; flex:1; }
+  .rs-meta { display:flex; align-items:center; justify-content:space-between; font-size:11.5px; color:var(--faint); font-weight:700; }
+  .rs-flag { color:var(--accent-2); }
+  .rs-use { width:100%; margin-top:6px; }
+</style>
+<div class="rs-wrap">
+  <div class="rs-hero">
+    <h1>&#128172; Reddit Story Mode</h1>
+    <p>Original Reddit-style story narrated over Minecraft parkour. No captions, no overlays &mdash; just voice + gameplay.</p>
+    <button type="button" class="button primary rs-find" id="rs-find">&#128269; Find 5 Stories</button>
+  </div>
+  <div class="rs-status" id="rs-status"></div>
+  <div class="rs-cards" id="rs-cards"></div>
+</div>
+<script>
+(function(){
+  var findBtn=document.getElementById('rs-find');
+  var statusEl=document.getElementById('rs-status');
+  var cardsEl=document.getElementById('rs-cards');
+  function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function fmtDur(s){ s=parseInt(s||0,10); var m=Math.floor(s/60), r=s%60; return m+':'+(r<10?'0':'')+r; }
+  function setStatus(t){ statusEl.textContent=t||''; }
+  function renderCards(stories){
+    cardsEl.innerHTML='';
+    (stories||[]).forEach(function(s){
+      var c=document.createElement('div'); c.className='rs-card';
+      var flags=(s.risk_flags&&s.risk_flags.length)?('<span class="rs-flag">&#9888; '+esc(s.risk_flags.join(', '))+'</span>'):'';
+      c.innerHTML='<h3>'+esc(s.title)+'</h3>'
+        +'<div class="rs-hook">'+esc(s.hook)+'</div>'
+        +'<div class="rs-summary">'+esc(s.summary)+'</div>'
+        +'<div class="rs-meta"><span>&#9201; ~'+fmtDur(s.estimated_duration_sec)+'</span>'+flags+'</div>'
+        +'<button type="button" class="button rs-use">Use This Story</button>';
+      c.querySelector('.rs-use').addEventListener('click', function(){ useStory(s.id, this); });
+      cardsEl.appendChild(c);
+    });
+  }
+  function discover(){
+    findBtn.disabled=true; cardsEl.innerHTML=''; setStatus('Writing 5 original stories\\u2026 (this can take ~20s)');
+    fetch('/reddit-discover',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+      findBtn.disabled=false;
+      if(d&&d.stories&&d.stories.length){ setStatus('Pick a story to generate.'); renderCards(d.stories); }
+      else { setStatus((d&&d.error)||'Could not generate stories.'); }
+    }).catch(function(){ findBtn.disabled=false; setStatus('Could not generate stories (network error).'); });
+  }
+  function useStory(id, btn){
+    if(btn){ btn.disabled=true; btn.textContent='Starting\\u2026'; }
+    setStatus('Starting generation\\u2026');
+    fetch('/reddit-generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({story_id:id})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d&&d.job){ window.location.href=d.job; }
+        else { if(btn){ btn.disabled=false; btn.textContent='Use This Story'; } setStatus((d&&d.error)||'Could not start generation.'); }
+      }).catch(function(){ if(btn){ btn.disabled=false; btn.textContent='Use This Story'; } setStatus('Could not start generation.'); });
+  }
+  findBtn.addEventListener('click', discover);
+})();
+</script>
+"""
+
+
+def reddit_discover_stories():
+    """Generate 5 safe story candidates, persist them for this session, return the list."""
+    if reddit_stories is None:
+        raise RuntimeError("Reddit Story Mode is unavailable (module failed to import).")
+    stories = reddit_stories.generate_stories(status_cb=lambda m: print("[reddit]", m))
+    REDDIT_STORY_DIR.mkdir(parents=True, exist_ok=True)
+    REDDIT_SESSION_FILE.write_text(
+        json.dumps({"stories": stories, "at": time.time()}, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    return stories
+
+
+def reddit_story_by_id(story_id):
+    try:
+        data = json.loads(REDDIT_SESSION_FILE.read_text("utf-8"))
+        for s in data.get("stories", []):
+            if str(s.get("id")) == str(story_id):
+                return s
+    except Exception:
+        pass
+    return None
+
+
+def start_reddit_job(story):
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": [f"Queued Reddit Story: {story.get('title', 'story')}."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "reddit",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            result = reddit_orchestrator.run_story_job(
+                story, job_id, status_cb=status_cb, cancel_event=cancel_event)
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = result
+        except (RunCancelled, pipeline.PipelineCancelled):
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def reddit_page():
+    header = brand_header(back=True)
+    avail = reddit_stories is not None
+    warn = "" if avail else ('<section class="panel"><div class="apify-off">&#9888; Reddit Story Mode '
+                             'module failed to import; check the server console.</div></section>')
+    body = header + warn + REDDIT_PAGE_HTML
+    return page("Reddit Story Mode", body)
+
+
 def timeline_page(slug):
     project_dir = safe_project_dir(slug)
     if not project_dir:
@@ -4791,6 +5037,19 @@ def job_status_payload(job_id):
         "media_html": render_media_replacer(job_id, job),
     }
     return json.dumps(payload).encode("utf-8")
+
+
+def music_list_payload():
+    """List the background-music tracks (from the 'background music' folder) for the picker,
+    each with a /file URL so the browser can preview it."""
+    tracks = []
+    try:
+        for path in pipeline.background_music_files({}):
+            tracks.append({"name": path.stem.replace("_", " "), "file": path.name,
+                           "url": link_for(path)})
+    except Exception:
+        pass
+    return json.dumps({"tracks": tracks}).encode("utf-8")
 
 
 def tiktok_status_payload():
@@ -5086,6 +5345,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.send_bytes(json.dumps(timeline_library_payload(slug)).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/music-list":
+            self.send_bytes(music_list_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/reddit":
+            self.send_bytes(reddit_page())
         elif parsed.path == "/tiktok-status":
             self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/job":
@@ -5116,6 +5379,43 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/reddit-discover":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            try:
+                stories = reddit_discover_stories()
+                self.send_bytes(json.dumps({"stories": stories}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self.send_bytes(json.dumps({"error": str(exc)}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            return
+        if parsed.path == "/reddit-generate":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b"{}"
+                data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception:
+                data = {}
+            story = data.get("story") if isinstance(data.get("story"), dict) else None
+            if not story and data.get("story_id"):
+                story = reddit_story_by_id(data.get("story_id"))
+            if not story:
+                self.send_bytes(json.dumps({"error": "Story not found; click Find 5 Stories again."}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+                return
+            if reddit_orchestrator is None:
+                self.send_bytes(json.dumps({"error": "Reddit Story Mode is unavailable."}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+                return
+            job_id = start_reddit_job(story)
+            self.send_bytes(json.dumps({"job": f"/job?id={job_id}", "job_id": job_id}).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/tiktok-login":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

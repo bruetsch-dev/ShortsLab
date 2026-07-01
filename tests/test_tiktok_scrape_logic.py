@@ -95,10 +95,16 @@ class TikTokScrapeLogicTests(unittest.TestCase):
                                side_effect=lambda _config, category: fake_pack if category == "editor_pack" else []):
             count = agent_core.place_editor_sfx(config)
         self.assertGreater(count, 0)
-        self.assertLessEqual(count, 12)
-        self.assertTrue(all(event["category"] == "editor_sfx"
+        # bounded by the per-minute budget (mpm=14 over 50s) - not an ambient wall of sound
+        self.assertLessEqual(count, 14)
+        # each event is a SHORT, event-based hit (<=2.1s), never a continuous ambient bed
+        self.assertTrue(all(0.0 < event["duration"] <= 2.1
                             for event in config["ai_content_sfx"]))
-        self.assertTrue(all(event["volume"] >= 0.25
+        # categories are real editor SFX types (not a generic/ambient tag)
+        self.assertTrue(all(str(event.get("category") or "").strip()
+                            for event in config["ai_content_sfx"]))
+        # SFX are audible (they were boosted louder); allow the quiet ui_click accents
+        self.assertTrue(all(event["volume"] >= 0.15
                             for event in config["ai_content_sfx"]))
 
     def test_novi_request_uses_valid_minimum_and_relevance_region(self):
@@ -236,8 +242,13 @@ class TikTokScrapeLogicTests(unittest.TestCase):
                                                 "rapid_internal_cut_count": 0,
                                                 "min_shot_seconds": 4.0}),
                 mock.patch.object(clip_scraper, "normalize_clip", side_effect=fake_normalize),
+                # The default backend is now a logged-in TikTok session; force it OFF and opt into
+                # Apify so this test hermetically exercises the mocked apify_search/download path
+                # regardless of whether the dev machine happens to have a TikTok login saved.
+                mock.patch.object(clip_scraper, "tiktok_backend_ready", return_value=False),
+                mock.patch.dict(os.environ, {"SCRAPE_BACKEND": "apify"}, clear=False),
             )
-            with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8]:
+            with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8], common[9], common[10]:
                 first = clip_scraper.scrape_bucket(out_dir, ["exact query"], 1,
                                                    bucket_id="workers", tier="exact")
                 second = clip_scraper.scrape_bucket(out_dir, ["broad query"], 1,

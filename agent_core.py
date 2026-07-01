@@ -2349,8 +2349,12 @@ def adaptive_script_match_threshold(script_relevancy, attempt=0):
         attempt = max(0, int(attempt))
     except (TypeError, ValueError):
         attempt = 0
-    base = 5.5 + 1.9 * (relevancy / 100.0)
-    return round(max(4.5, base - attempt), 1)
+    # Start lower so thematically-coherent contextual b-roll can carry ESSAY/abstract narration
+    # (e.g. "you, they usually say it directly.") instead of the matcher rejecting every good clip
+    # as "doesn't literally depict this fragment" and ending with 0 matches. Quality gates (captions,
+    # off-topic D_REJECTED, unusable) still apply - this only relaxes literal-depiction strictness.
+    base = 4.6 + 1.7 * (relevancy / 100.0)
+    return round(max(4.0, base - attempt), 1)
 
 
 def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None, understanding=None):
@@ -2487,15 +2491,22 @@ SOCIAL_SYNONYM_MAP = {
 
 # Hook = a high-engagement, playful Japanese creator clip: dancing, cute gestures, or an
 # expressive camera-facing performance in the Miyu Kishi / Saaki-Sakii reference style.
+# Lead with GENERIC/varied queries (scrape_bucket's diversity slots take the first ~3-6, so leading
+# with generic terms keeps the hook pool from being just 2 creators). A few well-known creators are
+# interleaved for the reference energy, but the bulk is broad "cute Japanese dance/POV girl" queries.
 HOOK_PRESENTER_QUERIES = {
-    "exact": ["岸みゆ TikTok ダンス", "Miyu Kishi ダンス", "sakii_0405_ ダンス", "Saaki TikTok ダンス",
-              "日本人女子 ダンス 可愛い", "踊ってみた 女子", "カメラ目線 可愛い仕草 女子"],
+    "exact": ["日本人女子 ダンス 可愛い", "踊ってみた 女子 かわいい", "JK ダンス TikTok",
+              "あざと可愛い ダンス 女子", "女子高生 踊ってみた", "カメラ目線 可愛い仕草 女子",
+              "日本 女の子 ダンス 笑顔", "ゆるめ ダンス 女子", "可愛い 踊ってみた おすすめ",
+              "岸みゆ ダンス", "sakii_0405_ ダンス", "なえなの ダンス", "景井ひな ダンス"],
     "social": ["アイドル ダンス TikTok", "女子 可愛いダンス", "日本人女子 踊ってみた",
-               "あざと可愛い 女子", "カメラ目線 可愛い", "笑顔 ダンス 女子"],
-    "hashtag": ["#岸みゆ", "#踊ってみた", "#ダンス女子", "#あざと可愛い", "#アイドル",
-                "#可愛い", "#おすすめ", "#日本人女性"],
-    "english": ["Miyu Kishi TikTok dance", "Saaki Sakii Japanese creator dance",
-                "cute Japanese creator dancing", "Japanese idol playful TikTok dance"],
+               "あざと可愛い 女子", "カメラ目線 可愛い", "笑顔 ダンス 女子", "JD ダンス 可愛い",
+               "TikToker 女子 ダンス", "제이케이 댄스"],
+    "hashtag": ["#踊ってみた", "#ダンス女子", "#あざと可愛い", "#可愛い", "#おすすめ",
+                "#日本人女性", "#jkダンス", "#ダンス好きな人と繋がりたい", "#女の子"],
+    "english": ["cute Japanese creator dancing", "Japanese idol playful TikTok dance",
+                "kawaii Japanese girl dance TikTok", "Japanese TikToker dance to camera",
+                "Miyu Kishi TikTok dance"],
 }
 HOOK_MIN_LIKES = 20_000
 HOOK_PRESENTER_TARGET = ("young adult Japanese female creator with at least 20,000 likes on the source video, "
@@ -3981,9 +3992,12 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             "commute / late-night office); 'B_MATCH' = strong social-context match (expensive love -> couple on a "
             "date / paying a bill / shopping date / creator discussing dating money); 'C_MATCH' = "
             "emotional/atmospheric match (loneliness -> person alone in Tokyo night / small apartment / solo meal); "
-            "'D_REJECTED' = generic Japan b-roll or only weakly related (random Shibuya street for a specific claim). "
-            "Specific factual/claim lines need A_MATCH or B_MATCH; abstract/emotional lines may use B or C; "
-            "D_REJECTED must NOT be used to fill a specific scene.\n"
+            "'D_REJECTED' = OFF-TOPIC or contradictory footage (a random book cover / unrelated product for this "
+            "topic), NOT merely 'doesn't literally show the noun'. "
+            "Specific factual/claim lines prefer A_MATCH or B_MATCH; ABSTRACT or essay lines (a sentence fragment / "
+            "continuation / feeling with no concrete subject, e.g. \"you, they usually say it directly.\") should accept "
+            "a topically-coherent C_MATCH clip - that is the CORRECT choice, do NOT mark it D_REJECTED just because it "
+            "doesn't depict the fragment. Only use D_REJECTED for genuinely off-topic/misleading/unusable footage.\n"
             "  style_match (0-10): visual quality/vibe fit.\n"
             "  passes (bool): would a viewer understand WHY this clip plays during this sentence, AND is the clip "
             "clean (not UNUSABLE)?\n"
@@ -4008,7 +4022,12 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             'generic if applicable"}]}, "1": {...}, ...}} - one entry per scene index.'
         )
         messages = [
-            {"role": "system", "content": "You are a strict footage QA + editor. You only let a clip play under a narration line when it genuinely DEPICTS that line; otherwise you mark it for a fallback. Return JSON only."},
+            {"role": "system", "content": "You are a footage QA + editor for viral TikTok-style essays. A clip may play "
+             "under a narration line when it genuinely FITS that line: either by DEPICTING it (concrete lines with a clear "
+             "subject) OR by matching its TOPIC and MOOD (abstract/essay lines - a sentence fragment or feeling). Real "
+             "TikTok essays run coherent b-roll under abstract narration; that is CORRECT, not filler. Reject ONLY footage "
+             "that is off-topic/contradictory, has burned-in creator captions/text, is a screenshot/livestream/slideshow, "
+             "or is otherwise unusable. Return JSON only."},
             {"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
@@ -4494,6 +4513,30 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         j = rot.get(cat, 0); rot[cat] = j + 1
         return files[j % len(files)]
 
+    # VARIETY: normal cuts must NOT all be the same whoosh. Build a rotation across every cut-worthy
+    # category the user's library actually has (whooshes weighted higher, but pops/dings/flashes/
+    # clicks interleaved) so consecutive cuts sound different even when a category has one file.
+    _CUT_WEIGHTS = [("swipe_whoosh", 2), ("bright_whoosh", 2), ("whoosh_hit_combo", 1),
+                    ("caption_pop", 2), ("notification_ding", 1), ("camera_flash", 1),
+                    ("idea_reveal", 1), ("flash_blink", 1), ("ui_click", 1)]
+    cut_rotation = []
+    for _cat, _w in _CUT_WEIGHTS:
+        if lib.get(_cat):
+            cut_rotation.extend([_cat] * _w)
+    cut_ctr = {"i": 0}
+
+    def next_cut_cat(preferred=None):
+        """Pick the next cut sound: honor a specific preferred category if present, else round-robin
+        the weighted rotation so we cycle through ALL available cut sounds instead of one whoosh."""
+        if preferred and lib.get(preferred):
+            return preferred
+        if not cut_rotation:
+            return "bright_whoosh" if lib.get("bright_whoosh") else (
+                "swipe_whoosh" if lib.get("swipe_whoosh") else None)
+        cat = cut_rotation[cut_ctr["i"] % len(cut_rotation)]
+        cut_ctr["i"] += 1
+        return cat
+
     full = " ".join(str(s.get("exact_voice_text") or s.get("voice_line") or s.get("script") or "")
                     for s in scenes).lower()
     topic_money = any(w in full for w in ("money", "cost", "expensiv", "cheap", "afford", "price",
@@ -4575,11 +4618,10 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                 cat, reason, loud = "impact_hit", ("major_reveal" if beat in ("reveal", "shock", "turning_point") else "shocking_word"), True
             t = start
         else:
-            # every normal cut gets a WHOOSH (whoosh-dominant, reference style); a callout on this
-            # scene gets a separate quick click layered on the callout pop below.
-            cat = "swipe_whoosh" if link_visual in ("subtle_swipe", "glitch", "whoosh") else "bright_whoosh"
-            if not lib.get(cat):
-                cat = "bright_whoosh" if lib.get("bright_whoosh") else "swipe_whoosh"
+            # normal cut: rotate through the whole cut-sound family so it's never 14x the same
+            # whoosh. A swipe-flavored transition still prefers a swipe; everything else round-robins.
+            pref = "swipe_whoosh" if link_visual in ("subtle_swipe", "glitch", "whoosh") else None
+            cat = next_cut_cat(preferred=pref)
 
         # topic accent (only when the line actually names the topic; capped 3 each)
         if reason in ("visual_callout", "clip_cut"):
@@ -4607,9 +4649,17 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         rec = rec_by_path.get(path, {})
         db = sfx_library.CAT_DB.get(cat, -18)
         vol = round(min(0.85, sfx_library.db_to_gain(db)), 3)
-        dur = float(rec.get("trim_len") or 0.9)
+        # Editor SFX must be SHORT punchy HITS, not long swooshes. A 1.2s whoosh every ~1.9s covers
+        # ~40% of the video with filtered noise and reads as a continuous "Rauschen". Hard-cap the
+        # PLAYED length per family so each is a quick transient with clear air between them.
+        _MAX_DUR = {"bright_whoosh": 0.42, "swipe_whoosh": 0.42, "whoosh_hit_combo": 0.5,
+                    "caption_pop": 0.28, "ui_click": 0.22, "notification_ding": 0.5,
+                    "idea_reveal": 0.6, "camera_flash": 0.35, "flash_blink": 0.3,
+                    "impact_hit": 0.55, "low_impact": 0.7,
+                    "payment_ding": 0.6, "school_bell": 0.7, "message_sent": 0.5}
+        dur = min(float(rec.get("trim_len") or 0.9), _MAX_DUR.get(cat, 0.45))
         events.append({"path": str(path), "start": round(t, 3),
-                       "duration": round(min(2.0, dur) + 0.04, 3), "volume": vol,
+                       "duration": round(dur + 0.02, 3), "volume": vol,
                        "category": cat, "id": f"sfx-{len(events):02d}", "sfx_type": cat})
         if loud:
             last_loud = t
@@ -7290,6 +7340,17 @@ def run_project(form, status_cb=None):
                     unmatched = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
                     if not unmatched:
                         break
+                    # ANTI-TIMEOUT: abstract narration ("the quiet ways friendship is shown") rarely
+                    # matches concrete b-roll, so re-searching + re-scoring the whole pool again just
+                    # burns minutes (each pass is expensive) and used to hit the 45-min watchdog with
+                    # 0 clips. If the pool is already large, stop re-searching and let the fast
+                    # continuity fallback below fill the scenes from the clean pool.
+                    _matched_so_far = sum(1 for i, c in enumerate(scene_clips) if i > 0 and c is not None)
+                    if len(body_pool) >= scene_total and _matched_so_far == 0:
+                        log(status_cb, f"Pool already has {len(body_pool)} clean clips but abstract "
+                                       "narration isn't matching concrete footage; skipping further "
+                                       "re-search and using continuity fill (no 45-min re-scoring).")
+                        break
                     current_match_threshold = adaptive_script_match_threshold(script_relevancy, rnd)
                     lines = [(scene_text_for_planning(scenes_override[i]) or scenes_override[i].get("script", ""))
                              for i in unmatched]
@@ -7339,8 +7400,11 @@ def run_project(form, status_cb=None):
 
                 # One final no-download relaxation pass. This is cheaper than a fourth search and
                 # lets clean contextual C_MATCH footage carry abstract/compound narration lines.
+                # Skip it entirely when NOTHING has matched and the pool is already large - another
+                # full re-score would just burn minutes for 0 gain; the continuity fill covers it.
                 remaining_body = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
-                if remaining_body and body_pool:
+                _any_matched = any(c is not None for i, c in enumerate(scene_clips) if i > 0)
+                if remaining_body and body_pool and not (not _any_matched and len(body_pool) >= scene_total):
                     current_match_threshold = adaptive_script_match_threshold(
                         script_relevancy, MAX_SCRAPE_ROUNDS)
                     log(status_cb, f"Final semantic fallback: re-scoring {len(remaining_body)} unmatched "
@@ -7546,6 +7610,56 @@ def run_project(form, status_cb=None):
                       "hook_presenter_score", "reason")}
                     for d in clip_decision_log if isinstance(d, dict)],
             }
+
+            # FINAL CLEAN-UP PASS (captions + no-repeat): the LLM vision matcher can still let a
+            # captioned clip through, and the continuity fallback can hand the SAME clip to two
+            # scenes when the clean pool is small. Re-measure burned-in text on every chosen clip and
+            # swap (a) any clip that STILL shows captions and (b) any NON-ADJACENT duplicate, always
+            # preferring an unused, caption-free pool clip. Adjacent visual holds are preserved.
+            _ff_cap, _ = clip_scraper._ffmpeg_tools()
+            _cap_cache = {}
+
+            def _cap_score(_c):
+                _k = str(Path(_c).resolve())
+                if _k not in _cap_cache:
+                    try:
+                        _cap_cache[_k] = clip_scraper.text_heaviness_score(Path(_c), _ff_cap, per_clip)
+                    except Exception:
+                        _cap_cache[_k] = 0.0
+                return _cap_cache[_k]
+
+            _CAP_MAX = 2.8
+            _used_keys = set()
+            _prev_key = None
+            _swaps = 0
+            _cap_swaps = 0
+            for _idx in range(len(scene_clips)):
+                _clip = scene_clips[_idx]
+                if _clip is None:
+                    _prev_key = None
+                    continue
+                _key = str(Path(_clip).resolve())
+                _is_dup = _key in _used_keys and _key != _prev_key
+                _is_capt = _cap_score(_clip) > _CAP_MAX
+                if _is_dup or _is_capt:
+                    _cand = [p for p in fallback_pool if str(Path(p).resolve()) not in _used_keys]
+                    _clean = [p for p in _cand if _cap_score(p) <= _CAP_MAX]
+                    # prefer an unused caption-free clip; for a pure duplicate any unused clip helps
+                    _repl = _least_used(_clean) if _clean else (_least_used(_cand) if (_cand and _is_dup) else None)
+                    if _repl is not None:
+                        scene_clips[_idx] = _repl
+                        if _is_capt and _cap_score(_repl) <= _CAP_MAX:
+                            _cap_swaps += 1
+                        elif _is_dup:
+                            _swaps += 1
+                        _key = str(Path(_repl).resolve())
+                        if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
+                            clip_decision_log[_idx]["cleanup_swapped"] = True
+                _used_keys.add(_key)
+                _prev_key = _key
+            if _swaps or _cap_swaps:
+                log(status_cb, f"Final clean-up: swapped {_cap_swaps} captioned + {_swaps} duplicate "
+                               "clip(s) for clean unused footage.")
 
             # Place only clips that passed semantic matching for this exact scene.  The previous
             # reuse cycle filled rejected scenes with an unrelated clip accepted for a different
@@ -7753,11 +7867,22 @@ def run_project(form, status_cb=None):
     # cheap on found-footage. Force transition SFX off for video; keep content/ambient SFX.
     # Also never use the TikTok clips' own audio (only narration + ambient SFX + music).
     if clip_source == "scrape":
-        # Scrape references are voice + discrete editorial hits. A continuous suspense/ambient
-        # bed masks those hits and was the "annoying ambient sound" heard in failed renders.
-        background_music_enabled = False
-        config["background_music_enabled"] = False
-        config["background_music_user_enabled"] = False
+        # Background music in scrape mode is now the USER'S CHOICE (music picker). When they pick a
+        # track it plays as a ducked bed under the voice (like the reference channel); otherwise no
+        # bed (the old default) so nothing masks the editorial SFX hits.
+        _bg_choice = (str(form.get("background_music_choice") or "").strip()
+                      if isinstance(form, dict) else "")
+        _bg_on = bool(_bg_choice) and _bg_choice.lower() not in ("none", "off", "auto_none", "")
+        if _bg_on:
+            background_music_enabled = True
+            config["background_music_enabled"] = True
+            config["background_music_user_enabled"] = True
+            config["background_music_file"] = _bg_choice
+            log(status_cb, f"Background music: '{_bg_choice}' as a ducked bed under the voice.")
+        else:
+            background_music_enabled = False
+            config["background_music_enabled"] = False
+            config["background_music_user_enabled"] = False
         config["transition_sfx_enabled"] = False
         config["sfx_enabled"] = bool(out_sfx)
         # Reference edits use SHORT, real edited hits only - never a synthesized ambient bed and
@@ -7779,9 +7904,14 @@ def run_project(form, status_cb=None):
         config["editor_sfx_max_per_minute"] = 46
         config["editor_sfx_volume_with_speech"] = 0.46
         config["final_loudness_lufs"] = -16.5
-        # belt-and-suspenders: nothing continuous under the voice in scrape (no music, no clip audio)
-        config["background_music_volume"] = 0.0
-        config["background_music_volume_with_speech"] = 0.0
+        # music bed levels: ducked ~-16 dB under the voice when the user picked a track, else silent.
+        if _bg_on:
+            config["background_music_volume"] = 0.28            # intro/outro (no speech) bed level
+            config["background_music_volume_with_speech"] = 0.15  # ducked under the narration
+        else:
+            config["background_music_volume"] = 0.0
+            config["background_music_volume_with_speech"] = 0.0
+        # never mix the scraped clips' own audio under the voice (only the chosen music, if any)
         config["mix_seedance_audio_with_speech"] = False
         # measure the voice noise floor / HF hiss so the report proves the rauschen is handled
         _noise = measure_voice_noise(audio_path)
@@ -8232,5 +8362,36 @@ def run_project(form, status_cb=None):
         report["gpt_contact_sheet"] = str(gpt_contact_sheet)
     report_path = project_dir / "review" / "agent_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    tidy_debug_artifacts(project_dir, status_cb=status_cb)
     log(status_cb, "Done.")
     return report
+
+
+def tidy_debug_artifacts(project_dir, status_cb=None):
+    """Tuck the transient working images (vision-matcher poster frames, hook frames, FX frames,
+    review contact sheets) into a single hidden _debug/ folder so the project shows just the final
+    MP4(s) and its media - not hundreds of internal JPGs. Non-destructive: nothing is deleted."""
+    project_dir = Path(project_dir)
+    debug_dir = project_dir / "_debug"
+    moved = 0
+    try:
+        # whole frame-dump folders under review/
+        for name in ("_clip_match", "_hook_match", "_fx_frames"):
+            src = project_dir / "review" / name
+            if src.exists():
+                dst = debug_dir / name
+                debug_dir.mkdir(exist_ok=True)
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.move(str(src), str(dst))
+                moved += 1
+        # the review contact-sheet JPGs (the 'captioned frames' images)
+        for sheet in (project_dir / "review").glob("*_review_sheet.jpg"):
+            debug_dir.mkdir(exist_ok=True)
+            shutil.move(str(sheet), str(debug_dir / sheet.name))
+            moved += 1
+    except Exception:
+        pass
+    if moved:
+        log(status_cb, f"Tidied {moved} internal debug artifact group(s) into _debug/ "
+                       "(project now shows just the final video + media).")
