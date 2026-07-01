@@ -2830,6 +2830,11 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
 
     MAX_POOL = 110
     all_buckets = ([plan["hook"]] if plan.get("hook") else []) + (plan.get("buckets") or [])
+    try:
+        clip_scraper.reset_backend_search_health()   # per-run search health for the fail-fast below
+    except Exception:
+        pass
+    scrape_backend_dead = False
     for bi, bucket in enumerate(all_buckets):
         if (cancel_check and cancel_check()) or len(pool) >= MAX_POOL:
             break
@@ -2891,7 +2896,33 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
             got += added
             log(status_cb, f"Bucket {bid}: {tier} tier found {added} usable clip(s)"
                            + ("" if got >= target else ", widening...") + ".")
+            # FAIL FAST: if the TikTok backend returned ZERO RAW items across every search so far
+            # (not merely 0 after quality filtering), the session is logged out / headless-blocked /
+            # captcha'd. Grinding through 11 buckets x 4 tiers is pointless (~35 min for nothing) -
+            # abort after ~6 searches. (items>0 but got==0 = strict filters, NOT dead: won't trip.)
+            if clip_scraper.backend_name() == "tiktok_login":
+                _h = clip_scraper.backend_search_health()
+                if _h.get("searches", 0) >= 6 and _h.get("items", 0) == 0:
+                    scrape_backend_dead = True
+                    break
+        if scrape_backend_dead:
+            _h = clip_scraper.backend_search_health()
+            _wall = _h.get("login_wall", 0)
+            log(status_cb, "Scrape ABORTED: TikTok returned 0 clips for "
+                           f"{_h.get('searches')} searches - the backend is not returning results. "
+                           + ("A LOGIN WALL / captcha was detected: your TikTok session is logged "
+                              "out or expired. " if _wall else
+                              "Likely an expired login or a headless block. ")
+                           + "Fix: click 'Reconnect TikTok' on the home page to log in again, then "
+                             "re-run. Scraping now opens a small TikTok browser window (headed) "
+                             "because TikTok blocks headless searches - if no window appears, "
+                             "restart the app so the new setting takes effect.")
+            break
         log(status_cb, f"Bucket {bid}: final candidate pool {got} clip(s).")
+
+    if scrape_backend_dead and not pool:
+        # surface the reason on the plan so run_project can report it instead of a vague empty pool
+        plan["scrape_backend_dead"] = True
 
     scene_bucket = {}
     for b in (plan.get("buckets") or []):
@@ -7404,11 +7435,17 @@ def run_project(form, status_cb=None):
                 # full re-score would just burn minutes for 0 gain; the continuity fill covers it.
                 remaining_body = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
                 _any_matched = any(c is not None for i, c in enumerate(scene_clips) if i > 0)
-                if remaining_body and body_pool and not (not _any_matched and len(body_pool) >= scene_total):
+                # ALWAYS run ONE final re-score at the FLOOR threshold when scenes are still unmatched.
+                # This is a single pass (not the expensive multi-round SEARCH loop the anti-timeout
+                # guards), so it's cheap - and it's essential: at high script-relevancy the first pass
+                # threshold is strict (e.g. 6.0/10 @80%), so an abstract/essay script can match 0 clips.
+                # Dropping to the floor (4.0/10) here lets the best real clips get properly accepted
+                # instead of the render ending up with NO scraped footage ("accepts no clips at 80%").
+                if remaining_body and body_pool:
                     current_match_threshold = adaptive_script_match_threshold(
                         script_relevancy, MAX_SCRAPE_ROUNDS)
                     log(status_cb, f"Final semantic fallback: re-scoring {len(remaining_body)} unmatched "
-                                   f"scene(s) at {current_match_threshold:.1f}/10.")
+                                   f"scene(s) at {current_match_threshold:.1f}/10 (floor).")
                     scene_clips, clip_decision_log = _match_body_candidates(
                         body_pool, current_match_threshold)
                     _apply_hook(scene_clips)
@@ -7476,6 +7513,28 @@ def run_project(form, status_cb=None):
                 if _key not in _fallback_seen:
                     _fallback_seen.add(_key)
                     fallback_pool.append(_candidate)
+            # SAFETY NET for "accepts no clips at high relevancy": when the vision matcher accepted very
+            # few (or ZERO) clips - typical for an abstract/essay script at 80% relevancy, where every
+            # clip scores below the strict semantic threshold - the accepted-only fallback_pool above is
+            # empty and every scene would get NO footage (empty/AI render). So keep a secondary pool of
+            # CLEAN RAW download clips: real vertical Japan footage that already passed the scraper's
+            # text/black-bar/fake-vertical gate at download time (just not the stricter vision 'clean'
+            # gate). A looser-matching real clip still beats an empty render.
+            def _download_clean(path):
+                m = clip_meta.get(str(path)) or {}
+                try: _th = float(m.get("text_heaviness", 0) or 0)
+                except (TypeError, ValueError): _th = 0.0
+                try: _bb = float(m.get("black_bar_score", 0) or 0)
+                except (TypeError, ValueError): _bb = 0.0
+                return (_th <= 3.5 and _bb <= 0.5 and not m.get("is_fake_vertical", False))
+            clean_raw_fallback = []
+            _seen_raw = set(_fallback_seen)
+            for _p in body_pool:
+                _rk = str(Path(_p).resolve())
+                if _rk in _seen_raw or not _download_clean(_p):
+                    continue
+                _seen_raw.add(_rk)
+                clean_raw_fallback.append(_p)
             usage_counts = {}
             for _, _assigned in accepted_body:
                 _key = str(Path(_assigned).resolve())
@@ -7494,32 +7553,34 @@ def run_project(form, status_cb=None):
                 if scene_clips[scene_index] is not None:
                     continue
                 wanted_bucket = scene_bucket.get(scene_index)
-                same_bucket_pool = [
-                    p for p in fallback_pool
-                    if (clip_meta.get(str(p)) or {}).get("bucket_id") == wanted_bucket and wanted_bucket
-                ]
-                fallback_clip = _least_used(same_bucket_pool)
-                if fallback_clip is not None:
-                    reason = f"adaptive least-used candidate from search bucket {wanted_bucket}"
-                    # Anti-loop: if this same-bucket clip has already been used and a fresher clip
-                    # exists anywhere in the clean pool, switch to it so we don't replay the same
-                    # 1-2 clips across every scene in a starved bucket.
-                    _bk_use = usage_counts.get(str(Path(fallback_clip).resolve()), 0)
-                    if _bk_use > 0 and fallback_pool:
-                        _alt = _least_used(fallback_pool)
-                        if _alt is not None and usage_counts.get(str(Path(_alt).resolve()), 0) < _bk_use:
-                            fallback_clip = _alt
-                            reason = "adaptive least-used clean-pool clip (variety over repeat)"
+                # All clean footage we can borrow for an unmatched scene: accepted semantic matches
+                # first (best), then CLEAN RAW download clips (looser but real - the safety net for
+                # "accepts no clips at 80%"). DISTRIBUTE by least-used so one clip is not replayed
+                # across the whole video (the "same clip reused" complaint), and prefer the scene's
+                # own search bucket for topical continuity.
+                combined_fallback = fallback_pool + clean_raw_fallback
+                if combined_fallback:
+                    same_bucket_pool = [
+                        p for p in combined_fallback
+                        if wanted_bucket and (clip_meta.get(str(p)) or {}).get("bucket_id") == wanted_bucket
+                    ]
+                    fallback_clip = _least_used(same_bucket_pool) or _least_used(combined_fallback)
+                    # Anti-repeat: never replay an already-used clip while a fresher one exists
+                    # anywhere - variety wins over staying in-bucket.
+                    _use = usage_counts.get(str(Path(fallback_clip).resolve()), 0)
+                    if _use > 0:
+                        _fresh = _least_used(combined_fallback)
+                        if _fresh is not None and usage_counts.get(str(Path(_fresh).resolve()), 0) < _use:
+                            fallback_clip = _fresh
+                    _is_accepted = fallback_clip in fallback_pool
+                    _in_bucket = (wanted_bucket and (clip_meta.get(str(fallback_clip)) or {}).get("bucket_id") == wanted_bucket)
+                    reason = ("adaptive least-used " + ("accepted" if _is_accepted else "clean-raw")
+                              + " clip" + (f" from bucket {wanted_bucket}" if _in_bucket else " (variety over repeat)"))
                 elif scene_index > 1 and scene_clips[scene_index - 1] is not None:
-                    # If search has no alternative, hold the previous visual instead of jumping
-                    # away and later cutting back to the same file. The renderer continues the
-                    # clip's source time across this adjacent hold.
+                    # Truly nothing to borrow - hold the previous visual instead of jumping away and
+                    # later cutting back. The renderer continues the clip's source time across the hold.
                     fallback_clip = scene_clips[scene_index - 1]
-                    donor_index = scene_index - 1
-                    reason = f"adaptive adjacent visual hold from scene {donor_index}"
-                elif fallback_pool:
-                    fallback_clip = _least_used(fallback_pool)
-                    reason = "adaptive least-used clean-pool continuity fallback"
+                    reason = f"adaptive adjacent visual hold from scene {scene_index - 1}"
                 else:
                     continue
                 scene_clips[scene_index] = fallback_clip

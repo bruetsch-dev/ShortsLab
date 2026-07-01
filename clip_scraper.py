@@ -377,6 +377,25 @@ def backend_name():
     return "none"
 
 
+def backend_search_health():
+    """Cumulative search health for the active backend this run: {searches, items, login_wall}.
+    Lets the caller fail fast when the backend returns NOTHING (logged out / headless block)."""
+    if tiktok_backend_ready() and tiktok_login is not None:
+        try:
+            return tiktok_login.search_stats()
+        except Exception:
+            return {}
+    return {}
+
+
+def reset_backend_search_health():
+    if tiktok_login is not None:
+        try:
+            tiktok_login.reset_search_stats()
+        except Exception:
+            pass
+
+
 def _ensure_tiktok_cookies(status_cb=None):
     """Open (lazily) the shared logged-in session and point yt-dlp at its cookies."""
     sess = tiktok_login.get_session(status_cb=status_cb)

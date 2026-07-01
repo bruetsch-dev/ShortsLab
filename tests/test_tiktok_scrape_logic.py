@@ -33,8 +33,14 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         )
 
     def test_semantic_threshold_relaxes_after_each_failed_round(self):
+        # At 80% relevancy the first pass starts moderately strict (6.0/10) and relaxes toward the
+        # 4.0 floor on each failed round, so abstract scripts still reach a threshold the pool can
+        # meet (was 7.0->4.5; lowered so 80% no longer rejects every clip).
         thresholds = [agent_core.adaptive_script_match_threshold(80, attempt) for attempt in range(4)]
-        self.assertEqual(thresholds, [7.0, 6.0, 5.0, 4.5])
+        self.assertEqual(thresholds, [6.0, 5.0, 4.0, 4.0])
+        # monotonically non-increasing and never below the 4.0 floor
+        self.assertTrue(all(a >= b for a, b in zip(thresholds, thresholds[1:])))
+        self.assertGreaterEqual(min(thresholds), 4.0)
 
     def test_pacing_and_voice_sync_use_only_words_in_each_cut(self):
         source = [{

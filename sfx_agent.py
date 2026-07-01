@@ -362,6 +362,27 @@ def mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, st
     return out_path
 
 
+def _scenes_from_cuts_and_phrases(cuts, phrases, duration):
+    """Build the `scenes` list that `agent_core.place_editor_sfx` expects from an uploaded video's
+    detected hard cuts + timed transcript. Each cut is a real edit point (a scene boundary); the
+    transcript text overlapping each segment drives the same big-moment / topic-accent detection the
+    normal agent run uses. Scene 0 starts at 0.0 so it gets the hook-opening impact."""
+    bounds = sorted({0.0} | {round(float(c), 3) for c in (cuts or [])
+                             if 0.2 < float(c) < max(0.3, duration - 0.05)})
+    scenes = []
+    for k, start in enumerate(bounds):
+        end = bounds[k + 1] if k + 1 < len(bounds) else duration
+        # Assign a phrase to the ONE scene where it STARTS (not every scene it overlaps), so a
+        # dramatic line marks a single cut as a big moment and the cuts in between stay "normal" -
+        # letting the variety rotation (whoosh/pop/ding/flash) cover them instead of everything
+        # becoming an impact. This mirrors the normal run's per-cut word assignment.
+        text = " ".join(str(p.get("text", "")) for p in (phrases or [])
+                        if start <= float(p.get("start", 0.0)) < end).strip()
+        scenes.append({"start": round(start, 3), "end": round(end, 3),
+                       "exact_voice_text": text, "script": text, "fx": {}})
+    return scenes
+
+
 def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out_dir=None,
                            generate_missing=True):
     video_path = Path(video_path)
@@ -401,19 +422,33 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     if phrases:
         log(status_cb, f"Transcript: {len(phrases)} timed phrase(s).")
 
-    catalog = library_catalog(config)
-    events = plan_sfx_with_llm(duration, cuts, phrases, catalog, reasoning_model, status_cb)
-    plan_source = "opus"
-    if not events:
-        log(status_cb, "Using automatic cut-based sound effects.")
-        events = fallback_plan(cuts, phrases, duration)
-        plan_source = "automatic"
-    log(status_cb, f"Planned {len(events)} sound-effect event(s) [{plan_source}].")
-
-    segments = resolve_segments(config, events, duration, ffprobe, status_cb=status_cb)
-    log(status_cb, f"Placed {len(segments)} sound effect(s) after spacing/dedup.")
+    # Use the EXACT same SFX engine as the normal agent run: agent_core.place_editor_sfx over the
+    # user's local, classified sfx_library (variety rotation across cut sounds, per-category dB
+    # volumes/CAT_DB, short-punchy duration caps, density/spacing gates, big-moment impacts + topic
+    # accents). We synthesize the `scenes` it needs from this uploaded video's cuts + transcript.
+    plan_source = "editor_pack"
+    scenes = _scenes_from_cuts_and_phrases(cuts, phrases, duration)
+    sfx_config = {
+        "sfx_enabled": True,
+        "scenes": scenes,
+        "duration": duration,
+        "editor_sfx_max_per_minute": int(config.get("editor_sfx_max_per_minute", 42)),
+    }
+    log(status_cb, f"Placing editor SFX over {len(scenes)} cut point(s) with the local SFX library "
+                   "(same engine as a normal run)...")
+    agent_core.place_editor_sfx(sfx_config, reasoning_model=reasoning_model, status_cb=status_cb)
+    events = sfx_config.get("ai_content_sfx") or []
+    sfx_report = sfx_config.get("sfx_report") or {}
+    segments = [{
+        "path": Path(e["path"]), "start": float(e["start"]),
+        "duration": float(e["duration"]), "volume": float(e["volume"]),
+        "category": e.get("category") or e.get("sfx_type") or "sfx",
+        "reason": e.get("sfx_type") or e.get("category") or "",
+    } for e in events if e.get("path")]
+    log(status_cb, f"Placed {len(segments)} sound effect(s) [{plan_source}].")
     if not segments:
-        raise RuntimeError("No sound effects could be placed (empty plan or library).")
+        raise RuntimeError("No sound effects placed - your soundeffects/ library has no usable clips. "
+                           "Drop SFX files into the soundeffects/ folder and try again.")
 
     mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
     log(status_cb, "SFX enhancement complete.")
@@ -430,6 +465,7 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
              "file": s["path"].name, "reason": s["reason"]}
             for s in segments
         ],
+        "sfx_report": sfx_report,   # same scanner/classification/summary as a normal agent run
     }
     plan_path.write_text(json.dumps(plan_payload, indent=2), encoding="utf-8")
 

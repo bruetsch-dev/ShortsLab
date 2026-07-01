@@ -121,8 +121,6 @@ def top_nav():
         '<nav class="nav-actions">'
         f'<a class="button" href="/?new=1">{ICON_NEW}<span>New project</span></a>'
         f'<a class="button secondary" href="/assets">{ICON_GRID}<span>Assets</span></a>'
-        f'<a class="button secondary nav-sfx" href="/sfx">{ICON_SFX}<span>SFX master</span></a>'
-        f'<a class="button secondary nav-captions" href="/captions">{ICON_SFX}<span>Caption master</span></a>'
         '<span class="nav-sep" aria-hidden="true"></span>'
         '<button type="button" class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">'
         '<span class="tt-knob"><span class="tt-sun">&#9728;</span><span class="tt-moon">&#9789;</span></span></button>'
@@ -531,7 +529,7 @@ def app_style():
         color: var(--text);
         position: relative; overflow-x: hidden;
       }
-      main { max-width: 1320px; margin: 0 auto; padding: 26px clamp(18px, 3.5vw, 44px) 60px; position: relative; z-index: 1; }
+      main { max-width: 1320px; margin: 0 auto; padding: 16px clamp(18px, 3.5vw, 44px) 24px; position: relative; z-index: 1; }
       h1 {
         font-family: var(--display);
         font-size: 19px; margin: 0; letter-spacing: 0; font-weight: 400; line-height: 1.15;
@@ -540,19 +538,14 @@ def app_style():
       h2 { font-family: var(--pixel); font-size: 15px; margin: 0 0 13px; color: var(--ink); font-weight: 400; letter-spacing: .3px; text-transform: uppercase; }
       ::selection { background: var(--accent-2); color: #fff; }
       :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-      .top { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding-bottom: 16px; margin-bottom: 24px; border-bottom: 3px solid var(--ink); }
+      .top { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding-bottom: 10px; margin-bottom: 14px; border-bottom: 3px solid var(--ink); }
       .brand { display: flex; gap: 13px; align-items: center; min-width: 0; }
-      .brand-mark { display: none; }
+      /* the real app logo (static/app_icon.png) as the brand mark - it already has the pixel badge,
+         ink border and hard shadow baked in, so render it crisp (pixelated) at header size. */
+      .brand-mark { display: block; flex: 0 0 auto; width: 46px; height: 46px; image-rendering: pixelated; }
       .sub { color: var(--muted); margin-top: 7px; max-width: 760px; line-height: 1.5; font-size: 14px; }
       .ico { flex: 0 0 auto; vertical-align: middle; }
-      /* wordmark logo lockup: a violet glyph block before the title */
-      /* pixel asterisk logo glyph before the wordmark */
-      .brand > div { position: relative; padding-left: 42px; }
-      .brand > div::before {
-        content: "\\002731"; position: absolute; left: 0; top: -2px; width: 30px; height: 30px;
-        display: grid; place-items: center; font-size: 22px; color: var(--accent);
-        text-shadow: 2px 2px 0 var(--ink);
-      }
+      .brand > div { position: relative; }
       .nav-actions { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
       .nav-actions .button {
         width: auto; min-width: 0; display: inline-flex; align-items: center; gap: 8px;
@@ -617,12 +610,19 @@ def app_style():
       .create-bar {
         grid-column: 1 / -1;
         position: relative; z-index: 1;
-        display: flex; flex-direction: column; gap: 15px;
-        padding: 17px 19px; border-radius: var(--r-lg);
-        margin-bottom: 22px; border: 3px solid var(--ink);
+        display: flex; flex-direction: column; gap: 12px;
+        padding: 14px 18px; border-radius: var(--r-lg);
+        margin-bottom: 14px; border: 3px solid var(--ink);
         background: var(--bg-raised);
         box-shadow: var(--sh-2);
+        box-sizing: border-box;
+        max-height: calc(100vh - 148px);   /* keep the whole create step inside the window: top row + Create button stay pinned, settings scroll (border-box so padding+border are inside the cap) */
       }
+      /* the settings sections (clip source + outputs) live in a bounded scroll region so the
+         page itself never scrolls and the Create button is always visible */
+      .cbar-scroll { display: flex; flex-direction: column; gap: 12px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; margin: 0 -4px; padding: 0 4px; }
+      .cbar-scroll::-webkit-scrollbar { width: 8px; }
+      .cbar-scroll::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
       .cbar-row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-end; }
       .cbar-cell { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
       .cbar-cell.tiers, .cbar-cell.runtype { flex: 1 1 300px; }
@@ -728,7 +728,7 @@ def app_style():
       [data-step] { will-change: transform, opacity; }
       [data-step].wiz-anim { animation: wizIn .3s var(--ease) both; }
       @keyframes wizIn { from { opacity: 0; transform: translateX(46px); } to { opacity: 1; transform: translateX(0); } }
-      .wiz-headline { text-align: center; padding: 30px 16px 10px; margin-bottom: 6px; }
+      .wiz-headline { text-align: center; padding: 14px 16px 8px; margin-bottom: 4px; }
       .wiz-type { font-family: var(--display); font-size: clamp(17px, 3.2vw, 28px); color: var(--ink); line-height: 1.45; text-shadow: 2px 2px 0 rgba(232,71,43,.22); }
       .wiz-type::after { content: "\\2588"; margin-left: 2px; color: var(--accent-2); animation: wizCaret 1s steps(1) infinite; }
       @keyframes wizCaret { 50% { opacity: 0; } }
@@ -743,14 +743,18 @@ def app_style():
       #wiz-cont-btn { left: 100%; margin-left: 16px; }     /* just right of it, top corner */
       .wiz-topnav .wiz-back-btn[data-hidden="1"] { visibility: hidden; }
       /* ===== Mode-selection menu (step 0) ===== */
-      .wiz-modemenu { max-width: 720px; margin: 8px auto 0; }
-      .modemenu-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-      .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; text-align: left; width: 100%; min-height: 150px; padding: 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
+      /* bounded like the wizard steps: 4 big cards fit fully at normal viewports; on a very short
+         window the menu scrolls WITHIN itself instead of page-scrolling. Padding gives the cards'
+         hover shadow room so overflow:auto doesn't clip it. */
+      .wiz-modemenu { max-width: 840px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
+      .modemenu-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 150px; padding: 18px 22px 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
       .modemenu-card::after { display: none; }
       .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
       .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
-      .modemenu-card .mm-ico { font-size: 28px; line-height: 1; }
-      .modemenu-card .mm-title { font-family: var(--display); font-size: 15px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; }
+      .modemenu-card .mm-ico { font-size: 30px; line-height: 1; margin-bottom: 2px; }
+      /* TITLE on ONE line, clearly SEPARATED from the subtitle by a dashed rule + generous spacing */
+      .modemenu-card .mm-title { font-family: var(--display); font-size: 15px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; width: 100%; margin: 2px 0 18px; padding-bottom: 16px; border-bottom: 2px dashed var(--line-strong); }
       .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.5; }
       @media (max-width: 640px) { .modemenu-cards { grid-template-columns: 1fr; } }
       @media (max-width: 1120px) {
@@ -789,14 +793,24 @@ def app_style():
       .script-highlight {
         position: absolute; inset: 0; margin: 0; pointer-events: none; overflow: hidden;
         box-sizing: border-box; border: 1px solid transparent; border-radius: var(--r-md);
-        padding: 11px 13px; min-height: 360px;
+        padding: 11px 13px; min-height: 260px;
         white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word; color: var(--text);
       }
       .script-highlight .hook-mark { color: #fff; -webkit-text-fill-color: #fff; font-weight: 700; background: var(--accent-2); border-radius: 2px; box-shadow: 0 0 0 1px var(--ink); }
       .hook-controls { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
       .hook-controls .hook-btn { width: auto; min-width: 0; flex: 0 0 auto; padding: 8px 13px; font-size: 10px; }
       @media (max-width: 820px) { .script-highlight { min-height: 300px; } }
-      .action-btns { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; }
+      /* Onboarding SCRIPT step: the editor height scales with the window so the whole step fits a
+         short laptop/browser viewport with NO page scroll; a long script scrolls inside the textarea.
+         (#wizard scope wins over the global textarea min-height and the .script-highlight min-height.) */
+      #wizard .script-wrap textarea { min-height: 0; height: clamp(150px, calc(100vh - 400px), 300px); max-height: none; }
+      #wizard .script-highlight { min-height: 0; }
+      /* Safety net: the onboarding step container is bounded to the window, so ANY active step
+         (the script step, or the voice step's two stacked panels) scrolls WITHIN itself instead of
+         page-scrolling on short laptop/browser viewports. create-bar (step 4) has its own bound +
+         pinned Create button and is NOT a .stack child, so it is unaffected. */
+      .stack { max-height: calc(100vh - 140px); overflow-y: auto; overflow-x: hidden; }
+      .action-btns { display: grid; grid-template-columns: repeat(auto-fit, minmax(124px, 1fr)); gap: 7px; }
       .action-btns .action-btn {
         width: auto; min-width: 0;
         display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
@@ -808,7 +822,15 @@ def app_style():
       .action-btns .action-btn:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
       .action-btns .action-btn.active { border-color: var(--ink); background: var(--accent); color: #fff; }
       .action-btns .action-btn.active small { color: #fff; }
-      .speaker-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-bottom: 10px; max-height: 232px; overflow-y: auto; padding: 2px; }
+      /* Loaded-project ("main interface"): the run-mode actions panel appears BELOW the create-bar and
+         shares the viewport, so keep it compact and let the create-bar shrink (its settings scroll
+         internally, Create button stays pinned) so the whole loaded view fits with NO page scroll. */
+      #loaded-actions-panel { padding: 12px 16px; max-height: 190px; overflow-y: auto; }
+      #loaded-actions-panel > button:first-child { margin-bottom: 8px !important; padding: 9px 14px; }
+      #loaded-actions-panel > label { margin-bottom: 6px; }
+      .action-btns .action-btn { padding: 7px 9px; }
+      body.project-loaded .create-bar { max-height: calc(100vh - 345px); }
+      .speaker-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-bottom: 10px; max-height: 150px; overflow-y: auto; padding: 2px; }
       .speaker-tile { width: 100%; padding: 0; border: 2px solid var(--ink); border-radius: var(--r-md); overflow: hidden; background: var(--bg-input); cursor: pointer; aspect-ratio: 3 / 4; box-shadow: var(--sh-1); transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
       .speaker-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
       .speaker-tile:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 var(--ink); }
@@ -844,8 +866,8 @@ def app_style():
       .csrc-btn:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
       .csrc-btn.csrc-active { background: var(--accent); border-color: var(--accent-active); color: #fff; box-shadow: var(--sh-2); }
       .csrc-btn.csrc-active small { color: rgba(255,255,255,.82); }
-      .scrape-settings { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line-strong); }
-      .scrape-lbl { margin-top: 12px; }
+      .scrape-settings { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-strong); }
+      .scrape-lbl { margin-top: 8px; }
       .scrape-lbl:first-child { margin-top: 0; }
       .scrape-terms { min-height: 64px; resize: vertical; }
       .scrape-auto-note { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--ink); background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 10px; margin: 2px 0 6px; }
@@ -878,9 +900,12 @@ def app_style():
       .bgm-pick { margin: 8px 0 4px; }
       .bgm-row { display: flex; align-items: center; gap: 8px; }
       .bgm-row select { flex: 1; min-width: 0; }
-      .bgm-play { width: 26px; height: 26px; min-width: 26px; padding: 0; flex: 0 0 auto; font-size: 10px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
-      .bgm-play::after { display: none; }
-      .bgm-play:disabled { opacity: .5; cursor: default; }
+      /* !important because the global .button rule (width:100%; big padding) is defined later and
+         would otherwise win the cascade and blow this preview button up to full width. */
+      .bgm-play, .voice-play { width: 30px !important; height: 30px !important; min-width: 30px !important; padding: 0 !important; flex: 0 0 auto; font-size: 11px !important; line-height: 1; display: inline-flex !important; align-items: center; justify-content: center; }
+      .bgm-play::after, .voice-play::after { display: none; }
+      .bgm-play:disabled, .voice-play:disabled { opacity: .5; cursor: default; }
+      .voice-play.loading { opacity: .6; }
       input[type="range"] {
         -webkit-appearance: none; appearance: none; width: 100%; height: 8px; padding: 0; margin: 6px 0 2px;
         background: var(--bg-input); border: 1px solid var(--line-strong); border-radius: 999px; box-shadow: none; cursor: pointer;
@@ -933,7 +958,7 @@ def app_style():
       .filepick .filepick-btn { display: inline-flex; align-items: center; gap: 7px; border: 2px solid var(--ink); border-radius: var(--r-md); background: var(--accent); color: #fff; padding: 9px 15px; font-family: var(--pixel); font-size: 10px; text-transform: uppercase; box-shadow: var(--sh-1); }
       .filepick:hover .filepick-btn { transform: translate(-2px,-2px); box-shadow: 5px 5px 0 var(--ink); }
       .filepick .filepick-name { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      textarea { min-height: 360px; resize: vertical; line-height: 1.55; }
+      textarea { min-height: 260px; resize: vertical; line-height: 1.55; }
       textarea.visual-textarea { min-height: 210px; }
       .wide { grid-column: 1 / -1; }
       .panel {
@@ -1314,6 +1339,8 @@ def app_script():
         window.selectMode = function (mode) {
           try { if (typeof playClick === "function") playClick(); } catch (e) {}
           if (mode === "reddit") { window.location.href = "/reddit"; return; }
+          if (mode === "sfx") { window.location.href = "/sfx"; return; }
+          if (mode === "captions") { window.location.href = "/captions"; return; }
           wizGoto(1);   // Visuals From Script -> existing script workflow
         };
         function wizTypeIntro(cb) {
@@ -1401,11 +1428,13 @@ def app_script():
         window.showLoadedActions = function () {
           var panel = document.getElementById("loaded-actions-panel");
           if (panel) panel.style.display = "";
+          document.body.classList.add("project-loaded");   // lets the create-bar shrink to share the viewport
           window.setProjectMode("normal");
         };
         window.hideLoadedActions = function () {
           var panel = document.getElementById("loaded-actions-panel");
           if (panel) panel.style.display = "none";
+          document.body.classList.remove("project-loaded");
           var hidden = document.getElementById("loaded-project-mode");
           if (hidden) hidden.value = "normal";
         };
@@ -1589,6 +1618,29 @@ def app_script():
               au.onended = function () { if (play) play.innerHTML = "\\u25B6"; };
             } else { au.pause(); if (play) play.innerHTML = "\\u25B6"; }
           };
+          // ---- Voice preview: play a ~10s sample of the selected Gemini voice ----
+          window.voicePreview = function () {
+            var sel = document.getElementById("tts-voice-select"), btn = document.getElementById("voice-play"),
+                au = document.getElementById("voice-audio");
+            if (!sel || !au || !btn) return;
+            var voice = sel.value;
+            if (!au.paused && au.dataset.voice === voice) { au.pause(); btn.innerHTML = "\\u25B6"; return; }
+            btn.classList.add("loading"); btn.innerHTML = "\\u2026"; btn.disabled = true;
+            au.dataset.voice = voice;
+            au.src = "/voice-preview?voice=" + encodeURIComponent(voice);
+            au.onended = function () { btn.innerHTML = "\\u25B6"; };
+            var p = au.play();
+            (p && p.then ? p : Promise.resolve()).then(function () {
+              btn.classList.remove("loading"); btn.disabled = false; btn.innerHTML = "\\u275A\\u275A";
+            }).catch(function () {
+              btn.classList.remove("loading"); btn.disabled = false; btn.innerHTML = "\\u25B6";
+            });
+          };
+          var _vsel = document.getElementById("tts-voice-select");
+          if (_vsel) _vsel.addEventListener("change", function () {
+            var au = document.getElementById("voice-audio"), b = document.getElementById("voice-play");
+            if (au) au.pause(); if (b) b.innerHTML = "\\u25B6";
+          });
           function clearProjectMedia() {
             if (mediaBox) mediaBox.innerHTML = "";
             var mediaHint = document.getElementById("project-media-hint");
@@ -2382,6 +2434,16 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <span class="mm-title">Reddit Story Mode</span>
             <span class="mm-desc">Generate a Reddit-style story video with Minecraft parkour background and AI voiceover.</span>
           </button>
+          <button type="button" class="modemenu-card" onclick="selectMode('sfx')">
+            <span class="mm-ico">&#128266;</span>
+            <span class="mm-title">SFX Master</span>
+            <span class="mm-desc">Upload a finished Short and add editor sound effects with the local SFX library.</span>
+          </button>
+          <button type="button" class="modemenu-card" onclick="selectMode('captions')">
+            <span class="mm-ico">&#128172;&#65039;</span>
+            <span class="mm-title">Caption Master</span>
+            <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
+          </button>
         </div>
       </div>
 
@@ -2409,6 +2471,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
         </div>
 
+        <div class="cbar-scroll">
         <div class="cbar-sep" aria-hidden="true"></div>
         <div class="cbar-section" id="clipsource-panel">
           <span class="cbar-cap">Clip source {help_tip("Where the moving footage comes from. Generate = AI video/images (Seedance, GPT-Image). Scrape = download real TikTok clips that match a visual style and cut them together. Scraping disables the AI video/image models and the AI-image outputs.")}</span>
@@ -2482,6 +2545,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <label class="otoggle"><input type="checkbox" name="out_captions"{checked("out_captions")}><span>Captions</span></label>
           </div>
         </div>
+        </div>
 
         <button type="submit" class="create-short-btn create-short-big">&#9889; Create Short</button>
       </div>
@@ -2528,13 +2592,15 @@ def form_page(clear=False, open_load=False, load_slug=""):
         <div class="panel" data-step="3">
           <label>Voice &amp; narration {help_tip("Narration is generated from your script with Gemini TTS (English). The voice is force-aligned for frame-accurate word-by-word captions and beat-synced cuts. Optionally add a speaker face below for a lip-synced talking-head opening.")}</label>
           <input type="hidden" name="speaker_name" value="{esc(state.get('speaker_name') or 'Narrator')}">
-          <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <select name="tts_voice" style="flex:1; min-width:180px;">{voice_options}</select>
-            <select name="tts_model" style="flex:1; min-width:180px;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <select name="tts_voice" id="tts-voice-select" style="flex:1; min-width:170px;">{voice_options}</select>
+            <button type="button" class="button secondary voice-play" id="voice-play" onclick="voicePreview()" title="Preview this voice (~10s)">&#9654;</button>
+            <select name="tts_model" style="flex:1; min-width:170px;">
               <option value="flash"{' selected' if sel_tts_model == 'flash' else ''}>Gemini 2.5 Flash TTS (cheaper)</option>
               <option value="pro"{' selected' if sel_tts_model == 'pro' else ''}>Gemini 2.5 Pro TTS (higher quality)</option>
             </select>
           </div>
+          <audio id="voice-audio" preload="none"></audio>
           <input type="hidden" name="mix_voice_in_final" value="on">
           <div class="checks" style="margin-top:18px;">
             <label><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}> Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</label>
@@ -5242,6 +5308,34 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass        # the player closed the connection mid-stream (normal when seeking)
 
+    def serve_voice_preview(self, voice):
+        """Generate (once, cached) and serve a ~10s sample of a Gemini TTS voice so the user can
+        preview it before committing. Cached under generated_assets/voice_previews/<voice>.wav."""
+        voice = (voice or "").strip()
+        if voice not in pipeline.GEMINI_TTS_VOICES:
+            self.send_error(400, "Unknown voice")
+            return
+        prev_dir = ROOT / "generated_assets" / "voice_previews"
+        try:
+            prev_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        path = prev_dir / f"{voice}.wav"
+        if not path.exists() or path.stat().st_size < 4096:
+            if not os.environ.get("WAVESPEED_API_KEY", "").strip():
+                self.send_error(503, "WAVESPEED_API_KEY not set")
+                return
+            sample = ("Hey — this is a quick preview of this voice. I can narrate your story with "
+                      "energy, warmth, and a clear, punchy delivery for your short videos.")
+            try:
+                out = pipeline.generate_speech_gemini(sample, path, voice=voice, model="pro", status_cb=None)
+                path = Path(out)
+            except Exception as exc:  # noqa: BLE001
+                print("[voice-preview] failed:", exc)
+                self.send_error(500, "Voice preview generation failed")
+                return
+        self.serve_file_ranged(path, "audio/wav")
+
     def send_static_asset(self, name):
         allowed = {
             "app_icon.ico": "image/x-icon",
@@ -5347,6 +5441,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(json.dumps(timeline_library_payload(slug)).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/music-list":
             self.send_bytes(music_list_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/voice-preview":
+            voice = urllib.parse.parse_qs(parsed.query).get("voice", [""])[0]
+            self.serve_voice_preview(voice)
         elif parsed.path == "/reddit":
             self.send_bytes(reddit_page())
         elif parsed.path == "/tiktok-status":

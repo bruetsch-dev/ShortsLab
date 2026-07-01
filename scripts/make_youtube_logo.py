@@ -1,11 +1,11 @@
-"""Pixel-art YouTube channel logo for a TRAVEL / CULTURE / SOCIETY channel.
+"""CulturePin YouTube channel logo - PIXEL style.
 
-A chunky pixel globe (world = travel, cultures, society) with meridian/equator lines and a red
-travel location-pin, in the same warm-parchment + ink + blue + red palette as the app. Drawn on a
-small grid and scaled with NEAREST so pixels stay crisp. YouTube crops avatars to a CIRCLE, so the
-globe is centred and the important parts stay away from the corners.
+The pin IS the brand (CulturePin): a chunky pixel location-pin whose round head is a little globe
+(world = travel / cultures / society) with the Japan hinomaru, a pointed base, ink outline and the
+site's hard offset shadow, on warm parchment. Drawn on a small grid and scaled with NEAREST so the
+pixels stay crisp. YouTube crops avatars to a CIRCLE, so the pin is centred.
 
-Run: python scripts/make_youtube_logo.py  ->  writes youtube_logo.png (+ a circle-cropped preview)
+Run: python scripts/make_youtube_logo.py  ->  youtube_logo.png (+ circle preview)
 """
 
 from pathlib import Path
@@ -13,16 +13,16 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 
-PARCH = (239, 231, 214)     # background
-INK = (23, 21, 15)          # outlines
-OCEAN = (47, 111, 214)      # blue seas (--accent)
-OCEAN_D = (36, 86, 168)     # darker ocean for meridian shading
-LAND = (86, 156, 92)        # green continents
-LAND_HI = (120, 186, 120)   # lighter land top
-RED = (232, 71, 43)         # travel pin (--accent-2)
+PARCH = (239, 231, 214)
+INK = (23, 21, 15)
+OCEAN = (47, 111, 214)
+OCEAN_D = (36, 86, 168)
+LAND = (86, 156, 92)
+LAND_HI = (120, 186, 120)
+RED = (214, 30, 40)          # hinomaru / pin body red
 TRANSP = (0, 0, 0, 0)
 
-G = 32
+G = 34
 
 
 def build():
@@ -32,71 +32,62 @@ def build():
         if 0 <= x < G and 0 <= y < G:
             grid[y][x] = c if len(c) == 4 else c + (255,)
 
-    # globe centre + radius
-    cx, cy, r = 15.5, 16.5, 12.0
-    inside = lambda x, y: (x - cx) ** 2 + (y - cy) ** 2 <= r ** 2
-    ring = lambda x, y: (r - 1.1) ** 2 <= (x - cx) ** 2 + (y - cy) ** 2 <= (r + 0.4) ** 2
+    hx, hy, hr = 16.5, 13.0, 9.5           # globe/head centre + radius
+    tipy = 30                              # pin tip
 
-    # 1) ocean fill + ink ring
-    for y in range(G):
-        for x in range(G):
-            if inside(x, y):
-                put(x, y, OCEAN)
-            if ring(x, y):
-                put(x, y, INK)
+    def head(x, y):
+        return (x - hx) ** 2 + (y - hy) ** 2 <= hr ** 2
 
-    # 2) continents (hand-placed green blobs that read as land masses)
-    land = {
-        # left mass (americas-ish)
-        (9, 9), (10, 9), (9, 10), (10, 10), (11, 10), (9, 11), (10, 11), (8, 12), (9, 12), (10, 12),
-        (9, 13), (10, 13), (10, 14), (11, 14), (10, 15), (11, 15), (11, 16), (12, 16),
-        # centre/right mass (afro-eurasia-ish)
-        (16, 8), (17, 8), (18, 9), (16, 9), (17, 9), (19, 9), (16, 10), (17, 10), (18, 10), (19, 10),
-        (20, 10), (17, 11), (18, 11), (19, 11), (20, 11), (21, 11), (18, 12), (19, 12), (20, 12),
-        (17, 13), (18, 13), (19, 13), (18, 14), (19, 14), (20, 14),
-        # lower-right island (oceania-ish)
-        (21, 18), (22, 18), (21, 19), (14, 20), (15, 20), (16, 21),
-    }
-    for (x, y) in land:
-        if inside(x, y):
-            put(x, y, LAND)
-    # a lighter top edge on the land for a touch of depth
-    for (x, y) in land:
-        if inside(x, y) and (x, y - 1) not in land and grid[y - 1][x][:3] == OCEAN:
-            put(x, y - 1, LAND_HI) if inside(x, y - 1) else None
+    def body(x, y):                        # triangular point below the head
+        if y <= hy:
+            return False
+        frac = (tipy - y) / (tipy - hy)
+        halfw = hr * 0.92 * frac
+        return abs(x - hx) <= halfw and y <= tipy
 
-    # 3) meridian + equator lines (subtle darker-ocean curves) over remaining ocean only
-    for y in range(G):
-        for x in range(G):
-            if inside(x, y) and grid[y][x][:3] == OCEAN:
-                if abs(x - cx) < 0.9:                      # central meridian
-                    put(x, y, OCEAN_D)
-                if abs(y - cy) < 0.9:                      # equator
-                    put(x, y, OCEAN_D)
-                # a curved side meridian
-                if abs((x - cx) - 5.5 * (1 - ((y - cy) / r) ** 2) ** 0.5) < 0.7:
-                    put(x, y, OCEAN_D)
-                if abs((x - cx) + 5.5 * (1 - ((y - cy) / r) ** 2) ** 0.5) < 0.7:
-                    put(x, y, OCEAN_D)
+    sil = {(x, y) for y in range(G) for x in range(G) if head(x, y) or body(x, y)}
 
-    # 4) red travel location-pin (SOLID teardrop), top-right
-    px, py = 24, 5                                         # head centre
-    pin = set()
-    for y in range(2, 8):                                  # round head
-        for x in range(21, 28):
-            if (x - px) ** 2 + ((y - py) * 1.05) ** 2 <= 6.3:
-                pin.add((x, y))
-    pin |= {(px, 8), (px, 9), (px, 10)}                    # neck -> point
-    pin |= {(px - 1, 8), (px + 1, 8)}
-    # ink outline around the SILHOUETTE only, then red fill, then a hole in the head
-    for (x, y) in pin:
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
-            if (x + dx, y + dy) not in pin:
+    # 1) HARD offset shadow (ink, down-right) - site pixel style
+    for (x, y) in sil:
+        put(x + 1, y + 1, INK)
+
+    # 2) ink outline of the whole pin silhouette
+    for (x, y) in sil:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            if (x + dx, y + dy) not in sil:
                 put(x + dx, y + dy, INK)
-    for (x, y) in pin:
+
+    # 3) fill: red pin body (point), blue-ocean globe head
+    for (x, y) in sil:
         put(x, y, RED)
-    for (x, y) in [(px, py - 1), (px - 1, py), (px, py), (px + 1, py), (px, py + 1)]:
-        put(x, y, PARCH)                                   # white/parchment centre hole
+    for (x, y) in sil:
+        if head(x, y):
+            put(x, y, OCEAN)
+
+    # 4) green continents on the globe head
+    land = {(12, 8), (13, 8), (12, 9), (13, 9), (14, 9), (12, 10), (13, 10), (11, 11), (12, 11),
+            (12, 12), (13, 12), (13, 13),
+            (19, 8), (20, 8), (19, 9), (20, 9), (21, 9), (19, 10), (20, 10), (21, 10), (20, 11),
+            (21, 11), (20, 12),
+            (15, 16), (16, 16), (16, 17)}
+    for (x, y) in land:
+        if head(x, y):
+            put(x, y, LAND)
+    for (x, y) in land:                    # light top edge
+        if head(x, y - 1) and (x, y - 1) not in land and grid[y - 1][x][:3] == OCEAN:
+            put(x, y - 1, LAND_HI)
+
+    # 5) meridian + equator hint (darker ocean) on remaining ocean
+    for y in range(G):
+        for x in range(G):
+            if head(x, y) and grid[y][x][:3] == OCEAN:
+                if abs(x - hx) < 0.9 or abs(y - hy) < 0.9:
+                    put(x, y, OCEAN_D)
+
+    # 6) small Japan hinomaru dot lower-right on the globe (the pin "marks" Japan)
+    for (x, y) in [(20, 16), (21, 16), (20, 17), (21, 17)]:
+        if head(x, y):
+            put(x, y, RED)
 
     small = Image.new("RGBA", (G, G), TRANSP)
     small.putdata([tuple(grid[y][x]) for y in range(G) for x in range(G)])
@@ -106,15 +97,13 @@ def build():
 def main():
     small = build()
     big = small.resize((1024, 1024), Image.NEAREST)
-    out = ROOT / "youtube_logo.png"
-    big.save(out)
-    # circle-cropped preview (how YouTube shows the avatar)
+    big.save(ROOT / "youtube_logo.png")
     mask = Image.new("L", (1024, 1024), 0)
     ImageDraw.Draw(mask).ellipse([0, 0, 1023, 1023], fill=255)
-    circ = Image.new("RGBA", (1024, 1024), TRANSP)
-    circ.paste(big, (0, 0), mask)
-    circ.save(ROOT / "youtube_logo_circle.png")
-    print("Wrote:", out, "and youtube_logo_circle.png (circle preview)")
+    out = Image.new("RGBA", (1024, 1024), TRANSP)
+    out.paste(big, (0, 0), mask)
+    out.save(ROOT / "youtube_logo_circle.png")
+    print("Wrote pixel CulturePin logo: youtube_logo.png + youtube_logo_circle.png")
 
 
 if __name__ == "__main__":

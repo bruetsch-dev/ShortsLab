@@ -88,15 +88,27 @@ GEMINI_TTS_VOICES = [
 ]
 
 
+# A leading DELIVERY directive for Gemini TTS. Gemini 2.5 interprets a natural-language style
+# instruction at the top of the text and applies it to the performance WITHOUT reading it aloud -
+# this is what makes the narration genuinely ENERGETIC (not just EQ'd louder) and crisper. Set to
+# "" to disable instantly if a voice ever speaks it literally.
+TTS_STYLE_DIRECTIVE = ("Read the following with high energy and enthusiasm - an upbeat, engaging, "
+                       "punchy viral-narrator delivery, with crisp, clear enunciation")
+
+
 def format_tts_script(speaker_name, text):
-    """Prefix the script with the chosen speaker name, e.g. 'Rose: In 1814, ...'.
+    """Prefix the script with the chosen speaker name, e.g. 'Rose: In 1814, ...', plus an optional
+    energetic delivery directive that Gemini applies to the performance (not spoken).
 
     Gemini multi-speaker TTS keys lines by the speaker label, so the same name
-    must lead the text and appear in the `speakers` array.
+    must lead each line and appear in the `speakers` array.
     """
     speaker = (str(speaker_name or "").strip() or DEFAULT_TTS_SPEAKER)
     body = str(text or "").strip()
-    return f"{speaker}: {body}" if body else speaker
+    if not body:
+        return speaker
+    line = f"{speaker}: {body}"
+    return f"{TTS_STYLE_DIRECTIVE}:\n{line}" if TTS_STYLE_DIRECTIVE else line
 
 
 def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER,
@@ -236,12 +248,19 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
         # 250-800 Hz, moderate presence, gentle high rolloff). The old chain cut low-mid and BOOSTED
         # presence +4 + air, which was too bright/harsh and emphasized TTS grain. Now: gentle low-mid
         # warmth, only a touch of presence, strong de-ess, no air boost.
-        filters.append("equalizer=f=400:width_type=q:w=1.1:g=1.5")           # low-mid WARMTH (body)
+        # CLEARER + MORE ENERGETIC (the Pro model is clean, so we can add clarity back without the
+        # old hiss returning): de-mud the boxy low-mids, keep warm body, compress harder for a
+        # forward/energetic delivery, then lift DEFINITION (consonants) + PRESENCE + a touch of AIR
+        # so the voice cuts through. Strong de-ess + gate + lowpass still keep sibilance/hiss down.
+        filters.append("equalizer=f=250:width_type=q:w=1.2:g=-1.5")          # de-mud boxy low-mids (clarity)
+        filters.append("equalizer=f=450:width_type=q:w=1.1:g=1.3")           # warm body (kept)
         if style == "punchy":
-            filters.append("acompressor=threshold=-17dB:ratio=2.6:attack=8:release=150:makeup=2:knee=4")
-        filters.append("equalizer=f=4000:width_type=q:w=1.0:g=1.5")          # light presence for clarity (was +4)
-        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-3.5")         # de-ess (tames sibilance/hiss)
-        filters.append("lowpass=f=15500")                                   # trim ultra-high hiss
+            filters.append("acompressor=threshold=-19dB:ratio=3:attack=6:release=140:makeup=3:knee=4")  # forward/energetic
+        filters.append("equalizer=f=2600:width_type=q:w=1.2:g=2")            # definition/intelligibility (clarity)
+        filters.append("equalizer=f=4200:width_type=q:w=1.0:g=2.5")          # presence (clarity+energy; was +1.5)
+        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-3.5")         # de-ess (tames the added presence's sibilance/hiss)
+        filters.append("equalizer=f=12000:width_type=q:w=0.8:g=1.2")         # air/openness (HD clarity; conservative to keep hiss down)
+        filters.append("lowpass=f=15800")                                   # trim ultra-high hiss (a touch more air than 15.5k)
     if abs(speed - 1.0) > 0.001:
         filters.append(f"atempo={speed:.4f}")
     if style == "punchy":
@@ -263,9 +282,9 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
         os.replace(str(tmp), str(path))
         status_log(status_cb, f"Voice chain: speed {speed:.2f}x.")
         if style in ("punchy", "dehiss"):
-            status_log(status_cb, "Voice EQ: WARM profile (matched to reference) - denoise, low-mid "
-                                  "warmth, light presence, strong de-ess, gentle high rolloff; "
-                                  "loudnorm -15 LUFS; final gate silences the gaps.")
+            status_log(status_cb, "Voice EQ: CLEAR+ENERGETIC profile - denoise, de-mud, warm body, "
+                                  "forward compression, definition + presence + air lift for clarity, "
+                                  "strong de-ess; loudnorm -15 LUFS; final gate silences the gaps.")
         else:
             status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}'.")
     except Exception as exc:

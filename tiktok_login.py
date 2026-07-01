@@ -46,12 +46,28 @@ _MARKER = _STATE_DIR / "logged_in.json"
 SESSION_COOKIE_NAMES = ("sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt")
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-_HEADLESS_SEARCH = (os.environ.get("TIKTOK_HEADLESS", "1").strip().lower()
-                    not in ("0", "false", "no"))
+# TikTok aggressively blocks HEADLESS browsers - even a logged-in session returns 0 search
+# results in headless mode (empty feed / login-wall). So search runs HEADED by default (a small
+# Chromium window opens during scraping), matching the working headed login. Set TIKTOK_HEADLESS=1
+# to force headless (faster, no window, but usually returns nothing).
+_HEADLESS_SEARCH = (os.environ.get("TIKTOK_HEADLESS", "0").strip().lower()
+                    in ("1", "true", "yes"))
 _LOCALE = os.environ.get("TIKTOK_LOCALE", "en-US").strip() or "en-US"
 
 _LOCK = threading.Lock()
 _SESSION = [None]                       # the shared Session, lazily created per run
+# per-run search health: lets the caller fail FAST when the backend returns nothing at all
+# (expired login / headless block / captcha) instead of grinding through every bucket.
+_SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0}
+
+
+def search_stats():
+    """Cumulative search health for this run: {searches, items, login_wall}."""
+    return dict(_SEARCH_STATS)
+
+
+def reset_search_stats():
+    _SEARCH_STATS.update(searches=0, items=0, login_wall=0)
 
 
 def _status(cb, msg):
@@ -235,11 +251,23 @@ class Session:
 
     def _open(self):
         self._p = sync_playwright().start()
+        args = ["--disable-blink-features=AutomationControlled", "--no-first-run",
+                "--no-default-browser-check", "--mute-audio"]
+        if not self.headless:
+            # TikTok blocks HEADLESS, so we must run a real (headed) browser - but the user does NOT
+            # want to see a window. Push it FAR off-screen: it still renders normally (off-screen is
+            # not headless and not minimized), so TikTok serves results, but nothing is visible.
+            # Disable occlusion/background throttling so the off-screen window isn't slowed down.
+            # Set TIKTOK_WINDOW_VISIBLE=1 to watch it (debugging).
+            if os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() not in ("1", "true", "yes"):
+                args += ["--window-position=-2400,-2400", "--window-size=1280,900",
+                         "--disable-backgrounding-occluded-windows",
+                         "--disable-renderer-backgrounding",
+                         "--disable-background-timer-throttling",
+                         "--disable-features=CalculateNativeWinOcclusion"]
         self._ctx = self._p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
-            viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled", "--no-first-run",
-                  "--no-default-browser-check", "--mute-audio"])
+            viewport={"width": 1280, "height": 900}, args=args)
 
     def cookies(self):
         try:
@@ -302,11 +330,24 @@ class Session:
             # last-resort: parse the embedded hydration JSON if XHRs were blocked
             if not collected:
                 _absorb(self._hydration_items(page))
+            # If we got nothing, is TikTok showing a login wall / captcha (session dead or
+            # headless blocked)? Record it so the caller can fail fast with a clear message.
+            if not collected:
+                try:
+                    low = (page.content() or "").lower()
+                    if ("log in to tiktok" in low or "login-modal" in low
+                            or "verify to continue" in low or "/captcha" in low
+                            or "secsdk-captcha" in low):
+                        _SEARCH_STATS["login_wall"] += 1
+                except Exception:
+                    pass
         finally:
             try:
                 page.close()
             except Exception:
                 pass
+        _SEARCH_STATS["searches"] += 1
+        _SEARCH_STATS["items"] += len(collected)
         if collected:
             self._refresh_cookies_quietly()
         _status(cb, f"TikTok search {query!r}: collected {len(collected)} candidate item(s).")
