@@ -748,7 +748,11 @@ def app_style():
          hover shadow room so overflow:auto doesn't clip it. */
       .wiz-modemenu { max-width: 840px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
       .modemenu-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-      .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 150px; padding: 18px 22px 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
+      /* scoped under .modemenu-cards (0,2,0) so display:flex BEATS the global button rule
+         (button:not(.preview-button) is 0,1,1 and was forcing display:block -> the icon/title/desc
+         spans rendered inline and collided with the title's underline). */
+      .modemenu-cards .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 150px; padding: 18px 22px 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
+      .modemenu-cards .modemenu-card .mm-title, .modemenu-cards .modemenu-card .mm-desc, .modemenu-cards .modemenu-card .mm-ico { display: block; }
       .modemenu-card::after { display: none; }
       .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
       .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
