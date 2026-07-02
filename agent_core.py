@@ -2509,6 +2509,7 @@ HOOK_PRESENTER_QUERIES = {
                 "Miyu Kishi TikTok dance"],
 }
 HOOK_MIN_LIKES = 20_000
+MIN_CLIP_LIKES = 10_000     # every scraped clip needs at least 10K likes
 HOOK_PRESENTER_TARGET = ("young adult Japanese female creator with at least 20,000 likes on the source video, "
                          "dancing or playfully acting cute to camera with Miyu Kishi / Saaki-Sakii-style hook energy, "
                          "expressive face, clean vertical frame; NOT anime/CGI/screen-recording, not a child, "
@@ -2544,6 +2545,9 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
             "  semantic = lifestyle / feeling / behaviour queries\n"
             "  broad  = broad TikTok-native queries\n"
             "  hashtag = #hashtag social-discovery queries (e.g. #恋愛あるある #おひとりさま #社会人の日常)\n"
+            "Give 5-7 queries PER TIER, and make every query a genuinely DIFFERENT angle: rotate synonyms, "
+            "slang, formal/casual phrasing, different concrete nouns and camera perspectives (POV / vlog / "
+            "walking tour / close-up). Near-duplicate wordings waste searches and are skipped.\n"
             "Also add creator-discussion queries where useful (a creator TALKING about the topic), e.g. "
             "恋愛について話す 女子, 仕事疲れた 話す.\n"
             f"Useful synonym families to widen with: {syn}.\n"
@@ -2822,22 +2826,30 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
         # are generous now (the renderer freezes rather than loops, and MAX_POOL bounds the total).
         intent = bucket.get("search_intent", "lifestyle_broll")
         if intent == "hook_influencer":
-            return 10
+            return 14
         scene_count = len(bucket.get("used_by_scene_ids") or [])
         if intent in ("specific_action", "proof_like_social_clip"):
-            return max(4, min(12, scene_count + 2))
-        return max(3, min(10, scene_count + 1))
+            return max(6, min(16, scene_count + 3))
+        return max(5, min(14, scene_count + 2))
 
-    MAX_POOL = 110
-    all_buckets = ([plan["hook"]] if plan.get("hook") else []) + (plan.get("buckets") or [])
+    MAX_POOL = 160
+    BUCKET_TIME_BUDGET_S = 180.0    # one starving bucket must not eat the whole run
+    # WHEN to search what: the hook bucket always first (scene 0 is mandatory), then body buckets
+    # ordered by how many scenes they cover - so if time/pool runs out, the scenes that need the
+    # most footage were searched first, not whatever order the planner happened to emit.
+    hook_buckets = [plan["hook"]] if plan.get("hook") else []
+    body_buckets = list(plan.get("buckets") or [])
+    body_buckets.sort(key=lambda b: len(b.get("used_by_scene_ids") or []), reverse=True)
+    all_buckets = hook_buckets + body_buckets
     try:
-        clip_scraper.reset_backend_search_health()   # per-run search health for the fail-fast below
+        clip_scraper.reset_backend_search_health()   # per-run search health + query dedupe reset
     except Exception:
         pass
     scrape_backend_dead = False
     for bi, bucket in enumerate(all_buckets):
         if (cancel_check and cancel_check()) or len(pool) >= MAX_POOL:
             break
+        bucket_t0 = time.time()
         bid = str(bucket.get("bucket_id", f"bucket_{bi:02d}"))
         intent = bucket.get("search_intent", "lifestyle_broll")
         is_hook = (intent == "hook_influencer")
@@ -2853,18 +2865,22 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
         for tier in TIERS:
             if got >= target or (cancel_check and cancel_check()):
                 break
+            if time.time() - bucket_t0 > BUCKET_TIME_BUDGET_S:
+                log(status_cb, f"Bucket {bid}: time budget ({BUCKET_TIME_BUDGET_S:.0f}s) reached with "
+                               f"{got} clip(s); moving on so other scenes still get footage.")
+                break
             qs = [str(q).strip() for q in (bucket.get("query_tiers", {}).get(tier) or []) if str(q).strip()]
             if not qs:
                 continue
-            log(status_cb, f"  [{bid} · {tier}] searching TikTok: {' · '.join(qs[:6])}")
+            log(status_cb, f"  [{bid} · {tier}] searching TikTok: {' · '.join(qs[:8])}")
             out_dir = cand_root / bid
             try:
                 got_dicts = clip_scraper.scrape_bucket(
-                    out_dir, qs[:6], max(2, target - got), bucket_id=bid, tier=tier,
+                    out_dir, qs[:8], max(2, target - got), bucket_id=bid, tier=tier,
                     bucket_terms=bucket_terms, per_clip_seconds=per_clip_seconds,
                     status_cb=status_cb, cancel_check=cancel_check, seen_ids=seen_ids,
                     query_perf=query_perf, candidate_statuses=candidate_statuses,
-                    min_likes=HOOK_MIN_LIKES if is_hook else 0,
+                    min_likes=HOOK_MIN_LIKES if is_hook else MIN_CLIP_LIKES,
                     search_sort="MOST_LIKED") or []
             except Exception as exc:  # noqa: BLE001
                 log(status_cb, f"Bucket {bid}: {tier} tier search failed ({exc.__class__.__name__}).")
@@ -4056,8 +4072,10 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             {"role": "system", "content": "You are a footage QA + editor for viral TikTok-style essays. A clip may play "
              "under a narration line when it genuinely FITS that line: either by DEPICTING it (concrete lines with a clear "
              "subject) OR by matching its TOPIC and MOOD (abstract/essay lines - a sentence fragment or feeling). Real "
-             "TikTok essays run coherent b-roll under abstract narration; that is CORRECT, not filler. Reject ONLY footage "
-             "that is off-topic/contradictory, has burned-in creator captions/text, is a screenshot/livestream/slideshow, "
+             "TikTok essays run coherent b-roll under abstract narration; that is CORRECT, not filler. Any burned-in "
+             "captions were already BLURRED at intake - do NOT reject a clip for mild, blurred or leftover text; only "
+             "reject when text DOMINATES the frame (text post / meme wall / subtitle karaoke). Reject ONLY footage "
+             "that is off-topic/contradictory, text-dominated, a screenshot/livestream/slideshow, "
              "or is otherwise unusable. Return JSON only."},
             {"role": "user", "content": [
                 {"type": "text", "text": prompt},
@@ -4114,8 +4132,10 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             # rescue a bad script match.
             candidate_meta = clip_meta.get(str(clip_paths[cn])) if (0 <= cn < n) else {}
             deterministic_stable = int((candidate_meta or {}).get("rapid_internal_cut_count") or 0) == 0
-            clean = (not has_creator_text and txt_hs <= 3.0 and raw_fs >= 6.0
-                     and edit_stability >= 6.0 and deterministic_stable)
+            # Captions were blurred at intake - mild text must not block a good clip. Creator
+            # text only blocks when it is HEAVY; the hard text bar matches the scraper policy.
+            clean = ((not has_creator_text or txt_hs <= 4.5) and txt_hs <= 5.5
+                     and raw_fs >= 5.0 and edit_stability >= 6.0 and deterministic_stable)
             accept = (valid and passes and clean and mclass != "D_REJECTED"
                       and sm >= match_threshold)
             chosen = None
@@ -7168,7 +7188,7 @@ def run_project(form, status_cb=None):
             log(status_cb, f"Scrape: clip_scraper unavailable ({exc.__class__.__name__}); skipping scrape.")
         if clip_scraper is not None:
             scene_total = len(scenes_override) if scenes_override else max(1, seedance_clip_count)
-            SCRAPE_CAP = 34
+            SCRAPE_CAP = 48
             MAX_SCRAPE_ROUNDS = int(form.get("scrape_rounds", 3) or 3) if isinstance(form, dict) else 3
             MAX_SCRAPE_ROUNDS = max(1, min(5, MAX_SCRAPE_ROUNDS))
             try:
@@ -7404,6 +7424,7 @@ def run_project(form, status_cb=None):
                             bucket_terms=" ".join(lines)[:200], per_clip_seconds=per_clip,
                             status_cb=status_cb, cancel_check=_cancel, seen_ids=retry_seen_ids,
                             query_perf=query_perf, candidate_statuses=candidate_statuses,
+                            min_likes=MIN_CLIP_LIKES,
                             search_sort="MOST_LIKED") or []
                     else:
                         log(status_cb, "   no new retry terms returned; re-scoring the existing pool "
@@ -7690,11 +7711,12 @@ def run_project(form, status_cb=None):
                         _cap_cache[_k] = 0.0
                 return _cap_cache[_k]
 
-            _CAP_MAX = 2.8
+            _CAP_MAX = 5.5   # matches the scraper's text-plastered bar; lighter captions were already blurred
             _used_keys = set()
             _prev_key = None
             _swaps = 0
             _cap_swaps = 0
+            _blurred = 0
             for _idx in range(len(scene_clips)):
                 _clip = scene_clips[_idx]
                 if _clip is None:
@@ -7717,11 +7739,25 @@ def run_project(form, status_cb=None):
                         _key = str(Path(_repl).resolve())
                         if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
                             clip_decision_log[_idx]["cleanup_swapped"] = True
+                    elif _is_capt:
+                        # No clean replacement available: BLUR the burned-in caption regions so
+                        # the leftover captions melt into the footage instead of standing out.
+                        try:
+                            _n_blur = clip_scraper.blur_caption_regions(
+                                Path(_clip), _ff_cap, per_clip, status_cb=status_cb)
+                        except Exception:
+                            _n_blur = 0
+                        if _n_blur:
+                            _cap_cache.pop(_key, None)      # score changed after the blur
+                            _blurred += 1
+                            if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
+                                clip_decision_log[_idx]["captions_blurred"] = True
                 _used_keys.add(_key)
                 _prev_key = _key
-            if _swaps or _cap_swaps:
+            if _swaps or _cap_swaps or _blurred:
                 log(status_cb, f"Final clean-up: swapped {_cap_swaps} captioned + {_swaps} duplicate "
-                               "clip(s) for clean unused footage.")
+                               f"clip(s); blurred leftover captions on {_blurred} clip(s) with no "
+                               "clean replacement.")
 
             # Place only clips that passed semantic matching for this exact scene.  The previous
             # reuse cycle filled rejected scenes with an unrelated clip accepted for a different

@@ -1142,6 +1142,11 @@ def app_style():
       }
       .media-tile .media-del::after { display: none; }
       .media-tile .media-del:hover { opacity: 1; color: #fff; background: rgba(240,104,115,.85); border: 0; transform: none; box-shadow: none; }
+      /* green checkmark on DECLINED tiles: manually accept the clip into the project */
+      .media-tile .media-accept { position: absolute; top: 6px; left: 6px; z-index: 3; width: 24px; height: 24px; min-width: 0; padding: 0; display: grid; place-items: center; border: 0; border-radius: 7px; background: rgba(31,191,107,.92); color: #fff; font-size: 14px; line-height: 1; cursor: pointer; }
+      .media-tile .media-accept::after { display: none; }
+      .media-tile .media-accept:hover { background: #1fbf6b; color: #fff; transform: none; box-shadow: none; }
+      .media-tile.declined-tile { border-color: var(--accent-2); }
       /* no sticky: a sticky right column scrolls out of step with the left column. */
       .preview-section { grid-column: 2; align-self: start; }
       /* fixed 3 columns so tiles stay the SAME size on every tab (was auto-fit, which
@@ -2262,6 +2267,27 @@ def app_script():
             }
             return;
           }
+          var acc = event.target.closest(".media-accept");
+          if (acc) {
+            event.preventDefault();
+            var acceptPath = acc.getAttribute("data-accept-path");
+            fetch("/accept-media", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: "path=" + encodeURIComponent(acceptPath)
+            }).then(function (r) { return r.json(); }).then(function (d) {
+              if (d && d.ok) {
+                var tile = acc.closest(".media-tile");
+                if (tile) {
+                  tile.classList.remove("declined-tile");
+                  var k = tile.querySelector(".media-kind");
+                  if (k) k.textContent = "clip";
+                }
+                acc.remove();
+              }
+            }).catch(function () {});
+            return;
+          }
           var trigger = event.target.closest("[data-preview-src]");
           if (!trigger) return;
           var box = ensureLightbox();
@@ -2269,6 +2295,27 @@ def app_script():
           box.querySelector("img").alt = trigger.getAttribute("data-preview-title") || "Preview";
           box.querySelector(".lightbox-title").textContent = trigger.getAttribute("data-preview-title") || "Preview";
           box.classList.add("open");
+        });
+
+        document.addEventListener("mouseover", function (event) {
+          var tile = event.target.closest(".media-tile");
+          if (!tile) return;
+          var vid = tile.querySelector("video");
+          if (vid && vid.paused) {
+            vid.muted = true;
+            var pr = vid.play();
+            if (pr && pr.catch) pr.catch(function () {});
+          }
+        });
+        document.addEventListener("mouseout", function (event) {
+          var tile = event.target.closest(".media-tile");
+          if (!tile) return;
+          if (event.relatedTarget && tile.contains(event.relatedTarget)) return;
+          var vid = tile.querySelector("video");
+          if (vid && !vid.paused) {
+            vid.pause();
+            try { vid.currentTime = 0; } catch (e) {}
+          }
         });
 
         window.addEventListener("load", function () {
@@ -3646,6 +3693,11 @@ def project_media_files(project_dir):
             lower_parts = {p.lower() for p in path.parts}
             if "_candidates" in lower_parts or "_raw" in lower_parts:
                 continue
+            # rejected-but-watchable clips: shown in the media panel with a checkmark so the
+            # user can review and manually accept them into the project
+            if "_declined" in lower_parts:
+                items.append(("declined", path))
+                continue
             # derived poster thumbnails (clip.poster.jpg) are not real draggable media
             if path.name.lower().endswith(".poster.jpg"):
                 continue
@@ -3690,8 +3742,15 @@ def media_preview_markup(kind, path, replaceable=False, queued=False, input_name
         if replaceable
         else f'<label>{esc(label)}</label>'
     )
+    tile_cls = " queued" if queued else ""
+    accept_html = ""
+    if kind == "declined":
+        tile_cls += " declined-tile"
+        accept_html = (f'<button class="media-accept" type="button" title="Accept this clip into the project" '
+                       f'data-accept-path="{esc(resolved)}">&#10003;</button>')
     return (
-        f'<article class="media-tile{" queued" if queued else ""}">'
+        f'<article class="media-tile{tile_cls}">'
+        f'{accept_html}'
         f'<span class="media-kind">{esc(kind)}</span>'
         f'<button class="preview-button" type="button" data-preview-src="{link_for(path)}" data-preview-title="{esc(path.name)}">'
         f'{preview}</button>'
@@ -5723,6 +5782,31 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", f"/job?id={urllib.parse.quote(new_job)}")
             self.end_headers()
+            return
+        if parsed.path == "/accept-media":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            raw = urllib.parse.parse_qs(body.decode("utf-8", errors="replace")).get("path", [""])[0]
+            resolved = safe_requested_path(raw)
+            projects_root = agent_core.PROJECTS_DIR.resolve()
+            ok = False
+            if (resolved and resolved.is_file() and projects_root in resolved.parents
+                    and "_declined" in {part.lower() for part in resolved.parts}):
+                try:
+                    import shutil as _sh
+                    dest = resolved.parent.parent / f"manual_{resolved.stem.replace('declined_', '')}.mp4"
+                    _sh.move(str(resolved), str(dest))
+                    try:
+                        resolved.with_suffix(".json").unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    ok = True
+                except Exception:
+                    ok = False
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
             return
         if parsed.path == "/delete-media":
             length = int(self.headers.get("Content-Length", "0"))

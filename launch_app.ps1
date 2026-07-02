@@ -10,15 +10,24 @@ if (-not (Test-Path $iconPath)) {
     $iconPath = Join-Path $appDir "static\start_icon.ico"
 }
 
-# Clean up old profile dirs to prevent disk space bloat
-$oldProfiles = Get-ChildItem -Path $appDir -Filter "browser-profile-*" -Directory
+# Clean up the old per-session random profiles. A FRESH profile on every start made Edge re-run
+# its first-run auto-sign-in each launch - THAT was the "we're syncing your browser data" flyout
+# (and the translate prompt) appearing every single time the app opened.
+$oldProfiles = Get-ChildItem -Path $appDir -Filter "browser-profile-*" -Directory -ErrorAction SilentlyContinue
 foreach ($profile in $oldProfiles) {
     Remove-Item -Path $profile.FullName -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Generate a unique profile directory for this session so Edge doesn't delegate to a background process
-$profileDir = Join-Path $appDir "browser-profile-$(Get-Random)"
-New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+# ONE persistent, dedicated app profile instead (any non-default --user-data-dir already forces a
+# separate Edge process, so the per-session randomness was never needed). On first creation we
+# pre-seed the profile preferences: sign-in DISABLED (kills the auto-sign-in + sync flyout for
+# good) and translate prompts off - scoped to THIS app profile only; normal Edge is untouched.
+$profileDir = Join-Path $appDir "browser-profile"
+if (-not (Test-Path (Join-Path $profileDir "Default"))) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $profileDir "Default") | Out-Null
+    $prefs = '{"signin":{"allowed":false,"allowed_on_next_startup":false},"sync_promo":{"show_on_first_run_allowed":false},"translate":{"enabled":false},"credentials_enable_service":false}'
+    Set-Content -Path (Join-Path $profileDir "Default\Preferences") -Value $prefs -Encoding utf8
+}
 
 # Setup the shortcut so it points to THIS script instead of directly to Edge
 $shell = New-Object -ComObject WScript.Shell
@@ -93,6 +102,9 @@ $arguments = @(
     "--window-size=1920,1080",
     "--user-data-dir=`"$profileDir`"",
     "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-sync",
+    "--disable-features=msImplicitSignin,msSeamlessWebToBrowserSignIn,msFirstRunExperience,TranslateUI",
     "--disable-extensions"
 ) -join " "
 

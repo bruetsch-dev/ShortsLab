@@ -239,6 +239,51 @@ def _extract_items_from_payload(payload):
     return items
 
 
+def _hide_offscreen_from_taskbar():
+    """Windows only: strip the TASKBAR BUTTON from our off-screen scrape window so nothing shows
+    or blinks in the taskbar. Only windows parked DEEP off-screen (left AND top <= -2000, i.e. the
+    -2400,-2400 position we launch at - no real monitor sits there) get the WS_EX_TOOLWINDOW style
+    (hide -> restyle -> show-without-activate is the required Win32 dance). Returns True if at
+    least one window was found."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    SW_HIDE, SW_SHOWNA = 0, 8
+    found = [False]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _lp):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            rect = ctypes.wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            if rect.left <= -2000 and rect.top <= -2000:
+                found[0] = True
+                style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if not (style & WS_EX_TOOLWINDOW):
+                    user32.ShowWindow(hwnd, SW_HIDE)
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                          (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+                    user32.ShowWindow(hwnd, SW_SHOWNA)
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        return False
+    return found[0]
+
+
 class Session:
     """A reusable logged-in TikTok browser session. One persistent context for a whole run."""
 
@@ -268,6 +313,12 @@ class Session:
         self._ctx = self._p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
             viewport={"width": 1280, "height": 900}, args=args)
+        if not self.headless:
+            # remove the taskbar button of the off-screen window (it kept blinking for attention)
+            for _wait in (0.4, 1.2, 2.0):
+                time.sleep(_wait)
+                if _hide_offscreen_from_taskbar():
+                    break
 
     def cookies(self):
         try:
@@ -284,6 +335,8 @@ class Session:
         query = str(query or "").strip()
         if not query:
             return []
+        if not self.headless:
+            _hide_offscreen_from_taskbar()      # windows can be re-created between searches
         collected = []
         seen = set()
 
@@ -319,14 +372,25 @@ class Session:
                 page.goto(url, timeout=45000, wait_until="domcontentloaded")
             except Exception as exc:
                 _status(cb, f"TikTok search: navigation failed for {query!r} ({exc.__class__.__name__}).")
-            # let the first XHR settle, then scroll to page in more results
-            page.wait_for_timeout(2500)
+            # let the first XHR settle, then scroll ADAPTIVELY: a dead query fails FAST (settle +
+            # one probe scroll ~4s instead of a fixed 8-scroll ~14s), and a productive query stops
+            # as soon as two consecutive scrolls add nothing new (results stagnated).
+            page.wait_for_timeout(1800)
             self._maybe_dismiss_overlays(page)
             scrolls = 0
-            while len(collected) < want and scrolls < max_scrolls:
+            stagnant = 0
+            last_n = len(collected)
+            while len(collected) < want and scrolls < max_scrolls and stagnant < 2:
                 page.mouse.wheel(0, 2600)
-                page.wait_for_timeout(1400)
+                page.wait_for_timeout(1100)
                 scrolls += 1
+                if len(collected) <= last_n:
+                    stagnant += 1
+                    if not collected:
+                        break                     # nothing at all after settle + probe -> dead query
+                else:
+                    stagnant = 0
+                last_n = len(collected)
             # last-resort: parse the embedded hydration JSON if XHRs were blocked
             if not collected:
                 _absorb(self._hydration_items(page))

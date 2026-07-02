@@ -377,6 +377,22 @@ def backend_name():
     return "none"
 
 
+# Queries already searched THIS RUN (normalized). Buckets, tiers and retry rounds routinely
+# produce near-duplicate queries - re-searching them costs ~5-15s each for zero new clips.
+_SEEN_QUERIES = set()
+_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿]")
+
+
+def _norm_query(q):
+    return " ".join(str(q).replace("#", " ").split()).casefold()
+
+
+def _jp_first(queries):
+    """Japanese queries first - Japanese TikTok content is indexed under native terms, so JP
+    queries yield far more usable clips per search than their English variants."""
+    return sorted(queries, key=lambda q: 0 if _CJK_RE.search(str(q)) else 1)
+
+
 def backend_search_health():
     """Cumulative search health for the active backend this run: {searches, items, login_wall}.
     Lets the caller fail fast when the backend returns NOTHING (logged out / headless block)."""
@@ -389,6 +405,7 @@ def backend_search_health():
 
 
 def reset_backend_search_health():
+    _SEEN_QUERIES.clear()               # fresh run -> allow every query once again
     if tiktok_login is not None:
         try:
             tiktok_login.reset_search_stats()
@@ -676,8 +693,8 @@ def is_vertical_hq(path, ffprobe):
     return True
 
 
-def _sample_gray_frames(path, ffmpeg, n, seconds):
-    """Grab n grayscale frames spread across the clip as numpy arrays."""
+def _sample_bgr_frames(path, ffmpeg, n, seconds):
+    """Grab n COLOR (BGR) frames spread across the clip as numpy arrays."""
     if cv2 is None or not ffmpeg:
         return []
     frames = []
@@ -690,7 +707,7 @@ def _sample_gray_frames(path, ffmpeg, n, seconds):
                             "-frames:v", "1", "-vf", "scale=360:-1", str(fp)],
                            capture_output=True, timeout=30)
             if fp.exists():
-                img = cv2.imread(str(fp), cv2.IMREAD_GRAYSCALE)
+                img = cv2.imread(str(fp), cv2.IMREAD_COLOR)
                 if img is not None:
                     frames.append(img)
     except Exception:
@@ -705,21 +722,30 @@ def _sample_gray_frames(path, ffmpeg, n, seconds):
     return frames
 
 
-def _frame_caption_lines(gray):
-    """Count big white/yellow caption-like text lines in the centre band of one frame.
+def _sample_gray_frames(path, ffmpeg, n, seconds):
+    """Grab n grayscale frames spread across the clip as numpy arrays."""
+    return [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            for f in _sample_bgr_frames(path, ffmpeg, n, seconds)]
 
-    Edited captions are near-WHITE (or bright yellow) bold text, usually outlined and
-    horizontally centred. We threshold for very bright pixels and look for a wide, text-
-    height, centred blob whose stroke density is text-like. This deliberately ignores
-    coloured street signage, red lanterns and scattered city lights (which the reference
-    channels are full of and the user wants to keep). Returns an integer count.
+
+def _frame_caption_boxes(gray, hsv=None):
+    """Find caption-like regions in one frame; returns [(x, y, w, h), ...] in the frame's own
+    (scaled) coordinates.
+
+    Catches BOTH burned-caption styles:
+      - bright outlined text (white/yellow bold strokes, moderate fill), and
+      - TikTok's classic solid WHITE caption BUBBLE with dark text (near-solid bright block).
+    When `hsv` is given, a COLOR check rejects bright COLOURED regions (neon signs, lanterns,
+    store fronts glow pink/red/orange/blue - captions are WHITE or YELLOW): the bright pixels in
+    a candidate box must be predominantly white (low saturation) or caption-yellow.
     """
     if cv2 is None or np is None:
-        return 0
+        return []
+    boxes = []
     h, w = gray.shape
-    y0, y1 = int(0.30 * h), int(0.93 * h)
+    y0, y1 = int(0.22 * h), int(0.93 * h)
     band = gray[y0:y1, :]
-    # very bright pixels only -> white/yellow caption text, not coloured signage/lanterns
+    # very bright pixels only -> white/yellow caption text or a white caption bubble
     _, bright = cv2.threshold(band, 205, 255, cv2.THRESH_BINARY)
     # drop tiny speckle (scattered city lights are isolated dots, not strokes)
     bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN,
@@ -730,18 +756,69 @@ def _frame_caption_lines(gray):
     closed = cv2.morphologyEx(bright, cv2.MORPH_CLOSE,
                               cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky)))
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    lines = 0
     for c in cnts:
         x, y, bw, bbh = cv2.boundingRect(c)
         cx = x + bw / 2.0
-        if bw > 0.22 * w and 0.035 * h < bbh < 0.16 * h and 0.12 * w < cx < 0.88 * w:
-            # within the line box, how much is actually bright text vs filled block?
+        if bw > 0.16 * w and 0.028 * h < bbh < 0.22 * h and 0.12 * w < cx < 0.88 * w:
             roi = bright[y:y + bbh, x:x + bw]
             fill = float(roi.mean()) / 255.0
-            # text strokes give moderate fill; exclude solid white panels (high) and noise (low)
-            if 0.05 < fill < 0.55:
-                lines += 1
-    return lines
+            shape_ok = (0.05 < fill < 0.55) or (fill >= 0.55 and bw > 0.28 * w)
+            if not shape_ok:
+                continue
+            if hsv is not None:
+                # caption ink is WHITE (low saturation) or YELLOW; bright coloured blobs are
+                # signage/neon and must NOT count.
+                m = roi > 0
+                if int(m.sum()) >= 12:
+                    sroi = hsv[y + y0:y + y0 + bbh, x:x + bw, 1][m].astype(float)
+                    hroi = hsv[y + y0:y + y0 + bbh, x:x + bw, 0][m].astype(float)
+                    whiteish = sroi < 70
+                    yellowish = (sroi >= 70) & (hroi >= 18) & (hroi <= 38)
+                    if float((whiteish | yellowish).mean()) < 0.65:
+                        continue
+            boxes.append((x, y + y0, bw, bbh))
+    return boxes
+
+
+def _frame_caption_lines(gray):
+    """Count caption-like text lines in one frame (see _frame_caption_boxes)."""
+    return len(_frame_caption_boxes(gray))
+
+
+def _cluster_caption_boxes(per_frame_boxes):
+    """Cluster caption boxes ACROSS frames by screen position (IoU > 0.3). Burned-in captions sit
+    still; signage/scene text moves with the camera and never lines up. Returns a list of
+    {"box": (x, y, w, h) union, "frames": set(frame_idx)}."""
+    flat = [(fi, b) for fi, bs in enumerate(per_frame_boxes) for b in bs]
+    used = [False] * len(flat)
+
+    def _iou(a, b):
+        ax, ay, aw, ah = a; bx, by, bw, bh = b
+        ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+        iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+        inter = ix * iy
+        union = aw * ah + bw * bh - inter
+        return inter / union if union else 0.0
+
+    clusters = []
+    for i, (fi, b) in enumerate(flat):
+        if used[i]:
+            continue
+        used[i] = True
+        members, seen_frames = [b], {fi}
+        for j in range(i + 1, len(flat)):
+            if used[j]:
+                continue
+            fj, b2 = flat[j]
+            if _iou(b, b2) > 0.30:
+                used[j] = True
+                members.append(b2)
+                seen_frames.add(fj)
+        xs = [m[0] for m in members]; ys = [m[1] for m in members]
+        x2 = [m[0] + m[2] for m in members]; y2 = [m[1] + m[3] for m in members]
+        clusters.append({"box": (min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys)),
+                         "frames": seen_frames})
+    return clusters
 
 
 def has_burned_captions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=None):
@@ -1076,17 +1153,113 @@ def detect_fake_vertical_or_black_bars(path, ffmpeg, seconds=DEFAULT_CLIP_SECOND
 
 
 def text_heaviness_score(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS):
-    """0-10 estimate of burned-in caption/text load across 5 frames (10%/30%/50%/70%/90%-ish).
-    Uses the centre-band bright-text heuristic; tuned to ignore signage/neon."""
+    """0-10 estimate of burned-in caption load across 7 sampled COLOR frames.
+
+    Only PERSISTENT white/yellow text regions score heavily: burned captions sit at the SAME
+    screen position across frames, while bright signage/neon moves with the camera (and coloured
+    neon is already rejected by the hsv check). Transient bright text-like blobs add only a tiny
+    nudge - this keeps the neon night-street footage the channel lives on from being rejected."""
     if cv2 is None or np is None:
         return 0.0
-    frames = _sample_gray_frames(path, ffmpeg, 5, seconds)
-    if not frames:
+    bgr = _sample_bgr_frames(path, ffmpeg, 7, seconds)
+    if not bgr:
         return 0.0
-    counts = [_frame_caption_lines(g) for g in frames]
-    frac = sum(1 for c in counts if c >= 1) / len(counts)
-    avg = sum(counts) / len(counts)
-    return round(min(10.0, frac * 6.0 + avg * 2.0), 1)
+    per_frame = []
+    for f in bgr:
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        per_frame.append(_frame_caption_boxes(g, hsv=hsv))
+    n = len(per_frame)
+    clusters = _cluster_caption_boxes(per_frame)
+    persistent = [c for c in clusters if len(c["frames"]) >= 2]
+    transient = len(clusters) - len(persistent)
+    frames_with = set()
+    for c in persistent:
+        frames_with |= c["frames"]
+    frac = len(frames_with) / n
+    avg = sum(len(c["frames"]) for c in persistent) / n
+    score = frac * 6.0 + avg * 2.0 + min(0.8, transient * 0.15)
+    # peak rule: one frame stacked with 2+ PERSISTENT caption lines = captioned clip
+    stack = {}
+    for c in persistent:
+        for fi in c["frames"]:
+            stack[fi] = stack.get(fi, 0) + 1
+    if stack and max(stack.values()) >= 2:
+        score = max(score, 3.0)
+    return round(min(10.0, score), 1)
+
+
+def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=None):
+    """Blur PERSISTENT burned-in caption regions IN PLACE so leftover captions melt into the
+    footage instead of standing out. Detects caption-like boxes on 6 sampled frames, keeps only
+    regions that sit at the SAME screen position in >=2 frames (burned captions are static;
+    signage/scene text moves with the camera and never lines up), merges them, and boxblurs those
+    regions hard. Returns the number of blurred regions (0 = file untouched)."""
+    if cv2 is None or np is None or not ffmpeg:
+        return 0
+    path = Path(path)
+    bgr = _sample_bgr_frames(path, ffmpeg, 6, seconds)
+    if not bgr:
+        return 0
+    per_frame = []
+    for f in bgr:
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        per_frame.append(_frame_caption_boxes(g, hsv=hsv))
+    regions = [c["box"] for c in _cluster_caption_boxes(per_frame)
+               if len(c["frames"]) >= 2]                # persistent across frames = burned-in
+    if not regions:
+        return 0
+    regions = regions[:3]
+
+    # scale detection coords (frames are 360px wide) to the real video size
+    gh, gw = bgr[0].shape[:2]
+    _, ffprobe = _ffmpeg_tools()
+    vw = vh = 0
+    try:
+        r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+                           capture_output=True, text=True, timeout=20)
+        vw, vh = (int(v) for v in (r.stdout or "0x0").strip().split("x")[:2])
+    except Exception:
+        pass
+    if not (vw and vh):
+        return 0
+    sx, sy = vw / float(gw), vh / float(gh)
+    mx, my = int(vw * 0.02), int(vh * 0.012)            # margin so blur covers outlines/shadows
+
+    def _even(v):
+        return max(2, int(v) // 2 * 2)
+
+    parts = [f"[0:v]split={len(regions) + 1}[b0]" + "".join(f"[c{k}]" for k in range(len(regions)))]
+    cur = "b0"
+    for k, (x, y, w0, h0) in enumerate(regions):
+        X = max(0, int(x * sx) - mx); Y = max(0, int(y * sy) - my)
+        W = _even(min(vw - X, w0 * sx + 2 * mx)); H = _even(min(vh - Y, h0 * sy + 2 * my))
+        rad = max(10, min(30, H // 4))
+        parts.append(f"[c{k}]crop={W}:{H}:{X}:{Y},boxblur=luma_radius={rad}:luma_power=2:"
+                     f"chroma_radius={max(5, rad // 2)}:chroma_power=2,"
+                     f"eq=brightness=-0.06:saturation=0.9[bl{k}]")   # slight darken so white bubbles blend
+        nxt = f"o{k}"
+        parts.append(f"[{cur}][bl{k}]overlay={X}:{Y}[{nxt}]")
+        cur = nxt
+    tmp = path.with_name(path.stem + "_capblur" + path.suffix)
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-filter_complex", ";".join(parts), "-map", f"[{cur}]", "-map", "0:a?",
+           "-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "copy",
+           "-movflags", "+faststart", str(tmp)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=300)
+        if tmp.exists() and tmp.stat().st_size > 4096:
+            os.replace(str(tmp), str(path))
+            return len(regions)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return 0
 
 
 def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_terms="",
@@ -1102,6 +1275,22 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
     if not backend_active() or not queries:
         return []
+    # Search discipline: JAPANESE queries first (native terms index this content far better than
+    # the English variants), and NEVER re-run a query already searched this run - buckets, tiers
+    # and retry rounds routinely produce near-duplicates that would burn 5-15s each for nothing.
+    ordered = _jp_first(queries)
+    fresh, dup = [], 0
+    for q in ordered:
+        if _norm_query(q) in _SEEN_QUERIES:
+            dup += 1
+            continue
+        fresh.append(q)
+    if dup:
+        _status(status_cb, f"Scrape: skipped {dup} duplicate quer{'y' if dup == 1 else 'ies'} "
+                           "(already searched this run).")
+    queries = fresh
+    if not queries:
+        return []
     out_dir = Path(out_dir)
     raw_dir = out_dir / "_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1113,12 +1302,38 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     accepted = []
     # Do not let the first query monopolize the whole pool.  Search at least three
     # variants (when available), taking a bounded number from each before widening.
-    diversity_slots = min(3, len(queries), max(1, int(want)))
+    diversity_slots = min(5, len(queries), max(1, int(want)))
     per_query_quota = max(1, (int(want) + diversity_slots - 1) // diversity_slots)
 
     def _reject(raw):
         try:
             raw.unlink()
+        except Exception:
+            pass
+
+    def _declined_root():
+        p = out_dir
+        while p.name.lower() != "seedance 2.0" and p.parent != p:
+            p = p.parent
+        return (p if p.name.lower() == "seedance 2.0" else out_dir) / "_declined"
+
+    def _save_declined(raw_path, cid_, reason, score=None):
+        """Keep a bounded set of REJECTED-but-watchable clips (normalized 9:16) so the media panel
+        can show them - the user can review and manually ACCEPT one with the checkmark."""
+        try:
+            droot = _declined_root()
+            droot.mkdir(parents=True, exist_ok=True)
+            if len(list(droot.glob("*.mp4"))) >= 24:
+                return
+            key = hashlib.sha1(str(cid_ or raw_path).encode("utf-8", "ignore")).hexdigest()[:12]
+            dst = droot / f"declined_{key}.mp4"
+            if dst.exists():
+                return
+            if normalize_clip(raw_path, dst, ffmpeg, seconds=per_clip_seconds):
+                info = {"reason": str(reason)[:160]}
+                if score is not None:
+                    info["score"] = score
+                dst.with_suffix(".json").write_text(json.dumps(info), "utf-8")
         except Exception:
             pass
 
@@ -1134,7 +1349,8 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         if (cancel_check and cancel_check()) or len(accepted) >= want:
             break
         query_stop = min(int(want), len(accepted) + per_query_quota)
-        items = backend_search(q, max(4, want + 2), status_cb=status_cb,
+        _SEEN_QUERIES.add(_norm_query(q))
+        items = backend_search(q, max(6, want + 4), status_cb=status_cb,
                                sort=search_sort) or []
         if _APIFY_OUT_OF_CREDITS[0]:        # apify fallback: stop hammering a billing-blocked account
             break
@@ -1168,16 +1384,19 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             if fv["is_fake_vertical"] or fv["black_bar_score"] > 4.0:
                 _status(status_cb, f"Rejected clip ({bucket_id}/{q}): fake vertical / black bars "
                                    f"({fv['reason']})")
+                _save_declined(raw, cid, f"black bars / fake vertical: {fv['reason']}")
                 _reject(raw)
                 _cstat(cid, "rejected_black_bars", fv["reason"],
                        {"black_bar_score": fv["black_bar_score"], "is_fake_vertical": fv["is_fake_vertical"]})
                 continue
             th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
-            # 4.0 was too lax (it let clips with captions in 2 of 5 sampled frames through). 2.8
-            # rejects anything with burned-in text on more than one frame, keeping only clips that
-            # are essentially text-free (incidental signage still scores ~1.6 and is allowed).
-            if th > 2.8:
-                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): text-heavy TikTok captions ({th}/10)")
+            # POLICY: most Japanese TikToks carry SOME burned captions - rejecting them all
+            # starves the pool. Hard-reject only clips PLASTERED with text (constant multi-line
+            # captions / text posts, > 5.5); lighter captions are ACCEPTED and their persistent
+            # caption regions get BLURRED below so they melt into the footage.
+            if th > 7.0:
+                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): text-plastered TikTok ({th}/10)")
+                _save_declined(raw, cid, f"text-plastered ({th}/10)", score=th)
                 _reject(raw)
                 _cstat(cid, "rejected_text_heavy", f"burned-in text {th}/10",
                        {"text_heaviness_score": th})
@@ -1187,6 +1406,7 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                 _status(status_cb, f"Rejected clip ({bucket_id}/{q}): rapid internal edit montage "
                                    f"({stability['internal_cut_count']} cuts; shortest hold "
                                    f"{stability['min_shot_seconds']:.2f}s)")
+                _save_declined(raw, cid, f"rapid internal cuts ({stability['internal_cut_count']})")
                 _reject(raw)
                 _cstat(cid, "rejected_rapid_cuts", "source contains rapid internal edit cuts",
                        stability)
@@ -1206,6 +1426,16 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             if not final:
                 _cstat(cid, "rejected_quality", "normalize failed")
                 continue
+            # Captions in the accepted band (1.0-5.5): BLUR the persistent caption regions on the
+            # final clip so they melt into the footage instead of standing out under our own
+            # captions. Re-score after the blur so downstream gates see the softened state.
+            if th >= 1.0:
+                _softened = blur_caption_regions(final, ffmpeg, per_clip_seconds, status_cb=status_cb)
+                if _softened:
+                    th_after = text_heaviness_score(final, ffmpeg, per_clip_seconds)
+                    _status(status_cb, f"Softened {_softened} caption region(s) "
+                                       f"({bucket_id}/{q}, text {th}/10 -> {th_after}/10).")
+                    th = th_after
             clean += 1
             acc += 1
             accepted.append({"path": final, "meta": m, "query": q, "tier": tier, "clip_id": cid,
