@@ -24,6 +24,7 @@ Be honest about the limits:
 scrape_clips() never raises into the render; on failure it returns what it has.
 """
 
+import concurrent.futures
 import os
 import re
 import subprocess
@@ -1337,15 +1338,101 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         except Exception:
             pass
 
-    def _cstat(cid, status, reason, extra=None):
+    def _cstat(q_, cid, status, reason, extra=None):
         if candidate_statuses is not None:
-            row = {"clip_id": cid, "bucket_id": bucket_id, "source_query": q, "tier": tier,
+            row = {"clip_id": cid, "bucket_id": bucket_id, "source_query": q_, "tier": tier,
                    "status": status, "shown_in_media_panel": False, "reason": reason}
             if extra:
                 row.update(extra)
             candidate_statuses.append(row)
 
-    for q in queries:
+    def _analyze_item(raw, cid, m, q_, file_key):
+        """Full quality gate + normalize + caption blur for ONE downloaded clip. Runs in a
+        small thread pool: the ffmpeg/OpenCV work here (2 re-encodes + several frame passes,
+        ~20-30s per clip) dominated the whole scrape phase when it ran serially after each
+        download. Workers never call status_cb (it raises RunCancelled on the main thread's
+        cancel flag); log lines are returned and emitted serially by the collector."""
+        logs = []
+        if not is_vertical_hq(raw, ffprobe):
+            _reject(raw)
+            return {"kind": "reject", "vertical": False, "query": q_, "logs": logs,
+                    "status": "rejected_quality", "reason": "low-res / landscape file"}
+        fv = detect_fake_vertical_or_black_bars(raw, ffmpeg, per_clip_seconds)
+        if fv["is_fake_vertical"] or fv["black_bar_score"] > 4.0:
+            logs.append(f"Rejected clip ({bucket_id}/{q_}): fake vertical / black bars "
+                        f"({fv['reason']})")
+            _save_declined(raw, cid, f"black bars / fake vertical: {fv['reason']}")
+            _reject(raw)
+            return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
+                    "status": "rejected_black_bars", "reason": fv["reason"],
+                    "extra": {"black_bar_score": fv["black_bar_score"],
+                              "is_fake_vertical": fv["is_fake_vertical"]}}
+        th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
+        # POLICY: most Japanese TikToks carry SOME burned captions - rejecting them all
+        # starves the pool. Hard-reject only clips PLASTERED with text (constant multi-line
+        # captions / text posts); lighter captions are ACCEPTED and their persistent
+        # caption regions get BLURRED below so they melt into the footage.
+        if th > 7.0:
+            logs.append(f"Rejected clip ({bucket_id}/{q_}): text-plastered TikTok ({th}/10)")
+            _save_declined(raw, cid, f"text-plastered ({th}/10)", score=th)
+            _reject(raw)
+            return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
+                    "status": "rejected_text_heavy", "reason": f"burned-in text {th}/10",
+                    "extra": {"text_heaviness_score": th}}
+        stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
+        if not stability["stable"]:
+            logs.append(f"Rejected clip ({bucket_id}/{q_}): rapid internal edit montage "
+                        f"({stability['internal_cut_count']} cuts; shortest hold "
+                        f"{stability['min_shot_seconds']:.2f}s)")
+            _save_declined(raw, cid, f"rapid internal cuts ({stability['internal_cut_count']})")
+            _reject(raw)
+            return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
+                    "status": "rejected_rapid_cuts",
+                    "reason": "source contains rapid internal edit cuts", "extra": stability}
+        # Tier calls share out_dir.  A simple 00/01 counter overwrote clips from an
+        # earlier tier/round while the matcher still referenced those paths, making
+        # the selected footage differ from what vision reviewed.  Use a stable unique
+        # name tied to the TikTok item instead.
+        safe_bucket = re.sub(r"[^A-Za-z0-9_-]+", "_", str(bucket_id or "bucket"))[:36]
+        safe_tier = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tier or "tier"))[:20]
+        final = normalize_clip(raw, out_dir / f"cand_{safe_bucket}_{safe_tier}_{file_key}.mp4",
+                               ffmpeg, seconds=per_clip_seconds, start=stability["start"])
+        _reject(raw)
+        if not final:
+            return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
+                    "status": "rejected_quality", "reason": "normalize failed"}
+        # Captions in the accepted band (1.0-5.5): BLUR the persistent caption regions on the
+        # final clip so they melt into the footage instead of standing out under our own
+        # captions. Re-score after the blur so downstream gates see the softened state.
+        if th >= 1.0:
+            _softened = blur_caption_regions(final, ffmpeg, per_clip_seconds, status_cb=None)
+            if _softened:
+                th_after = text_heaviness_score(final, ffmpeg, per_clip_seconds)
+                logs.append(f"Softened {_softened} caption region(s) "
+                            f"({bucket_id}/{q_}, text {th}/10 -> {th_after}/10).")
+                th = th_after
+        record = {"path": final, "meta": m, "query": q_, "tier": tier, "clip_id": cid,
+                  "likes": m.get("likes", 0),
+                  "black_bar_score": fv["black_bar_score"], "text_heaviness": th,
+                  "is_fake_vertical": False,
+                  "internal_cut_count": stability["internal_cut_count"],
+                  "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
+                  "min_shot_seconds": stability["min_shot_seconds"]}
+        return {"kind": "accepted", "vertical": True, "query": q_, "logs": logs,
+                "status": "downloaded_pending_review", "reason": "passed pre-filters",
+                "record": record,
+                "extra": {"likes": m.get("likes", 0), "black_bar_score": fv["black_bar_score"],
+                          "text_heaviness_score": th,
+                          "internal_cut_count": stability["internal_cut_count"],
+                          "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
+                          "min_shot_seconds": stability["min_shot_seconds"]}}
+
+    # Downloads MUST stay on this thread (the logged-in browser session is single-threaded),
+    # but the per-clip ffmpeg/OpenCV gauntlet runs in a small pool so the next download
+    # proceeds while earlier clips are still being scored, normalized and caption-blurred.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    try:
+      for qidx, q in enumerate(queries):
         if (cancel_check and cancel_check()) or len(accepted) >= want:
             break
         query_stop = min(int(want), len(accepted) + per_query_quota)
@@ -1357,8 +1444,12 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         raw_n = len(items)
         meta_rej = dl = vert = clean = acc = 0
         meta_reasons = {}
+        # Phase A (serial): metadata filter + download. Overshoot the per-query quota by a
+        # couple of downloads because some of them will fail the parallel analysis below.
+        need = max(0, (query_stop - len(accepted)) + 2)
+        pending = []
         for it in items:
-            if (cancel_check and cancel_check()) or len(accepted) >= query_stop:
+            if (cancel_check and cancel_check()) or len(pending) >= need:
                 break
             ok, reason, m = pre_download_candidate_filter(
                 it, bucket_terms, seen_ids, min_likes=min_likes)
@@ -1366,92 +1457,43 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             if not ok:
                 meta_rej += 1
                 meta_reasons[reason] = meta_reasons.get(reason, 0) + 1
-                _cstat(cid, "pre_download_rejected", reason)
+                _cstat(q, cid, "pre_download_rejected", reason)
                 continue
-            raw = raw_dir / f"raw_{len(accepted)}_{dl}.mp4"
+            raw = raw_dir / f"raw_{qidx}_{dl}.mp4"
             dl += 1
             if not backend_download(it, raw, status_cb=None):
-                _cstat(cid, "download_failed", "download failed")
+                _cstat(q, cid, "download_failed", "download failed")
                 continue
             if cid:
                 seen_ids.add(cid)
-            if not is_vertical_hq(raw, ffprobe):
-                _reject(raw)
-                _cstat(cid, "rejected_quality", "low-res / landscape file")
-                continue
-            vert += 1
-            fv = detect_fake_vertical_or_black_bars(raw, ffmpeg, per_clip_seconds)
-            if fv["is_fake_vertical"] or fv["black_bar_score"] > 4.0:
-                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): fake vertical / black bars "
-                                   f"({fv['reason']})")
-                _save_declined(raw, cid, f"black bars / fake vertical: {fv['reason']}")
-                _reject(raw)
-                _cstat(cid, "rejected_black_bars", fv["reason"],
-                       {"black_bar_score": fv["black_bar_score"], "is_fake_vertical": fv["is_fake_vertical"]})
-                continue
-            th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
-            # POLICY: most Japanese TikToks carry SOME burned captions - rejecting them all
-            # starves the pool. Hard-reject only clips PLASTERED with text (constant multi-line
-            # captions / text posts, > 5.5); lighter captions are ACCEPTED and their persistent
-            # caption regions get BLURRED below so they melt into the footage.
-            if th > 7.0:
-                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): text-plastered TikTok ({th}/10)")
-                _save_declined(raw, cid, f"text-plastered ({th}/10)", score=th)
-                _reject(raw)
-                _cstat(cid, "rejected_text_heavy", f"burned-in text {th}/10",
-                       {"text_heaviness_score": th})
-                continue
-            stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
-            if not stability["stable"]:
-                _status(status_cb, f"Rejected clip ({bucket_id}/{q}): rapid internal edit montage "
-                                   f"({stability['internal_cut_count']} cuts; shortest hold "
-                                   f"{stability['min_shot_seconds']:.2f}s)")
-                _save_declined(raw, cid, f"rapid internal cuts ({stability['internal_cut_count']})")
-                _reject(raw)
-                _cstat(cid, "rejected_rapid_cuts", "source contains rapid internal edit cuts",
-                       stability)
-                continue
-            # Tier calls share out_dir.  A simple 00/01 counter overwrote clips from an
-            # earlier tier/round while the matcher still referenced those paths, making
-            # the selected footage differ from what vision reviewed.  Use a stable unique
-            # name tied to the TikTok item instead.
             file_key = hashlib.sha1(
                 str(cid or it.get("webVideoUrl") or it.get("id") or raw.name).encode("utf-8", "ignore")
             ).hexdigest()[:12]
-            safe_bucket = re.sub(r"[^A-Za-z0-9_-]+", "_", str(bucket_id or "bucket"))[:36]
-            safe_tier = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tier or "tier"))[:20]
-            final = normalize_clip(raw, out_dir / f"cand_{safe_bucket}_{safe_tier}_{file_key}.mp4",
-                                   ffmpeg, seconds=per_clip_seconds, start=stability["start"])
-            _reject(raw)
-            if not final:
-                _cstat(cid, "rejected_quality", "normalize failed")
+            pending.append((executor.submit(_analyze_item, raw, cid, m, q, file_key), cid))
+        # Phase B: collect the analysis results in download order.
+        for fut, cid in pending:
+            if cancel_check and cancel_check():
+                break
+            try:
+                res = fut.result()
+            except Exception:
                 continue
-            # Captions in the accepted band (1.0-5.5): BLUR the persistent caption regions on the
-            # final clip so they melt into the footage instead of standing out under our own
-            # captions. Re-score after the blur so downstream gates see the softened state.
-            if th >= 1.0:
-                _softened = blur_caption_regions(final, ffmpeg, per_clip_seconds, status_cb=status_cb)
-                if _softened:
-                    th_after = text_heaviness_score(final, ffmpeg, per_clip_seconds)
-                    _status(status_cb, f"Softened {_softened} caption region(s) "
-                                       f"({bucket_id}/{q}, text {th}/10 -> {th_after}/10).")
-                    th = th_after
-            clean += 1
-            acc += 1
-            accepted.append({"path": final, "meta": m, "query": q, "tier": tier, "clip_id": cid,
-                             "likes": m.get("likes", 0),
-                             "black_bar_score": fv["black_bar_score"], "text_heaviness": th,
-                             "is_fake_vertical": False,
-                             "internal_cut_count": stability["internal_cut_count"],
-                             "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
-                             "min_shot_seconds": stability["min_shot_seconds"]})
-            _status(status_cb, f"Downloaded accepted candidate {len(accepted)} for bucket {bucket_id} (query {q})")
-            _cstat(cid, "downloaded_pending_review", "passed pre-filters",
-                   {"likes": m.get("likes", 0), "black_bar_score": fv["black_bar_score"],
-                    "text_heaviness_score": th,
-                    "internal_cut_count": stability["internal_cut_count"],
-                    "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
-                    "min_shot_seconds": stability["min_shot_seconds"]})
+            for line in res.get("logs") or []:
+                _status(status_cb, line)
+            if res.get("vertical"):
+                vert += 1
+            if res["kind"] == "accepted":
+                clean += 1
+                if len(accepted) < want:
+                    acc += 1
+                    accepted.append(res["record"])
+                    _status(status_cb, f"Downloaded accepted candidate {len(accepted)} for bucket {bucket_id} (query {res['query']})")
+                    _cstat(res["query"], cid, "downloaded_pending_review", "passed pre-filters", res.get("extra"))
+                else:
+                    _cstat(res["query"], cid, "downloaded_pending_review",
+                           "passed pre-filters (bucket already full)", res.get("extra"))
+            else:
+                _cstat(res["query"], cid, res["status"], res["reason"], res.get("extra"))
         if query_perf is not None:
             query_perf.append({"query": q, "bucket_id": bucket_id, "tier": tier,
                                "sort": str(search_sort or "MOST_LIKED").upper(),
@@ -1463,6 +1505,9 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                                 sorted(meta_reasons.items(), key=lambda row: row[1], reverse=True))
             _status(status_cb, f"Metadata filter ({bucket_id}/{q}): rejected {meta_rej}/{raw_n} "
                                f"candidate(s) ({summary}).")
+    finally:
+        # On cancel, drop queued clips but let the (max 3) running ffmpeg jobs finish.
+        executor.shutdown(wait=True, cancel_futures=True)
     try:
         if raw_dir.exists():
             for f in raw_dir.glob("*"):

@@ -54,6 +54,19 @@ try {
     # Port not listening, nothing to kill
 }
 
+# Kill any leftover browser windows that still use OUR app profile. If one lingers (old app
+# window still open, Edge background mode), the new msedge.exe would just hand the URL to it
+# and exit instantly - Wait-Process below would then kill the fresh server immediately and the
+# window would show ERR_CONNECTION_REFUSED.
+try {
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction Stop |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*browser-profile*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 600
+} catch {
+    # CIM unavailable or nothing to kill
+}
+
 $pyProcess = Start-Process `
     -FilePath "py" `
     -ArgumentList @("-B", "app.py", "--host", "127.0.0.1", "--port", [string]$port) `
@@ -63,7 +76,8 @@ $pyProcess = Start-Process `
 
 
 $ready = $false
-for ($i = 0; $i -lt 40; $i++) {
+for ($i = 0; $i -lt 120; $i++) {
+    if ($pyProcess.HasExited) { break }
     try {
         Invoke-WebRequest -UseBasicParsing $url -TimeoutSec 1 | Out-Null
         $ready = $true
@@ -111,7 +125,20 @@ $arguments = @(
 $browserProcess = Start-Process -FilePath $browser -ArgumentList $arguments -PassThru
 
 if ($pyProcess -and $browserProcess) {
-    # Wait for the browser to exit, then kill python
-    Wait-Process -Id $browserProcess.Id
+    # Keep the server alive as long as ANY browser process is still using our app profile.
+    # (The spawned msedge.exe may delegate to another process and exit early, so waiting on
+    # that single PID alone is not reliable.)
+    try { Wait-Process -Id $browserProcess.Id -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Seconds 2
+    while ($true) {
+        $alive = $null
+        try {
+            $alive = Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction Stop |
+                Where-Object { $_.CommandLine -and $_.CommandLine -like "*browser-profile*" } |
+                Select-Object -First 1
+        } catch { break }
+        if (-not $alive) { break }
+        Start-Sleep -Seconds 3
+    }
     Stop-Process -Id $pyProcess.Id -Force -ErrorAction SilentlyContinue
 }

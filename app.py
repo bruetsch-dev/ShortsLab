@@ -15,6 +15,7 @@ import pipeline
 import sfx_agent
 import caption_agent
 import visual_agent
+import viral_transformation
 try:
     from reddit_story_mode import story_generator as reddit_stories
     from reddit_story_mode import orchestrator as reddit_orchestrator
@@ -747,8 +748,8 @@ def app_style():
       /* bounded like the wizard steps: 4 big cards fit fully at normal viewports; on a very short
          window the menu scrolls WITHIN itself instead of page-scrolling. Padding gives the cards'
          hover shadow room so overflow:auto doesn't clip it. */
-      .wiz-modemenu { max-width: 840px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
-      .modemenu-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .wiz-modemenu { max-width: 900px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
+      .modemenu-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
       /* scoped under .modemenu-cards (0,2,0) so display:flex BEATS the global button rule
          (button:not(.preview-button) is 0,1,1 and was forcing display:block -> the icon/title/desc
          spans rendered inline and collided with the title's underline). */
@@ -760,7 +761,7 @@ def app_style():
       .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
       .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
       .modemenu-card .mm-ico { font-size: 28px; line-height: 1; flex: 0 0 auto; }
-      .modemenu-card .mm-title { font-family: var(--display); font-size: 14px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; }
+      .modemenu-card .mm-title { font-family: var(--display); font-size: 13px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
       .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.5; }
       @media (max-width: 640px) { .modemenu-cards { grid-template-columns: 1fr; } }
       @media (max-width: 1120px) {
@@ -1147,6 +1148,10 @@ def app_style():
       .media-tile .media-accept::after { display: none; }
       .media-tile .media-accept:hover { background: #1fbf6b; color: #fff; transform: none; box-shadow: none; }
       .media-tile.declined-tile { border-color: var(--accent-2); }
+      /* Viral Transformation topic chips */
+      .vt-topics { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; margin-top: 4px; }
+      .vt-topics .vt-topic { width: 100%; min-width: 0; padding: 9px 10px; font-size: 12px; font-weight: 700; text-transform: none; }
+      .vt-topics .vt-topic.active { background: var(--accent); color: #fff; }
       /* no sticky: a sticky right column scrolls out of step with the left column. */
       .preview-section { grid-column: 2; align-self: start; }
       /* fixed 3 columns so tiles stay the SAME size on every tab (was auto-fit, which
@@ -1353,6 +1358,7 @@ def app_script():
           if (mode === "sfx") { window.location.href = "/sfx"; return; }
           if (mode === "captions") { window.location.href = "/captions"; return; }
           if (mode === "visual") { window.location.href = "/visual"; return; }
+          if (mode === "viraltrans") { window.location.href = "/viraltrans"; return; }
           wizGoto(1);   // Visuals From Script -> existing script workflow
         };
         function wizTypeIntro(cb) {
@@ -2498,6 +2504,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">Visual Master</span></span>
             <span class="mm-desc">Upload a Short and Opus 4.8 adds intelligent animated red arrows + fitting SFX.</span>
           </button>
+          <button type="button" class="modemenu-card" onclick="selectMode('viraltrans')">
+            <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">Viral Transformation</span></span>
+            <span class="mm-desc">Pick one topic - the agents create concept, scenes, AI clips, captions, audio and the final Short fully autonomously.</span>
+          </button>
         </div>
       </div>
 
@@ -2851,6 +2861,50 @@ def visual_page():
     return page("AI Visual-Arrow Pass", body)
 
 
+def viraltrans_page():
+    chips = "".join(
+        f'<button type="button" class="vt-topic" data-topic="{esc(t)}" onclick="vtPick(this)">{esc(t)}</button>'
+        for t in viral_transformation.TOPIC_PRESETS)
+    body = f"""
+    {brand_header()}
+    <form method="post" action="/viraltrans-generate">
+      <section class="stack">
+        <div class="panel accent">
+          <label>Viral Transformation Short &mdash; pick ONE topic. That's all.</label>
+          <div class="hint" style="margin-bottom:10px;">The agents handle everything else autonomously: concept, the DECLARE &rarr; ASSESS &rarr; ISOLATE &rarr; PROCESS &rarr; BUILD &rarr; REVEAL structure, GPT-Image-2 reference images, Seedance&nbsp;2.0 clips, QA, captions, music/SFX, final MP4 and metadata. No voice script, no visual script, no prompts.</div>
+          <div class="vt-topics">{chips}</div>
+          <label style="margin-top:12px;">Or type your own topic</label>
+          <input type="text" name="topic" id="vt-topic" placeholder="e.g. street dog salon" autocomplete="off">
+          <button type="submit" style="margin-top:14px;">&#129529; Generate</button>
+        </div>
+      </section>
+      <section class="stack">
+        <div class="loaded-media-panel">
+          <h2 style="margin-bottom: 12px;">What happens after Generate</h2>
+          <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
+            <li><strong>Planning concept</strong> &mdash; the Topic Strategist narrows your topic into an "I Removed 5,000 Tangles From This Street Dog For This" style concept with an absurd metric (+ safety check).</li>
+            <li><strong>Creating scenes</strong> &mdash; a strict 12&ndash;16 scene plan across the six phases, 35&ndash;42s total, PROCESS gets the most cuts.</li>
+            <li><strong>Generating images &amp; WaveSpeed videos</strong> &mdash; one GPT-Image-2 reference per scene keeps the subject consistent; Seedance&nbsp;2.0 animates each one. Failures retry, then fall back to a zoom/pan motion clip.</li>
+            <li><strong>Checking clips</strong> &mdash; vision QA rejects distorted/off-topic clips.</li>
+            <li><strong>Editing final short</strong> &mdash; hard cuts, bold 1&ndash;5-word captions, music + satisfying SFX, riser + payoff hit on the reveal.</li>
+            <li><strong>Export complete</strong> &mdash; MP4 + YouTube/TikTok titles, description and hashtags.</li>
+          </ol>
+        </div>
+      </section>
+    </form>
+    <script>
+      window.vtPick = function (btn) {{
+        document.querySelectorAll(".vt-topic").forEach(function (b) {{ b.classList.remove("active"); }});
+        btn.classList.add("active");
+        var input = document.getElementById("vt-topic");
+        if (input) input.value = btn.getAttribute("data-topic");
+        try {{ if (typeof playClick === "function") playClick(); }} catch (e) {{}}
+      }};
+    </script>
+    """
+    return page("Viral Transformation Creator", body)
+
+
 def caption_page():
     body = f"""
     {brand_header()}
@@ -3156,6 +3210,59 @@ def start_visual_job(fields, files):
                 else:
                     JOBS[job_id]["status"] = "done"
                     JOBS[job_id]["result"] = result
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_viraltrans_job(fields):
+    job_id = str(int(time.time() * 1000))
+    raw_topic = fields.get("topic")
+    topic = str(raw_topic[0] if isinstance(raw_topic, list) and raw_topic else raw_topic or "").strip()
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Queued."], "log_times": [time.time()],
+            "result": None, "error": None, "cancel_event": cancel_event,
+            "project_dir": None, "created_at": time.time(), "job_kind": "viraltrans",
+        }
+    if not topic:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "Choose or enter a topic first."
+            JOBS[job_id]["logs"].append("Error: no topic chosen.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            status_cb("Started.")
+            result = viral_transformation.run_transformation_job(
+                topic, status_cb=status_cb, cancel_event=cancel_event)
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+                    JOBS[job_id]["project_dir"] = result.get("project")
         except Exception as exc:
             with JOB_LOCK:
                 if cancel_event.is_set() or isinstance(exc, RunCancelled):
@@ -5571,6 +5678,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(sfx_page())
         elif parsed.path == "/visual":
             self.send_bytes(visual_page())
+        elif parsed.path == "/viraltrans":
+            self.send_bytes(viraltrans_page())
         elif parsed.path == "/captions":
             self.send_bytes(caption_page())
         elif parsed.path == "/timeline":
@@ -5978,6 +6087,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fields, files = {}, {}
             job_id = start_visual_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
+            self.end_headers()
+            return
+        if parsed.path == "/viraltrans-generate":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            fields = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"))
+            job_id = start_viraltrans_job(fields)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()

@@ -262,10 +262,15 @@ def _hide_offscreen_from_taskbar():
         try:
             if not user32.IsWindowVisible(hwnd):
                 return True
+            # CRITICAL: minimized windows report sentinel positions like -32000/-25600, which a
+            # naive "deep negative" check matches - that restyled EVERY minimized window on the
+            # system. Skip iconic windows and match ONLY our exact -2400,-2400 parking band.
+            if user32.IsIconic(hwnd):
+                return True
             rect = ctypes.wintypes.RECT()
             if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 return True
-            if rect.left <= -2000 and rect.top <= -2000:
+            if -2600 <= rect.left <= -2200 and -2600 <= rect.top <= -2200:
                 found[0] = True
                 style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                 if not (style & WS_EX_TOOLWINDOW):

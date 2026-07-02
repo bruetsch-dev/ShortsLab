@@ -1487,6 +1487,8 @@ def collaborate_json(messages, max_tokens=1800, temperature=0.15, timeout=180,
     proposal = None
     try:
         proposal = _post_llm_json(thinker, messages, max_tokens, temperature, timeout)
+    except WaveSpeedBalanceError:
+        raise
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Collaborative {label}: thinker failed ({exc.__class__.__name__}); critic solos.")
     sys_msg = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
@@ -1506,6 +1508,8 @@ def collaborate_json(messages, max_tokens=1800, temperature=0.15, timeout=180,
         corrected = _post_llm_json(critic, crit_messages, max_tokens, temperature, timeout)
         if corrected:
             return corrected
+    except WaveSpeedBalanceError:
+        raise
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Collaborative {label}: critic failed ({exc.__class__.__name__}); using the draft.")
     return proposal
@@ -2220,6 +2224,12 @@ def request_text_url(url, timeout=45, min_interval=1.1, referer=""):
         return response.read().decode(charset, errors="replace")
 
 
+class WaveSpeedBalanceError(RuntimeError):
+    """The WaveSpeed account has no credit left - every API call fails with HTTP 403
+    'balance not enough'. Raised so a run ABORTS immediately with a clear message
+    instead of silently blank-falling-back for half an hour."""
+
+
 def post_json_url(url, payload, timeout=75):
     # Thinking models (Gemini 2.x/3.x, GLM, Qwen, DeepSeek...) spend output tokens
     # on internal reasoning; a low max_tokens then yields EMPTY content
@@ -2245,8 +2255,38 @@ def post_json_url(url, payload, timeout=75):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        if exc.code in (402, 403) and "balance" in body.lower():
+            raise WaveSpeedBalanceError(
+                "WaveSpeed account balance is EMPTY - the API rejects every request "
+                "(HTTP 403 'balance not enough'). Top up your credit at "
+                "https://wavespeed.ai and start the run again.") from exc
+        raise
+
+
+def assert_wavespeed_balance(status_cb=None):
+    """One tiny LLM ping at run start: an empty WaveSpeed balance aborts the run within
+    seconds with a clear message instead of failing every call silently for 30+ minutes.
+    Transient API hiccups never block a run - only the explicit balance error raises."""
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        return
+    try:
+        post_json_url(WAVESPEED_LLM_API, {
+            "model": GPT55_MODEL,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 8}, timeout=45)
+    except WaveSpeedBalanceError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Balance preflight inconclusive ({exc.__class__.__name__}) - continuing.")
 
 
 def wikipedia_search_pages(query, limit=4):
@@ -2394,7 +2434,7 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
         "HOOK (first clip): a REAL, relatable young Japanese woman creator (candid lifestyle / POV / everyday vibe, "
         "like @sakii_0405_) - NOT a glam model, NOT stock, NOT 'attractive japanese woman'. Search the way these "
         "creators are actually tagged, with varied native terms/synonyms: 日本 女の子 日常, 女子 vlog, 一人暮らし 女子, "
-        "JK 日常, 主人公感, 自撮り 女の子, かわいい 日常, #日常 #女子 #一人暮らし #JK. Return one such native hook_query.\n"
+        "主人公感, 自撮り 女の子, かわいい 日常, 20代 女子 vlog, #日常 #女子 #一人暮らし. Return one such native hook_query.\n"
         'Return STRICT JSON only: {"hook_query": "...", "queries": ["...", ...]} - one strong query per script '
         "line plus a few extra, 12-18 total, mostly Japanese.\n\n"
         f"Title: {title}\nVoice script:\n{script}\n"
@@ -2495,15 +2535,15 @@ SOCIAL_SYNONYM_MAP = {
 # with generic terms keeps the hook pool from being just 2 creators). A few well-known creators are
 # interleaved for the reference energy, but the bulk is broad "cute Japanese dance/POV girl" queries.
 HOOK_PRESENTER_QUERIES = {
-    "exact": ["日本人女子 ダンス 可愛い", "踊ってみた 女子 かわいい", "JK ダンス TikTok",
-              "あざと可愛い ダンス 女子", "女子高生 踊ってみた", "カメラ目線 可愛い仕草 女子",
+    "exact": ["日本人女子 ダンス 可愛い", "踊ってみた 女子 かわいい", "20代 女子 ダンス",
+              "あざと可愛い ダンス 女子", "お姉さん ダンス 可愛い", "カメラ目線 可愛い仕草 女子",
               "日本 女の子 ダンス 笑顔", "ゆるめ ダンス 女子", "可愛い 踊ってみた おすすめ",
               "岸みゆ ダンス", "sakii_0405_ ダンス", "なえなの ダンス", "景井ひな ダンス"],
     "social": ["アイドル ダンス TikTok", "女子 可愛いダンス", "日本人女子 踊ってみた",
-               "あざと可愛い 女子", "カメラ目線 可愛い", "笑顔 ダンス 女子", "JD ダンス 可愛い",
-               "TikToker 女子 ダンス", "제이케이 댄스"],
+               "あざと可愛い 女子", "カメラ目線 可愛い", "笑顔 ダンス 女子", "大人可愛い ダンス",
+               "TikToker 女子 ダンス"],
     "hashtag": ["#踊ってみた", "#ダンス女子", "#あざと可愛い", "#可愛い", "#おすすめ",
-                "#日本人女性", "#jkダンス", "#ダンス好きな人と繋がりたい", "#女の子"],
+                "#日本人女性", "#ダンス好きな人と繋がりたい", "#女の子"],
     "english": ["cute Japanese creator dancing", "Japanese idol playful TikTok dance",
                 "kawaii Japanese girl dance TikTok", "Japanese TikToker dance to camera",
                 "Miyu Kishi TikTok dance"],
@@ -2548,6 +2588,8 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
             "Give 5-7 queries PER TIER, and make every query a genuinely DIFFERENT angle: rotate synonyms, "
             "slang, formal/casual phrasing, different concrete nouns and camera perspectives (POV / vlog / "
             "walking tour / close-up). Near-duplicate wordings waste searches and are skipped.\n"
+            "School terms (学校 / 女子高生 / JK / 制服 / 教室) are allowed ONLY when the script is actually "
+            "ABOUT school life - and even then only for body-footage buckets, never anything hook-like.\n"
             "Also add creator-discussion queries where useful (a creator TALKING about the topic), e.g. "
             "恋愛について話す 女子, 仕事疲れた 話す.\n"
             f"Useful synonym families to widen with: {syn}.\n"
@@ -4180,6 +4222,8 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
         log(status_cb, f"Scrape: {placed}/{len(scenes)} scene(s) got a clip that passes the script-match gate "
                        f"(>= {match_threshold:.1f}); {len(scenes) - placed} scene(s) -> re-search / fallback.")
         return (scene_clips, decision_log)
+    except WaveSpeedBalanceError:
+        raise                                  # abort the whole run with the clear balance message
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Scrape: semantic matching ERROR ({exc.__class__.__name__}: {exc}).")
         log(status_cb, "Scrape: traceback -> " + traceback.format_exc().replace("\n", " | ")[:900])
@@ -6752,6 +6796,9 @@ def run_project(form, status_cb=None):
                 "Scrape runs need an Apify token. Add APIFY_TOKEN=... to the .env file "
                 "(get one at apify.com), then restart the app and run again."
             )
+
+    # Abort NOW if the WaveSpeed balance is empty - before TTS/director/scrape burn time.
+    assert_wavespeed_balance(status_cb=status_cb)
 
     visual_script = clean_text(form.get("visual_script", ""))
     # "Use visual direction" toggle: when off, ignore the visual-direction text entirely.

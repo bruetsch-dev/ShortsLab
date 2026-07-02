@@ -1393,6 +1393,11 @@ def request_json(method, url, key, payload=None, timeout=180):
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
+        if exc.code in (402, 403) and "balance" in raw.lower():
+            raise RuntimeError(
+                "WaveSpeed account balance is EMPTY - the API rejects every request "
+                "(HTTP 403 'balance not enough'). Top up your credit at "
+                "https://wavespeed.ai and start the run again.") from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {raw}") from exc
 
 
@@ -1435,6 +1440,11 @@ def request_multipart_upload(url, key, path, timeout=240):
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
+        if exc.code in (402, 403) and "balance" in raw.lower():
+            raise RuntimeError(
+                "WaveSpeed account balance is EMPTY - the API rejects every request "
+                "(HTTP 403 'balance not enough'). Top up your credit at "
+                "https://wavespeed.ai and start the run again.") from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {raw}") from exc
 
 
