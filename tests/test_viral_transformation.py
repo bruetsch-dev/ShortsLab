@@ -29,11 +29,12 @@ class ViralTransformationTests(unittest.TestCase):
         self.assertFalse(s["safe"])
 
     def test_scene_plan_structure(self):
+        import math
         s = agents.topic_strategist("rusty knife restoration")
         plan = agents.plan_scenes(s)
         scenes = plan["scenes"]
-        self.assertGreaterEqual(len(scenes), 10)
-        self.assertLessEqual(len(scenes), 16)
+        self.assertGreaterEqual(len(scenes), 8)
+        self.assertLessEqual(len(scenes), 10)
         phases = [sc["phase"] for sc in scenes]
         # all six phases present, in the fixed order
         self.assertEqual(set(phases), set(agents.PHASES))
@@ -46,13 +47,16 @@ class ViralTransformationTests(unittest.TestCase):
         total = 0.0
         for sc in scenes:
             self.assertGreaterEqual(sc["duration_seconds"], 1.5)
-            self.assertLessEqual(sc["duration_seconds"], 4.5)
+            self.assertLessEqual(sc["duration_seconds"], 4.0)
             self.assertTrue(1 <= len(sc["caption"].split()) <= 5)
             self.assertTrue(sc["image_prompt"] and sc["video_motion_prompt"])
             self.assertIn("negative_prompt", sc)
             total += sc["duration_seconds"]
         self.assertGreaterEqual(total, 28.0)
-        self.assertLessEqual(total, 47.0)
+        self.assertLessEqual(total, 40.0)
+        # the GENERATED Seedance footage (the API generates min 4s per scene) stays ~40s
+        generated = sum(max(4, int(math.ceil(sc["duration_seconds"]))) for sc in scenes)
+        self.assertLessEqual(generated, 40)
 
     def test_metadata_fallback_uses_formula(self):
         s = agents.topic_strategist("filthy sneaker cleaning")

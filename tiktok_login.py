@@ -1,4 +1,4 @@
-"""TikTok login-based clip discovery - the Apify replacement.
+"""TikTok login-based clip discovery - the primary backend alongside X/Twitter.
 
 No API keys. The user logs in to TikTok ONCE inside a Chromium window we control
 (a dedicated, persistent browser profile), and from then on we drive that logged-in
@@ -19,13 +19,16 @@ Public surface used by clip_scraper:
     status()                         -> dict for the UI
     login(status_cb, timeout_s)      -> headed one-time login, returns bool
     logout()                         -> wipe the saved session
-    get_session(status_cb)           -> a reusable logged-in Session (or None)
+    ensure_session(status_cb)        -> open/reuse the session on the worker thread (bool)
+    search_sync(query, ...)          -> run a search on the worker thread, block for items
     export_cookies_txt(path)         -> write cookies.txt for yt-dlp
-    close_session()                  -> tear the shared session down
+    close_session()                  -> tear the shared session down (on the worker thread)
 """
 
+import concurrent.futures
 import os
 import json
+import subprocess
 import time
 import threading
 from pathlib import Path
@@ -55,7 +58,14 @@ _HEADLESS_SEARCH = (os.environ.get("TIKTOK_HEADLESS", "0").strip().lower()
 _LOCALE = os.environ.get("TIKTOK_LOCALE", "en-US").strip() or "en-US"
 
 _LOCK = threading.Lock()
-_SESSION = [None]                       # the shared Session, lazily created per run
+_SESSION = [None]                       # the shared Session; ONLY touched on the worker thread
+# Playwright's SYNC api is thread-affine, and a half-closed driver POISONS the calling thread:
+# every later sync_playwright().start() there dies with "Sync API inside the asyncio loop".
+# Cure (same as twitter_login): ALL Playwright work is funneled through ONE dedicated worker
+# thread that outlives job runs - the session is created, searched, cookie-read and closed only
+# there, and survives across runs (no per-run reopen churn, no cross-thread closes).
+_EXECUTOR = None
+_EXEC_LOCK = threading.Lock()
 # per-run search health: lets the caller fail FAST when the backend returns nothing at all
 # (expired login / headless block / captcha) instead of grinding through every bucket.
 _SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0}
@@ -139,10 +149,9 @@ def export_cookies_txt(path=None, cookies=None):
     Uses the shared session if `cookies` is not supplied. Returns the path or None."""
     path = Path(path or COOKIES_TXT)
     if cookies is None:
-        sess = _SESSION[0]
-        if sess is None:
+        cookies = _session_cookies_threadsafe()
+        if cookies is None:
             return None
-        cookies = sess.cookies()
     if not _has_session_cookie(cookies):
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +169,11 @@ def login(status_cb=None, timeout_s=300):
                            "&& playwright install chromium).")
         return False
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # CRITICAL: if a zombie Chromium still holds this profile (leftover off-screen scrape
+    # window), the new browser DELEGATES to it - and the "new" login window then opens in
+    # THAT process, inheriting its off-screen -2400,-2400 position. To the user, clicking
+    # Connect/Reconnect does exactly NOTHING. Kill the leftovers first.
+    _kill_stale_profile_processes()
     _status(status_cb, "Opening a Chromium window - log in to your TikTok account in it. "
                        "This window stays connected; you only do this once.")
     with sync_playwright() as p:
@@ -167,7 +181,7 @@ def login(status_cb=None, timeout_s=300):
             str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled", "--no-first-run",
-                  "--no-default-browser-check"])
+                  "--no-default-browser-check", "--window-position=120,60"])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
@@ -289,6 +303,27 @@ def _hide_offscreen_from_taskbar():
     return found[0]
 
 
+def _kill_stale_profile_processes():
+    """Windows only: force-kill any Chromium process still holding PROFILE_DIR open. Needed
+    because a crashed run / cross-thread-poisoned session / killed process can leave the browser
+    alive without Playwright knowing about it - the NEXT launch_persistent_context() against the
+    same profile then silently delegates the URL to that zombie and exits instantly, which
+    Playwright surfaces as a confusing TargetClosedError."""
+    if os.name != "nt":
+        return
+    try:
+        marker = str(PROFILE_DIR).replace("'", "''")
+        cmd = (
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" -ErrorAction Stop | "
+            f"Where-Object {{ $_.CommandLine -and $_.CommandLine -like '*{marker}*' }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                       capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
 class Session:
     """A reusable logged-in TikTok browser session. One persistent context for a whole run."""
 
@@ -300,24 +335,41 @@ class Session:
         self._open()
 
     def _open(self):
-        self._p = sync_playwright().start()
-        args = ["--disable-blink-features=AutomationControlled", "--no-first-run",
-                "--no-default-browser-check", "--mute-audio"]
-        if not self.headless:
-            # TikTok blocks HEADLESS, so we must run a real (headed) browser - but the user does NOT
-            # want to see a window. Push it FAR off-screen: it still renders normally (off-screen is
-            # not headless and not minimized), so TikTok serves results, but nothing is visible.
-            # Disable occlusion/background throttling so the off-screen window isn't slowed down.
-            # Set TIKTOK_WINDOW_VISIBLE=1 to watch it (debugging).
-            if os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() not in ("1", "true", "yes"):
-                args += ["--window-position=-2400,-2400", "--window-size=1280,900",
-                         "--disable-backgrounding-occluded-windows",
-                         "--disable-renderer-backgrounding",
-                         "--disable-background-timer-throttling",
-                         "--disable-features=CalculateNativeWinOcclusion"]
-        self._ctx = self._p.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
-            viewport={"width": 1280, "height": 900}, args=args)
+        # A crashed run, a cross-thread-poisoned session, or a killed process can leave the
+        # PREVIOUS Chromium instance still holding PROFILE_DIR open. A new launch against the
+        # same profile then silently DELEGATES to that zombie and exits immediately, which
+        # Playwright reports as TargetClosedError - kill any such leftover first.
+        _kill_stale_profile_processes()
+        try:
+            self._p = sync_playwright().start()
+            args = ["--disable-blink-features=AutomationControlled", "--no-first-run",
+                    "--no-default-browser-check", "--mute-audio"]
+            if not self.headless:
+                # TikTok blocks HEADLESS, so we must run a real (headed) browser - but the user does NOT
+                # want to see a window. Push it FAR off-screen: it still renders normally (off-screen is
+                # not headless and not minimized), so TikTok serves results, but nothing is visible.
+                # Disable occlusion/background throttling so the off-screen window isn't slowed down.
+                # Set TIKTOK_WINDOW_VISIBLE=1 to watch it (debugging).
+                if os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() not in ("1", "true", "yes"):
+                    args += ["--window-position=-2400,-2400", "--window-size=1280,900",
+                             "--disable-backgrounding-occluded-windows",
+                             "--disable-renderer-backgrounding",
+                             "--disable-background-timer-throttling",
+                             "--disable-features=CalculateNativeWinOcclusion"]
+            self._ctx = self._p.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
+                viewport={"width": 1280, "height": 900}, args=args)
+        except Exception:
+            # Don't leak a started-but-unused Playwright driver connection on a failed launch -
+            # its dispatcher thread lingering has been observed to poison the NEXT sync_playwright()
+            # call in this same thread ("Sync API inside the asyncio loop").
+            if self._p is not None:
+                try:
+                    self._p.stop()
+                except Exception:
+                    pass
+                self._p = None
+            raise
         if not self.headless:
             # remove the taskbar button of the off-screen window (it kept blinking for attention)
             for _wait in (0.4, 1.2, 2.0):
@@ -334,12 +386,15 @@ class Session:
     def logged_in(self):
         return _has_session_cookie(self.cookies())
 
-    def search(self, query, want=12, status_cb=None, sort="MOST_LIKED", max_scrolls=8):
+    def search(self, query, want=12, status_cb=None, sort="MOST_LIKED", max_scrolls=8,
+               timeout_s=None):
         """Run a logged-in keyword search and return up to ~want native TikTok item dicts."""
         cb = status_cb or self._status_cb
         query = str(query or "").strip()
         if not query:
             return []
+        deadline = (time.monotonic() + max(0.1, float(timeout_s))
+                    if timeout_s is not None else None)
         if not self.headless:
             _hide_offscreen_from_taskbar()      # windows can be re-created between searches
         collected = []
@@ -374,7 +429,9 @@ class Session:
         try:
             url = "https://www.tiktok.com/search/video?q=" + _quote(query)
             try:
-                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                nav_ms = 45000 if deadline is None else max(
+                    1000, min(45000, int((deadline - time.monotonic()) * 1000)))
+                page.goto(url, timeout=nav_ms, wait_until="domcontentloaded")
             except Exception as exc:
                 _status(cb, f"TikTok search: navigation failed for {query!r} ({exc.__class__.__name__}).")
             # let the first XHR settle, then scroll ADAPTIVELY: a dead query fails FAST (settle +
@@ -385,7 +442,8 @@ class Session:
             scrolls = 0
             stagnant = 0
             last_n = len(collected)
-            while len(collected) < want and scrolls < max_scrolls and stagnant < 2:
+            while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
+                   and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)
                 scrolls += 1
@@ -419,8 +477,19 @@ class Session:
         _SEARCH_STATS["items"] += len(collected)
         if collected:
             self._refresh_cookies_quietly()
+        if str(sort or "").upper() == "MOST_LIKED":
+            def _likes(item):
+                stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
+                    item.get("stats") if isinstance(item.get("stats"), dict) else {})
+                try:
+                    return int(item.get("diggCount") or item.get("digg_count")
+                               or item.get("likeCount") or stats.get("diggCount")
+                               or stats.get("digg_count") or stats.get("likeCount") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            collected.sort(key=_likes, reverse=True)
         _status(cb, f"TikTok search {query!r}: collected {len(collected)} candidate item(s).")
-        return collected[:max(want, len(collected))]
+        return collected[:max(0, int(want))]
 
     def _maybe_dismiss_overlays(self, page):
         # best-effort close of cookie / login nags that can cover the feed
@@ -475,29 +544,112 @@ def _quote(s):
     return urllib.parse.quote(str(s), safe="")
 
 
-def get_session(status_cb=None):
-    """Return the shared logged-in Session, creating it on first use. None if not ready."""
-    if not is_ready():
+# ------------------------------------------------------------- worker-thread plumbing
+# ALL Playwright work runs on this ONE dedicated thread (see note at _EXECUTOR). Job
+# threads only ever talk to it through futures, so a session can never be created in
+# one thread and closed from another - the exact pattern that poisoned job threads
+# with "Sync API inside the asyncio loop" and made every later reopen fail.
+
+def _executor():
+    global _EXECUTOR
+    with _EXEC_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="tiktok-scrape")
+        return _EXECUTOR
+
+
+def _on_worker_thread():
+    return threading.current_thread().name.startswith("tiktok-scrape")
+
+
+def _session_on_worker(status_cb=None):
+    if _SESSION[0] is None:
+        try:
+            _SESSION[0] = Session(status_cb=status_cb)
+        except Exception as exc:            # noqa: BLE001
+            _status(status_cb, f"TikTok session failed to open ({exc.__class__.__name__}: {exc}).")
+            _SESSION[0] = None
+    return _SESSION[0]
+
+
+def _search_on_worker(query, want, status_cb, sort, timeout_s=None):
+    sess = _session_on_worker(status_cb)
+    if sess is None:
+        return []
+    try:
+        return sess.search(query, want=want, status_cb=status_cb, sort=sort,
+                           timeout_s=timeout_s) or []
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
+        # a dead browser poisons every later search on this session - drop it so the
+        # next call rebuilds a fresh one (still on this same worker thread)
+        try:
+            _SESSION[0].close()
+        except Exception:
+            pass
+        _SESSION[0] = None
+        return []
+
+
+def _session_cookies_threadsafe():
+    """Current session cookies, fetched on the worker thread (None when no session)."""
+    if _on_worker_thread():                 # already there - a future would deadlock
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    def _get():
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    try:
+        return _executor().submit(_get).result(timeout=30)
+    except Exception:
         return None
-    with _LOCK:
-        if _SESSION[0] is None:
-            try:
-                _SESSION[0] = Session(status_cb=status_cb)
-            except Exception as exc:        # noqa: BLE001
-                _status(status_cb, f"TikTok session failed to open ({exc.__class__.__name__}: {exc}).")
-                _SESSION[0] = None
-                return None
-        return _SESSION[0]
+
+
+def ensure_session(status_cb=None, timeout_s=120.0):
+    """Open (or reuse) the logged-in session on the worker thread. True when ready."""
+    if not is_ready():
+        return False
+    try:
+        return (_executor().submit(_session_on_worker, status_cb)
+                .result(timeout=timeout_s) is not None)
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok session failed to open ({exc.__class__.__name__}: {exc}).")
+        return False
+
+
+def search_sync(query, want=12, status_cb=None, sort="MOST_LIKED", timeout_s=None):
+    """Run a logged-in keyword search on the worker thread and block for the result."""
+    if not is_ready():
+        return []
+    wait = 150.0 if timeout_s is None else max(10.0, float(timeout_s) + 30.0)
+    try:
+        return (_executor().submit(_search_on_worker, query, int(want), status_cb, sort,
+                                   timeout_s).result(timeout=wait)) or []
+    except concurrent.futures.TimeoutError:
+        _status(status_cb, f"TikTok search timed out for {query!r}; moving on.")
+        return []
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
+        return []
 
 
 def close_session():
-    with _LOCK:
+    global _EXECUTOR
+    with _EXEC_LOCK:
+        ex = _EXECUTOR
+    if ex is None:
+        return
+
+    def _close():
         if _SESSION[0] is not None:
             try:
                 _SESSION[0].close()
             except Exception:
                 pass
             _SESSION[0] = None
+    try:
+        ex.submit(_close).result(timeout=30)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- CLI
@@ -516,11 +668,10 @@ if __name__ == "__main__":
         print("logged out")
     elif cmd == "search":
         q = sys.argv[2] if len(sys.argv) > 2 else "tokyo street"
-        sess = get_session()
-        if not sess:
+        if not ensure_session(status_cb=print):
             print("not logged in - run: python tiktok_login.py login")
             sys.exit(1)
-        items = sess.search(q, want=10, status_cb=print)
+        items = search_sync(q, want=10, status_cb=print)
         for it in items[:10]:
             a = (it.get("author") or {})
             print("-", it.get("id"), "@" + str(a.get("uniqueId")), "|",

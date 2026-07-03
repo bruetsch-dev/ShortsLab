@@ -210,17 +210,12 @@ def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
 
 def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
                             ffmpeg=None, status_cb=None, style="punchy"):
-    """Clean, shape and speed up a generated voiceover in place.
+    """Adjust ONLY the pace of a generated voiceover in place - NO sound processing.
 
-    style="punchy" (default) targets the viral listicle/documentary voice, tuned WARM to match
-    the reference channel (warm low-mid body, moderate presence, gentle high rolloff - NOT harsh):
-        highpass + FFT denoise   -> kill the TTS noise floor ("Rauschen")
-        low-mid warmth EQ        -> full, warm body (250-800 Hz)
-        acompressor (moderate)   -> even, consistent level (not over-squashed)
-        light presence + de-ess  -> clarity without brightness/sibilance
-        atempo                   -> 1.15-1.25x pace without changing pitch
-        loudnorm + gate + limiter-> hot, consistent, silent gaps
-    style="clean" keeps the old gentle chain (denoise + speed + loudnorm only).
+    The former chain (denoise + EQ stack + compressor + loudnorm + gate + limiter) made the
+    voice sound dull/processed, so per user request (2026-07-03) the TTS audio is taken AS IS:
+    the only change is atempo (pitch-preserving pacing) plus the technical resample for muxing.
+    `denoise` and `style` are kept for call-site compatibility and IGNORED.
     Runs before forced alignment, so word timing matches the new pace. Returns the Path
     (unchanged on failure / no ffmpeg).
     """
@@ -233,67 +228,23 @@ def apply_voice_postprocess(path, speed=1.0, denoise=True, sample_rate=44100,
     except (TypeError, ValueError):
         speed = 1.0
     speed = max(0.5, min(2.0, speed))
-    # The Gemini TTS output carries a CONSTANT broadband noise floor (~-45 dB) - the "Rauschen".
-    # A mild denoise alone never removes it because the downstream compressor + loudnorm LIFT that
-    # floor right back up in the gaps, so it reads as a continuous "bed" under the whole voice.
-    # The fix is two-fold: (1) a stronger spectral denoise up front, and (2) a real gate placed
-    # AFTER loudnorm, so whatever floor loudnorm raises in the silent gaps is gated to true silence.
-    # Verified on real TTS: continuous -45 dB floor -> -inf in gaps, speech still ~-15 dB RMS.
-    filters = []
-    if denoise:
-        filters.append("highpass=f=80")
-        filters.append("afftdn=nr=20:nf=-30")      # STRONG broadband denoise (kills the TTS hiss floor)
-    if style in ("punchy", "dehiss"):
-        # WARM profile (tuned to the user's reference video's tonal balance: warm low-mid peak at
-        # 250-800 Hz, moderate presence, gentle high rolloff). The old chain cut low-mid and BOOSTED
-        # presence +4 + air, which was too bright/harsh and emphasized TTS grain. Now: gentle low-mid
-        # warmth, only a touch of presence, strong de-ess, no air boost.
-        # CLEARER + MORE ENERGETIC (the Pro model is clean, so we can add clarity back without the
-        # old hiss returning): de-mud the boxy low-mids, keep warm body, compress harder for a
-        # forward/energetic delivery, then lift DEFINITION (consonants) + PRESENCE + a touch of AIR
-        # so the voice cuts through. Strong de-ess + gate + lowpass still keep sibilance/hiss down.
-        filters.append("equalizer=f=250:width_type=q:w=1.2:g=-1.5")          # de-mud boxy low-mids (clarity)
-        filters.append("equalizer=f=450:width_type=q:w=1.1:g=1.3")           # warm body (kept)
-        if style == "punchy":
-            filters.append("acompressor=threshold=-19dB:ratio=3:attack=6:release=140:makeup=3:knee=4")  # forward/energetic
-        filters.append("equalizer=f=2600:width_type=q:w=1.2:g=2")            # definition/intelligibility (clarity)
-        filters.append("equalizer=f=4200:width_type=q:w=1.0:g=2.5")          # presence (clarity+energy; was +1.5)
-        filters.append("equalizer=f=6800:width_type=q:w=1.4:g=-3.5")         # de-ess (tames the added presence's sibilance/hiss)
-        filters.append("equalizer=f=12000:width_type=q:w=0.8:g=1.2")         # air/openness (HD clarity; conservative to keep hiss down)
-        filters.append("lowpass=f=15800")                                   # trim ultra-high hiss (a touch more air than 15.5k)
-    if abs(speed - 1.0) > 0.001:
-        filters.append(f"atempo={speed:.4f}")
-    if style == "punchy":
-        filters.append("loudnorm=I=-15:TP=-1.0:LRA=10")
-        # FINAL gate: silence the gaps so the noise floor never reads as a background bed.
-        filters.append("agate=threshold=0.02:ratio=2.5:range=0.04:attack=8:release=160:knee=3")
-        filters.append("alimiter=limit=0.97")
-    elif style == "dehiss":
-        filters.append("loudnorm=I=-15:TP=-1.0:LRA=11")
-        filters.append("agate=threshold=0.02:ratio=2.5:range=0.04:attack=8:release=160:knee=3")
-        filters.append("alimiter=limit=0.97")
-    else:
-        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    if abs(speed - 1.0) <= 0.001:
+        status_log(status_cb, "Voice: used AS IS (no effects, no speed change).")
+        return path
     tmp = path.with_name(path.stem + "_pp" + path.suffix)
     cmd = [ffmpeg, "-y", "-i", str(path), "-ar", str(sample_rate),
-           "-af", ",".join(filters), str(tmp)]
+           "-af", f"atempo={speed:.4f}", str(tmp)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         os.replace(str(tmp), str(path))
-        status_log(status_cb, f"Voice chain: speed {speed:.2f}x.")
-        if style in ("punchy", "dehiss"):
-            status_log(status_cb, "Voice EQ: CLEAR+ENERGETIC profile - denoise, de-mud, warm body, "
-                                  "forward compression, definition + presence + air lift for clarity, "
-                                  "strong de-ess; loudnorm -15 LUFS; final gate silences the gaps.")
-        else:
-            status_log(status_cb, f"Voice post-processed: speed {speed:.2f}x, style '{style}'.")
+        status_log(status_cb, f"Voice: speed {speed:.2f}x, otherwise used AS IS (no effects).")
     except Exception as exc:
         try:
             if tmp.exists():
                 tmp.unlink()
         except Exception:
             pass
-        status_log(status_cb, f"Voice post-process skipped ({exc}).")
+        status_log(status_cb, f"Voice speed change skipped ({exc}).")
     return path
 
 
@@ -962,6 +913,24 @@ def draw_arrow(draw, start, end, fill, width=12):
 # bold shaft + a proper triangular head (head ~2.3x shaft wide, ~2.2x shaft long). No scribble /
 # sketch / back-swept / multi-part geometry.
 DEFAULT_THICK_RED_ARROW = (228, 30, 24)
+ARROW_STYLE_PALETTES = {
+    "default_thick_red_arrow": {
+        "fill": DEFAULT_THICK_RED_ARROW, "highlight": (255, 96, 74),
+        "shade": (172, 18, 14), "outline": (251, 247, 238), "shadow": (12, 10, 8),
+    },
+    "yellow_sticker_arrow": {
+        "fill": (255, 205, 35), "highlight": (255, 239, 120),
+        "shade": (210, 135, 8), "outline": (255, 251, 232), "shadow": (30, 24, 8),
+    },
+    "white_sticker_arrow": {
+        "fill": (247, 247, 244), "highlight": (255, 255, 255),
+        "shade": (185, 185, 180), "outline": (25, 23, 20), "shadow": (5, 5, 5),
+    },
+    "neon_green_arrow": {
+        "fill": (82, 242, 92), "highlight": (175, 255, 182),
+        "shade": (20, 158, 57), "outline": (248, 255, 238), "shadow": (7, 24, 10),
+    },
+}
 
 
 def draw_thick_arrow(draw, start, end, fill, shaft_w=22, shadow_fill=None):
@@ -986,7 +955,8 @@ def draw_thick_arrow(draw, start, end, fill, shaft_w=22, shadow_fill=None):
     draw.polygon((end, c1, c2), fill=fill)                  # triangular head
 
 
-def build_arrow_sprite(length, shaft, angle_rad, curve=0.14, alpha=1.0):
+def build_arrow_sprite(length, shaft, angle_rad, curve=0.14, alpha=1.0,
+                       style="default_thick_red_arrow"):
     """The ONE styled red callout arrow ('viral sticker' look): a TAPERED, gently CURVED shaft
     into a big triangular head, with a cream outline, a top highlight + bottom shade bevel, and
     the signature hard ink offset shadow - so it pops on any footage and matches the app's
@@ -1048,13 +1018,14 @@ def build_arrow_sprite(length, shaft, angle_rad, curve=0.14, alpha=1.0):
     hi = mask & ~np.roll(mask, d, 0)                    # top inner edge -> highlight
     lo = mask & ~np.roll(mask, -d, 0)                   # bottom inner edge -> shade
 
+    palette = ARROW_STYLE_PALETTES.get(str(style), ARROW_STYLE_PALETTES["default_thick_red_arrow"])
     a = int(245 * max(0.0, min(1.0, alpha)))
     out = np.zeros((size_y, size_x, 4), dtype=np.uint8)
-    out[shadow] = (12, 10, 8, int(a * 0.45))
-    out[outline] = (251, 247, 238, a)                   # cream sticker outline
-    out[mask] = DEFAULT_THICK_RED_ARROW + (a,)
-    out[hi] = (255, 96, 74, a)                          # bevel highlight
-    out[lo] = (172, 18, 14, a)                          # bevel shade
+    out[shadow] = palette["shadow"] + (int(a * 0.45),)
+    out[outline] = palette["outline"] + (a,)
+    out[mask] = palette["fill"] + (a,)
+    out[hi] = palette["highlight"] + (a,)
+    out[lo] = palette["shade"] + (a,)
     return Image.fromarray(out), (tip[0], tip[1])
 
 
@@ -1063,10 +1034,16 @@ def render_callout_arrow(spec, width, height, alpha, pop):
     Returns (RGBA tile, (x, y) paste position) or None."""
     cx = width * float(spec.get("cx", 0.5)); cy = height * float(spec.get("cy", 0.5))
     from_left = spec.get("from", "left") == "left"
-    shaft = max(12, int(height * 0.017 * max(0.55, pop)))
+    editor_scale = max(0.25, min(3.0, float(spec.get("editor_scale", 1.0) or 1.0)))
+    shaft = max(8, int(height * 0.017 * max(0.55, pop) * editor_scale))
     length = shaft * 7.2
-    angle = 0.0 if from_left else math.pi                 # points right / left
-    built = build_arrow_sprite(length, shaft, angle, curve=0.0, alpha=alpha)   # STRAIGHT arrow
+    try:
+        rotation = max(-180.0, min(180.0, float(spec.get("editor_rotation", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        rotation = 0.0
+    angle = (0.0 if from_left else math.pi) + math.radians(rotation)
+    built = build_arrow_sprite(length, shaft, angle, curve=0.0, alpha=alpha,
+                               style=spec.get("arrow_style", "default_thick_red_arrow"))
     if not built:
         return None
     tile, (tip_x, tip_y) = built
@@ -1077,6 +1054,55 @@ def render_callout_arrow(spec, width, height, alpha, pop):
         x = int(cx + gap - tip_x)
     y = int(cy - tip_y)
     return tile, (x, y)
+
+
+def apply_overlay_editor_transform(spec):
+    """Apply timeline-editor move/scale fields without destroying the authored overlay data."""
+    spec = dict(spec or {})
+    try:
+        scale = max(0.25, min(3.0, float(spec.get("editor_scale", 1.0) or 1.0)))
+    except (TypeError, ValueError):
+        scale = 1.0
+    try:
+        rotation = math.radians(max(-180.0, min(180.0, float(spec.get("editor_rotation", 0.0) or 0.0))))
+    except (TypeError, ValueError):
+        rotation = 0.0
+    kind = str(spec.get("type") or "")
+    try:
+        ex = float(spec["editor_x"]) if spec.get("editor_x") is not None else None
+        ey = float(spec["editor_y"]) if spec.get("editor_y") is not None else None
+    except (TypeError, ValueError):
+        ex = ey = None
+    if kind in ("callout", "highlight"):
+        if ex is not None: spec["cx"] = ex
+        if ey is not None: spec["cy"] = ey
+        if kind == "highlight":
+            spec["rx"] = float(spec.get("rx", 0.18)) * scale
+            spec["ry"] = float(spec.get("ry", 0.10)) * scale
+    elif kind == "arrows":
+        items = [list(item[:4]) for item in (spec.get("items") or []) if len(item) >= 4]
+        if items:
+            xs = [v for item in items for v in (float(item[0]), float(item[2]))]
+            ys = [v for item in items for v in (float(item[1]), float(item[3]))]
+            cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+            tx, ty = (ex if ex is not None else cx), (ey if ey is not None else cy)
+            cos_r, sin_r = math.cos(rotation), math.sin(rotation)
+            def point(x, y):
+                dx, dy = (float(x) - cx) * scale, (float(y) - cy) * scale
+                return tx + dx * cos_r - dy * sin_r, ty + dx * sin_r + dy * cos_r
+            spec["items"] = [[*point(a, b), *point(c, d)] for a, b, c, d in items]
+    elif kind in ("paper", "counter", "newspaper"):
+        w, h = float(spec.get("w", 0.72)), float(spec.get("h", 0.16))
+        if ex is not None: spec["x"] = ex - w * scale / 2
+        if ey is not None: spec["y"] = ey - h * scale / 2
+        spec["w"], spec["h"] = w * scale, h * scale
+        if spec.get("font") is not None:
+            spec["font"] = max(12, int(float(spec["font"]) * scale))
+    elif kind == "stamp":
+        if ex is not None: spec["x"] = ex
+        if ey is not None: spec["y"] = ey
+        spec["font"] = max(12, int(float(spec.get("font", 72)) * scale))
+    return spec
 
 
 def draw_ring(draw, cx, cy, rx, ry, fill, width=8, dash=26):
@@ -1187,7 +1213,8 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
         return img
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    for spec in overlay_specs:
+    for raw_spec in overlay_specs:
+        spec = apply_overlay_editor_transform(raw_spec)
         kind = spec.get("type")
         start = float(spec.get("start", 0.0))
         end = float(spec.get("end", 1.0))
@@ -1237,29 +1264,49 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
             ry = int(height * float(spec.get("ry", 0.10)))
             draw_ring(draw, cx, cy, rx, ry, (225, 32, 25, int(220 * hit)), width=8, dash=0)
         elif kind == "arrows":
+            arrow_width = max(3, int(11 * float(spec.get("editor_scale", 1.0) or 1.0)))
+            arrow_style = str(spec.get("arrow_style") or "default_thick_red_arrow")
+            arrow_fill = ARROW_STYLE_PALETTES.get(
+                arrow_style, ARROW_STYLE_PALETTES["default_thick_red_arrow"])["fill"]
             for item in spec.get("items", []):
                 draw_arrow(
                     draw,
                     (int(width * item[0]), int(height * item[1])),
                     (int(width * item[2]), int(height * item[3])),
-                    (225, 32, 25, int(220 * hit)),
-                    width=11,
+                    arrow_fill + (int(220 * hit),),
+                    width=arrow_width,
                 )
         elif kind == "callout":
             # ARROWS ONLY: a single clean thick red arrow (default_thick_red_arrow). Circles and
             # stamps are disabled - any non-arrow callout shape is ignored here as a safety net.
             if spec.get("shape") != "arrow":
                 continue
-            a_in = clamp(local / 0.16, 0.0, 1.0)
+            animation = str(spec.get("animation") or "pop").lower()
+            try:
+                scene_duration = max(0.1, float(scene.get("end", 0)) - float(scene.get("start", 0)))
+                overlay_duration = max(0.1, (end - start) * scene_duration)
+                entrance_ratio = max(0.04, min(0.85, float(spec.get("animation_duration", 0.28)) / overlay_duration))
+            except (TypeError, ValueError):
+                entrance_ratio = 0.16
+            a_in = 1.0 if animation == "none" else clamp(local / entrance_ratio, 0.0, 1.0)
             a_out = clamp((1.0 - local) / 0.22, 0.0, 1.0)
             alpha = a_in * a_out
             if alpha <= 0.02:
                 continue
-            grow = clamp(local / 0.22, 0.0, 1.0)
-            pop = 0.6 + 0.4 * (1.0 - (1.0 - grow) ** 2) + 0.06 * math.sin(grow * math.pi)   # quick pop-in
+            grow = a_in
+            if animation == "bounce":
+                pop = 0.35 + 0.65 * grow + 0.24 * math.sin(grow * math.pi)
+            elif animation == "pop":
+                pop = 0.6 + 0.4 * (1.0 - (1.0 - grow) ** 2) + 0.06 * math.sin(grow * math.pi)
+            else:  # fade / slide / none keep their authored size
+                pop = 1.0
             tile = render_callout_arrow(spec, width, height, alpha, pop)
             if tile is not None:
-                overlay.alpha_composite(tile[0], tile[1])
+                pos = tile[1]
+                if animation == "slide":
+                    direction = -1 if spec.get("from", "left") == "left" else 1
+                    pos = (pos[0] + int(direction * (1.0 - a_in) * width * 0.22), pos[1])
+                overlay.alpha_composite(tile[0], pos)
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -1324,6 +1371,12 @@ def scene_renders_caption(config, scene):
     if not bool(config.get("render_captions", True)):
         return False
     return bool(scene.get("render_caption", True))
+
+
+def animated_captions_enabled(config):
+    """One authoritative master gate for generated word-by-word captions."""
+    return (bool(config.get("render_captions", True))
+            and bool(config.get("animated_captions", config.get("captions_enabled", True))))
 
 
 def build_scene_prompt(config, scene):
@@ -2374,6 +2427,29 @@ def plan_sfx_events(config, has_speech=False):
     return plan
 
 
+def _apply_sfx_override(ev, ov, at_key="at"):
+    """Apply one editor override (enabled/volume/path/start_abs) onto an event dict."""
+    if not ov:
+        return ev
+    if ov.get("volume") is not None:
+        try:
+            ev["volume"] = round(float(ov["volume"]), 3)
+        except (TypeError, ValueError):
+            pass
+    if ov.get("path"):
+        try:
+            if Path(ov["path"]).exists():
+                ev["path"] = str(ov["path"])
+        except Exception:
+            pass
+    if ov.get("start_abs") is not None:
+        try:
+            ev[at_key] = round(max(0.0, float(ov["start_abs"])), 3)
+        except (TypeError, ValueError):
+            pass
+    return ev
+
+
 def sfx_event_plan(config, has_speech=False):
     """plan_sfx_events with the user's per-event overrides applied (for the editor)."""
     overrides = config.get("sfx_overrides") or {}
@@ -2382,11 +2458,7 @@ def sfx_event_plan(config, has_speech=False):
         ev = dict(ev)
         ov = overrides.get(ev["id"]) or {}
         ev["enabled"] = ov.get("enabled", True) is not False
-        if ov.get("volume") is not None:
-            try:
-                ev["volume"] = round(float(ov["volume"]), 3)
-            except (TypeError, ValueError):
-                pass
+        _apply_sfx_override(ev, ov, at_key="at")
         out.append(ev)
     return out
 
@@ -2410,32 +2482,68 @@ def custom_sfx_segments(config):
     return out
 
 
+def overlay_appearance_sfx_segments(config):
+    """Explicit sounds attached to a visual's entrance in the timeline editor."""
+    out = []
+    for scene_index, scene in enumerate(config.get("scenes", [])):
+        scene_start = float(scene.get("start", 0) or 0)
+        scene_duration = max(0.1, float(scene.get("end", scene_start)) - scene_start)
+        sid = str(scene.get("id", scene_index))
+        for overlay_index, overlay in enumerate(scene.get("overlays") or []):
+            path = str(overlay.get("appear_sfx_path") or "")
+            if not path or not Path(path).exists() or Path(path).suffix.lower() not in SFX_EXTS:
+                continue
+            try:
+                rel_start = max(0.0, min(1.0, float(overlay.get("start", 0.0) or 0.0)))
+                volume = max(0.0, min(0.6, float(overlay.get("appear_sfx_volume", 0.22) or 0.0)))
+                duration = max(0.08, min(2.0, float(overlay.get("appear_sfx_duration", 1.0) or 1.0)))
+            except (TypeError, ValueError):
+                continue
+            if volume <= 0:
+                continue
+            oid = str(overlay.get("id") or overlay_index)
+            out.append({
+                "path": path, "start": round(scene_start + rel_start * scene_duration, 3),
+                "duration": duration, "volume": volume, "category": "overlay_appearance",
+                "id": f"overlay-sfx-{sid}-{oid}",
+            })
+    return out
+
+
 def ai_content_sfx_segments(config):
     """Ambient sound beds planned + generated by plan_and_generate_ambient_sfx (agent_core).
-    These are the main content SFX for atmospheric scripts that match no keyword triggers."""
+    These are the main content SFX for atmospheric scripts that match no keyword triggers.
+    Timeline-editor overrides (mute/volume/replace sound/move) are honoured per event id."""
+    overrides = config.get("sfx_overrides") or {}
     out = []
     for cs in (config.get("ai_content_sfx") or []):
+        ov = overrides.get(str(cs.get("id") or "")) or {}
+        if ov.get("enabled") is False:
+            continue
         path = cs.get("path")
         if not path or not Path(path).exists():
             continue
-        out.append({"path": path, "start": round(float(cs.get("start", 0) or 0), 3),
-                    "duration": float(cs.get("duration") or 4.0),
-                    "volume": max(0.0, min(0.9, float(cs.get("volume") or 0.1))),
-                    "category": str(cs.get("category") or "ambient"),
-                    "id": str(cs.get("id") or "ambient")})
+        seg = {"path": path, "start": round(float(cs.get("start", 0) or 0), 3),
+               "duration": float(cs.get("duration") or 4.0),
+               "volume": max(0.0, min(0.9, float(cs.get("volume") or 0.1))),
+               "category": str(cs.get("category") or "ambient"),
+               "id": str(cs.get("id") or "ambient")}
+        _apply_sfx_override(seg, ov, at_key="start")
+        out.append(seg)
     return out
 
 
 def build_sfx_segments(config, has_speech=False):
+    explicit_segments = custom_sfx_segments(config) + overlay_appearance_sfx_segments(config)
     if not bool(config.get("sfx_enabled", True)):
-        return custom_sfx_segments(config)
+        return explicit_segments
     # Proceed if there is a library root, OR generation is on, OR place_editor_sfx already planned
     # local SFX (config['ai_content_sfx']) - the latter is the provided-local-assets scrape path.
     if (not sfx_library_root(config) and not bool(config.get("sfx_generation_enabled", False))
             and not config.get("ai_content_sfx")):
-        return custom_sfx_segments(config)
+        return explicit_segments
     if not config.get("scenes"):
-        return custom_sfx_segments(config)
+        return explicit_segments
     overrides = config.get("sfx_overrides") or {}
     # per-output toggles: content SFX vs transition SFX can be turned off independently
     content_on = config.get("sfx_content_enabled", config.get("sfx_enabled", True))
@@ -2465,10 +2573,24 @@ def build_sfx_segments(config, has_speech=False):
             continue
         if any(abs(e["start"] - ev["at"]) < 0.18 for e in events):
             continue
-        path = choose_sfx(config, ev["category"], f"{ev['id']}|{ev['scene_id']}")
+        path = None
+        if ov.get("path"):
+            try:
+                if Path(ov["path"]).exists():
+                    path = str(ov["path"])           # editor picked a specific sound
+            except Exception:
+                path = None
+        if not path:
+            path = choose_sfx(config, ev["category"], f"{ev['id']}|{ev['scene_id']}")
         if not path:
             continue
-        events.append({"path": path, "start": ev["at"], "duration": ev["duration"],
+        start_at = ev["at"]
+        if ov.get("start_abs") is not None:
+            try:
+                start_at = round(max(0.0, float(ov["start_abs"])), 3)
+            except (TypeError, ValueError):
+                pass
+        events.append({"path": path, "start": start_at, "duration": ev["duration"],
                        "volume": round(volume, 3), "category": ev["category"], "id": ev["id"]})
     max_events = max(3, int(float(config.get("duration", 60)) / 60.0 * int(config.get("sfx_max_per_minute", 24))))
     transition_events = [e for e in events if e.get("category") == "analog_transitions"]
@@ -2485,7 +2607,7 @@ def build_sfx_segments(config, has_speech=False):
                 if float(segment.get("duration") or 0) <= 2.1
             ]
         result.extend(content_segments)
-    result.extend(custom_sfx_segments(config))
+    result.extend(explicit_segments)
     return sorted(result, key=lambda e: e["start"])
 
 
@@ -2674,12 +2796,56 @@ def render_video(config, basename=None):
     vignette = make_vignette(width, height)
 
     # Precompute viral word-by-word caption timelines (sourced from spoken script).
-    captions_enabled = bool(config.get("animated_captions", config.get("captions_enabled", True)))
+    captions_enabled = animated_captions_enabled(config)
     caption_max_words = int(config.get("caption_max_words", 3))
     caption_uppercase = bool(config.get("caption_uppercase", True))
     caption_chunks_by_scene = {}
+    timeline_caption_chunks = []
     first_scene_id = config["scenes"][0].get("id", "1") if config.get("scenes") else None
-    if captions_enabled:
+    if captions_enabled and config.get("timeline_editor_render"):
+        # Timeline edits change visuals, not the original voiceover. Prefer canonical audio
+        # sentence timestamps so captions stay on speech after clip reorder/trim/speed edits.
+        caption_track = []
+        try:
+            audio_analysis_path = asset_dir.parent / "input" / "audio_analysis.json"
+            audio_analysis = json.loads(audio_analysis_path.read_text(encoding="utf-8"))
+            caption_track = [
+                {"start": row.get("start", 0), "end": row.get("end", 0),
+                 "text": row.get("text", ""), "word_timings": []}
+                for row in (audio_analysis.get("sentence_timestamps") or [])
+                if isinstance(row, dict) and str(row.get("text") or "").strip()
+            ]
+        except Exception:
+            caption_track = []
+        if not caption_track:
+            caption_track = list(config.get("timeline_caption_track") or [])
+        for row in caption_track:
+            try:
+                start = max(0.0, float(row.get("start", 0) or 0))
+                end = max(start + 0.05, float(row.get("end", start) or start))
+            except (TypeError, ValueError):
+                continue
+            word_times = []
+            for word in (row.get("word_timings") or []):
+                if not isinstance(word, dict):
+                    continue
+                word_times.append({
+                    "word": word.get("word", ""),
+                    "start": float(word.get("start", 0) or 0),
+                    "end": float(word.get("end", 0) or 0),
+                })
+            chunks = build_caption_chunks(
+                str(row.get("text") or ""), end - start, caption_max_words,
+                caption_uppercase, word_times=word_times)
+            for chunk in chunks:
+                shifted = dict(chunk)
+                shifted["start"] = float(chunk["start"]) + start
+                shifted["end"] = float(chunk["end"]) + start
+                shifted["words"] = [dict(word, start=float(word["start"]) + start,
+                                         end=float(word["end"]) + start)
+                                    for word in chunk.get("words", [])]
+                timeline_caption_chunks.append(shifted)
+    if captions_enabled and not timeline_caption_chunks:
         for i, scene in enumerate(config["scenes"], 1):
             sid = scene.get("id", str(i))
             ctext = (scene.get("caption") or scene.get("script") or "").strip()
@@ -2846,8 +3012,9 @@ def render_video(config, basename=None):
             if captions_enabled:
                 base = draw_animated_caption(
                     base,
-                    caption_chunks_by_scene.get(scene_id, []),
-                    local,
+                    (timeline_caption_chunks if timeline_caption_chunks
+                     else caption_chunks_by_scene.get(scene_id, [])),
+                    (t if timeline_caption_chunks else local),
                     width,
                     height,
                     config,

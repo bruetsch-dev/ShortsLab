@@ -146,7 +146,9 @@ def _fallback_plan(strategy):
     scenes = []
     sid = 1
     total_target = 38.0
-    counts = {"DECLARE": 1, "ASSESS": 2, "ISOLATE": 2, "PROCESS": 6, "BUILD": 2, "REVEAL": 2}
+    # Max 10 scenes: Seedance's minimum generation is 4s per scene, so 10 scenes keep the
+    # total GENERATED footage at ~40s (10 x 4s) while the final cut lands around 35-40s.
+    counts = {"DECLARE": 1, "ASSESS": 1, "ISOLATE": 1, "PROCESS": 4, "BUILD": 1, "REVEAL": 2}
     n = sum(counts.values())
     base = total_target / n
     subj = strategy["subject"]
@@ -155,7 +157,7 @@ def _fallback_plan(strategy):
         for k in range(cnt):
             state = ("before" if phase in ("DECLARE", "ASSESS", "ISOLATE")
                      else "after" if phase == "REVEAL" else "mid-process")
-            dur = round(min(4.5, max(1.5, base + (0.8 if phase in ("DECLARE", "REVEAL") else -0.3))), 1)
+            dur = round(min(4.0, max(1.5, base + (0.8 if phase in ("DECLARE", "REVEAL") else -0.3))), 1)
             caption = _FALLBACK_CAPTIONS[phase][k % len(_FALLBACK_CAPTIONS[phase])].replace("{claim}", claim)
             desc = {"DECLARE": f"{subj} in its worst state, {strategy['before_state']}",
                     "ASSESS": f"hands measuring/inspecting {subj} with a tool (ruler, comb, flashlight)",
@@ -182,8 +184,9 @@ def _fallback_plan(strategy):
 
 
 def _normalize_plan(plan, strategy):
-    """Enforce the fixed structure: all 6 phases in order, 10-16 scenes, durations 1.5-4.5s,
-    total 30-45s, PROCESS has the most scenes, captions <= 5 words."""
+    """Enforce the fixed structure: all 6 phases in order, 8-10 scenes (Seedance generates
+    a minimum of 4s per scene, so 10 scenes cap the generated footage at ~40s), durations
+    1.5-4.0s, total ~32-40s, PROCESS has the most scenes, captions <= 5 words."""
     scenes = plan.get("scenes") if isinstance(plan, dict) else None
     if not isinstance(scenes, list) or not scenes:
         return _fallback_plan(strategy)
@@ -195,7 +198,7 @@ def _normalize_plan(plan, strategy):
         if phase not in PHASES:
             continue
         try:
-            dur = max(1.5, min(4.5, float(sc.get("duration_seconds", 3.0))))
+            dur = max(1.5, min(4.0, float(sc.get("duration_seconds", 3.0))))
         except (TypeError, ValueError):
             dur = 3.0
         caption = " ".join(str(sc.get("caption", "")).split()[:5]) or \
@@ -218,22 +221,30 @@ def _normalize_plan(plan, strategy):
     # order scenes by the fixed phase sequence, keep relative order within a phase
     order = {p: i for i, p in enumerate(PHASES)}
     cleaned.sort(key=lambda s: order[s["phase"]])
+    # Cap at 10 scenes so the GENERATED Seedance footage stays ~40s total (the API's
+    # minimum generation is 4s per scene). Trim each phase down to its share (PROCESS
+    # keeps the most) instead of falling back wholesale when the LLM plans too many.
+    _keep = {"DECLARE": 1, "ASSESS": 1, "ISOLATE": 1, "PROCESS": 4, "BUILD": 1, "REVEAL": 2}
+    for phase, keep in _keep.items():
+        idxs = [i for i, s in enumerate(cleaned) if s["phase"] == phase]
+        for i in reversed(idxs[keep:]):
+            del cleaned[i]
     for i, sc in enumerate(cleaned):
         sc["scene_id"] = i + 1
     have = {s["phase"] for s in cleaned}
-    if len(cleaned) < 10 or len(cleaned) > 18 or have != set(PHASES):
+    if len(cleaned) < 8 or have != set(PHASES):
         return _fallback_plan(strategy)
     n_process = sum(1 for s in cleaned if s["phase"] == "PROCESS")
     if n_process < max(3, max(sum(1 for s in cleaned if s["phase"] == p) for p in PHASES if p != "PROCESS")):
         return _fallback_plan(strategy)
     total = sum(s["duration_seconds"] for s in cleaned)
-    if not (28.0 <= total <= 47.0):        # rescale into the 35-42s window
+    if not (30.0 <= total <= 40.0):        # rescale toward the ~38s target
         factor = 38.0 / total
         for sc in cleaned:
-            sc["duration_seconds"] = round(max(1.5, min(4.5, sc["duration_seconds"] * factor)), 1)
+            sc["duration_seconds"] = round(max(1.5, min(4.0, sc["duration_seconds"] * factor)), 1)
         total = sum(s["duration_seconds"] for s in cleaned)
     return {"title": str(plan.get("title") or strategy["concept_title"])[:120],
-            "scenes": cleaned[:16], "total_duration": round(total, 1)}
+            "scenes": cleaned, "total_duration": round(total, 1)}
 
 
 def plan_scenes(strategy, reasoning_model=None, status_cb=None):
@@ -252,7 +263,7 @@ def plan_scenes(strategy, reasoning_model=None, status_cb=None):
         "micro-actions, MOST scenes here, each visibly improving the subject) -> BUILD "
         "(drying/styling/final steps, 'almost done') -> REVEAL (clean final result, "
         "before/after, end on a clean final shot).\n"
-        "Timeline: 12-16 scenes, each 1.5-4.5 seconds, total 35-42 seconds.\n"
+        "Timeline: 8-10 scenes MAXIMUM, each 1.5-4.0 seconds, total 32-40 seconds.\n"
         "Per scene write:\n"
         "- caption: 1-5 simple bold words that raise curiosity (e.g. '5,000 tangles', 'First "
         "cut', 'Layer one', 'Still going', 'Almost clean', 'For this'). No punctuation spam.\n"

@@ -15,3 +15,4 @@ json-repair
 # After install run once: python -m playwright install chromium
 yt-dlp
 playwright
+rapidocr-onnxruntime

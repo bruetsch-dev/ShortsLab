@@ -310,6 +310,16 @@ def find_matching_scrape_project(script):
     return matches[0].name
 
 
+def should_reuse_same_script_media(fused_slug, requested_same_script, form):
+    """Keep downloaded social media across same-script retries.
+
+    ``force_regenerate`` is the UI's fresh voice/take option and must not throw away a long scrape.
+    Only the separate, explicit ``force_rescrape`` escape hatch opts out of saved-media recovery.
+    """
+    return bool(fused_slug or requested_same_script) \
+        and not form_flag(form, "force_rescrape", False)
+
+
 def log(status_cb, message):
     if status_cb:
         status_cb(message)
@@ -352,6 +362,94 @@ def consume_replace_requests(form):
 
 def config_for_json(config):
     return {key: value for key, value in config.items() if not str(key).startswith("_")}
+
+
+def current_media_exclusions(form):
+    """Snapshot paths the user removed from the live Accepted/Assigned media panel."""
+    if not isinstance(form, dict):
+        return set()
+    values = form.get("_media_exclusions")
+    lock = form.get("_media_exclusion_lock")
+    if values is None:
+        return set()
+    if lock:
+        with lock:
+            return {str(value).lower() for value in values}
+    return {str(value).lower() for value in values}
+
+
+def reconcile_manual_scrape_exclusions(config, project_dir, form, status_cb=None):
+    """Replace assigned files manually removed in the live panel with a non-excluded candidate."""
+    if str(config.get("clip_source") or "") != "scrape":
+        return 0
+    project_dir = Path(project_dir)
+    clip_dir = project_dir / "seedance 2.0"
+    candidate_root = clip_dir / "_candidates"
+    exclusions = current_media_exclusions(form)
+    if not exclusions and all((clip_dir / str(sc.get("clip") or "")).exists()
+                              for sc in config.get("scenes", []) if sc.get("clip")):
+        return 0
+    candidates = []
+    if candidate_root.exists():
+        for path in candidate_root.rglob("*.mp4"):
+            parts = {part.lower() for part in path.parts}
+            if "_raw" in parts or "_manual_removed" in parts:
+                continue
+            if path.exists() and str(path.resolve()).lower() not in exclusions:
+                candidates.append(path)
+    used = set()
+    for scene in config.get("scenes", []):
+        assigned = clip_dir / str(scene.get("clip") or "")
+        meta = {}
+        if assigned.name:
+            try:
+                meta = json.loads(assigned.with_suffix(".json").read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+        source = str(meta.get("source_path") or "")
+        if source and source.lower() not in exclusions and assigned.exists():
+            used.add(source.lower())
+    changed = 0
+    for index, scene in enumerate(config.get("scenes", [])):
+        clip_name = str(scene.get("clip") or "")
+        if not clip_name.startswith("scraped_"):
+            continue
+        assigned = clip_dir / clip_name
+        try:
+            meta = json.loads(assigned.with_suffix(".json").read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        old_source = str(meta.get("source_path") or "")
+        if assigned.exists() and (not old_source or old_source.lower() not in exclusions):
+            continue
+        choices = [p for p in candidates if str(p.resolve()).lower() not in used]
+        if not choices:
+            choices = list(candidates)
+        if not choices:
+            log(status_cb, f"Manual exclusion left scene {index} without an accepted replacement.")
+            continue
+        source_path = sorted(choices, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)[0]
+        assigned.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, assigned)
+        source_meta = {}
+        try:
+            source_meta = json.loads(source_path.with_suffix(".json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        platform = str(source_meta.get("platform") or "tiktok")
+        scene["scrape_source"] = "twitter" if platform in {"x", "twitter"} else "tiktok"
+        scene["scrape_clip_id"] = source_meta.get("clip_id") or str(source_path.resolve())
+        scene["match_class"] = "MANUAL_REPLACEMENT"
+        assigned.with_suffix(".json").write_text(json.dumps({
+            "status": "assigned", "scene_id": str(scene.get("id", index)),
+            "source_path": str(source_path.resolve()), "platform": scene["scrape_source"],
+            "clip_id": scene["scrape_clip_id"],
+        }, indent=2), encoding="utf-8")
+        used.add(str(source_path.resolve()).lower())
+        changed += 1
+    if changed:
+        log(status_cb, f"Manual media exclusions: replaced {changed} assigned clip(s) before render.")
+    return changed
 
 
 def form_int(form, key, default, minimum=0, maximum=99):
@@ -903,8 +1001,12 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     is_form = isinstance(form, dict)
     cancel_event = form.get("_cancel_event") if is_form else None
 
+    force_regenerate = bool(is_form and (
+        form_flag(form, "regenerate_voice", False)
+        or form_flag(form, "force_regenerate", False)
+    ))
     existing = find_existing_voiceover(project_dir)
-    if existing:
+    if existing and not force_regenerate:
         prior_script_path = Path(project_dir) / "input" / "script.txt"
         prior_script = prior_script_path.read_text(encoding="utf-8") if prior_script_path.exists() else ""
         if prior_script.strip() and prior_script.strip() == script.strip():
@@ -2397,6 +2499,16 @@ def adaptive_script_match_threshold(script_relevancy, attempt=0):
     return round(max(4.0, base - attempt), 1)
 
 
+def should_run_final_semantic_rescore(current_threshold, floor_threshold, remaining_count,
+                                      pool_count, any_matched, scene_count):
+    """Only pay for another full vision pass when it can actually lower the threshold."""
+    if not remaining_count or not pool_count:
+        return False
+    if not any_matched and pool_count >= scene_count:
+        return False
+    return float(floor_threshold) < float(current_threshold) - 0.01
+
+
 def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None, understanding=None):
     """Let the Reasoning Agent derive TikTok b-roll search queries straight from the
     voice script (concrete places/objects/actions per scene), plus the scroll-stop hook
@@ -2588,8 +2700,9 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
             "Give 5-7 queries PER TIER, and make every query a genuinely DIFFERENT angle: rotate synonyms, "
             "slang, formal/casual phrasing, different concrete nouns and camera perspectives (POV / vlog / "
             "walking tour / close-up). Near-duplicate wordings waste searches and are skipped.\n"
-            "School terms (学校 / 女子高生 / JK / 制服 / 教室) are allowed ONLY when the script is actually "
-            "ABOUT school life - and even then only for body-footage buckets, never anything hook-like.\n"
+            "School terms: when the script IS about school life, DO use them actively in the body buckets "
+            "(学校 / 女子高生 / JK / 制服 / 教室 / 高校生活 / #jk) - they index that content best. When the "
+            "script is NOT about school, never use them.\n"
             "Also add creator-discussion queries where useful (a creator TALKING about the topic), e.g. "
             "恋愛について話す 女子, 仕事疲れた 話す.\n"
             f"Useful synonym families to widen with: {syn}.\n"
@@ -2604,12 +2717,22 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
         )},
     ]
     try:
-        if collaborate:
-            plan = collaborate_json(messages, max_tokens=4000, temperature=0.3, status_cb=status_cb, label="social search plan") or {}
-        else:
-            plan = _post_llm_json(reasoning_model or GPT55_MODEL, messages, 4000, 0.3) or {}
-        buckets = plan.get("buckets") if isinstance(plan.get("buckets"), list) else []
-        buckets = [b for b in buckets if isinstance(b, dict) and b.get("query_tiers")]
+        # 8000 tokens: a full plan (10+ buckets x 4 tiers x 5-7 queries for 30 scenes) regularly
+        # overflowed 4000, truncating the JSON -> empty buckets -> the whole run silently fell
+        # back to flat queries. One retry covers transient API/parse failures.
+        buckets = []
+        for _attempt in range(2):
+            if collaborate:
+                plan = collaborate_json(messages, max_tokens=8000, temperature=0.3, status_cb=status_cb, label="social search plan") or {}
+            else:
+                plan = _post_llm_json(reasoning_model or GPT55_MODEL, messages, 8000, 0.3) or {}
+            buckets = plan.get("buckets") if isinstance(plan.get("buckets"), list) else []
+            buckets = [b for b in buckets if isinstance(b, dict) and b.get("query_tiers")]
+            if buckets:
+                break
+            log(status_cb, "Social search plan came back empty/truncated - retrying once..."
+                if _attempt == 0 else
+                "Social search plan empty after retry - the run will use flat fallback queries.")
         # Models occasionally serialize scene ids as "0 1 2" despite the requested array.
         # Normalize once here; iterating that string character-by-character silently mapped
         # double-digit scenes to the wrong search bucket.
@@ -2654,11 +2777,12 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
 
 
 def find_reusable_social_clips(project_dir, title, script, understanding=None,
-                               reasoning_model=None, status_cb=None, max_clips=50):
-    """Ask the reasoning agent which existing projects cover the same topic, then expose only
-    their accepted ``scraped_*.mp4`` files to the current vision matcher.
+                               reasoning_model=None, status_cb=None, max_clips=None):
+    """Expose this same-script project's finalized clips and pre-filtered candidate downloads.
 
     Current-project clips are staged before placement because placement replaces ``scraped_*``.
+    Failed/cancelled runs never reached placement, so their ``_candidates/cand_*.mp4`` files are
+    equally important reusable inputs and have already passed the intake quality gates.
     Returns (body_paths, hook_paths, clip_meta, report).
     """
     project_dir = Path(project_dir)
@@ -2675,8 +2799,24 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
     for candidate_dir in [project_dir]:
         if not candidate_dir.is_dir():
             continue
-        clips = sorted((candidate_dir / "seedance 2.0").glob("scraped_*.mp4"))
-        clips = [p for p in clips if p.is_file() and p.stat().st_size > 4096]
+        seedance_dir = candidate_dir / "seedance 2.0"
+        finalized = sorted(seedance_dir.glob("scraped_*.mp4"))
+        downloaded_all = sorted((seedance_dir / "_candidates").rglob("cand_*.mp4")) \
+            if (seedance_dir / "_candidates").exists() else []
+        # Round-robin buckets so the bounded reuse pool covers the whole script instead of
+        # taking the first 50 alphabetical files from only a few folders.
+        by_bucket = {}
+        for path in downloaded_all:
+            by_bucket.setdefault(path.parent.name, []).append(path)
+        downloaded = []
+        while any(by_bucket.values()):
+            for bucket in sorted(by_bucket):
+                if by_bucket[bucket]:
+                    downloaded.append(by_bucket[bucket].pop(0))
+        clips = [p for p in [*finalized, *downloaded]
+                 if p.is_file() and p.stat().st_size > 4096
+                 and "_raw" not in {part.lower() for part in p.parts}
+                 and "_existing_reuse" not in {part.lower() for part in p.parts}]
         if not clips:
             continue
         old_script_path = candidate_dir / "input" / "script.txt"
@@ -2756,13 +2896,21 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
     selected_report = []
     total = 0
     try:
+        reuse_limit = max(0, int(max_clips)) if max_clips is not None else None
+    except (TypeError, ValueError):
+        reuse_limit = None
+
+    def reuse_limit_reached():
+        return reuse_limit is not None and total >= reuse_limit
+
+    try:
         import clip_scraper as _clip_quality
         _reuse_ffmpeg, _reuse_ffprobe = _clip_quality._ffmpeg_tools()
     except Exception:
         _clip_quality = None
         _reuse_ffmpeg = _reuse_ffprobe = None
     for candidate in selected:
-        if total >= max_clips:
+        if reuse_limit_reached():
             break
         config_scenes = candidate["config"].get("scenes") if isinstance(candidate["config"].get("scenes"), list) else []
         prior_by_clip = {
@@ -2783,27 +2931,60 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
             verified_hook_likes = 0
         added = 0
         rejected_rapid = 0
-        for source in candidate["clips"][:30]:
-            if total >= max_clips:
+        rejected_captions = 0
+        for source in candidate["clips"]:
+            if reuse_limit_reached():
                 break
             prior = prior_by_clip.get(source.name) or {}
+            is_downloaded_candidate = "_candidates" in {part.lower() for part in source.parts}
+            candidate_bucket = source.parent.name if is_downloaded_candidate else ""
+            candidate_sidecar = {}
+            try:
+                candidate_sidecar = json.loads(source.with_suffix(".json").read_text(
+                    encoding="utf-8", errors="replace"))
+            except Exception:
+                candidate_sidecar = {}
+            candidate_platform = str(candidate_sidecar.get("platform")
+                                     or prior.get("scrape_source") or "tiktok").lower()
+            hook_source_floor = (HOOK_MIN_LIKES // 4
+                                 if candidate_platform == "twitter" else HOOK_MIN_LIKES)
             try:
                 index = int(re.search(r"(\d+)$", source.stem).group(1))
             except Exception:
                 index = -1
-            is_verified_hook = (index == 0 and bool(social.get("hook_first"))
-                                and verified_hook_likes >= HOOK_MIN_LIKES)
+            # A hook candidate only reaches this folder after scrape_bucket's hard 20K gate.
+            is_verified_hook = (candidate_bucket == "hook_influencer"
+                                or (index == 0 and bool(social.get("hook_first"))
+                                    and verified_hook_likes >= hook_source_floor))
             # Never feed an unverified previous opening into body matching.
-            if index == 0 and not is_verified_hook:
+            # ``cand_*_0`` means the first download in a search bucket, not scene 0. The old
+            # check accidentally discarded the first saved body clip from every bucket on rerun.
+            if not is_downloaded_candidate and index == 0 and not is_verified_hook:
                 continue
             stability = {"stable": True, "internal_cut_count": 0,
                          "rapid_internal_cut_count": 0, "min_shot_seconds": None}
-            if _clip_quality and _reuse_ffmpeg:
+            if _clip_quality and _reuse_ffmpeg and not is_downloaded_candidate:
                 stability = _clip_quality.stable_segment_profile(
                     source, _reuse_ffmpeg, _reuse_ffprobe, seconds=4.0)
                 if not stability.get("stable", True):
                     rejected_rapid += 1
                     continue
+            try:
+                reuse_text_score = float(candidate_sidecar.get("text_heaviness")
+                                         or prior.get("text_heaviness_score") or 0.0)
+            except (TypeError, ValueError):
+                reuse_text_score = 0.0
+            if _clip_quality and _reuse_ffmpeg and is_downloaded_candidate:
+                try:
+                    reuse_text_score = _clip_quality.text_heaviness_score(
+                        source, _reuse_ffmpeg, _clip_quality.DEFAULT_CLIP_SECONDS)
+                    persistent_caption = _clip_quality.has_burned_captions(
+                        source, _reuse_ffmpeg, _clip_quality.DEFAULT_CLIP_SECONDS)
+                    if _clip_quality.is_captioned_candidate(reuse_text_score, persistent_caption):
+                        rejected_captions += 1
+                        continue
+                except Exception:
+                    pass
             usable = source
             if source.parent.parent.resolve() == project_dir.resolve():
                 cache = project_dir / "seedance 2.0" / "_candidates" / "_existing_reuse"
@@ -2813,15 +2994,21 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
                 if not usable.exists() or usable.stat().st_size != source.stat().st_size:
                     shutil.copy2(source, usable)
             item_meta = {
-                "bucket_id": f"existing_project:{candidate['slug']}",
+                "bucket_id": (candidate_bucket or f"existing_project:{candidate['slug']}"),
                 "source_query": f"existing project: {candidate['title']}",
                 "tier": "existing_project", "search_intent": "project_reuse",
-                "platform": "tiktok", "clip_id": f"existing:{candidate['slug']}:{source.name}",
+                "platform": candidate_platform,
+                "clip_id": (candidate_sidecar.get("clip_id")
+                            or f"existing:{candidate['slug']}:{source.name}"),
                 "caption": clean_text(str(prior.get("exact_voice_text") or prior.get("script") or ""))[:160],
                 "black_bar_score": float(prior.get("black_bar_score") or 0),
-                "text_heaviness": float(prior.get("text_heaviness_score") or 0),
+                "text_heaviness": reuse_text_score,
                 "is_fake_vertical": bool(prior.get("is_fake_vertical", False)),
-                "likes": verified_hook_likes if is_verified_hook else 0,
+                "likes": (max(hook_source_floor, verified_hook_likes,
+                              int(candidate_sidecar.get("likes") or 0))
+                          if is_verified_hook else
+                          int(candidate_sidecar.get("likes") or
+                              (MIN_CLIP_LIKES if is_downloaded_candidate else 0))),
                 "reused_from_project": candidate["slug"],
                 "internal_cut_count": stability.get("internal_cut_count", 0),
                 "rapid_internal_cut_count": stability.get("rapid_internal_cut_count", 0),
@@ -2835,6 +3022,7 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
             "topic_similarity": selected_scores[candidate["slug"]],
             "reason": selected_reasons.get(candidate["slug"], ""), "clips_added": added,
             "rapid_montages_rejected": rejected_rapid,
+            "captioned_clips_rejected": rejected_captions,
         })
     if selected_report:
         log(status_cb, "Existing-project agent selected: " + "; ".join(
@@ -2891,7 +3079,8 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
     for bi, bucket in enumerate(all_buckets):
         if (cancel_check and cancel_check()) or len(pool) >= MAX_POOL:
             break
-        bucket_t0 = time.time()
+        bucket_t0 = time.monotonic()
+        bucket_deadline = bucket_t0 + BUCKET_TIME_BUDGET_S
         bid = str(bucket.get("bucket_id", f"bucket_{bi:02d}"))
         intent = bucket.get("search_intent", "lifestyle_broll")
         is_hook = (intent == "hook_influencer")
@@ -2907,14 +3096,15 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
         for tier in TIERS:
             if got >= target or (cancel_check and cancel_check()):
                 break
-            if time.time() - bucket_t0 > BUCKET_TIME_BUDGET_S:
+            if time.monotonic() >= bucket_deadline:
                 log(status_cb, f"Bucket {bid}: time budget ({BUCKET_TIME_BUDGET_S:.0f}s) reached with "
                                f"{got} clip(s); moving on so other scenes still get footage.")
                 break
             qs = [str(q).strip() for q in (bucket.get("query_tiers", {}).get(tier) or []) if str(q).strip()]
             if not qs:
                 continue
-            log(status_cb, f"  [{bid} · {tier}] searching TikTok: {' · '.join(qs[:8])}")
+            log(status_cb, f"  [{bid} · {tier}] searching {', '.join(platforms)}: "
+                           f"{' · '.join(qs[:8])}")
             out_dir = cand_root / bid
             try:
                 got_dicts = clip_scraper.scrape_bucket(
@@ -2923,7 +3113,8 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
                     status_cb=status_cb, cancel_check=cancel_check, seen_ids=seen_ids,
                     query_perf=query_perf, candidate_statuses=candidate_statuses,
                     min_likes=HOOK_MIN_LIKES if is_hook else MIN_CLIP_LIKES,
-                    search_sort="MOST_LIKED") or []
+                    search_sort="MOST_LIKED", platforms=platforms,
+                    deadline=bucket_deadline) or []
             except Exception as exc:  # noqa: BLE001
                 log(status_cb, f"Bucket {bid}: {tier} tier search failed ({exc.__class__.__name__}).")
                 got_dicts = []
@@ -2938,7 +3129,8 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
                     hook_pool.append(p)
                 clip_meta[str(p)] = {
                     "bucket_id": bid, "source_query": d.get("query", ""), "tier": tier,
-                    "search_intent": intent, "platform": "tiktok", "clip_id": d.get("clip_id"),
+                    "search_intent": intent, "platform": d.get("platform", "tiktok"),
+                    "clip_id": d.get("clip_id"),
                     "caption": (d.get("meta") or {}).get("caption", "")[:160],
                     "author": (d.get("meta") or {}).get("author", ""),
                     "hashtags": (d.get("meta") or {}).get("hashtags", [])[:8],
@@ -2958,20 +3150,21 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
             # (not merely 0 after quality filtering), the session is logged out / headless-blocked /
             # captcha'd. Grinding through 11 buckets x 4 tiers is pointless (~35 min for nothing) -
             # abort after ~6 searches. (items>0 but got==0 = strict filters, NOT dead: won't trip.)
-            if clip_scraper.backend_name() == "tiktok_login":
-                _h = clip_scraper.backend_search_health()
-                if _h.get("searches", 0) >= 6 and _h.get("items", 0) == 0:
-                    scrape_backend_dead = True
-                    break
+            _backend_names = [name for name in clip_scraper.backend_name(platforms).split("+") if name]
+            _h = clip_scraper.backend_search_health(platforms)
+            if (_backend_names and _h.get("searches", 0) >= 6 * len(_backend_names)
+                    and _h.get("items", 0) == 0):
+                scrape_backend_dead = True
+                break
         if scrape_backend_dead:
-            _h = clip_scraper.backend_search_health()
+            _h = clip_scraper.backend_search_health(platforms)
             _wall = _h.get("login_wall", 0)
-            log(status_cb, "Scrape ABORTED: TikTok returned 0 clips for "
+            log(status_cb, "Scrape ABORTED: selected social sources returned 0 clips for "
                            f"{_h.get('searches')} searches - the backend is not returning results. "
-                           + ("A LOGIN WALL / captcha was detected: your TikTok session is logged "
+                           + ("A LOGIN WALL / captcha was detected: a selected session is logged "
                               "out or expired. " if _wall else
                               "Likely an expired login or a headless block. ")
-                           + "Fix: click 'Reconnect TikTok' on the home page to log in again, then "
+                           + "Fix: reconnect TikTok/X on the home page, then "
                              "re-run. Scraping now opens a small TikTok browser window (headed) "
                              "because TikTok blocks headless searches - if no window appears, "
                              "restart the app so the new setting takes effect.")
@@ -3993,16 +4186,17 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
                 if c:
                     accepted_edges.append((s, i, c, d))
         # Global greedy assignment across batches.  This retains second-best batch options when
-        # two scenes want the same clip instead of simply blanking the later scene.
-        assigned_scenes, used_clips = set(), set()
+        # two scenes want the same clip instead of simply blanking the later scene. A source
+        # clip may serve up to TWO scenes (cleanup keeps duplicates off adjacent cuts).
+        assigned_scenes, used_clips = set(), {}
         for _score, i, c, d in sorted(accepted_edges, key=lambda row: row[0], reverse=True):
             clip_key = str(Path(c).resolve())
-            if i in assigned_scenes or clip_key in used_clips:
+            if i in assigned_scenes or used_clips.get(clip_key, 0) >= 2:
                 continue
             merged_clips[i] = c
             merged_log[i] = d
             assigned_scenes.add(i)
-            used_clips.add(clip_key)
+            used_clips[clip_key] = used_clips.get(clip_key, 0) + 1
         log(status_cb, f"Scrape: {sum(1 for c in merged_clips if c)}/{len(scenes)} scene(s) matched across batches.")
         return (merged_clips, merged_log)
 
@@ -4057,13 +4251,15 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             "Each contact-sheet tile shows 4 frames sampled across ONE clip (labeled clip_00, clip_01, ...), so "
             "judge the WHOLE clip, not one frame.\n\n"
             "STEP 1 - PROFILE every clip: subjects, actions, location, mood, and quality flags. A clip is UNUSABLE "
-            "(never pick it for any scene) if it is: heavy burned-in Japanese text/captions covering the centre or "
-            "the subject's face, a screenshot / text post / quiz / diagnosis / chat-screen, a TikTok LIVE / "
-            "livestream / screen recording, a slideshow of stills, anime / VTuber / CGI, idol promo / audition, "
-            "horizontal with big black bars, or not actually Japan. Prefer CLEAN raw footage (real people, real "
-            "places, real actions, low text, good light) over a text-heavy clip even if its topic seems perfect. "
-            "Also reject a rapid montage: the selected source must hold one coherent shot long enough that our own "
-            "timeline does not create sub-second double/triple cuts.\n\n"
+            "(never pick it for any scene) if it contains ANY persistent creator-added caption, subtitle, sticker, "
+            "username, watermark, or a blurred/smeared patch where text was removed; also reject a text wall (quiz / diagnosis / "
+            "chat-screen where text IS the content), a TikTok LIVE / livestream / screen recording, a slideshow of "
+            "stills, anime / VTuber / CGI, AI-GENERATED photoreal footage (impossibly perfect model-like faces and "
+            "skin, uncanny crowds, AI-art watermark/handle) - this app cuts REAL found footage only, idol promo / "
+            "audition, horizontal with big black bars, or not actually "
+            "Japan. Captioned clips are NOT usable and must never be selected, even when topically perfect. "
+            "Also reject a rapid montage: the selected source must hold one coherent shot long "
+            "enough that our own timeline does not create sub-second double/triple cuts.\n\n"
             "STEP 2 - For EACH scene, pick the BEST clip and score it:\n"
             "  script_match (0-10): does the clip literally DEPICT what the line says (subject + action + emotion), "
             "not just 'somewhere in Japan'? A pretty neon skyline for a line about STRESS or CLEAN STREETS is a LOW "
@@ -4071,27 +4267,39 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             "for 'alone' = HIGH.\n"
             "  raw_footage (0-10): how clean/real is it as raw footage (10 = clean real footage, no overlays/bars; "
             "0 = screenshot/text-card/livestream).\n"
-            "  text_heavy (0-10): how much burned-in original text covers the frame (0 = none, 10 = text IS the clip; "
-            ">3 means reject for this app because our own captions will be added).\n"
-            "  has_creator_text (bool): TRUE if ANY persistent creator-added subtitle, commentary, sticker, username, "
-            "or editing-app watermark appears in multiple sampled frames, even when it occupies little screen area. "
-            "Natural store signs or a machine interface are acceptable; creator-added text is a hard reject.\n"
-            "  edit_stability (0-10): 10 = one coherent continuous shot; 0 = rapid montage/slideshow. Below 6 is reject.\n"
+            "  text_heavy (0-10): how much burned-in original text covers the frame (0 = none, 10 = text IS the clip). "
+            "Any persistent creator text or visible caption-removal blur is unacceptable; score it accurately.\n"
+            "  has_creator_text (bool): TRUE if a persistent creator-added subtitle, commentary, sticker, username, "
+            "or editing-app watermark appears in multiple sampled frames. TRUE makes the clip unusable.\n"
+            "  edit_stability (0-10): 10 = one coherent continuous shot; 0 = rapid montage/slideshow. Below 5 is reject.\n"
             "  match_class: 'A_MATCH' = direct visual match (line about tired workers -> tired office worker / "
             "commute / late-night office); 'B_MATCH' = strong social-context match (expensive love -> couple on a "
             "date / paying a bill / shopping date / creator discussing dating money); 'C_MATCH' = "
             "emotional/atmospheric match (loneliness -> person alone in Tokyo night / small apartment / solo meal); "
             "'D_REJECTED' = OFF-TOPIC or contradictory footage (a random book cover / unrelated product for this "
             "topic), NOT merely 'doesn't literally show the noun'. "
-            "Specific factual/claim lines prefer A_MATCH or B_MATCH; ABSTRACT or essay lines (a sentence fragment / "
-            "continuation / feeling with no concrete subject, e.g. \"you, they usually say it directly.\") should accept "
-            "a topically-coherent C_MATCH clip - that is the CORRECT choice, do NOT mark it D_REJECTED just because it "
-            "doesn't depict the fragment. Only use D_REJECTED for genuinely off-topic/misleading/unusable footage.\n"
+            "Specific factual/claim lines prefer A_MATCH or B_MATCH; ABSTRACT or essay lines should accept a "
+            "topically-coherent C_MATCH clip.\n"
             "  style_match (0-10): visual quality/vibe fit.\n"
             "  passes (bool): would a viewer understand WHY this clip plays during this sentence, AND is the clip "
             "clean (not UNUSABLE)?\n"
-            "Be honest: if nothing in the pool truly fits a line, give a low script_match, match_class D_REJECTED "
-            "and passes=false - DO NOT inflate scores to fill the timeline.\n"
+            "CRITICAL - THE SCENES ARE FRAGMENTS: the scene lines below are consecutive CUTS of ONE narration "
+            "about the topic stated above. Half of them are connective fragments with no concrete subject "
+            "(\"make you fit.\", \"is not an excuse.\", \"Because in Japan, being late\"). A fragment can NEVER "
+            "'depict' anything - judging it literally is WRONG. For any fragment, pick the pool clip whose "
+            "footage best fits the OVERALL topic and the surrounding scenes, class it C_MATCH with script_match "
+            "6-7 and passes=true. D_REJECTED exists ONLY for footage that does not belong to this topic at all "
+            "(wrong subject/place) or is unusable - a real TikTok essay runs on-topic b-roll under every "
+            "fragment, and a scene left empty is a WORSE outcome than coherent on-topic b-roll.\n"
+            "Be honest on CONCRETE claim lines: if nothing depicts the claim, use a contextual C_MATCH rather "
+            "than pretending an A_MATCH - but do not inflate A/B scores.\n"
+            "  visual_type: classify each SCENE LINE first - 'concrete' (names a showable object/action: "
+            "pushers, champagne tower, delay certificate), 'context' (place/social setting: Shinjuku, rush "
+            "hour, at work), or 'abstract' (fragment/feeling/transition/question: \"is not an excuse.\", "
+            "\"But here is the dark part.\"). The acceptance bar is LOWER for context and much lower for "
+            "abstract lines - report the type honestly.\n"
+            "  bucket_match (0-10): how well the clip fits the scene's assigned BUCKET/topic regardless of "
+            "the literal line (this is what carries abstract lines).\n"
             f"CURRENT ADAPTIVE MATCH THRESHOLD: {match_threshold:.1f}/10. "
             + ("This is a relaxed retry: accept a coherent C_MATCH contextual or atmospheric clip when it is "
                "clearly compatible with the sentence, even if it does not literally show every noun. Still reject "
@@ -4104,6 +4312,7 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             + "\n".join(candidate_lines) + "\n\n"
             + f"Scenes:\n" + "\n".join(scene_lines) + "\n\n"
             + 'Return STRICT JSON: {"scenes": {"0": {"clip": <clip_number or -1>, "script_match": <0-10>, '
+            '"bucket_match": <0-10>, "visual_type": "concrete|context|abstract", '
             '"raw_footage": <0-10>, "text_heavy": <0-10>, "has_creator_text": true|false, "edit_stability": <0-10>, "match_class": "A_MATCH|B_MATCH|C_MATCH|D_REJECTED", '
             '"style_match": <0-10>, "passes": true|false, "reason": "short why", '
             '"fallback_type": "ai_video|speaker|proof_card|abstract_broll|reuse_previous", '
@@ -4114,10 +4323,9 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             {"role": "system", "content": "You are a footage QA + editor for viral TikTok-style essays. A clip may play "
              "under a narration line when it genuinely FITS that line: either by DEPICTING it (concrete lines with a clear "
              "subject) OR by matching its TOPIC and MOOD (abstract/essay lines - a sentence fragment or feeling). Real "
-             "TikTok essays run coherent b-roll under abstract narration; that is CORRECT, not filler. Any burned-in "
-             "captions were already BLURRED at intake - do NOT reject a clip for mild, blurred or leftover text; only "
-             "reject when text DOMINATES the frame (text post / meme wall / subtitle karaoke). Reject ONLY footage "
-             "that is off-topic/contradictory, text-dominated, a screenshot/livestream/slideshow, "
+             "TikTok essays run coherent b-roll under abstract narration; that is CORRECT, not filler. Reject ANY "
+             "persistent creator caption/subtitle/sticker/watermark and any obvious blurred caption-removal patch; "
+             "clean raw footage is mandatory. Also reject footage that is off-topic/contradictory, a screenshot/livestream/slideshow, "
              "or is otherwise unusable. Return JSON only."},
             {"role": "user", "content": [
                 {"type": "text", "text": prompt},
@@ -4134,7 +4342,7 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
         smap = plan.get("scenes") if isinstance(plan.get("scenes"), dict) else {}
 
-        scene_clips, decision_log, used = [], [], set()
+        scene_clips, decision_log, used = [], [], {}
         for idx, s in enumerate(scenes):
             d = smap.get(str(idx)) if isinstance(smap.get(str(idx)), dict) else {}
             try:
@@ -4164,25 +4372,42 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
             _creator_text_value = d.get("has_creator_text", False)
             has_creator_text = (_creator_text_value is True or
                                 str(_creator_text_value).strip().lower() in {"true", "1", "yes"})
+            try:
+                bucket_m = float(d.get("bucket_match", 0))
+            except (TypeError, ValueError):
+                bucket_m = 0.0
+            visual_type = str(d.get("visual_type", "") or "").strip().lower()
+            if visual_type not in ("concrete", "context", "abstract"):
+                visual_type = "context"
             mclass = str(d.get("match_class", "") or "").strip().upper()
             if mclass not in ("A_MATCH", "B_MATCH", "C_MATCH", "D_REJECTED"):
                 mclass = "D_REJECTED" if sm < MIN_SCRIPT_MATCH_SCORE else "B_MATCH"
             passes = bool(d.get("passes", False))
-            valid = (0 <= cn < n) and (cn in kept) and (cn not in used)
-            # HARD gates: script must carry it; the clip must be clean raw footage (not a text-heavy
-            # screenshot/livestream); and a D_REJECTED clip can never fill a scene. Style can never
-            # rescue a bad script match.
+            # a good source clip may serve up to TWO scenes (the final cleanup keeps
+            # duplicates off ADJACENT cuts); a hard one-scene ban starved long scripts.
+            valid = (0 <= cn < n) and (cn in kept) and (used.get(cn, 0) < 2)
+            # HARD gates: clean raw footage only, and D_REJECTED never fills a scene.
             candidate_meta = clip_meta.get(str(clip_paths[cn])) if (0 <= cn < n) else {}
             deterministic_stable = int((candidate_meta or {}).get("rapid_internal_cut_count") or 0) == 0
-            # Captions were blurred at intake - mild text must not block a good clip. Creator
-            # text only blocks when it is HEAVY; the hard text bar matches the scraper policy.
-            clean = ((not has_creator_text or txt_hs <= 4.5) and txt_hs <= 5.5
-                     and raw_fs >= 5.0 and edit_stability >= 6.0 and deterministic_stable)
-            accept = (valid and passes and clean and mclass != "D_REJECTED"
-                      and sm >= match_threshold)
+            try:
+                deterministic_text = float((candidate_meta or {}).get("text_heaviness") or 0.0)
+            except (TypeError, ValueError):
+                deterministic_text = 0.0
+            # Strict clean-footage contract: creator text is a hard failure, not a soft ranking
+            # signal. The deterministic OCR gate backs up the vision judgment.
+            clean = (not has_creator_text and txt_hs <= 1.5 and deterministic_text <= 1.5
+                     and raw_fs >= 4.0 and edit_stability >= 5.0 and deterministic_stable)
+            # TYPE-AWARE bar: a concrete claim must match the line; a place/social line needs
+            # less; an abstract fragment only needs clean on-topic bucket footage.
+            _type_offset = {"concrete": 0.6, "context": 1.4, "abstract": 2.4}[visual_type]
+            _type_floor = {"concrete": 4.0, "context": 3.2, "abstract": 2.5}[visual_type]
+            eff_threshold = max(_type_floor, match_threshold - _type_offset)
+            score_ok = (sm >= eff_threshold
+                        or (visual_type in ("context", "abstract") and bucket_m >= 5.0))
+            accept = (valid and passes and clean and mclass != "D_REJECTED" and score_ok)
             chosen = None
             if accept:
-                chosen = clip_paths[cn]; used.add(cn)
+                chosen = clip_paths[cn]; used[cn] = used.get(cn, 0) + 1
             rejected = d.get("rejected") if isinstance(d.get("rejected"), list) else []
             cmeta = clip_meta.get(str(clip_paths[cn])) if (0 <= cn < n) else {}
             decision_log.append({
@@ -4193,6 +4418,9 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
                 "source_query": (cmeta or {}).get("source_query") if chosen else None,
                 "query_tier": (cmeta or {}).get("tier") if chosen else None,
                 "match_class": (mclass if chosen else "D_REJECTED"),
+                "visual_type": visual_type,
+                "bucket_match_score": round(bucket_m, 1),
+                "effective_threshold": round(eff_threshold, 1),
                 "script_match_score": round(sm, 1),
                 "style_match_score": round(stm, 1),
                 "raw_visual_footage_score": round(raw_fs, 1),
@@ -4265,7 +4493,8 @@ def _tally_clip_quality_filters(decision_log):
 def score_hook_candidates(hook_clips, project_dir, reasoning_model=None, status_cb=None, collaborate=False):
     """Dedicated high-engagement Japanese-creator HOOK finder. The opening shot must be ONE real
     young adult Japanese woman dancing or playfully acting cute to camera, with an expressive face,
-    clean vertical frame and low burned-in text. The 20K-like metadata gate runs before this scorer.
+    clean vertical frame and no burned-in text. The engagement gate runs before this scorer
+    (20K TikTok likes or the 5K X equivalent).
 
     Returns a list (best score first) of dicts:
     [{"clip": Path, "hook_presenter_score": float, "passed": bool, "scores": {...}, "reason": str}].
@@ -4306,7 +4535,7 @@ def score_hook_candidates(hook_clips, project_dir, reasoning_model=None, status_
             "real young-adult Japanese woman DANCING or playfully acting cute directly to the camera, with the "
             "polished, expressive energy of Miyu Kishi / Saaki-Sakii-style creator clips. It needs an immediate cute "
             "gesture, dance move, playful expression, or pose—not a static talking head. The metadata gate has "
-            "already required at least 20,000 likes. Require a clean vertical frame and low burned-in text. "
+            "already required at least 20,000 TikTok likes or 5,000 X likes. Require a clean vertical frame and no burned-in text. "
             "Each contact-sheet tile shows several frames across ONE candidate clip (clip_00, clip_01, ...), so "
             "judge the whole clip.\n"
             "Score EACH clip 0-10 on: face_visibility, eye_contact, dance_or_playful_action, "
@@ -4331,7 +4560,7 @@ def score_hook_candidates(hook_clips, project_dir, reasoning_model=None, status_
                 {"type": "image_url", "image_url": {"url": image_data_url(sheet)}},
             ]},
         ]
-        log(status_cb, "Hook Finder: scoring 20K+ cute/dance creator candidates...")
+        log(status_cb, "Hook Finder: scoring popular clean cute/dance creator candidates (20K+ TikTok / 5K+ X)...")
         if collaborate:
             plan = collaborate_json(messages, max_tokens=3000, temperature=0.1, status_cb=status_cb, label="hook casting") or {}
         else:
@@ -4600,13 +4829,43 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         return 0
 
     rot = {}
+    use_count = {}
+    # HARD per-file cap: with a single file in a category (e.g. impact_hit had exactly one,
+    # udar-ot-vzgliada-skaly), every hook/big-moment played the SAME sound 5-10x per video.
+    # After the cap the event falls through to an alternative category instead.
+    _FILE_CAP_DEFAULT = 2
+    _FILE_CAP = {"ui_click": 5, "caption_pop": 4, "notification_ding": 4}
+    _ALT_CATS = {"impact_hit": ["low_impact", "whoosh_hit_combo", "bright_whoosh", "camera_flash"],
+                 "low_impact": ["impact_hit", "bright_whoosh"],
+                 "camera_flash": ["flash_blink", "caption_pop"],
+                 "swipe_whoosh": ["bright_whoosh", "whoosh_hit_combo"],
+                 "bright_whoosh": ["swipe_whoosh", "caption_pop"]}
 
-    def pick(cat):                                    # rotate variations within a category
+    def pick(cat):                                    # rotate variations, honor the per-file cap
         files = lib.get(cat) or []
         if not files:
             return None
-        j = rot.get(cat, 0); rot[cat] = j + 1
-        return files[j % len(files)]
+        cap = _FILE_CAP.get(cat, _FILE_CAP_DEFAULT)
+        j = rot.get(cat, 0)
+        for step in range(len(files)):
+            cand = files[(j + step) % len(files)]
+            if use_count.get(str(cand), 0) < cap:
+                rot[cat] = j + step + 1
+                use_count[str(cand)] = use_count.get(str(cand), 0) + 1
+                return cand
+        return None                                   # whole category exhausted
+
+    def pick_with_alts(cat):
+        """Pick from cat, falling through to alternatives when its files hit the cap.
+        Returns (path, actual_category) or (None, None)."""
+        p = pick(cat)
+        if p:
+            return p, cat
+        for alt in _ALT_CATS.get(cat, []) + ["notification_ding", "caption_pop", "ui_click"]:
+            p = pick(alt)
+            if p:
+                return p, alt
+        return None, None
 
     # VARIETY: normal cuts must NOT all be the same whoosh. Build a rotation across every cut-worthy
     # category the user's library actually has (whooshes weighted higher, but pops/dings/flashes/
@@ -4736,12 +4995,10 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             reason, loud = "clip_cut", False
         if not (cat and density_ok(t, loud=loud)):
             continue
-        path = pick(cat)
+        path, picked_cat = pick_with_alts(cat)
         if not path:
-            cat = "bright_whoosh" if lib.get("bright_whoosh") else ("swipe_whoosh" if lib.get("swipe_whoosh") else None)
-            path = pick(cat) if cat else None
-            if not path:
-                continue
+            continue
+        cat = picked_cat
         rec = rec_by_path.get(path, {})
         db = sfx_library.CAT_DB.get(cat, -18)
         vol = round(min(0.85, sfx_library.db_to_gain(db)), 3)
@@ -6205,36 +6462,6 @@ def apply_llm_corrections(config, review):
     return corrected, changed
 
 
-def create_no_audio_variant(video_path, status_cb=None):
-    video_path = Path(video_path)
-    ffmpeg = pipeline.find_ffmpeg()
-    if not ffmpeg or not video_path.exists():
-        return None
-    out = video_path.with_name(f"{video_path.stem}_no_audio{video_path.suffix}")
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-i",
-        str(video_path),
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "copy",
-        "-an",
-        str(out),
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        log(status_cb, f"Saved render variant without audio: {out.name}")
-        return out
-    except Exception as exc:
-        log(status_cb, f"No-audio render variant skipped: {exc}")
-        return None
-
-
 def render_audio_variant(config, suffix, status_cb=None, **overrides):
     variant = dict(config)
     variant["output_basename"] = f"{config.get('output_basename', config.get('project_slug', 'short'))}_{suffix}"
@@ -6254,9 +6481,6 @@ def render_audio_variant(config, suffix, status_cb=None, **overrides):
 
 def create_render_variants(config, final_output, status_cb=None):
     variants = {"all_sounds": str(final_output)}
-    no_audio = create_no_audio_variant(final_output, status_cb=status_cb)
-    if no_audio:
-        variants["no_audio"] = str(no_audio)
     no_sfx = render_audio_variant(
         config,
         "no_sfx",
@@ -6528,6 +6752,75 @@ def gather_web_images_for_script(
     return downloaded
 
 
+def recover_legacy_timeline_overlays(config, project_dir):
+    """Restore editable arrows for renders made before overlays were persisted in project.json.
+
+    Older runs kept the validated callout decisions in review/agent_report.json, but wrote
+    project.json immediately before visual-FX planning. The exact target coordinates were not
+    included in that report, so recovered arrows start in a safe upper-centre position and remain
+    fully movable in the timeline editor.
+    """
+    scenes = config.get("scenes") or []
+    if not scenes or config.get("timeline_overlays_managed"):
+        return 0
+    if any(scene.get("overlays") for scene in scenes):
+        return 0
+    report_path = Path(project_dir) / "review" / "agent_report.json"
+    if not report_path.exists():
+        return 0
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    rows = report.get("scene_visual_fx")
+    if not isinstance(rows, list):
+        rows = ((report.get("visual_fx_report") or {}).get("scene_visual_fx") or [])
+    recovered = 0
+    by_id = {str(scene.get("id", i)): scene for i, scene in enumerate(scenes)}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not (row.get("callout_enabled") or str(row.get("callout_type", "")).lower() == "arrow"):
+            continue
+        raw_id = row.get("scene_id")
+        scene = by_id.get(str(raw_id))
+        index = None
+        try:
+            index = int(raw_id)
+        except (TypeError, ValueError):
+            pass
+        if scene is None and index is not None and 0 <= index < len(scenes):
+            scene = scenes[index]
+        if scene is None:
+            continue
+        try:
+            duration = max(0.6, float(scene.get("end", 0)) - float(scene.get("start", 0)))
+        except (TypeError, ValueError):
+            duration = 2.0
+        start = min(0.45, 0.25 / duration)
+        end = min(0.98, start + 0.8 / duration)
+        # Newer reports may contain coordinates; old ones did not. Keep the fallback above the
+        # caption band so the user can immediately grab and position it over the real target.
+        try:
+            cx = max(0.05, min(0.95, float(row.get("cx", row.get("anchor_cx", 0.5)))))
+            cy = max(0.08, min(0.92, float(row.get("cy", row.get("anchor_cy", 0.38)))))
+        except (TypeError, ValueError):
+            cx, cy = 0.5, 0.38
+        sid = str(scene.get("id", index if index is not None else recovered))
+        scene["overlays"] = [{
+            "id": f"legacy-arrow-{sid}", "type": "callout", "shape": "arrow",
+            "cx": round(cx, 4), "cy": round(cy, 4),
+            "from": "left" if cx > 0.5 else "right",
+            "start": round(start, 3), "end": round(end, 3),
+            "legacy_recovered": True,
+        }]
+        recovered += 1
+    if recovered:
+        config["smart_overlays"] = True
+        config["_legacy_overlays_recovered"] = recovered
+    return recovered
+
+
 def load_project_config(slug):
     """Load the latest saved render config for a project (for the timeline editor)."""
     config_dir = PROJECTS_DIR / slug / "config"
@@ -6543,6 +6836,15 @@ def load_project_config(slug):
         path = candidates[0]
     config = json.loads(path.read_text(encoding="utf-8"))
     config["project_slug"] = slug
+    recover_legacy_timeline_overlays(config, PROJECTS_DIR / slug)
+    timeline_edits_path = config_dir / "timeline_edits.json"
+    if timeline_edits_path.exists():
+        try:
+            saved_edits = json.loads(timeline_edits_path.read_text(encoding="utf-8"))
+            if isinstance(saved_edits, dict):
+                apply_timeline_edits_to_config(config, saved_edits, slug)
+        except Exception:
+            pass
     return config
 
 
@@ -6552,6 +6854,19 @@ def apply_timeline_edits_to_config(config, edits, slug):
     live render, the Save button and Agent rework."""
     edits = edits or {}
     scenes = config.get("scenes", [])
+    # Preserve narration timing before visual clips are reordered/resized. The voiceover stays
+    # unchanged, so captions must follow its original timeline rather than the edited visuals.
+    if not config.get("timeline_caption_track"):
+        config["timeline_caption_track"] = [
+            {
+                "start": float(scene.get("start", 0) or 0),
+                "end": float(scene.get("end", scene.get("start", 0)) or 0),
+                "text": str(scene.get("exact_voice_text") or scene.get("caption")
+                            or scene.get("script") or ""),
+                "word_timings": list(scene.get("word_timings") or []),
+            }
+            for scene in sorted(scenes, key=lambda row: float(row.get("start", 0) or 0))
+        ]
     # newly added clips dragged in from the library
     added_by_id = {}
     for a in (edits.get("added") or []):
@@ -6580,6 +6895,56 @@ def apply_timeline_edits_to_config(config, edits, slug):
         if rid and src:
             replaced_by_id[rid] = r
     dur_by_id = {str(d.get("id")): d.get("duration") for d in (edits.get("scenes") or []) if d.get("duration") is not None}
+    speed_by_id = {str(d.get("id")): d.get("speed") for d in (edits.get("scenes") or [])
+                   if d.get("speed") is not None}
+    blur_by_id = {str(d.get("id")): bool(d.get("blur_captions")) for d in (edits.get("scenes") or [])
+                  if d.get("blur_captions") is not None}
+    overlays_by_id = {}
+    for row in (edits.get("overlays") or []):
+        sid = str(row.get("scene_id") or "") if isinstance(row, dict) else ""
+        if not sid:
+            continue
+        cleaned = []
+        for raw in (row.get("items") or []):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            item["id"] = str(item.get("id") or f"ov-{sid}-{len(cleaned)}")[:80]
+            for key, lo, hi, default in (("editor_x", 0.0, 1.0, 0.5),
+                                          ("editor_y", 0.0, 1.0, 0.5),
+                                          ("editor_scale", 0.25, 3.0, 1.0),
+                                          ("editor_rotation", -180.0, 180.0, 0.0),
+                                          ("animation_duration", 0.1, 1.5, 0.28),
+                                          ("appear_sfx_volume", 0.0, 0.6, 0.22),
+                                          ("appear_sfx_duration", 0.08, 2.0, 1.0)):
+                if item.get(key) is None:
+                    continue
+                try:
+                    item[key] = round(max(lo, min(hi, float(item[key]))), 4)
+                except (TypeError, ValueError):
+                    item[key] = default
+            allowed_styles = {"default_thick_red_arrow", "yellow_sticker_arrow",
+                              "white_sticker_arrow", "neon_green_arrow"}
+            allowed_animations = {"none", "fade", "pop", "slide", "bounce"}
+            item["arrow_style"] = (str(item.get("arrow_style") or "default_thick_red_arrow")
+                                   if str(item.get("arrow_style") or "default_thick_red_arrow") in allowed_styles
+                                   else "default_thick_red_arrow")
+            item["animation"] = (str(item.get("animation") or "pop").lower()
+                                 if str(item.get("animation") or "pop").lower() in allowed_animations
+                                 else "pop")
+            sfx_path = str(item.get("appear_sfx_path") or "")
+            if sfx_path:
+                try:
+                    resolved_sfx = Path(sfx_path).resolve()
+                    if (not resolved_sfx.is_file()
+                            or resolved_sfx.suffix.lower() not in pipeline.SFX_EXTS):
+                        raise ValueError("invalid overlay SFX")
+                    item["appear_sfx_path"] = str(resolved_sfx)
+                except Exception:
+                    item.pop("appear_sfx_path", None)
+                    item.pop("appear_sfx_name", None)
+            cleaned.append(item)
+        overlays_by_id[sid] = cleaned
     order = edits.get("order")
     idmap = {str(s.get("id", i)): s for i, s in enumerate(scenes)}
     idmap.update(added_by_id)
@@ -6597,6 +6962,8 @@ def apply_timeline_edits_to_config(config, edits, slug):
             dur = float(scene.get("end", 0)) - float(scene.get("start", 0))
         dur = max(0.5, min(20.0, dur or 1.0))
         scene = dict(scene)
+        if sid in overlays_by_id:
+            scene["overlays"] = overlays_by_id[sid]
         # apply an in-editor media replacement for this scene (copy the chosen file into the project
         # so the renderer resolves it; keep the scene duration -> new clip is trimmed to that length)
         if sid in replaced_by_id:
@@ -6615,6 +6982,9 @@ def apply_timeline_edits_to_config(config, edits, slug):
                         scene["clip"] = dest.name      # scene_clip_path resolves clip_dir/<name>
                         scene["asset"] = dest.name
                         scene["seedance"] = True
+                        # new media -> the old speed/blur source chain no longer applies
+                        scene.pop("timeline_speed_src", None)
+                        scene.pop("caption_blur_src", None)
                     else:
                         dest_dir = project_dir / "web images"
                         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -6626,6 +6996,92 @@ def apply_timeline_edits_to_config(config, edits, slug):
                         scene["seedance"] = False
             except Exception:
                 pass
+        # BURNED-IN CAPTION BLUR: per-media toggle from the editor. Applied as a PRE-PASS
+        # like clip speed: the ORIGINAL is copied to capblur_<sid>_<stem>.mp4 and only the
+        # OCR-detected caption letters get blurred there - toggling OFF simply points the
+        # scene back at the untouched original. Runs BEFORE the speed pre-pass so a re-speed
+        # re-encodes the blurred footage, not the raw one.
+        want_blur = blur_by_id.get(sid) if sid in blur_by_id else bool(scene.get("blur_captions"))
+        scene["blur_captions"] = bool(want_blur)
+        if scene.get("clip"):
+            try:
+                clip_dir = project_dir / "seedance 2.0"
+                base = str(scene.get("caption_blur_src") or scene.get("timeline_speed_src") or scene["clip"])
+                if want_blur and not base.startswith(("speed_", "capblur_")) and (clip_dir / base).exists():
+                    dest = clip_dir / f"capblur_{sid}_{Path(base).stem[:24]}.mp4"
+                    if not dest.exists():
+                        shutil.copy2(clip_dir / base, dest)
+                        found = 0
+                        try:
+                            import clip_scraper as _cs_blur
+                            found = _cs_blur.blur_caption_regions(dest, pipeline.find_ffmpeg())
+                        except Exception:
+                            found = 0
+                        if not found:
+                            # no burned-in captions detected -> drop the useless copy
+                            dest.unlink(missing_ok=True)
+                    if dest.exists() and dest.stat().st_size > 4096:
+                        scene["caption_blur_src"] = base
+                        # the blurred file becomes the base every later step works from
+                        if scene.get("timeline_speed_src"):
+                            scene["timeline_speed_src"] = dest.name
+                        if not str(scene.get("clip") or "").startswith("speed_"):
+                            scene["clip"] = dest.name
+                            scene["asset"] = dest.name
+                elif not want_blur and scene.get("caption_blur_src"):
+                    orig0 = str(scene["caption_blur_src"])
+                    if (clip_dir / orig0).exists():
+                        if scene.get("timeline_speed_src"):
+                            scene["timeline_speed_src"] = orig0
+                        if not str(scene.get("clip") or "").startswith("speed_"):
+                            scene["clip"] = orig0
+                            scene["asset"] = orig0
+                    # keep caption_blur_src: re-enabling later reuses the cached capblur file
+            except Exception:
+                pass
+        # CLIP SPEED: applied as a safe PRE-PASS - the source clip is re-encoded once into a
+        # speed_<sid>_<x>.mp4 (setpts, no audio) and the scene points at that file. The normal
+        # per-scene trim then cuts it to the scene duration, so the render graph is untouched.
+        try:
+            speed = float(speed_by_id.get(sid)) if sid in speed_by_id else float(scene.get("timeline_speed") or 1.0)
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = max(0.5, min(2.0, speed))
+        # Persist the user's chosen value even when the source clip is temporarily unavailable or
+        # FFmpeg cannot prepare the cached speed file during Save. Render/load can retry later.
+        scene["timeline_speed"] = speed
+        if abs(speed - 1.0) > 0.01 and scene.get("clip"):
+            try:
+                clip_dir = project_dir / "seedance 2.0"
+                # always re-encode from the ORIGINAL clip (remembered across saves) so the
+                # user can change 1.25x -> 1.5x -> 1.0x without compounding re-encodes
+                src_name = str(scene.get("timeline_speed_src") or scene["clip"])
+                src = clip_dir / src_name
+                if src.exists() and not src_name.startswith("speed_"):
+                    tag = str(round(speed, 2)).replace(".", "p")
+                    dest = clip_dir / f"speed_{sid}_{tag}_{src.stem[:24]}.mp4"
+                    if not dest.exists():
+                        ffm = pipeline.find_ffmpeg()
+                        subprocess.run([ffm, "-y", "-hide_banner", "-loglevel", "error",
+                                        "-i", str(src), "-vf", f"setpts=PTS/{speed:.4f}",
+                                        "-an", "-c:v", "libx264", "-crf", "19",
+                                        "-preset", "veryfast", str(dest)],
+                                       capture_output=True, timeout=300)
+                    if dest.exists() and dest.stat().st_size > 4096:
+                        scene["clip"] = dest.name
+                        scene["asset"] = dest.name
+                        scene["timeline_speed"] = speed   # editor reloads with the value
+                        scene["timeline_speed_src"] = src_name
+            except Exception:
+                pass
+        elif sid in speed_by_id:
+            # back to 1.0x: point the scene at the remembered original again
+            orig = str(scene.get("timeline_speed_src") or "")
+            if orig and str(scene.get("clip") or "").startswith("speed_") \
+                    and (project_dir / "seedance 2.0" / orig).exists():
+                scene["clip"] = orig
+                scene["asset"] = orig
+            scene["timeline_speed"] = speed
         scene["start"] = round(t, 3)
         scene["end"] = round(t + dur, 3)
         t += dur
@@ -6634,6 +7090,9 @@ def apply_timeline_edits_to_config(config, edits, slug):
         raise RuntimeError("Timeline has no scenes left to render.")
     config["scenes"] = new_scenes
     config["duration"] = round(t, 3)
+    if "overlays" in edits:
+        config["smart_overlays"] = any(scene.get("overlays") for scene in new_scenes)
+        config["timeline_overlays_managed"] = True
 
     volumes = edits.get("volumes") or {}
 
@@ -6681,12 +7140,21 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 pass
         if item.get("enabled") is not None:
             entry["enabled"] = bool(item["enabled"])
+        # editor moved the event (absolute seconds) or picked a different sound file
+        if item.get("start_abs") is not None:
+            try:
+                entry["start_abs"] = round(max(0.0, float(item["start_abs"])), 3)
+            except (TypeError, ValueError):
+                pass
+        if item.get("path_override"):
+            entry["path"] = str(item["path_override"])
         if entry:
             overrides[eid] = entry
     if overrides:
         config["sfx_overrides"] = overrides
         config["sfx_enabled"] = True
-    if custom_sfx:
+    if "sfx" in edits or "transitions" in edits:
+        # always replace: deleting an added sound must not leave the stale one behind
         config["custom_sfx"] = custom_sfx
     return config
 
@@ -6698,8 +7166,21 @@ def save_timeline_edits(slug, edits):
     apply_timeline_edits_to_config(config, edits, slug)
     project_dir = PROJECTS_DIR / slug
     out_path = project_dir / "config" / "project.json"
-    out_path.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
-    return {"ok": True, "scenes": len(config.get("scenes", []))}
+    edits_path = project_dir / "config" / "timeline_edits.json"
+    # Keep editor intent separately from the generated project config. A rerun may regenerate
+    # project.json, but reopening the timeline reapplies this sidecar exactly.
+    edits_tmp = edits_path.with_suffix(".json.tmp")
+    edits_tmp.write_text(json.dumps(edits or {}, indent=2), encoding="utf-8")
+    os.replace(edits_tmp, edits_path)
+    config_tmp = out_path.with_suffix(".json.tmp")
+    config_tmp.write_text(json.dumps(config_for_json(config), indent=2), encoding="utf-8")
+    os.replace(config_tmp, out_path)
+    # Verify the durable sidecar before claiming success to the browser.
+    verified = json.loads(edits_path.read_text(encoding="utf-8"))
+    if not isinstance(verified, dict):
+        raise RuntimeError("Timeline save verification failed.")
+    return {"ok": True, "scenes": len(config.get("scenes", [])),
+            "saved": True, "edits_file": str(edits_path)}
 
 
 def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
@@ -6709,6 +7190,7 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     if cancel_event is not None:
         config["_cancel_event"] = cancel_event
     apply_timeline_edits_to_config(config, edits, slug)
+    config["timeline_editor_render"] = True
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     config["output_basename"] = f"{slug}_timeline_{stamp}"
@@ -6720,6 +7202,385 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     output = pipeline.render_video(config)
     log(status_cb, f"Timeline render complete: {Path(output).name}")
     return {"title": config.get("title", slug), "project_dir": str(project_dir), "video": str(output)}
+
+
+def _timeline_words_from_sentences(sentence_rows, fallback_text, duration):
+    """Build approximate global word timings when forced alignment is unavailable."""
+    source_rows = []
+    for row in sentence_rows or []:
+        if not isinstance(row, dict):
+            continue
+        text = clean_text(str(row.get("text") or ""))
+        try:
+            start = max(0.0, float(row.get("start", 0.0) or 0.0))
+            end = min(float(duration), float(row.get("end", start) or start))
+        except (TypeError, ValueError):
+            continue
+        if text and end > start:
+            source_rows.append({"start": start, "end": end, "exact_voice_text": text})
+    if not source_rows:
+        source_rows = [{"start": 0.0, "end": float(duration),
+                        "exact_voice_text": clean_text(fallback_text)}]
+    return estimated_word_timeline_from_scenes(source_rows)
+
+
+def _retime_timeline_scenes(scenes, word_timeline, new_duration):
+    """Preserve the user's clip order/cut rhythm while making the new speech the master clock."""
+    ordered = [dict(scene) for scene in (scenes or [])]
+    if not ordered:
+        raise RuntimeError("Timeline has no clips to retime.")
+    new_duration = max(0.5, float(new_duration))
+    old_durations = []
+    for scene in ordered:
+        try:
+            old_durations.append(max(0.05, float(scene.get("end", 0))
+                                     - float(scene.get("start", 0))))
+        except (TypeError, ValueError):
+            old_durations.append(1.0)
+    old_total = sum(old_durations) or float(len(ordered))
+    # Long projects use a normal 0.5s minimum. Very short test/project audio still gets a
+    # complete, contiguous timeline rather than impossible negative space.
+    min_clip = min(0.5, new_duration / max(1, len(ordered)))
+    word_starts = sorted({round(float(word.get("start", 0.0)), 3)
+                          for word in (word_timeline or [])
+                          if isinstance(word, dict) and float(word.get("start", 0.0)) > 0.0})
+    boundaries = [0.0]
+    elapsed = 0.0
+    for index, old_duration in enumerate(old_durations[:-1]):
+        elapsed += old_duration
+        target = new_duration * elapsed / old_total
+        lower = boundaries[-1] + min_clip
+        remaining = len(ordered) - index - 1
+        upper = new_duration - remaining * min_clip
+        eligible = [value for value in word_starts if lower <= value <= upper]
+        boundary = min(eligible, key=lambda value: abs(value - target)) if eligible else target
+        boundaries.append(round(max(lower, min(upper, boundary)), 3))
+    boundaries.append(round(new_duration, 3))
+
+    for index, scene in enumerate(ordered):
+        start, end = boundaries[index], boundaries[index + 1]
+        scene["start"] = round(start, 3)
+        scene["end"] = round(end, 3)
+        local_words = []
+        spoken = []
+        for word in word_timeline or []:
+            try:
+                word_start = float(word.get("start", 0.0))
+                word_end = float(word.get("end", word_start))
+            except (TypeError, ValueError):
+                continue
+            midpoint = (word_start + word_end) / 2.0
+            if start <= midpoint < end:
+                token = str(word.get("word") or "").strip()
+                if token:
+                    spoken.append(token)
+                    local_words.append({
+                        "word": token,
+                        "start": round(max(0.0, word_start - start), 3),
+                        "end": round(max(0.0, min(end, word_end) - start), 3),
+                    })
+        scene["word_timings"] = local_words
+        if spoken:
+            voice = clean_text(" ".join(spoken))
+            scene["script"] = voice
+            scene["exact_voice_text"] = voice
+            scene["voice_line"] = voice
+    return ordered
+
+
+def _persist_retimed_timeline(slug, config):
+    """Save retimed config and update the editor sidecar so reopening cannot restore old cuts."""
+    project_dir = PROJECTS_DIR / slug
+    config_path = project_dir / "config" / "project.json"
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, config_path)
+
+    edits_path = project_dir / "config" / "timeline_edits.json"
+    edits = {}
+    if edits_path.exists():
+        try:
+            edits = json.loads(edits_path.read_text(encoding="utf-8"))
+        except Exception:
+            edits = {}
+    if not isinstance(edits, dict):
+        edits = {}
+    prior_scene_edits = {str(row.get("id")): dict(row)
+                         for row in (edits.get("scenes") or []) if isinstance(row, dict)}
+    retimed_edits = []
+    for index, scene in enumerate(config.get("scenes") or []):
+        sid = str(scene.get("id", index))
+        row = prior_scene_edits.get(sid, {"id": sid})
+        row["duration"] = round(float(scene.get("end", 0))
+                                - float(scene.get("start", 0)), 3)
+        retimed_edits.append(row)
+    edits["order"] = [str(scene.get("id", index))
+                      for index, scene in enumerate(config.get("scenes") or [])]
+    edits["scenes"] = retimed_edits
+    edits_tmp = edits_path.with_suffix(".json.tmp")
+    edits_tmp.write_text(json.dumps(edits, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(edits_tmp, edits_path)
+
+
+def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=True):
+    """Create a fresh TTS take and retime timeline clips/captions to the new audio."""
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    input_dir = project_dir / "input"
+    script_path = input_dir / "script.txt"
+    script = clean_text(script_path.read_text(encoding="utf-8", errors="replace")
+                        if script_path.exists() else "")
+    run_form = {}
+    try:
+        run_form = json.loads((input_dir / "run_form.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    if not script:
+        script = clean_text(str(run_form.get("script") or ""))
+    if not script:
+        raise RuntimeError("The project has no saved script to regenerate.")
+    check_cancel({"_cancel_event": cancel_event} if cancel_event else {})
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    versions_dir = input_dir / "voice_versions" / stamp
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    for stem in ("voiceover", "hook", "body"):
+        for extension in AUDIO_EXTS:
+            source = input_dir / f"{stem}{extension}"
+            if source.exists():
+                shutil.copy2(source, versions_dir / source.name)
+    old_analysis = input_dir / "audio_analysis.json"
+    if old_analysis.exists():
+        shutil.copy2(old_analysis, versions_dir / old_analysis.name)
+
+    form = dict(run_form) if isinstance(run_form, dict) else {}
+    form["regenerate_voice"] = "on"
+    form["force_regenerate"] = "on"
+    form["use_audio_timing"] = "on"
+    if cancel_event is not None:
+        form["_cancel_event"] = cancel_event
+    log(status_cb, "Regenerating speech with the project's saved speaker and voice settings...")
+    audio_path = generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
+    if not audio_path or not Path(audio_path).exists():
+        raise RuntimeError("Fresh speech generation failed; the previous take remains backed up.")
+    duration = probe_audio_duration(audio_path)
+    if not duration:
+        raise RuntimeError("Fresh speech was created, but its duration could not be measured.")
+    check_cancel({"_cancel_event": cancel_event} if cancel_event else {})
+
+    analysis, word_timeline = None, []
+    try:
+        import voice_align
+        if voice_align.available():
+            log(status_cb, "Force-aligning the new speech for exact caption and cut timing...")
+            analysis, word_timeline = voice_align.analysis_from_audio(
+                audio_path, script_text=script, duration=duration, status_cb=status_cb)
+    except Exception as exc:
+        log(status_cb, f"Local speech alignment failed ({exc}); trying audio analysis fallback.")
+    if not analysis:
+        try:
+            analysis = analyze_audio_with_gemini(
+                audio_path, str(config.get("title") or slug), script,
+                status_cb=status_cb, audio_duration=duration)
+        except Exception as exc:
+            log(status_cb, f"Audio analysis fallback unavailable ({exc}); using measured text timing.")
+            analysis = None
+    if not word_timeline:
+        word_timeline = _timeline_words_from_sentences(
+            (analysis or {}).get("sentence_timestamps") or [], script, duration)
+    if not analysis:
+        try:
+            import voice_align
+            sentence_rows = voice_align.sentences_from_words(word_timeline)
+        except Exception:
+            sentence_rows = [{"start": 0.0, "end": round(duration, 3), "text": script}]
+        analysis = {"transcript": script, "duration_seconds": round(duration, 3),
+                    "sentence_timestamps": sentence_rows,
+                    "timing_source": "measured_text_timing"}
+    analysis["duration_seconds"] = round(duration, 3)
+    old_duration = float(config.get("duration") or 0.0)
+    config["scenes"] = _retime_timeline_scenes(config.get("scenes") or [],
+                                                word_timeline, duration)
+    config["duration"] = round(duration, 3)
+    config["audio_duration_seconds"] = round(duration, 3)
+    config["audio_path"] = str(Path(audio_path).resolve())
+    config["timing_audio_path"] = str(Path(audio_path).resolve())
+    config["speech_audio_in_final"] = True
+    config["timeline_editor_render"] = True
+    config["voice_speed"] = float(form.get("voice_speed", config.get("voice_speed", 1.2)) or 1.2)
+    caption_track = []
+    for row in analysis.get("sentence_timestamps") or []:
+        if not isinstance(row, dict) or not str(row.get("text") or "").strip():
+            continue
+        try:
+            start = float(row.get("start", 0.0)); end = float(row.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        local = []
+        for word in word_timeline:
+            midpoint = (float(word.get("start", 0.0)) + float(word.get("end", 0.0))) / 2.0
+            if start <= midpoint < end:
+                local.append({"word": str(word.get("word") or ""),
+                              "start": round(max(0.0, float(word.get("start", 0.0)) - start), 3),
+                              "end": round(max(0.0, float(word.get("end", 0.0)) - start), 3)})
+        caption_track.append({"start": round(start, 3), "end": round(end, 3),
+                              "text": str(row.get("text") or ""), "word_timings": local})
+    config["timeline_caption_track"] = caption_track
+    old_analysis.write_text(json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8")
+    _persist_retimed_timeline(slug, config)
+    log(status_cb, f"Speech retime complete: {old_duration:.2f}s -> {duration:.2f}s; "
+                   f"{len(config['scenes'])} clips and {len(caption_track)} caption phrases updated.")
+    if not render:
+        return {"title": config.get("title", slug), "project_dir": str(project_dir),
+                "video": None, "retimed_scenes": len(config["scenes"]),
+                "audio": str(audio_path)}
+
+    config["output_basename"] = f"{slug}_timeline_revoice_{stamp}"
+    attach_cancel_event(config, {"_cancel_event": cancel_event} if cancel_event else {})
+    out_config_path = project_dir / "config" / f"project_timeline_revoice_{stamp}.json"
+    out_config_path.write_text(json.dumps(config_for_json(config), indent=2,
+                                          ensure_ascii=False), encoding="utf-8")
+    config["_config_path"] = str(out_config_path)
+    log(status_cb, "Rendering the retimed timeline with the fresh speech...")
+    output = pipeline.render_video(config)
+    log(status_cb, f"Speech-regenerated timeline render complete: {Path(output).name}")
+    return {"title": config.get("title", slug), "project_dir": str(project_dir),
+            "video": str(output), "retimed_scenes": len(config["scenes"]),
+            "audio": str(audio_path)}
+
+
+def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None):
+    """Search fresh TikTok/X footage for only the marked timeline scenes, then render.
+
+    This is deliberately separate from a full same-script rerun: unmarked media remains intact,
+    and every replacement must pass the normal download-quality and semantic vision gates.
+    """
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    if str(config.get("clip_source") or "").lower() != "scrape":
+        raise RuntimeError("Targeted social replacement is only available for TikTok/X scrape projects.")
+    wanted = {str(value) for value in (scene_ids or []) if str(value)}
+    indexed_targets = [(index, scene) for index, scene in enumerate(config.get("scenes") or [])
+                       if str(scene.get("id", index)) in wanted]
+    if not indexed_targets:
+        raise RuntimeError("No marked scrape scenes were found in the saved timeline.")
+    try:
+        import clip_scraper
+    except Exception as exc:
+        raise RuntimeError("TikTok/X scraper is unavailable.") from exc
+    platforms = clip_scraper.normalize_platforms(config.get("scrape_platforms") or "tiktok,x")
+    if not clip_scraper.backend_active(platforms):
+        raise RuntimeError("TikTok/X is not connected. Connect at least one selected source first.")
+
+    def cancelled():
+        return bool(cancel_event and cancel_event.is_set())
+
+    target_scenes = [dict(scene) for _, scene in indexed_targets]
+    lines = [scene_text_for_planning(scene) or str(scene.get("script") or "")
+             for scene in target_scenes]
+    title = str(config.get("title") or slug)
+    full_script = " ".join(str(scene.get("exact_voice_text") or scene.get("script") or "")
+                           for scene in (config.get("scenes") or []))
+    reasoning_model = str((config.get("wavespeed") or {}).get("reasoning_model")
+                          or "openai/gpt-5.5")
+    understanding = {}
+    try:
+        understanding = json.loads((project_dir / "input" / "script_understanding.json").read_text(
+            encoding="utf-8"))
+    except Exception:
+        pass
+    if not understanding:
+        understanding = comprehend_script(title, full_script, reasoning_model=reasoning_model,
+                                           status_cb=status_cb)
+    check_cancel({"_cancel_event": cancel_event} if cancel_event else {})
+    log(status_cb, f"Timeline replacement: searching {', '.join(sorted(platforms))} for "
+                   f"{len(target_scenes)} marked scene(s), leaving every other clip untouched.")
+    queries = llm_scene_scrape_queries(lines, understanding=understanding,
+                                       reasoning_model=reasoning_model, status_cb=status_cb)
+    if not queries:
+        queries = [clean_text(line)[:100] for line in lines if clean_text(line)]
+    if not queries:
+        raise RuntimeError("Could not derive social search queries for the marked scenes.")
+    try:
+        per_clip = max(4.0, min(8.0, max(float(scene.get("end", 0))
+                                         - float(scene.get("start", 0))
+                                         for scene in target_scenes)))
+    except Exception:
+        per_clip = 5.0
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = project_dir / "seedance 2.0" / "_candidates" / f"timeline_replace_{stamp}"
+    candidate_statuses = []
+    got = clip_scraper.scrape_bucket(
+        out_dir, queries[:32], min(40, max(8, len(target_scenes) * 6)),
+        bucket_id=f"timeline_replace_{stamp}", tier="timeline_replace",
+        bucket_terms=" ".join(lines)[:500], per_clip_seconds=per_clip,
+        status_cb=status_cb, cancel_check=cancelled, candidate_statuses=candidate_statuses,
+        min_likes=MIN_CLIP_LIKES, search_sort="MOST_LIKED", platforms=platforms,
+        deadline=time.monotonic() + 900.0) or []
+    if cancelled():
+        raise pipeline.PipelineCancelled("Timeline replacement cancelled.")
+    pool, clip_meta = [], {}
+    for item in got:
+        path = item.get("path")
+        if not path:
+            continue
+        pool.append(Path(path))
+        clip_meta[str(path)] = {
+            "bucket_id": "timeline_replacement", "tier": "timeline_replace",
+            "source_query": item.get("query", ""),
+            "platform": item.get("platform", "tiktok"), "clip_id": item.get("clip_id"),
+            "caption": (item.get("meta") or {}).get("caption", "")[:160],
+            "likes": int(item.get("likes") or 0),
+            "black_bar_score": item.get("black_bar_score", 0.0),
+            "text_heaviness": item.get("text_heaviness", 0.0),
+            "rapid_internal_cut_count": item.get("rapid_internal_cut_count", 0),
+        }
+    if not pool:
+        raise RuntimeError("TikTok/X returned no clean candidates for the marked scenes.")
+    try:
+        relevancy = int(config.get("script_relevancy") or 85)
+    except (TypeError, ValueError):
+        relevancy = 85
+    matches, decisions = assign_clips_to_scenes_by_vision(
+        target_scenes, pool, project_dir, reasoning_model=reasoning_model,
+        status_cb=status_cb, understanding=understanding, clip_meta=clip_meta,
+        min_script_match_score=adaptive_script_match_threshold(relevancy, 0))
+    unmatched = [lines[index] for index, match in enumerate(matches) if match is None]
+    if unmatched:
+        raise RuntimeError("No semantically matching clean TikTok/X replacement for: "
+                           + "; ".join(text[:80] for text in unmatched))
+
+    for local_index, ((scene_index, scene), source) in enumerate(zip(indexed_targets, matches)):
+        sid = str(scene.get("id", scene_index))
+        source = Path(source)
+        suffix = source.suffix.lower() if source.suffix else ".mp4"
+        key = hashlib.sha1(str(source.resolve()).encode("utf-8", "ignore")).hexdigest()[:10]
+        dest = project_dir / "seedance 2.0" / f"timeline_replaced_{sid}_{key}{suffix}"
+        shutil.copy2(source, dest)
+        updated = config["scenes"][scene_index]
+        updated["clip"] = dest.name
+        updated["asset"] = dest.name
+        updated["seedance"] = True
+        meta = clip_meta.get(str(source)) or {}
+        updated["scrape_source"] = meta.get("platform", "tiktok")
+        updated["scrape_clip_id"] = meta.get("clip_id") or str(source)
+        updated["match_class"] = (decisions[local_index] or {}).get("match_class", "TIMELINE_REPLACEMENT")
+        updated["script_match_score"] = (decisions[local_index] or {}).get("script_match_score")
+        log(status_cb, f"Timeline replacement: scene {sid} -> {source.name} "
+                       f"({meta.get('platform', 'tiktok')}).")
+
+    config["timeline_editor_render"] = True
+    config["output_basename"] = f"{slug}_timeline_social_replace_{stamp}"
+    attach_cancel_event(config, {"_cancel_event": cancel_event} if cancel_event else {})
+    config_path = project_dir / "config" / "project.json"
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, config_path)
+    log(status_cb, "Rendering timeline with targeted TikTok/X replacements...")
+    output = pipeline.render_video(config)
+    return {"title": config.get("title", slug), "project_dir": str(project_dir),
+            "video": str(output), "replaced_scenes": len(matches)}
 
 
 def run_project(form, status_cb=None):
@@ -6755,11 +7616,18 @@ def run_project(form, status_cb=None):
                        "(no new folder).")
     else:
         slug = unique_project_slug(slugify(title))
-    # Same-script reuse: when we fused into an existing scrape project, its voiceover + scraped
-    # clips are already for THIS exact script - reuse them (no new TTS, no new TikTok search)
-    # unless the user explicitly forces a fresh take.
-    reuse_same_script = bool(fused_slug) and not form_flag(form, "force_regenerate", False)
     project_dir = PROJECTS_DIR / slug
+    # Same-script reuse also applies when the user explicitly LOADS a failed project. Previously
+    # it only applied to automatic fusion, so "load to rerun" ignored all downloaded candidates.
+    requested_same_script = False
+    if requested_slug:
+        try:
+            prior_script = (project_dir / "input" / "script.txt").read_text(
+                encoding="utf-8", errors="replace")
+            requested_same_script = (_script_fingerprint(prior_script) == _script_fingerprint(script))
+        except Exception:
+            requested_same_script = False
+    reuse_same_script = should_reuse_same_script_media(fused_slug, requested_same_script, form)
     for folder in ["seedance 2.0", "gpt images", "web images", "input", "config", "renders", "review", "local media", "speaker", "speaker clip"]:
         (project_dir / folder).mkdir(parents=True, exist_ok=True)
     if requested_slug or fused_slug:
@@ -6784,18 +7652,23 @@ def run_project(form, status_cb=None):
     except Exception:
         pass
 
-    # A scrape run pulls real TikTok footage, which requires a logged-in connection.
+    # A scrape run requires at least one selected, logged-in social source.
     # Enforce it up front so we don't burn voiceover/director work on a run that can't
     # source any clips.
     if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
-        # TikTok clips come from Apify (real keyword search + watermark-free download).
-        _scrape_cookies = (str(form.get("scrape_cookies_file", "") or "").strip()
-                           or str(form.get("scrape_cookies", "") or "").strip())
-        if not os.environ.get("APIFY_TOKEN", "").strip() and not _scrape_cookies:
+        _requested_scrape_platforms = [
+            p.strip() for p in str(form.get("scrape_platforms", "tiktok,x") or "").replace("\n", ",").split(",")
+            if p.strip()
+        ] or ["tiktok", "x"]
+        try:
+            import clip_scraper as _cs_check
+            _scrape_ready = bool(_cs_check.backend_active(_requested_scrape_platforms))
+        except Exception:
+            _scrape_ready = False
+        if not _scrape_ready:
             raise RuntimeError(
-                "Scrape runs need an Apify token. Add APIFY_TOKEN=... to the .env file "
-                "(get one at apify.com), then restart the app and run again."
-            )
+                "None of the selected social sources are connected. Connect TikTok and/or X "
+                "on the home page, then re-run.")
 
     # Abort NOW if the WaveSpeed balance is empty - before TTS/director/scrape burn time.
     assert_wavespeed_balance(status_cb=status_cb)
@@ -6810,7 +7683,9 @@ def run_project(form, status_cb=None):
     speaker_image_path = form.get("speaker_image_path", "")
     # Default audio path: synthesize the narration from the script with Gemini TTS
     # (the user picks speaker + voice). An uploaded file, if any, still wins.
-    if not audio_path and reuse_same_script and not form_flag(form, "regenerate_voice", False):
+    if (not audio_path and reuse_same_script
+            and not form_flag(form, "regenerate_voice", False)
+            and not form_flag(form, "force_regenerate", False)):
         _vo = existing_project_voiceover(project_dir)
         if _vo:
             # The saved voiceover was processed by an OLDER chain that brightened the TTS hiss into a
@@ -7089,9 +7964,9 @@ def run_project(form, status_cb=None):
     if clip_source not in ("generate", "scrape"):
         clip_source = "generate"
     scrape_platforms = [
-        p.strip() for p in str(form.get("scrape_platforms", "tiktok,instagram") or "").replace("\n", ",").split(",")
+        p.strip() for p in str(form.get("scrape_platforms", "tiktok,x") or "").replace("\n", ",").split(",")
         if p.strip()
-    ] or ["tiktok", "instagram"]
+    ] or ["tiktok", "x"]
     scrape_terms = str(form.get("scrape_terms", "") or "").strip()
     try:
         script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 70)))))
@@ -7222,7 +8097,7 @@ def run_project(form, status_cb=None):
     # were replayed forever. That is exactly how burned-in Japanese TikTok captions kept showing up.
     # Same-script runs now fall through to the normal pipeline, which reuses this project's already
     # DOWNLOADED clips via find_reusable_social_clips (so no full re-download) but RE-VALIDATES every
-    # one through the strict semantic matcher (rejects has_creator_text / text_heavy>3) and only
+    # one through the strict semantic matcher (rejects text-dominated clips) and only
     # searches TikTok again for scenes the clean existing clips cannot cover.
     if clip_source == "scrape" and reuse_same_script and not form_flag(form, "force_rescrape", False):
         log(status_cb, "Same-script reuse: re-validating this project's existing clips through the "
@@ -7281,7 +8156,21 @@ def run_project(form, status_cb=None):
             hook_relaxed = False
             body_pool = []                         # pool minus hook clips (body scenes only)
             scene_clips = [None] * scene_total
-            with step_watchdog(form, "Clip scrape", limit_s=2700, status_cb=status_cb):
+            # HOOK STRATEGY: by default the hook is TOPIC footage - scene 0 simply joins the
+            # normal vision matching, so a trains script opens on trains, a school script on a
+            # school visual. The generic dance/cute-influencer hook (dedicated search bucket +
+            # presenter scorer, scene 0 reserved) only runs when explicitly enabled.
+            # Found-footage mode always opens with the requested 20K+ cute/dance creator hook.
+            # The UI submits this explicitly; defaulting on also keeps programmatic scrape runs
+            # consistent with the product contract.
+            use_influencer_hook = form_flag(form, "influencer_hook", True)
+            if not use_influencer_hook:
+                log(status_cb, "Hook: topic-matched (scene 0 joins normal matching); "
+                               "influencer/dance hook is OFF.")
+            # Social search is intentionally unbounded. Large pools plus vision matching can take
+            # longer than 45 minutes; user cancellation and provider-level deadlines still work,
+            # but the app must never discard a healthy scrape merely because elapsed time passed.
+            with step_watchdog(form, "Clip scrape", limit_s=0, status_cb=status_cb):
                 if social_plan.get("buckets"):
                     existing_body, existing_hooks, existing_meta = [], [], {}
                     project_reuse_report = {"searched_projects": 0, "selected_projects": []}
@@ -7308,15 +8197,23 @@ def run_project(form, status_cb=None):
                     else:
                         log(status_cb, "New script: scraping fresh TikTok footage - no reuse of any old/other media.")
 
-                    # Always scrape the fresh script-matched body buckets; reuse a verified existing
-                    # hook only on a same-script run.
+                    # A failed same-script run may already have dozens of pre-filtered candidate
+                    # downloads. Use them FIRST and skip another 30-50 minute scrape when the
+                    # reusable pool is already large enough to cover the edit.
+                    reuse_pool_sufficient = len(existing_body) >= max(12, scene_total)
                     first_search_plan = {
-                        "buckets": list(social_plan.get("buckets") or []),
-                        "hook": None if existing_hooks else social_plan.get("hook"),
+                        "buckets": ([] if reuse_pool_sufficient
+                                    else list(social_plan.get("buckets") or [])),
+                        "hook": (None if (existing_hooks or not use_influencer_hook)
+                                 else social_plan.get("hook")),
                     }
                     if existing_body:
-                        log(status_cb, f"Same-script run reused {len(existing_body)} of this project's own "
-                                       "body clip(s); still running the fresh script-matched TikTok scrape.")
+                        if reuse_pool_sufficient:
+                            log(status_cb, f"Same-script failed-run recovery: reusing {len(existing_body)} "
+                                           "pre-filtered body candidate(s); skipping a duplicate full scrape.")
+                        else:
+                            log(status_cb, f"Same-script run reused {len(existing_body)} body candidate(s); "
+                                           "searching only because the saved pool is still too small.")
                     if first_search_plan["buckets"] or first_search_plan["hook"]:
                         (fresh_pool, fresh_meta, fresh_perf, _fresh_scene_bucket, fresh_hooks,
                          fresh_statuses, _fresh_summary) = scrape_social_plan(
@@ -7337,17 +8234,67 @@ def run_project(form, status_cb=None):
                                 continue
                     filter_summary = _summarize_candidate_filters(candidate_statuses)
                 else:
-                    # back-compat: flat query fallback if bucket planning failed
+                    # Fallback when bucket planning failed: flat queries through the SAME
+                    # scrape_bucket path (metadata pre-filter + gates + blur + tiktok_login
+                    # backend). The old scrape_clips path only knew Apify/yt-dlp-cookies and
+                    # returned 0 with "not connected" even with a working TikTok login -
+                    # which silently emptied the pool for the whole run.
+                    log(status_cb, "Bucket planning returned nothing - falling back to flat "
+                                   "script-derived queries through the standard scrape path.")
                     _splan = llm_scrape_plan(script, title, visual_script, script_relevancy,
                                              reasoning_model=reasoning_model, status_cb=status_cb,
                                              understanding=script_understanding)
-                    terms = ", ".join(_splan.get("queries") or []) or scrape_terms
-                    pool = clip_scraper.scrape_clips(
-                        seedance_target_dir, scrape_platforms, terms,
-                        max(10, min(int(scene_total * 1.6), SCRAPE_CAP)), script_text=script,
-                        script_relevancy=script_relevancy, per_clip_seconds=per_clip,
-                        lead_query=_splan.get("hook_query"), cookies=_cookies,
-                        status_cb=status_cb, cancel_check=_cancel) or []
+                    _flat_queries = [q for q in (_splan.get("queries") or []) if str(q).strip()]
+                    _flat_queries += [q.strip() for q in re.split(r"[,\n]", scrape_terms or "")
+                                      if q.strip()]
+                    _fallback_dicts = clip_scraper.scrape_bucket(
+                        seedance_target_dir / "_candidates" / "fallback", _flat_queries[:16],
+                        max(10, min(int(scene_total * 1.6), SCRAPE_CAP)),
+                        bucket_id="fallback", tier="flat", bucket_terms=str(script)[:200],
+                        per_clip_seconds=per_clip, status_cb=status_cb, cancel_check=_cancel,
+                        candidate_statuses=candidate_statuses, min_likes=MIN_CLIP_LIKES,
+                        search_sort="MOST_LIKED", platforms=scrape_platforms,
+                        deadline=time.monotonic() + 180.0) or []
+                    for d in _fallback_dicts:
+                        p = d.get("path")
+                        if not p:
+                            continue
+                        pool.append(p)
+                        clip_meta[str(p)] = {
+                            "bucket_id": "fallback", "tier": "flat",
+                            "platform": d.get("platform", "tiktok"),
+                            "source_query": d.get("query", ""), "clip_id": d.get("clip_id"),
+                            "caption": (d.get("meta") or {}).get("caption", "")[:160],
+                            "black_bar_score": d.get("black_bar_score", 0.0),
+                            "text_heaviness": d.get("text_heaviness", 0.0),
+                            "likes": d.get("likes", 0),
+                            "internal_cut_count": d.get("internal_cut_count", 0),
+                            "rapid_internal_cut_count": d.get("rapid_internal_cut_count", 0),
+                        }
+                    hook_q = str(_splan.get("hook_query") or "").strip()
+                    if hook_q:
+                        _hd = clip_scraper.scrape_bucket(
+                            seedance_target_dir / "_candidates" / "fallback", [hook_q], 3,
+                            bucket_id="fallback_hook", tier="flat", bucket_terms=hook_q,
+                            per_clip_seconds=per_clip, status_cb=status_cb, cancel_check=_cancel,
+                            candidate_statuses=candidate_statuses, min_likes=HOOK_MIN_LIKES,
+                            search_sort="MOST_LIKED", platforms=scrape_platforms,
+                            deadline=time.monotonic() + 180.0) or []
+                        for d in _hd:
+                            if d.get("path"):
+                                hp = d["path"]
+                                hook_pool.append(hp)
+                                pool.append(hp)
+                                clip_meta[str(hp)] = {
+                                    "bucket_id": "fallback_hook", "tier": "flat",
+                                    "platform": d.get("platform", "tiktok"),
+                                    "source_query": d.get("query", ""),
+                                    "clip_id": d.get("clip_id"),
+                                    "caption": (d.get("meta") or {}).get("caption", "")[:160],
+                                    "likes": int(d.get("likes") or 0),
+                                    "black_bar_score": d.get("black_bar_score", 0.0),
+                                    "text_heaviness": d.get("text_heaviness", 0.0),
+                                }
 
                 # ---- Dedicated HOOK finder: score 20K+ cute/dance creator clips, reserve scene 0 ----
                 # Hook-bucket clips are kept out of the body pool because their job is scroll-stop
@@ -7358,33 +8305,38 @@ def run_project(form, status_cb=None):
                         status_cb=status_cb, collaborate=collaborate_reasoning)
                     for hook_result in hook_results:
                         hook_result["likes"] = int((clip_meta.get(str(hook_result.get("clip"))) or {}).get("likes") or 0)
+                    def _hook_likes_ok(result):
+                        result_meta = clip_meta.get(str(result.get("clip"))) or {}
+                        floor = clip_scraper.platform_like_floor(
+                            HOOK_MIN_LIKES, result_meta.get("platform", "tiktok"))
+                        return int(result.get("likes") or 0) >= floor
                     best_hook = next((r["clip"] for r in hook_results if r.get("passed")), None)
                     if best_hook is None:
                         relaxed_hook = next((r for r in hook_results
                                              if r.get("vision_passed")
                                              and float(r.get("hook_presenter_score") or 0) >= 5.5
-                                             and int(r.get("likes") or 0) >= HOOK_MIN_LIKES), None)
+                                             and _hook_likes_ok(r)), None)
                         if relaxed_hook is None:
                             relaxed_hook = next((r for r in hook_results
                                                  if float((r.get("scores") or {}).get("dance_or_playful_action") or 0) >= 4
-                                                 and int(r.get("likes") or 0) >= HOOK_MIN_LIKES), None)
+                                                 and _hook_likes_ok(r)), None)
                         if relaxed_hook is None:
                             relaxed_hook = next((r for r in hook_results
-                                                 if int(r.get("likes") or 0) >= HOOK_MIN_LIKES), None)
+                                                 if _hook_likes_ok(r)), None)
                         if relaxed_hook is not None:
                             best_hook = relaxed_hook["clip"]
                             hook_relaxed = True
                             log(status_cb, "Hook Finder: no clip cleared the strict score; using the best "
-                                           "20K+ like cute/dance search candidate instead of aborting.")
+                                           "engagement-qualified cute/dance candidate instead of aborting.")
                 hook_keys = {str(Path(p).resolve()) for p in hook_pool}
                 body_pool = [p for p in pool if str(Path(p).resolve()) not in hook_keys]
                 retry_seen_ids = {str(m.get("clip_id")) for m in clip_meta.values()
                                   if isinstance(m, dict) and m.get("clip_id")}
 
                 def _apply_hook(clips):
-                    # Scene 0 is reserved for a hook that actually passed the presenter gate.
-                    # A body match or a failed hook candidate must never silently replace it.
-                    if clips:
+                    # Influencer mode: scene 0 is reserved for a hook that passed the presenter
+                    # gate. Topic mode: scene 0 was matched normally - leave it alone.
+                    if clips and use_influencer_hook:
                         clips[0] = best_hook
                     return clips
 
@@ -7406,8 +8358,25 @@ def run_project(form, status_cb=None):
                                f"(script relevancy {script_relevancy}%).")
 
                 def _match_body_candidates(candidates, threshold):
-                    """Keep scene 0 out of body matching so it cannot consume a useful body clip."""
-                    if scene_total <= 1 or not candidates:
+                    """Influencer mode keeps scene 0 out of body matching (reserved for the
+                    presenter hook); topic mode matches ALL scenes including the hook."""
+                    if not candidates:
+                        return ([None] * scene_total, [None] * scene_total)
+                    if not use_influencer_hook:
+                        clips, decisions = assign_clips_to_scenes_by_vision(
+                            scenes_override, candidates, project_dir,
+                            reasoning_model=reasoning_model, status_cb=status_cb,
+                            understanding=script_understanding, clip_meta=clip_meta,
+                            scene_specs=scene_specs, collaborate=collaborate_reasoning,
+                            min_script_match_score=threshold)
+                        clips = list(clips or [])
+                        decisions = list(decisions or [])
+                        while len(clips) < scene_total:
+                            clips.append(None)
+                        while len(decisions) < scene_total:
+                            decisions.append(None)
+                        return (clips, decisions)
+                    if scene_total <= 1:
                         return ([None] * scene_total, [None] * scene_total)
                     body_specs = {i - 1: spec for i, spec in scene_specs.items() if i > 0}
                     clips, decisions = assign_clips_to_scenes_by_vision(
@@ -7433,11 +8402,23 @@ def run_project(form, status_cb=None):
 
                 # Keep searching TikTok for any BODY scene still unmatched (targeted retry rounds).
                 # Scene 0 is the hook and is never re-searched here.
+                _first_body_scene = 1 if use_influencer_hook else 0
                 for rnd in range(1, MAX_SCRAPE_ROUNDS):
                     if _cancel():
                         break
-                    unmatched = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
+                    unmatched = [i for i, c in enumerate(scene_clips)
+                                 if i >= _first_body_scene and c is None]
                     if not unmatched:
+                        break
+                    # FILL FIRST, SEARCH LAST: when the pool is already big and most scenes
+                    # matched, the continuity fill below covers the gaps - re-searching for a
+                    # handful of abstract lines burns 15+ minutes for near-zero gain.
+                    _matched_now = sum(1 for i, c in enumerate(scene_clips)
+                                       if i >= _first_body_scene and c is not None)
+                    if len(body_pool) >= scene_total and _matched_now >= max(3, scene_total // 2):
+                        log(status_cb, f"{len(unmatched)} scene(s) unmatched but the pool has "
+                                       f"{len(body_pool)} clips and {_matched_now} matched - "
+                                       "using continuity fill instead of another search round.")
                         break
                     # ANTI-TIMEOUT: abstract narration ("the quiet ways friendship is shown") rarely
                     # matches concrete b-roll, so re-searching + re-scoring the whole pool again just
@@ -7453,7 +8434,8 @@ def run_project(form, status_cb=None):
                     current_match_threshold = adaptive_script_match_threshold(script_relevancy, rnd)
                     lines = [(scene_text_for_planning(scenes_override[i]) or scenes_override[i].get("script", ""))
                              for i in unmatched]
-                    log(status_cb, f"Scrape round {rnd + 1}: re-searching TikTok for {len(unmatched)} "
+                    log(status_cb, f"Scrape round {rnd + 1}: re-searching "
+                                   f"{', '.join(scrape_platforms)} for {len(unmatched)} "
                                    f"scene(s); relaxing semantic threshold to "
                                    f"{current_match_threshold:.1f}/10...")
                     retry_terms = llm_scene_scrape_queries(lines, understanding=script_understanding,
@@ -7472,7 +8454,8 @@ def run_project(form, status_cb=None):
                             status_cb=status_cb, cancel_check=_cancel, seen_ids=retry_seen_ids,
                             query_perf=query_perf, candidate_statuses=candidate_statuses,
                             min_likes=MIN_CLIP_LIKES,
-                            search_sort="MOST_LIKED") or []
+                            search_sort="MOST_LIKED", platforms=scrape_platforms,
+                            deadline=time.monotonic() + 180.0) or []
                     else:
                         log(status_cb, "   no new retry terms returned; re-scoring the existing pool "
                                        "at the lower threshold.")
@@ -7483,7 +8466,8 @@ def run_project(form, status_cb=None):
                         pool.append(p)
                         body_pool.append(p)
                         clip_meta[str(p)] = {
-                            "bucket_id": "retry", "tier": "retry", "platform": "tiktok",
+                            "bucket_id": "retry", "tier": "retry",
+                            "platform": d.get("platform", "tiktok"),
                             "source_query": d.get("query", ""), "clip_id": d.get("clip_id"),
                             "caption": (d.get("meta") or {}).get("caption", "")[:160],
                             "black_bar_score": d.get("black_bar_score", 0.0),
@@ -7498,26 +8482,43 @@ def run_project(form, status_cb=None):
                         body_pool, current_match_threshold)
                     _apply_hook(scene_clips)
 
-                # One final no-download relaxation pass. This is cheaper than a fourth search and
-                # lets clean contextual C_MATCH footage carry abstract/compound narration lines.
-                # Skip it entirely when NOTHING has matched and the pool is already large - another
-                # full re-score would just burn minutes for 0 gain; the continuity fill covers it.
+                # One final no-download relaxation pass can rescue a PARTIALLY matched edit.
+                # When a large pool matched absolutely nothing, repeating every vision batch at a
+                # lower number has consistently returned the same D_REJECTED decisions and added
+                # 10-20 minutes. In that case go directly to the controlled same-bucket clean-footage
+                # fallback below.
                 remaining_body = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
                 _any_matched = any(c is not None for i, c in enumerate(scene_clips) if i > 0)
-                # ALWAYS run ONE final re-score at the FLOOR threshold when scenes are still unmatched.
-                # This is a single pass (not the expensive multi-round SEARCH loop the anti-timeout
-                # guards), so it's cheap - and it's essential: at high script-relevancy the first pass
-                # threshold is strict (e.g. 6.0/10 @80%), so an abstract/essay script can match 0 clips.
-                # Dropping to the floor (4.0/10) here lets the best real clips get properly accepted
-                # instead of the render ending up with NO scraped footage ("accepts no clips at 80%").
-                if remaining_body and body_pool:
-                    current_match_threshold = adaptive_script_match_threshold(
-                        script_relevancy, MAX_SCRAPE_ROUNDS)
+                _large_zero_match_pool = (not _any_matched and len(body_pool) >= scene_total)
+                _floor_threshold = adaptive_script_match_threshold(
+                    script_relevancy, MAX_SCRAPE_ROUNDS)
+                _can_relax_further = _floor_threshold < current_match_threshold - 0.01
+                _run_final_rescore = should_run_final_semantic_rescore(
+                    current_match_threshold, _floor_threshold, len(remaining_body),
+                    len(body_pool), _any_matched, scene_total)
+                if _run_final_rescore:
                     log(status_cb, f"Final semantic fallback: re-scoring {len(remaining_body)} unmatched "
-                                   f"scene(s) at {current_match_threshold:.1f}/10 (floor).")
-                    scene_clips, clip_decision_log = _match_body_candidates(
-                        body_pool, current_match_threshold)
+                                   f"scene(s) at {_floor_threshold:.1f}/10 (floor).")
+                    rescored_clips, rescored_log = _match_body_candidates(
+                        body_pool, _floor_threshold)
+                    # Preserve every scene already accepted at the stricter threshold. The old
+                    # assignment replaced the entire list, so a weaker pass could erase good
+                    # matches before the continuity fallback ran.
+                    for scene_index in remaining_body:
+                        if scene_index < len(rescored_clips) and rescored_clips[scene_index] is not None:
+                            scene_clips[scene_index] = rescored_clips[scene_index]
+                        if scene_index < len(rescored_log) and rescored_log[scene_index] is not None:
+                            clip_decision_log[scene_index] = rescored_log[scene_index]
+                    current_match_threshold = _floor_threshold
                     _apply_hook(scene_clips)
+                elif _large_zero_match_pool:
+                    log(status_cb, f"Semantic matcher accepted 0 scenes from {len(body_pool)} clean clips; "
+                                   "skipping a redundant full re-score and using same-bucket clean-footage "
+                                   "fallbacks immediately.")
+                elif remaining_body and body_pool and not _can_relax_further:
+                    log(status_cb, f"Semantic matcher already ran at the {_floor_threshold:.1f}/10 floor; "
+                                   "skipping the duplicate full-pool re-score and filling remaining scenes "
+                                   "from same-bucket clean footage.")
 
                 # Preserve the hard 20K-like gate even if vision scoring is unavailable/overly
                 # strict. Hook queries themselves target cute/dance creators, so choose the most-
@@ -7571,7 +8572,8 @@ def run_project(form, status_cb=None):
             # from the same semantic search bucket; otherwise hold/reuse the nearest accepted body
             # clip. This is controlled continuity, not arbitrary global filler.
             relaxed_scene_count = 0
-            accepted_body = [(i, c) for i, c in enumerate(scene_clips) if i > 0 and c]
+            _fb_first = 1 if use_influencer_hook else 0
+            accepted_body = [(i, c) for i, c in enumerate(scene_clips) if i >= _fb_first and c]
             fallback_pool = []
             _fallback_seen = set()
             # Continuity fallback must ONLY reuse clips that PASSED the matcher's caption/quality
@@ -7595,7 +8597,7 @@ def run_project(form, status_cb=None):
                 except (TypeError, ValueError): _th = 0.0
                 try: _bb = float(m.get("black_bar_score", 0) or 0)
                 except (TypeError, ValueError): _bb = 0.0
-                return (_th <= 3.5 and _bb <= 0.5 and not m.get("is_fake_vertical", False))
+                return (_th <= 1.5 and _bb <= 0.5 and not m.get("is_fake_vertical", False))
             clean_raw_fallback = []
             _seen_raw = set(_fallback_seen)
             for _p in body_pool:
@@ -7712,6 +8714,8 @@ def run_project(form, status_cb=None):
                     "enabled": True,
                     "reference_used": False,
                     "minimum_likes": HOOK_MIN_LIKES,
+                    "minimum_likes_by_platform": {"tiktok": HOOK_MIN_LIKES,
+                                                  "twitter": HOOK_MIN_LIKES // 4},
                     "queries": HOOK_PRESENTER_QUERIES,
                     "candidate_count": len(hook_pool),
                     "passed_count": hook_passed,
@@ -7758,12 +8762,12 @@ def run_project(form, status_cb=None):
                         _cap_cache[_k] = 0.0
                 return _cap_cache[_k]
 
-            _CAP_MAX = 5.5   # matches the scraper's text-plastered bar; lighter captions were already blurred
+            _CAP_MAX = 1.5   # strict: anything above incidental text is not renderable
             _used_keys = set()
             _prev_key = None
             _swaps = 0
             _cap_swaps = 0
-            _blurred = 0
+            _caption_drops = 0
             for _idx in range(len(scene_clips)):
                 _clip = scene_clips[_idx]
                 if _clip is None:
@@ -7775,8 +8779,12 @@ def run_project(form, status_cb=None):
                 if _is_dup or _is_capt:
                     _cand = [p for p in fallback_pool if str(Path(p).resolve()) not in _used_keys]
                     _clean = [p for p in _cand if _cap_score(p) <= _CAP_MAX]
-                    # prefer an unused caption-free clip; for a pure duplicate any unused clip helps
-                    _repl = _least_used(_clean) if _clean else (_least_used(_cand) if (_cand and _is_dup) else None)
+                    # A captioned clip may only be replaced by a clean clip. For a pure duplicate,
+                    # any unused candidate helps, but never use that looser branch for captions.
+                    if _is_capt:
+                        _repl = _least_used(_clean) if _clean else None
+                    else:
+                        _repl = _least_used(_clean) if _clean else (_least_used(_cand) if _cand else None)
                     if _repl is not None:
                         scene_clips[_idx] = _repl
                         if _is_capt and _cap_score(_repl) <= _CAP_MAX:
@@ -7787,24 +8795,19 @@ def run_project(form, status_cb=None):
                         if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
                             clip_decision_log[_idx]["cleanup_swapped"] = True
                     elif _is_capt:
-                        # No clean replacement available: BLUR the burned-in caption regions so
-                        # the leftover captions melt into the footage instead of standing out.
-                        try:
-                            _n_blur = clip_scraper.blur_caption_regions(
-                                Path(_clip), _ff_cap, per_clip, status_cb=status_cb)
-                        except Exception:
-                            _n_blur = 0
-                        if _n_blur:
-                            _cap_cache.pop(_key, None)      # score changed after the blur
-                            _blurred += 1
-                            if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
-                                clip_decision_log[_idx]["captions_blurred"] = True
+                        # Never blur captions. If no clean replacement exists, leave the scene
+                        # unassigned so the normal clean fallback/continuity path handles it.
+                        scene_clips[_idx] = None
+                        _caption_drops += 1
+                        if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
+                            clip_decision_log[_idx]["captioned_clip_dropped"] = True
+                        _prev_key = None
+                        continue
                 _used_keys.add(_key)
                 _prev_key = _key
-            if _swaps or _cap_swaps or _blurred:
+            if _swaps or _cap_swaps or _caption_drops:
                 log(status_cb, f"Final clean-up: swapped {_cap_swaps} captioned + {_swaps} duplicate "
-                               f"clip(s); blurred leftover captions on {_blurred} clip(s) with no "
-                               "clean replacement.")
+                               f"clip(s); dropped {_caption_drops} captioned clip(s) with no clean replacement.")
 
             # Place only clips that passed semantic matching for this exact scene.  The previous
             # reuse cycle filled rejected scenes with an unrelated clip accepted for a different
@@ -7834,10 +8837,21 @@ def run_project(form, status_cb=None):
                     try:
                         _shutil.copyfile(clip, dst)
                         cm = _assigned_meta(clip)
+                        try:
+                            dst.with_suffix(".json").write_text(json.dumps({
+                                "status": "assigned", "scene_id": str(sc.get("id", i)),
+                                "source_path": str(Path(clip).resolve()),
+                                "platform": cm.get("platform", "tiktok"),
+                                "clip_id": cm.get("clip_id") or str(Path(clip).resolve()),
+                                "likes": int(cm.get("likes") or 0),
+                                "text_heaviness": float(cm.get("text_heaviness") or 0.0),
+                            }, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
                         sc["clip"] = dst.name
                         sc["seedance"] = True
                         sc["visual_role"] = role
-                        sc["scrape_source"] = "tiktok"
+                        sc["scrape_source"] = cm.get("platform", "tiktok")
                         sc["scrape_clip_id"] = cm.get("clip_id") or str(Path(clip).resolve())
                         sc["match_class"] = mclass
                         sc["script_match_score"] = (dlog_by_scene.get(i) or {}).get("script_match_score")
@@ -7867,7 +8881,10 @@ def run_project(form, status_cb=None):
                 distinct = len(assigned_ids)
                 log(status_cb, f"Scrape: {matched}/{scene_total} scene(s) matched the script "
                                f"directly; final adaptive threshold was {current_match_threshold:.1f}/10.")
-                log(status_cb, f"Scrape: used {distinct} distinct TikTok clip(s) across {placed} scene(s) "
+                used_platforms = sorted({str(sc.get("scrape_source") or "tiktok")
+                                         for sc in scenes_override if sc.get("clip")})
+                log(status_cb, f"Scrape: used {distinct} distinct social clip(s) from "
+                               f"{', '.join(used_platforms)} across {placed} scene(s) "
                                f"(aim ~1 per cut; {scene_total} cuts).")
                 if distinct < max(6, (scene_total + 1) // 2):
                     log(status_cb, f"Scrape: WARNING only {distinct} distinct clip(s) for {scene_total} cuts - "
@@ -7890,7 +8907,7 @@ def run_project(form, status_cb=None):
                         sc["clip"] = dst.name
                         sc["seedance"] = True
                         sc["visual_role"] = "hook_influencer" if scene_index == 0 else "body"
-                        sc["scrape_source"] = "tiktok"
+                        sc["scrape_source"] = source_scene.get("scrape_source", "tiktok")
                         sc["scrape_clip_id"] = source_scene.get("scrape_clip_id")
                         sc["match_class"] = "RELAXED_CONTINUITY"
                         sc["script_match_score"] = None
@@ -7901,17 +8918,10 @@ def run_project(form, status_cb=None):
                                    "the render will continue instead of aborting.")
                     seedance_clip_count = len([s for s in scenes_override if s.get("clip")])
             elif unmatched_scenes:
-                if not getattr(clip_scraper, "backend_active", lambda: False)():
+                if not getattr(clip_scraper, "backend_active", lambda _p=None: False)(scrape_platforms):
                     raise RuntimeError(
-                        "TikTok is not connected. Open Settings -> 'Connect TikTok' (or run "
-                        "`python tiktok_login.py login`) and sign in once, then re-run. Scraping "
-                        "uses your own logged-in TikTok session - no API key needed.")
-                if getattr(clip_scraper, "apify_out_of_credits", lambda: False)():
-                    raise RuntimeError(
-                        "Apify is OUT OF CREDITS - every TikTok search was rejected (HTTP 402, "
-                        "not enough usage). Either connect a TikTok login (Settings -> Connect TikTok, "
-                        "no API key needed) or top up Apify, then re-run.")
-                raise RuntimeError("TikTok scrape returned no usable video files at all; cannot render a "
+                        "None of the selected social sources are connected. Connect TikTok and/or X, then re-run.")
+                raise RuntimeError("Social scrape returned no usable video files at all; cannot render a "
                                    "video layer. Check the console log for the search/download errors "
                                    "(login expired / rate-limit / network).")
             # The chosen clips are already copied to scraped_NN.mp4. KEEP the candidate pool on disk
@@ -8282,6 +9292,10 @@ def run_project(form, status_cb=None):
         log(status_cb, "Generating any keyword-triggered sound effects...")
         pipeline.ensure_generated_sfx(config, status_cb=status_cb)
 
+    # The live media panel can exclude an assigned clip while the run is still working. Repair
+    # those scene slots before visual analysis so arrows/reframes inspect the replacement footage.
+    reconcile_manual_scrape_exclusions(config, project_dir, form, status_cb=status_cb)
+
     # Visual effects. The old text-only emphasis guessed target zones and produced random arrows;
     # for scrape mode we now run the TARGET-BASED planner (plan_visual_fx): it looks at the actual
     # clip frame, only adds a red callout when a concrete relevant subject exists, and sets the
@@ -8321,6 +9335,14 @@ def run_project(form, status_cb=None):
             raise
         except Exception as exc:  # noqa: BLE001
             log(status_cb, f"Editor SFX step skipped ({exc.__class__.__name__}).")
+
+    # Catch exclusions clicked during visual/SFX planning as close to render as possible.
+    reconcile_manual_scrape_exclusions(config, project_dir, form, status_cb=status_cb)
+
+    # Persist the actual render state after visual-FX/SFX planning. Older runs saved project.json
+    # before this stage, so arrows appeared in the MP4 but were absent from the timeline editor.
+    Path(config.get("_config_path", config_path)).write_text(
+        json.dumps(config_for_json(config), indent=2), encoding="utf-8")
 
     # HARD pre-render gate for scrape mode: refuse to render a broken timeline (no hook, junk
     # clips, fake-vertical, D_REJECTED, wrong speech speed, emphasis on, semantic matching skipped).
@@ -8403,7 +9425,6 @@ def run_project(form, status_cb=None):
         "needs_media_recut": unresolved_media_review is not None,
         "metadata_cleanup": metadata_cleanup_result,
         "render_variants": render_variants,
-        "video_no_audio": render_variants.get("no_audio"),
         "video_no_sfx": render_variants.get("no_sfx"),
         "video_seedance_audio_only": render_variants.get("seedance_audio_only"),
         "video_voice_only": render_variants.get("voice_only"),

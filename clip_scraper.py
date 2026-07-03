@@ -25,6 +25,7 @@ scrape_clips() never raises into the render; on failure it returns what it has.
 """
 
 import concurrent.futures
+import math
 import os
 import re
 import subprocess
@@ -32,6 +33,8 @@ import json
 import hashlib
 import shutil
 import tempfile
+import threading
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -49,9 +52,14 @@ except Exception:  # pragma: no cover - CV filters degrade gracefully
     np = None
 
 try:
-    import tiktok_login              # logged-in TikTok search backend (Apify replacement)
-except Exception:  # pragma: no cover - optional; falls back to Apify if token present
+    import tiktok_login              # logged-in TikTok search backend (primary)
+except Exception:  # pragma: no cover - Playwright not installed
     tiktok_login = None
+
+try:
+    import twitter_login             # logged-in X/Twitter backend (searched IN PARALLEL)
+except Exception:  # pragma: no cover - Playwright not installed
+    twitter_login = None
 
 
 TARGET_W, TARGET_H = 1080, 1920
@@ -60,6 +68,10 @@ MIN_LONG_SIDE = 700          # reject sources whose long edge is below this (low
 MIN_PORTRAIT_RATIO = 1.20    # height/width must be at least this (reject landscape/square)
 CAPTION_FRAME_SAMPLES = 5    # frames sampled per clip for the burned-in-text check
 CAPTION_REJECT_FRAMES = 2    # reject the clip if this many sampled frames look captioned
+# Found-footage renders add their own captions. Even one persistent creator subtitle clashes
+# with them, while blurring a large subtitle destroys the footage underneath. Keep only clips
+# whose OCR load stays in the incidental-sign/watermark band.
+MAX_ACCEPTED_TEXT_HEAVINESS = 1.5
 
 # Lead query for the hook clip when the style is "women-forward" (the reference channels
 # always open on an attractive woman as the scroll-stop). Used on YouTube (anonymous).
@@ -190,192 +202,57 @@ def _ydl_opts(extra=None):
     return opts
 
 
-# ---- Apify TikTok scraper (real keyword search + watermark-free download) --------
-# yt-dlp can't search TikTok; Apify can. With shouldDownloadVideos the actor returns a
-# watermark-free mp4 on Apify storage (mediaUrls[0]) plus metadata (w/h/duration/caption)
-# we use to pre-filter before downloading. Token lives in APIFY_TOKEN (env / .env).
-# novi/tiktok-scraper-ultimate: ~10x cheaper than clockworks. It returns the RAW TikTok
-# objects (watermark-free CDN url at video.download_no_watermark_addr.url_list[0], dims at
-# video.width/height) instead of downloading to Apify storage - so we fetch the mp4 straight
-# from the TikTok CDN (needs a tiktok Referer header). _apify_* below handle both formats.
-APIFY_ACTOR = os.environ.get("APIFY_ACTOR", "novi~tiktok-scraper-ultimate").strip()
-# This scraper path is specifically used for Japanese social-footage searches.  Novi's
-# actor otherwise defaults to a US search region, which makes native Japanese queries
-# return substantially less relevant results.
-APIFY_LOCATION = (os.environ.get("SCRAPE_LOCATION", "JP") or "JP").strip().upper()
-
-
-def apify_token():
-    return (os.environ.get("APIFY_TOKEN", "") or "").strip()
-
-
-# Set once apify_search hits an HTTP 402 / "not-enough-usage" so the run can stop and report a
-# clear "out of credits" message instead of silently returning 0 clips for every query.
-_APIFY_OUT_OF_CREDITS = [False]
-
-
-def apify_out_of_credits():
-    return _APIFY_OUT_OF_CREDITS[0]
-
-
-def apify_active():
-    return bool(apify_token())
-
-
-def apify_search(queries, results_per_query, status_cb=None, sort_type="MOST_LIKED"):
-    """Run the Apify TikTok scraper for the given search keywords. Returns raw dataset items.
-    novi/tiktok-scraper-ultimate is the default actor (cheap, returns watermark-free CDN urls);
-    the clockworks schema is still produced if APIFY_ACTOR points back to it."""
-    tok = apify_token()
-    if not tok or not queries:
-        return []
-    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items?token={tok}"
-    if "clockworks" in APIFY_ACTOR:
-        body = {
-            "searchQueries": list(queries),
-            "resultsPerPage": max(1, int(results_per_query)),
-            "shouldDownloadVideos": True,
-            "shouldDownloadCovers": False,
-            "shouldDownloadSubtitles": False,
-            "proxyConfiguration": {"useApifyProxy": True},
-        }
-    else:
-        # Novi currently enforces a minimum maxItems of 20.  Values below that make a
-        # perfectly valid keyword search return an actor input error/empty dataset.
-        sort_type = str(sort_type or "MOST_LIKED").strip().upper()
-        if sort_type not in {"RELEVANCE", "MOST_LIKED", "MOST_RECENT", "DEFAULT"}:
-            sort_type = "RELEVANCE"
-        body = {
-            "keywords": list(queries),
-            "maxItems": min(100, max(20, int(results_per_query) * max(1, len(queries)))),
-            "sortType": sort_type,
-            "dateRange": "DEFAULT",
-            "includeSearchKeywords": True,
-            "customMapFunction": "(object) => { return {...object} }",
-        }
-        if APIFY_LOCATION:
-            body["location"] = APIFY_LOCATION
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=290) as r:
-            items = json.loads(r.read().decode("utf-8"))
-        return items if isinstance(items, list) else []
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace").strip()[:180]
-        except Exception:
-            pass
-        # Out of Apify credits / billing blocked -> a clear, actionable message (and a flag so the
-        # scrape stops hammering the API instead of silently returning 0 clips for every query).
-        if exc.code == 402 or "not-enough-usage" in detail or "exceed your remaining usage" in detail:
-            _APIFY_OUT_OF_CREDITS[0] = True
-            _status(status_cb, "Apify: OUT OF CREDITS - the account has no paid usage left to run the "
-                               "TikTok scraper. Top up at apify.com (or set a different APIFY_TOKEN). "
-                               "No clips can be scraped until then.")
-            return []
-        if exc.code in (401, 403):
-            _status(status_cb, f"Apify: auth failed (HTTP {exc.code}) - check APIFY_TOKEN in .env.")
-            return []
-        hint = " (run-sync timed out; fewer queries per call needed)" if exc.code in (408, 504) else ""
-        _status(status_cb, f"Apify: search failed (HTTP {exc.code}{': ' + detail if detail else ''}){hint}.")
-        return []
-    except Exception as exc:  # noqa: BLE001
-        _status(status_cb, f"Apify: search failed ({exc.__class__.__name__}: {exc}).")
-        return []
-
-
-def _apify_media_url(item):
-    if not isinstance(item, dict):
-        return None
-    # clockworks format: a ready Apify-storage url
-    mu = item.get("mediaUrls")
-    if isinstance(mu, list) and mu and isinstance(mu[0], str) and mu[0].startswith("http"):
-        return mu[0]
-    # novi raw-TikTok format: watermark-free CDN url nested in video.*
-    v = item.get("video") if isinstance(item.get("video"), dict) else {}
-    for field in ("download_no_watermark_addr", "play_addr_h264", "play_addr", "download_addr"):
-        addr = v.get(field)
-        if isinstance(addr, dict):
-            ul = addr.get("url_list")
-            if isinstance(ul, list) and ul and isinstance(ul[0], str) and ul[0].startswith("http"):
-                return ul[0]
-        elif isinstance(addr, str) and addr.startswith("http"):
-            return addr
-    return None
-
-
-def _apify_download(media_url, dest, status_cb=None):
-    tok = apify_token()
-    dl = media_url
-    if "api.apify.com" in media_url and tok and "token=" not in media_url:
-        dl = media_url + (("&" if "?" in media_url else "?") + f"token={tok}")
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    if "tiktokcdn" in media_url or "tiktok.com" in media_url:
-        headers["Referer"] = "https://www.tiktok.com/"   # TikTok CDN rejects requests without it
-    try:
-        req = urllib.request.Request(dl, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-            shutil.copyfileobj(r, f)
-    except Exception as exc:  # noqa: BLE001
-        _status(status_cb, f"Apify: download failed ({exc.__class__.__name__}).")
-        return None
-    return dest if dest.exists() and dest.stat().st_size > 4096 else None
-
-
-def _apify_item_portrait_hq(item):
-    if not isinstance(item, dict):
-        return None
-    vm = item.get("videoMeta") if isinstance(item.get("videoMeta"), dict) else {}
-    v = item.get("video") if isinstance(item.get("video"), dict) else {}
-    try:
-        w = int(vm.get("width") or v.get("width") or 0)
-        h = int(vm.get("height") or v.get("height") or 0)
-    except (TypeError, ValueError):
-        return None
-    if w <= 0 or h <= 0:
-        return None
-    if max(w, h) < MIN_LONG_SIDE:
-        return False
-    return h >= w * MIN_PORTRAIT_RATIO
-
-
-# ---- Search/download BACKEND switch (TikTok login preferred, Apify dormant fallback) ----
-# The default, no-API-key path is a logged-in TikTok session driven by Playwright
-# (tiktok_login.py): it runs the real keyword search and returns native TikTok item objects
-# that _item_meta already understands, then yt-dlp downloads the (watermark-free) mp4 using
-# cookies exported from that same session. Apify is only used if its token is set AND no
-# TikTok login exists, so existing setups keep working without it.
+# ---- Search/download BACKENDS: logged-in TikTok + X sessions (searched in parallel) ----
+# TikTok (tiktok_login.py) is the primary backend; X/Twitter (twitter_login.py) is searched
+# AT THE SAME TIME when its login is saved. Both return items in the same schema that
+# _item_meta understands, then yt-dlp downloads the mp4 using cookies exported from the
+# respective session. No API keys involved.
 
 def tiktok_backend_ready():
     return bool(tiktok_login is not None and tiktok_login.is_ready())
 
 
-def _apify_opt_in():
-    """Apify is OFF by default now - the login backend replaced it. It only runs when the
-    user explicitly sets SCRAPE_BACKEND=apify in the environment (legacy escape hatch)."""
-    return os.environ.get("SCRAPE_BACKEND", "").strip().lower() == "apify"
+def twitter_backend_ready():
+    return bool(twitter_login is not None and twitter_login.is_ready())
 
 
-def apify_enabled():
-    return bool(apify_active() and _apify_opt_in())
+def normalize_platforms(platforms=None):
+    """Return the requested scrape backends using the two canonical names."""
+    if isinstance(platforms, str):
+        platforms = re.split(r"[,\s]+", platforms)
+    requested = {str(p or "").strip().lower() for p in (platforms or ("tiktok", "twitter"))}
+    out = set()
+    if requested & {"tiktok", "tt"}:
+        out.add("tiktok")
+    if requested & {"x", "twitter", "x.com"}:
+        out.add("twitter")
+    return out or {"tiktok", "twitter"}
 
 
-def backend_active():
-    """True if a search backend can run. Default path = a saved TikTok login (no API key).
-    Apify only counts when explicitly opted in via SCRAPE_BACKEND=apify."""
-    return bool(tiktok_backend_ready() or apify_enabled())
+def platform_like_floor(min_likes, platform):
+    """Translate a TikTok-scale engagement floor to the source platform."""
+    try:
+        floor = max(0, int(min_likes or 0))
+    except (TypeError, ValueError):
+        floor = 0
+    return max(1, int(math.ceil(floor / 4.0))) if floor and str(platform).lower() == "twitter" else floor
 
 
-def backend_name():
-    if tiktok_backend_ready():
-        return "tiktok_login"
-    if apify_enabled():
-        return "apify"
-    return "none"
+def backend_active(platforms=None):
+    """True when at least one requested backend has a saved login."""
+    selected = normalize_platforms(platforms)
+    return (("tiktok" in selected and tiktok_backend_ready())
+            or ("twitter" in selected and twitter_backend_ready()))
+
+
+def backend_name(platforms=None):
+    selected = normalize_platforms(platforms)
+    names = []
+    if "tiktok" in selected and tiktok_backend_ready():
+        names.append("tiktok_login")
+    if "twitter" in selected and twitter_backend_ready():
+        names.append("twitter_login")
+    return "+".join(names) if names else "none"
 
 
 # Queries already searched THIS RUN (normalized). Buckets, tiers and retry rounds routinely
@@ -394,50 +271,124 @@ def _jp_first(queries):
     return sorted(queries, key=lambda q: 0 if _CJK_RE.search(str(q)) else 1)
 
 
-def backend_search_health():
-    """Cumulative search health for the active backend this run: {searches, items, login_wall}.
-    Lets the caller fail fast when the backend returns NOTHING (logged out / headless block)."""
-    if tiktok_backend_ready() and tiktok_login is not None:
+def backend_search_health(platforms=None):
+    """Cumulative search health across BOTH backends this run: {searches, items, login_wall}.
+    Lets the caller fail fast when the backends return NOTHING (logged out / blocked)."""
+    total = {"searches": 0, "items": 0, "login_wall": 0}
+    selected = normalize_platforms(platforms)
+    for platform, mod, ready in (("tiktok", tiktok_login, tiktok_backend_ready()),
+                                 ("twitter", twitter_login, twitter_backend_ready())):
+        if platform not in selected:
+            continue
+        if not ready or mod is None:
+            continue
         try:
-            return tiktok_login.search_stats()
+            st = mod.search_stats() or {}
+            for k in total:
+                total[k] += int(st.get(k) or 0)
         except Exception:
-            return {}
-    return {}
+            pass
+    return total
 
 
 def reset_backend_search_health():
     _SEEN_QUERIES.clear()               # fresh run -> allow every query once again
-    if tiktok_login is not None:
+    for mod in (tiktok_login, twitter_login):
+        if mod is not None:
+            try:
+                mod.reset_search_stats()
+            except Exception:
+                pass
+
+
+def _merge_backend_cookies(platforms=None):
+    """Write ONE Netscape cookies.txt combining the TikTok + X session cookies (the format is
+    domain-scoped, so yt-dlp picks the right ones per URL automatically). Returns the path."""
+    selected = normalize_platforms(platforms)
+    parts = []
+    if "tiktok" in selected and tiktok_backend_ready():
         try:
-            tiktok_login.reset_search_stats()
+            ck = tiktok_login.export_cookies_txt()
+            if ck and Path(ck).exists():
+                parts.append(Path(ck).read_text("utf-8"))
         except Exception:
             pass
-
-
-def _ensure_tiktok_cookies(status_cb=None):
-    """Open (lazily) the shared logged-in session and point yt-dlp at its cookies."""
-    sess = tiktok_login.get_session(status_cb=status_cb)
-    if sess is None:
+    if "twitter" in selected and twitter_backend_ready():
+        try:
+            ck = twitter_login.export_cookies_txt()
+            if ck and Path(ck).exists():
+                parts.append(Path(ck).read_text("utf-8"))
+        except Exception:
+            pass
+    if not parts:
         return None
-    ck = tiktok_login.export_cookies_txt()
+    merged = Path(__file__).resolve().parent / "generated_assets" / "merged_cookies.txt"
+    merged.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(p.strip() for p in parts if p.strip())
+    merged.write_text("# Netscape HTTP Cookie File\n"
+                      + "\n".join(l for l in body.splitlines() if l and not l.startswith("#"))
+                      + "\n", "utf-8")
+    return str(merged)
+
+
+def _ensure_tiktok_cookies(status_cb=None, platforms=None):
+    """Open (lazily) the shared TikTok session ON ITS WORKER THREAD and point yt-dlp at
+    the merged cookies. Returns True when the session is ready."""
+    ready = tiktok_login.ensure_session(status_cb=status_cb)
+    ck = _merge_backend_cookies(platforms)
     if ck:
-        set_cookies(ck)            # yt-dlp downloads authenticated as the logged-in user
-    return sess
+        set_cookies(ck)            # yt-dlp downloads authenticated per-domain
+    return ready
 
 
-def backend_search(query, want, status_cb=None, sort="MOST_LIKED"):
-    """Run one keyword search through the active backend. Returns raw item dicts."""
-    if tiktok_backend_ready():
-        sess = _ensure_tiktok_cookies(status_cb)
-        if sess is not None:
-            try:
-                return sess.search(query, want=int(want), status_cb=status_cb, sort=sort) or []
-            except Exception as exc:  # noqa: BLE001
-                _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
-                return []
-    if apify_enabled():
-        return apify_search([query], int(want), status_cb=status_cb, sort_type=sort) or []
-    return []
+def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=None, deadline=None):
+    """Search the selected logged-in backends and return one popularity-ranked result set.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value shared with the bucket caller, so
+    one weak query cannot silently run beyond the bucket budget.
+    """
+    selected = normalize_platforms(platforms)
+    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+    if remaining is not None and remaining <= 0:
+        return []
+    # Ensure the TikTok session exists BEFORE kicking off the X worker: two sync_playwright
+    # instances starting at the same moment in different threads race in greenlet dispatch
+    # (observed: "Cannot switch to a different thread" on the very first parallel search).
+    # Both backends now run on their own dedicated worker threads - this thread only waits.
+    tt_ready = (_ensure_tiktok_cookies(status_cb, selected)
+                if "tiktok" in selected and tiktok_backend_ready() else False)
+    x_future = None
+    if "twitter" in selected and twitter_backend_ready():
+        # X searches on its worker thread while the TikTok search runs on the TikTok worker
+        x_future = twitter_login.search_async(
+            query, want=int(want), status_cb=status_cb, timeout_s=remaining)
+    items = []
+    if tt_ready:
+        items = tiktok_login.search_sync(query, want=int(want), status_cb=status_cb,
+                                         sort=sort, timeout_s=remaining) or []
+    if x_future is not None:
+        try:
+            wait_s = 90.0 if deadline is None else max(0.1, deadline - time.monotonic())
+            x_items = x_future.result(timeout=min(90.0, wait_s)) or []
+        except concurrent.futures.TimeoutError:
+            x_future.cancel()
+            _status(status_cb, f"X search timed out for {query!r}; moving to the next query.")
+            x_items = []
+        except Exception as exc:  # noqa: BLE001
+            _status(status_cb, f"X search failed ({exc.__class__.__name__}: {exc}).")
+            x_items = []
+        if x_items:
+            ck = _merge_backend_cookies(selected)
+            if ck:
+                set_cookies(ck)    # make sure yt-dlp has x.com cookies for these downloads
+            items.extend(x_items)
+    if str(sort or "").upper() == "MOST_LIKED":
+        items.sort(key=lambda item: int((_item_meta(item) or {}).get("likes") or 0), reverse=True)
+    platforms_found = sorted({(_item_meta(item) or {}).get("platform", "tiktok") for item in items})
+    _status(status_cb, f"Social search {query!r}: {len(items)} result(s) from "
+                       f"{', '.join(platforms_found) if platforms_found else 'selected backends'} "
+                       "ranked by likes.")
+    return items
 
 
 def _ytdlp_fetch(url, dest, status_cb=None, max_seconds=16.0):
@@ -479,21 +430,21 @@ def _ytdlp_fetch(url, dest, status_cb=None, max_seconds=16.0):
 
 
 def backend_download(item, dest, status_cb=None):
-    """Download a candidate item to dest via the right mechanism for its source backend."""
-    if isinstance(item, dict) and item.get("_source") == "tiktok_login":
-        url = item.get("webVideoUrl") or item.get("url") or ""
-        return _ytdlp_fetch(url, dest, status_cb=status_cb) if url else None
-    murl = _apify_media_url(item)
-    return _apify_download(murl, dest, status_cb=status_cb) if murl else None
+    """Download a candidate item to dest (yt-dlp with the logged-in session's cookies)."""
+    if not isinstance(item, dict):
+        return None
+    url = item.get("webVideoUrl") or item.get("url") or ""
+    return _ytdlp_fetch(url, dest, status_cb=status_cb) if url else None
 
 
 def close_backend():
-    """Tear down the shared TikTok session at the end of a run."""
-    if tiktok_login is not None:
-        try:
-            tiktok_login.close_session()
-        except Exception:
-            pass
+    """Tear down the shared TikTok + X sessions at the end of a run."""
+    for mod in (tiktok_login, twitter_login):
+        if mod is not None:
+            try:
+                mod.close_session()
+            except Exception:
+                pass
 
 
 def _entries(info):
@@ -694,7 +645,7 @@ def is_vertical_hq(path, ffprobe):
     return True
 
 
-def _sample_bgr_frames(path, ffmpeg, n, seconds):
+def _sample_bgr_frames(path, ffmpeg, n, seconds, width=360):
     """Grab n COLOR (BGR) frames spread across the clip as numpy arrays."""
     if cv2 is None or not ffmpeg:
         return []
@@ -705,7 +656,7 @@ def _sample_bgr_frames(path, ffmpeg, n, seconds):
             t = max(0.1, seconds * (i + 0.5) / n)
             fp = tmp / f"f{i}.jpg"
             subprocess.run([ffmpeg, "-y", "-ss", str(t), "-i", str(path),
-                            "-frames:v", "1", "-vf", "scale=360:-1", str(fp)],
+                            "-frames:v", "1", "-vf", f"scale={int(width)}:-1", str(fp)],
                            capture_output=True, timeout=30)
             if fp.exists():
                 img = cv2.imread(str(fp), cv2.IMREAD_COLOR)
@@ -721,6 +672,57 @@ def _sample_bgr_frames(path, ffmpeg, n, seconds):
         except Exception:
             pass
     return frames
+
+
+# ---- REAL text detection (RapidOCR) --------------------------------------------
+# The brightness/shape/color heuristic behind the old caption detector scored WHITE SHIRTS,
+# bright facades and train roofs as 10/10 "text-plastered" and rejected perfectly clean
+# clips (verified on real declined footage 2026-07-03). Actual OCR is the only reliable
+# signal: it reads LETTERS, not bright rectangles. RapidOCR (onnxruntime, offline, reads
+# Japanese + Latin) runs per-thread; when it is unavailable the text score is 0 and the
+# vision matcher remains the text gate.
+_OCR_LOCAL = threading.local()
+
+
+def _get_ocr():
+    if getattr(_OCR_LOCAL, "failed", False):
+        return None
+    ocr = getattr(_OCR_LOCAL, "ocr", None)
+    if ocr is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            ocr = RapidOCR()
+            _OCR_LOCAL.ocr = ocr
+        except Exception:
+            _OCR_LOCAL.failed = True
+            return None
+    return ocr
+
+
+def _ocr_text_rows(bgr, min_conf=0.55):
+    """Detected REAL text lines in one frame: [(x, y, w, h), ...] (>=2 chars). The default
+    confidence suits SCORING; the caption BLUR passes a lower one so partially-styled lines
+    (bold outline text the recognizer half-reads) are still covered."""
+    ocr = _get_ocr()
+    if ocr is None:
+        return []
+    try:
+        result, _ = ocr(bgr, use_det=True, use_cls=False, use_rec=True)
+    except Exception:
+        return []
+    rows = []
+    for r in (result or []):
+        try:
+            quad, text, conf = r[0], str(r[1]), float(r[2])
+        except Exception:
+            continue
+        if conf < min_conf or len(text.strip()) < 2:
+            continue
+        xs = [p[0] for p in quad]
+        ys = [p[1] for p in quad]
+        x, y = int(min(xs)), int(min(ys))
+        rows.append((x, y, max(1, int(max(xs) - x)), max(1, int(max(ys) - y))))
+    return rows
 
 
 def _sample_gray_frames(path, ffmpeg, n, seconds):
@@ -823,14 +825,36 @@ def _cluster_caption_boxes(per_frame_boxes):
 
 
 def has_burned_captions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=None):
-    """True if several sampled frames show big edited caption/text lines."""
-    if cv2 is None:
+    """True only for screen-fixed, caption-shaped text persistent across sampled frames.
+
+    Natural scene text (vending-machine labels, storefront signs, packaging) may produce lots
+    of OCR, but it must not be treated as a creator subtitle merely because it is readable.
+    """
+    if cv2 is None or np is None:
         return False  # can't check -> don't block
-    frames = _sample_gray_frames(path, ffmpeg, CAPTION_FRAME_SAMPLES, seconds)
+    frames = _sample_bgr_frames(path, ffmpeg, CAPTION_FRAME_SAMPLES, seconds)
     if not frames:
         return False
-    hits = sum(1 for g in frames if _frame_caption_lines(g) >= 1)
-    return hits >= CAPTION_REJECT_FRAMES
+    h, w = frames[0].shape[:2]
+    per_frame = []
+    for frame in frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        per_frame.append(_frame_caption_boxes(gray, hsv=hsv))
+    clusters = _cluster_caption_boxes(per_frame)
+    required_frames = max(3, int(math.ceil(len(frames) * 0.6)))
+    for cluster in clusters:
+        x, y, bw, bh = cluster["box"]
+        cx = x + bw / 2.0
+        # Creator subtitles are broad, screen-centred lines locked to the same UI position.
+        # Product labels tend to be smaller/multiple/object-bound and fail this geometry.
+        if (len(cluster["frames"]) >= required_frames
+                and bw >= 0.25 * w
+                and 0.22 * w <= cx <= 0.78 * w
+                and 0.20 * h <= y <= 0.90 * h
+                and bh <= 0.24 * h):
+            return True
+    return False
 
 
 def normalize_clip(src, out_path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, start=0.0):
@@ -889,100 +913,6 @@ def _evaluate_url(url, raw_dir, ffmpeg, ffprobe, per_clip_seconds, status_cb):
 _evaluate_url._n = 0
 
 
-def _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
-                      per_clip_seconds, lead_query, status_cb, cancel_check):
-    """Apify path: real TikTok keyword search + watermark-free download, then the same
-    vertical/HQ/no-text filters + normalize. Returns normalized clip Paths (hook first)."""
-    out_dir = Path(out_dir)
-    raw_dir = out_dir / "_raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    ffmpeg, ffprobe = _ffmpeg_tools()
-    if not ffmpeg:
-        _status(status_cb, "Scrape: ffmpeg not found, cannot prepare clips.")
-        return []
-    accepted = []   # raw paths, hook first
-    idx = [0]
-
-    def _take(items, need, hook=False):
-        # prefer portrait+HQ by metadata, then download watermark-free + filter text
-        ordered = sorted(items, key=lambda it: 0 if _apify_item_portrait_hq(it) else 1)
-        for it in ordered:
-            if cancel_check and cancel_check():
-                return
-            if len(accepted) >= need:
-                return
-            if _apify_item_portrait_hq(it) is False:
-                continue  # landscape / low-res by metadata
-            murl = _apify_media_url(it)
-            if not murl:
-                continue
-            raw = raw_dir / f"raw_{idx[0]:02d}.mp4"
-            idx[0] += 1
-            if not _apify_download(murl, raw, status_cb=status_cb):
-                continue
-            if not is_vertical_hq(raw, ffprobe):
-                try: raw.unlink()
-                except Exception: pass
-                continue
-            # NOTE: the brightness-based burned-caption heuristic is intentionally NOT applied
-            # here. It false-positives on bright Tokyo neon/daylight footage and was rejecting
-            # ~every clip, starving the pool. The vision quality-gate in agent_core
-            # (assign_clips_to_scenes_by_vision) is the authoritative caption/AI/relevance
-            # filter now and reliably rejects captioned clips from the poster frames.
-            accepted.append(raw)
-            if hook:
-                return
-
-    # 1) Hook: a real woman via a dedicated search query.
-    if lead_query:
-        _status(status_cb, "Apify: searching TikTok for a hook clip (real influencer)...")
-        _take(apify_search([lead_query], 6, status_cb=status_cb), 1, hook=True)
-
-    # 2) The rest from per-style queries. Apify's run-sync endpoint caps near 300s and
-    #    downloads every matched video before returning, so sending all queries at once
-    #    (with shouldDownloadVideos) routinely times out. Search in small chunks instead:
-    #    each sync run stays fast, one failing chunk can't wipe out the whole pool, and we
-    #    stop early once enough clips are accepted.
-    queries = build_queries(["tiktok"], terms, script_text, script_relevancy, count=max(count, 3))
-    _status(status_cb, f"Apify (legacy fallback path): searching TikTok for {len(queries)} flat queries...")
-    per_q = max(2, (count // max(len(queries), 1)) + 2)
-    need_total = count + (1 if accepted else 0)
-    CHUNK = 3
-    got_any = False
-    for i in range(0, len(queries), CHUNK):
-        if (cancel_check and cancel_check()) or len(accepted) >= need_total:
-            break
-        chunk = queries[i:i + CHUNK]
-        items = apify_search(chunk, per_q, status_cb=status_cb)
-        if items:
-            got_any = True
-            _take(items, need_total)
-    if not got_any and not accepted:
-        _status(status_cb, "Apify: no clips returned for these queries. Try broader style terms.")
-        return []
-
-    # 3) Normalize accepted raws into the seedance folder, hook first.
-    results = []
-    for raw in accepted[:count]:
-        stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
-        if not stability["stable"]:
-            _status(status_cb, "Scrape: skipped a clip whose usable window is an internal rapid-cut montage.")
-            continue
-        final = normalize_clip(raw, out_dir / f"scraped_{len(results):02d}.mp4", ffmpeg,
-                               seconds=per_clip_seconds, start=stability["start"])
-        if final:
-            results.append(final)
-            _status(status_cb, f"Scrape: prepared clip {len(results)}.")
-    try:
-        for f in raw_dir.glob("*"):
-            f.unlink()
-        raw_dir.rmdir()
-    except Exception:
-        pass
-    _status(status_cb, f"Scrape: {len(results)} watermark-free TikTok clip(s) ready.")
-    return results
-
-
 # ---- Metadata-driven pre-download filtering + post-download junk rejection -------
 # Reject obvious junk by metadata BEFORE spending a download, then reject fake-vertical /
 # black-bar / text-heavy clips AFTER download. The vision matcher in agent_core is still the
@@ -996,6 +926,19 @@ _LIVE_SCREEN_TERMS = ("ライブ配信", "生配信", "live配信", "配信中",
                       "実況プレイ", "live stream", "livestream")
 _IDOL_PROMO_TERMS = ("オーディション", "audition", "アイドル募集", "案件", "プロモ", "宣伝",
                      "広告", "sponsored", "#pr", "#ad")
+# AI-generated "photoreal Japan aesthetic" accounts flood 満員電車/新宿-style searches with
+# fake footage (verified live: 3 of 4 accepted clips were @ArtGen-style AI videos). Their
+# metadata almost always self-labels. Substring terms must be UNAMBIGUOUS (never bare "ai" -
+# it matches 'air', 'sakai', ...); short tokens are matched exactly against the hashtag list.
+_AI_CONTENT_TERMS = ("aiart", "ai art", "ai-generated", "ai generated", "aigenerated",
+                     "generated by ai", "made with ai", "created with ai", "midjourney",
+                     "stable diffusion", "stablediffusion", "comfyui", "civitai", "runway",
+                     "texttovideo", "text to video", "ai video", "aivideo", "ai girl",
+                     "aigirl", "ai beauty", "aibeauty", "ai model", "aimodel", "artgen",
+                     "aigen", "ai_gen", "kling ai", "pika labs", "luma dream", "grok imagine",
+                     "ai生成", "ai動画", "ai美女", "aiグラビア", "aiモデル", "aiイラスト", "ai美人")
+_AI_HASHTAGS = {"ai", "aiart", "aigirl", "aivideo", "aimodel", "aibeauty", "aigravure",
+                "sora", "midjourney", "veo", "veo3", "kling", "aiaesthetic", "aiphoto"}
 
 
 def _item_meta(item):
@@ -1057,17 +1000,22 @@ def _item_meta(item):
         ))
     except (TypeError, ValueError):
         m["likes"] = 0
+    m["platform"] = str(item.get("_platform") or "tiktok")
     return m
 
 
 def pre_download_candidate_filter(item, bucket_terms="", seen_ids=None, min_likes=0):
     """Decide BEFORE download whether a candidate is worth fetching, from metadata only.
-    Returns (accept: bool, reason: str, meta: dict). Rejects format junk (slideshow / live /
-    screen-recording / anime / news / quiz / idol-promo / non-vertical / low-res / duplicate)."""
+    Returns (accept: bool, reason: str, meta: dict).
+
+    Metadata text remains a weak signal, so fuzzy topic/style flags only affect ranking.
+    Reliable quality failures and the caller-supplied minimum-like floor are hard rejects.
+    Surviving candidates are ranked by likes before download."""
     m = _item_meta(item)
     seen_ids = seen_ids if seen_ids is not None else set()
     blob = " ".join([m.get("caption", ""), " ".join(m.get("hashtags", [])),
-                     m.get("author_name", ""), m.get("author_sig", ""), m.get("music", "")]).lower()
+                     m.get("author", ""), m.get("author_name", ""), m.get("author_sig", ""),
+                     m.get("music", "")]).lower()
     vid = m.get("id") or m.get("url")
     if vid and vid in seen_ids:
         return False, "duplicate video id/url", m
@@ -1075,29 +1023,44 @@ def pre_download_candidate_filter(item, bucket_terms="", seen_ids=None, min_like
         return False, "slideshow/image post", m
     w, h = m.get("w", 0), m.get("h", 0)
     if w and h:
-        if h < w * MIN_PORTRAIT_RATIO:
-            return False, "non-vertical source (metadata aspect ratio)", m
+        if h < w:                                      # true landscape by exact metadata
+            return False, "landscape source (metadata dimensions)", m
         if max(w, h) < 600:
             return False, "too low resolution", m
     dur = m.get("duration", 0.0)
     if dur and (dur < 1.5 or dur > 600):
         return False, "duration out of range", m
-    try:
-        min_likes = max(0, int(min_likes or 0))
-    except (TypeError, ValueError):
-        min_likes = 0
-    if min_likes and int(m.get("likes") or 0) < min_likes:
-        likes = int(m.get("likes") or 0)
-        reason = f"likes below {min_likes:,} ({likes:,})" if likes else f"like count missing/below {min_likes:,}"
-        return False, reason, m
-    if any(t in blob for t in _ANIME_GAME_TERMS):
-        return False, "anime/vtuber/game/cgi content", m
-    if any(t in blob for t in _NEWS_QUIZ_TERMS):
-        return False, "news/quiz/diagnosis/textpost", m
     if any(t in blob for t in _LIVE_SCREEN_TERMS):
         return False, "livestream/screen recording", m
+    # Self-labeled AI content stays a HARD reject: the tags are unambiguous by design
+    # (never a bare "ai") and generated footage must not enter a found-footage edit.
+    tags = {str(t).lstrip("#").strip().lower() for t in (m.get("hashtags") or [])}
+    if any(t in blob for t in _AI_CONTENT_TERMS) or (tags & _AI_HASHTAGS):
+        return False, "ai-generated content", m
+    # X engagement is structurally lower than TikTok. Use the same 4x normalization as ranking:
+    # TikTok body/hook floors stay 10K/20K; X equivalents become 2.5K/5K.
+    like_floor = platform_like_floor(min_likes, m.get("platform"))
+    m["effective_min_likes"] = like_floor
+    if like_floor and int(m.get("likes") or 0) < like_floor:
+        return False, f"below minimum likes ({int(m.get('likes') or 0):,} < {like_floor:,})", m
+
+    # ---- soft signals: penalties + popularity bonus -> rank_score (higher = fetch first)
+    penalty = 0.0
+    flags = []
+    if any(t in blob for t in _ANIME_GAME_TERMS):
+        penalty += 3.0; flags.append("possible_anime_gaming")
+    if any(t in blob for t in _NEWS_QUIZ_TERMS):
+        penalty += 2.0; flags.append("possible_news_textpost")
     if any(t in blob for t in _IDOL_PROMO_TERMS):
-        return False, "idol/audition/promo content", m
+        penalty += 2.0; flags.append("possible_promo_ad")
+    if w and h and h < w * MIN_PORTRAIT_RATIO:
+        penalty += 1.5; flags.append("squareish_aspect")
+    likes = int(m.get("likes") or 0)
+    if m.get("platform") == "twitter":
+        likes *= 4                                     # X likes run ~4x lower for equal reach
+    m["penalty"] = round(penalty, 1)
+    m["penalty_flags"] = flags
+    m["rank_score"] = round(math.log10(likes + 1) - penalty, 2)
     return True, "passed metadata pre-filter", m
 
 
@@ -1153,68 +1116,244 @@ def detect_fake_vertical_or_black_bars(path, ffmpeg, seconds=DEFAULT_CLIP_SECOND
     return out
 
 
-def text_heaviness_score(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS):
-    """0-10 estimate of burned-in caption load across 7 sampled COLOR frames.
-
-    Only PERSISTENT white/yellow text regions score heavily: burned captions sit at the SAME
-    screen position across frames, while bright signage/neon moves with the camera (and coloured
-    neon is already rejected by the hsv check). Transient bright text-like blobs add only a tiny
-    nudge - this keeps the neon night-street footage the channel lives on from being rejected."""
+def _ocr_frame_stats(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, n=4, width=540):
+    """OCR n sampled frames. Returns (area_fracs, line_counts, texts): per-frame text-area
+    fraction + confident line count for the heaviness score, and ALL read strings (looser
+    conf 0.4) so callers can check for AI-art watermarks like '@ArtGenTokyo'."""
     if cv2 is None or np is None:
-        return 0.0
-    bgr = _sample_bgr_frames(path, ffmpeg, 7, seconds)
-    if not bgr:
-        return 0.0
-    per_frame = []
+        return [], [], []
+    bgr = _sample_bgr_frames(path, ffmpeg, n, seconds, width=width)
+    ocr = _get_ocr()
+    if not bgr or ocr is None:
+        return [], [], []
+    areas, lines, texts = [], [], []
     for f in bgr:
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
-        per_frame.append(_frame_caption_boxes(g, hsv=hsv))
-    n = len(per_frame)
-    clusters = _cluster_caption_boxes(per_frame)
-    persistent = [c for c in clusters if len(c["frames"]) >= 2]
-    transient = len(clusters) - len(persistent)
-    frames_with = set()
-    for c in persistent:
-        frames_with |= c["frames"]
-    frac = len(frames_with) / n
-    avg = sum(len(c["frames"]) for c in persistent) / n
-    score = frac * 6.0 + avg * 2.0 + min(0.8, transient * 0.15)
-    # peak rule: one frame stacked with 2+ PERSISTENT caption lines = captioned clip
-    stack = {}
-    for c in persistent:
-        for fi in c["frames"]:
-            stack[fi] = stack.get(fi, 0) + 1
-    if stack and max(stack.values()) >= 2:
-        score = max(score, 3.0)
-    return round(min(10.0, score), 1)
+        h, w = f.shape[:2]
+        try:
+            result, _ = ocr(f, use_det=True, use_cls=False, use_rec=True)
+        except Exception:
+            result = None
+        area, cnt = 0.0, 0
+        for r in (result or []):
+            try:
+                quad, text, conf = r[0], str(r[1]).strip(), float(r[2])
+            except Exception:
+                continue
+            if conf >= 0.4 and len(text) >= 2:
+                texts.append(text)
+            if conf < 0.55 or len(text) < 2:
+                continue
+            xs = [p[0] for p in quad]
+            ys = [p[1] for p in quad]
+            area += max(1.0, max(xs) - min(xs)) * max(1.0, max(ys) - min(ys))
+            cnt += 1
+        areas.append(area / float(w * h))
+        lines.append(cnt)
+    return areas, lines, texts
+
+
+def _score_from_ocr(areas, lines):
+    if not areas:
+        return 0.0
+    mean_area_pct = 100.0 * sum(areas) / len(areas)
+    mean_lines = sum(lines) / float(len(lines))
+    return round(min(10.0, mean_area_pct * 0.85 + mean_lines * 0.35), 1)
+
+
+def is_captioned_candidate(text_heaviness, persistent_caption_shape=False):
+    """Hard caption gate: require both OCR evidence and screen-fixed subtitle geometry.
+
+    OCR load alone is natural on vending machines, menus, signs and packaging.
+    """
+    try:
+        score = float(text_heaviness or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return bool(persistent_caption_shape and score > 0.55)
+
+
+def balanced_platform_candidates(scored, limit, selected_platforms=None):
+    """Pick the most-liked candidates within each requested platform without TikTok crowd-out.
+
+    ``scored`` rows are ``(rank_score, item, metadata, clip_id)`` and are already sorted best
+    first. With TikTok and X active, alternate their best rows; use either side to fill shortages.
+    """
+    limit = max(0, int(limit or 0))
+    rows = list(scored or [])
+    if not limit:
+        return []
+    requested = normalize_platforms(selected_platforms)
+    if not {"tiktok", "twitter"}.issubset(requested):
+        return rows[:limit]
+    grouped = {"tiktok": [], "twitter": []}
+    remainder = []
+    for row in rows:
+        try:
+            platform = str((row[2] or {}).get("platform") or "tiktok").lower()
+        except Exception:
+            platform = "tiktok"
+        if platform in grouped:
+            grouped[platform].append(row)
+        else:
+            remainder.append(row)
+    if not grouped["tiktok"] or not grouped["twitter"]:
+        return rows[:limit]
+    chosen = []
+    while len(chosen) < limit and (grouped["tiktok"] or grouped["twitter"]):
+        for platform in ("tiktok", "twitter"):
+            if grouped[platform] and len(chosen) < limit:
+                chosen.append(grouped[platform].pop(0))
+    leftovers = grouped["tiktok"] + grouped["twitter"] + remainder
+    leftovers.sort(key=lambda row: row[0], reverse=True)
+    chosen.extend(leftovers[:max(0, limit - len(chosen))])
+    return chosen[:limit]
+
+
+# watermark patterns of AI-art accounts, matched against OCR-READ on-screen text
+_AI_WATERMARK_RE = re.compile(
+    r"artgen|aigen|ai[\s_.\-]?art|ai[\s_.\-]?generated|midjourney|stable\s*diffusion|"
+    r"grok|aigc|ai[\s_.\-]?video|@ai\b", re.IGNORECASE)
+
+
+def text_heaviness_score(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS):
+    """0-10 burned-in text load, measured by REAL OCR on 4 sampled frames.
+
+    Calibrated on real declined footage (2026-07-03): clean clips 0, a single caption line
+    ~1-5, a multi-line info overlay ~4-7, a text wall (text post / karaoke subtitles) >8.5.
+    The previous brightness heuristic scored white shirts and bright facades as 10/10
+    "text-plastered" and rejected perfectly clean clips. Returns 0.0 when OCR is
+    unavailable - the vision matcher remains the text gate in that case."""
+    areas, lines, _texts = _ocr_frame_stats(path, ffmpeg, seconds)
+    return _score_from_ocr(areas, lines)
+
+
+def _cluster_text_lines(per_frame, frame_w):
+    """Cluster OCR text boxes across frames into CAPTION LINES. Word-by-word captions change
+    their WIDTH every second at the same screen line, so strict IoU clustering split them into
+    fragments (-> half-blurred captions). Two boxes belong to the same line when they overlap
+    vertically by >=50% of the smaller height AND their horizontal centers sit within 35% of
+    the frame width. Returns [{"box": union, "frames": set}]."""
+    clusters = []
+    for fi, boxes in enumerate(per_frame):
+        for (x, y, w, h) in boxes:
+            cx = x + w / 2.0
+            placed = False
+            for c in clusters:
+                X, Y, W, H = c["box"]
+                ov = min(y + h, Y + H) - max(y, Y)
+                if ov >= 0.5 * min(h, H) and abs(cx - (X + W / 2.0)) <= 0.35 * frame_w:
+                    nx, ny = min(x, X), min(y, Y)
+                    c["box"] = (nx, ny, max(x + w, X + W) - nx, max(y + h, Y + H) - ny)
+                    c["frames"].add(fi)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"box": (x, y, w, h), "frames": {fi}})
+    return clusters
+
+
+def _caption_text_stroke_mask(frames, per_frame_boxes, allowed_regions=None):
+    """Build a feathered mask of caption GLYPHS, never their rectangular OCR boxes.
+
+    OCR only supplies line quadrilaterals. Inside those lines, local contrast plus common
+    white/yellow caption colours isolate letter strokes and their outlines. The union across
+    sampled frames handles changing word-by-word captions without masking the scene between
+    letters. ``allowed_regions`` limits work to persistent caption clusters.
+    """
+    if cv2 is None or np is None or not frames:
+        return None
+    fh, fw = frames[0].shape[:2]
+    mask = np.zeros((fh, fw), dtype=np.uint8)
+
+    def overlaps_region(box):
+        if not allowed_regions:
+            return True
+        x, y, w, h = box
+        for X, Y, W, H in allowed_regions:
+            if min(x + w, X + W) > max(x, X) and min(y + h, Y + H) > max(y, Y):
+                return True
+        return False
+
+    for frame, boxes in zip(frames, per_frame_boxes):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        for box in boxes:
+            if not overlaps_region(box):
+                continue
+            x, y, w, h = box
+            pad_x, pad_y = max(1, int(w * 0.03)), max(1, int(h * 0.10))
+            x0, y0 = max(0, x - pad_x), max(0, y - pad_y)
+            x1, y1 = min(fw, x + w + pad_x), min(fh, y + h + pad_y)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            g = gray[y0:y1, x0:x1]
+            c = hsv[y0:y1, x0:x1]
+            smooth = cv2.GaussianBlur(g, (0, 0), sigmaX=max(0.8, h / 14.0))
+            contrast = cv2.absdiff(g, smooth)
+            local_cut = max(14, int(np.percentile(contrast, 72)))
+            high_contrast = contrast >= local_cut
+            white = (g >= 175) & (c[:, :, 1] <= 105)
+            yellow = ((c[:, :, 0] >= 15) & (c[:, :, 0] <= 42)
+                      & (c[:, :, 1] >= 70) & (c[:, :, 2] >= 145))
+            bright_fill = float((g >= 195).mean())
+            if bright_fill >= 0.42:
+                # TikTok white caption bubble: keep the bubble/scene intact and select only
+                # its dark, locally contrasting letter strokes.
+                glyph = (g <= 170) & high_contrast
+            else:
+                # Outlined creator captions: select bright/yellow ink plus its close outline.
+                glyph = (white | yellow) & (high_contrast | (contrast >= 9))
+                edges = cv2.Canny(g, 55, 150) > 0
+                near_ink = cv2.dilate((white | yellow).astype(np.uint8),
+                                      np.ones((3, 3), np.uint8), iterations=1) > 0
+                glyph |= edges & near_ink
+            glyph_u8 = (glyph.astype(np.uint8) * 255)
+            glyph_u8 = cv2.dilate(glyph_u8,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                                  iterations=1)
+            target = mask[y0:y1, x0:x1]
+            np.maximum(target, glyph_u8, out=target)
+    if not int(np.count_nonzero(mask)):
+        return None
+    # A small feather hides mask edges but cannot expand into a rectangular patch.
+    return cv2.GaussianBlur(mask, (0, 0), sigmaX=1.6)
 
 
 def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=None):
-    """Blur PERSISTENT burned-in caption regions IN PLACE so leftover captions melt into the
-    footage instead of standing out. Detects caption-like boxes on 6 sampled frames, keeps only
-    regions that sit at the SAME screen position in >=2 frames (burned captions are static;
-    signage/scene text moves with the camera and never lines up), merges them, and boxblurs those
-    regions hard. Returns the number of blurred regions (0 = file untouched)."""
+    """Blur only OCR-detected caption LETTERS in place, never a rectangular line/box.
+
+    Automatic scraping rejects captioned footage; this is retained for explicit/manual and
+    legacy cleanup. It creates a feathered glyph mask from sampled frames and blends a blurred
+    copy of the video through that mask. Returns the caption-region count (0 = untouched).
+    """
     if cv2 is None or np is None or not ffmpeg:
         return 0
     path = Path(path)
-    bgr = _sample_bgr_frames(path, ffmpeg, 6, seconds)
-    if not bgr:
+    bgr = _sample_bgr_frames(path, ffmpeg, 8, seconds, width=720)
+    if not bgr or _get_ocr() is None:
         return 0
-    per_frame = []
-    for f in bgr:
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
-        per_frame.append(_frame_caption_boxes(g, hsv=hsv))
-    regions = [c["box"] for c in _cluster_caption_boxes(per_frame)
-               if len(c["frames"]) >= 2]                # persistent across frames = burned-in
+    gh, gw = bgr[0].shape[:2]
+    # LOW-confidence detection for the blur: styled caption lines (bold outline text) are
+    # often only half-read by the recognizer - at 0.55 whole lines went uncovered.
+    per_frame = [_ocr_text_rows(f, min_conf=0.35) for f in bgr]
+    clusters = _cluster_text_lines(per_frame, gw)
+    regions = []
+    for c in clusters:
+        x, y, w, h = c["box"]
+        cx = x + w / 2.0
+        # persistent lines are burned captions; a line seen once still counts when it is
+        # caption-SHAPED (wide or horizontally centered) - captions swap text every 1-2s
+        # and can hit a single sampled frame ("only half the captions got blurred").
+        if len(c["frames"]) >= 2 or w >= 0.20 * gw or 0.30 * gw <= cx <= 0.70 * gw:
+            regions.append((x, y, w, h))
     if not regions:
         return 0
-    regions = regions[:3]
+    regions = regions[:8]
+    stroke_mask = _caption_text_stroke_mask(bgr, per_frame, allowed_regions=regions)
+    if stroke_mask is None:
+        return 0
 
-    # scale detection coords (frames are 360px wide) to the real video size
-    gh, gw = bgr[0].shape[:2]
+    # Scale the sparse glyph mask to the real video size.
     _, ffprobe = _ffmpeg_tools()
     vw = vh = 0
     try:
@@ -1226,27 +1365,21 @@ def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=N
         pass
     if not (vw and vh):
         return 0
-    sx, sy = vw / float(gw), vh / float(gh)
-    mx, my = int(vw * 0.02), int(vh * 0.012)            # margin so blur covers outlines/shadows
-
-    def _even(v):
-        return max(2, int(v) // 2 * 2)
-
-    parts = [f"[0:v]split={len(regions) + 1}[b0]" + "".join(f"[c{k}]" for k in range(len(regions)))]
-    cur = "b0"
-    for k, (x, y, w0, h0) in enumerate(regions):
-        X = max(0, int(x * sx) - mx); Y = max(0, int(y * sy) - my)
-        W = _even(min(vw - X, w0 * sx + 2 * mx)); H = _even(min(vh - Y, h0 * sy + 2 * my))
-        rad = max(10, min(30, H // 4))
-        parts.append(f"[c{k}]crop={W}:{H}:{X}:{Y},boxblur=luma_radius={rad}:luma_power=2:"
-                     f"chroma_radius={max(5, rad // 2)}:chroma_power=2,"
-                     f"eq=brightness=-0.06:saturation=0.9[bl{k}]")   # slight darken so white bubbles blend
-        nxt = f"o{k}"
-        parts.append(f"[{cur}][bl{k}]overlay={X}:{Y}[{nxt}]")
-        cur = nxt
+    mask_full = cv2.resize(stroke_mask, (vw, vh), interpolation=cv2.INTER_LINEAR)
+    mask_path = path.with_name(path.stem + "_capmask.png")
+    if not cv2.imwrite(str(mask_path), mask_full):
+        return 0
     tmp = path.with_name(path.stem + "_capblur" + path.suffix)
+    # NOTE: no "shortest=1" on maskedmerge (ffmpeg 8.x rejects it -> silent graph death) and
+    # NO "-loop 1" on the mask (an endless input makes the graph run forever). The single-frame
+    # mask is repeated by framesync and the graph ends with the primary video.
+    graph = ("[0:v]split=2[base][blur_src];"
+             "[blur_src]gblur=sigma=22[blurred];"
+             "[1:v]format=gray[mask];"
+             "[base][blurred][mask]maskedmerge[v]")
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
-           "-filter_complex", ";".join(parts), "-map", f"[{cur}]", "-map", "0:a?",
+           "-i", str(mask_path),
+           "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
            "-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "copy",
            "-movflags", "+faststart", str(tmp)]
     try:
@@ -1260,29 +1393,37 @@ def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=N
             pass
     except Exception:
         pass
+    finally:
+        try:
+            mask_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     return 0
 
 
 def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_terms="",
                   per_clip_seconds=DEFAULT_CLIP_SECONDS, status_cb=None, cancel_check=None,
                   seen_ids=None, query_perf=None, candidate_statuses=None, min_likes=0,
-                  search_sort="MOST_LIKED"):
+                  search_sort="MOST_LIKED", platforms=None, deadline=None):
     """Search the EXACT given bucket queries (NO script-derived expansion via build_queries),
     pre-filter by metadata, download, then reject fake-vertical/black-bar and text-heavy clips.
     Returns accepted dicts: {path, meta, query, tier, clip_id, black_bar_score, text_heaviness,
     is_fake_vertical}. Records per-query stats in query_perf and per-candidate status rows in
-    candidate_statuses (lists, if provided). Uses the active search backend (a logged-in TikTok
-    session by default, Apify only as a fallback when its token is set)."""
+    candidate_statuses (lists, if provided). Uses the logged-in TikTok session backend."""
     queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
-    if not backend_active() or not queries:
+    selected_platforms = normalize_platforms(platforms)
+    if not backend_active(selected_platforms) or not queries:
         return []
     # Search discipline: JAPANESE queries first (native terms index this content far better than
     # the English variants), and NEVER re-run a query already searched this run - buckets, tiers
     # and retry rounds routinely produce near-duplicates that would burn 5-15s each for nothing.
     ordered = _jp_first(queries)
+    # dedupe NAMESPACE: retry rounds may re-run a main-phase query once (the pool state has
+    # changed by then), but never repeat within their own phase.
+    _ns = "retry" if str(tier or "").startswith("retry") else "main"
     fresh, dup = [], 0
     for q in ordered:
-        if _norm_query(q) in _SEEN_QUERIES:
+        if f"{_ns}|{_norm_query(q)}" in _SEEN_QUERIES:
             dup += 1
             continue
         fresh.append(q)
@@ -1347,8 +1488,8 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             candidate_statuses.append(row)
 
     def _analyze_item(raw, cid, m, q_, file_key):
-        """Full quality gate + normalize + caption blur for ONE downloaded clip. Runs in a
-        small thread pool: the ffmpeg/OpenCV work here (2 re-encodes + several frame passes,
+        """Full quality gate + normalize for ONE downloaded clip. Runs in a
+        small thread pool: the ffmpeg/OpenCV work here (re-encode + several frame passes,
         ~20-30s per clip) dominated the whole scrape phase when it ran serially after each
         download. Workers never call status_cb (it raises RunCancelled on the main thread's
         cancel flag); log lines are returned and emitted serially by the collector."""
@@ -1367,17 +1508,30 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                     "status": "rejected_black_bars", "reason": fv["reason"],
                     "extra": {"black_bar_score": fv["black_bar_score"],
                               "is_fake_vertical": fv["is_fake_vertical"]}}
-        th = text_heaviness_score(raw, ffmpeg, per_clip_seconds)
-        # POLICY: most Japanese TikToks carry SOME burned captions - rejecting them all
-        # starves the pool. Hard-reject only clips PLASTERED with text (constant multi-line
-        # captions / text posts); lighter captions are ACCEPTED and their persistent
-        # caption regions get BLURRED below so they melt into the footage.
-        if th > 7.0:
-            logs.append(f"Rejected clip ({bucket_id}/{q_}): text-plastered TikTok ({th}/10)")
-            _save_declined(raw, cid, f"text-plastered ({th}/10)", score=th)
+        # One OCR pass (width 720 so small watermarks stay readable) gives BOTH the text
+        # score and the on-screen strings for the AI-watermark check below.
+        _areas, _lines, _texts = _ocr_frame_stats(raw, ffmpeg, per_clip_seconds, width=720)
+        th = _score_from_ocr(_areas, _lines)
+        # AI-art accounts flood these searches with photoreal FAKE footage; the metadata is
+        # often clean but the video carries their watermark (e.g. '@ArtGenTokyo') - OCR
+        # reads it. Found-footage mode must never use generated clips.
+        _wm = next((t for t in _texts if _AI_WATERMARK_RE.search(t)), None)
+        if _wm is not None:
+            logs.append(f"Rejected clip ({bucket_id}/{q_}): AI-art watermark on screen ({_wm!r})")
+            _save_declined(raw, cid, f"ai-generated (watermark {_wm[:40]!r})")
             _reject(raw)
             return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
-                    "status": "rejected_text_heavy", "reason": f"burned-in text {th}/10",
+                    "status": "rejected_ai_content", "reason": f"AI watermark {_wm[:40]!r}"}
+        # Captions are a HARD reject. Blurring large subtitles makes the underlying subject
+        # unrecognisable, so never modify and accept captioned footage as a workaround.
+        persistent_caption = has_burned_captions(
+            raw, ffmpeg, seconds=per_clip_seconds, status_cb=None)
+        if is_captioned_candidate(th, persistent_caption):
+            logs.append(f"Rejected clip ({bucket_id}/{q_}): burned-in captions/text ({th}/10)")
+            _save_declined(raw, cid, f"burned-in captions/text ({th}/10)", score=th)
+            _reject(raw)
+            return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
+                    "status": "rejected_captions", "reason": f"burned-in captions/text {th}/10",
                     "extra": {"text_heaviness_score": th}}
         stability = stable_segment_profile(raw, ffmpeg, ffprobe, per_clip_seconds)
         if not stability["stable"]:
@@ -1401,27 +1555,30 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         if not final:
             return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
                     "status": "rejected_quality", "reason": "normalize failed"}
-        # Captions in the accepted band (1.0-5.5): BLUR the persistent caption regions on the
-        # final clip so they melt into the footage instead of standing out under our own
-        # captions. Re-score after the blur so downstream gates see the softened state.
-        if th >= 1.0:
-            _softened = blur_caption_regions(final, ffmpeg, per_clip_seconds, status_cb=None)
-            if _softened:
-                th_after = text_heaviness_score(final, ffmpeg, per_clip_seconds)
-                logs.append(f"Softened {_softened} caption region(s) "
-                            f"({bucket_id}/{q_}, text {th}/10 -> {th_after}/10).")
-                th = th_after
         record = {"path": final, "meta": m, "query": q_, "tier": tier, "clip_id": cid,
-                  "likes": m.get("likes", 0),
+                  "platform": m.get("platform", "tiktok"), "likes": m.get("likes", 0),
                   "black_bar_score": fv["black_bar_score"], "text_heaviness": th,
                   "is_fake_vertical": False,
                   "internal_cut_count": stability["internal_cut_count"],
                   "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
                   "min_shot_seconds": stability["min_shot_seconds"]}
+        # Persist live-panel metadata next to the accepted candidate immediately. The previous
+        # implementation kept this only in memory, so the running-job UI could not distinguish
+        # accepted TikTok footage from accepted X footage.
+        try:
+            final.with_suffix(".json").write_text(json.dumps({
+                "status": "accepted", "platform": m.get("platform", "tiktok"),
+                "likes": m.get("likes", 0), "clip_id": cid, "query": q_,
+                "bucket_id": bucket_id, "tier": tier, "text_heaviness": th,
+                "captioned": False,
+            }, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         return {"kind": "accepted", "vertical": True, "query": q_, "logs": logs,
                 "status": "downloaded_pending_review", "reason": "passed pre-filters",
                 "record": record,
-                "extra": {"likes": m.get("likes", 0), "black_bar_score": fv["black_bar_score"],
+                "extra": {"platform": m.get("platform", "tiktok"),
+                          "likes": m.get("likes", 0), "black_bar_score": fv["black_bar_score"],
                           "text_heaviness_score": th,
                           "internal_cut_count": stability["internal_cut_count"],
                           "rapid_internal_cut_count": stability["rapid_internal_cut_count"],
@@ -1429,36 +1586,46 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
 
     # Downloads MUST stay on this thread (the logged-in browser session is single-threaded),
     # but the per-clip ffmpeg/OpenCV gauntlet runs in a small pool so the next download
-    # proceeds while earlier clips are still being scored, normalized and caption-blurred.
+    # proceeds while earlier clips are still being scored and normalized.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     try:
       for qidx, q in enumerate(queries):
-        if (cancel_check and cancel_check()) or len(accepted) >= want:
+        if ((cancel_check and cancel_check()) or len(accepted) >= want
+                or (deadline is not None and time.monotonic() >= deadline)):
             break
         query_stop = min(int(want), len(accepted) + per_query_quota)
-        _SEEN_QUERIES.add(_norm_query(q))
-        items = backend_search(q, max(6, want + 4), status_cb=status_cb,
-                               sort=search_sort) or []
-        if _APIFY_OUT_OF_CREDITS[0]:        # apify fallback: stop hammering a billing-blocked account
-            break
+        _SEEN_QUERIES.add(f"{_ns}|{_norm_query(q)}")
+        # collect a LARGE candidate pool per search - the accept target is what must survive
+        # the gates, not what the search is allowed to return.
+        items = backend_search(q, max(12, want * 3), status_cb=status_cb,
+                               sort=search_sort, platforms=selected_platforms,
+                               deadline=deadline) or []
         raw_n = len(items)
         meta_rej = dl = vert = clean = acc = 0
         meta_reasons = {}
-        # Phase A (serial): metadata filter + download. Overshoot the per-query quota by a
-        # couple of downloads because some of them will fail the parallel analysis below.
-        need = max(0, (query_stop - len(accepted)) + 2)
-        pending = []
+        # Phase A (serial): metadata-filter ALL items first, then download in RANK order
+        # (popularity bonus minus soft penalties, after the requested minimum-like gate).
+        # Overshoot the quota because some downloads will fail the parallel analysis below.
+        need = max(0, (query_stop - len(accepted)) * 2 + 4)
+        scored = []
         for it in items:
-            if (cancel_check and cancel_check()) or len(pending) >= need:
-                break
             ok, reason, m = pre_download_candidate_filter(
                 it, bucket_terms, seen_ids, min_likes=min_likes)
-            cid = m.get("id") or m.get("url") or f"{bucket_id}:{q}:{raw_n}:{dl}"
+            cid = m.get("id") or m.get("url") or f"{bucket_id}:{q}:{raw_n}:{len(scored)}"
             if not ok:
                 meta_rej += 1
                 meta_reasons[reason] = meta_reasons.get(reason, 0) + 1
-                _cstat(q, cid, "pre_download_rejected", reason)
+                _cstat(q, cid, "pre_download_rejected", reason,
+                       {"platform": m.get("platform"), "likes": m.get("likes", 0)})
                 continue
+            scored.append((float(m.get("rank_score", 0.0)), it, m, cid))
+        scored.sort(key=lambda r: r[0], reverse=True)
+        scored = balanced_platform_candidates(scored, need, selected_platforms)
+        pending = []
+        for _rs, it, m, cid in scored:
+            if ((cancel_check and cancel_check()) or len(pending) >= need
+                    or (deadline is not None and time.monotonic() >= deadline)):
+                break
             raw = raw_dir / f"raw_{qidx}_{dl}.mp4"
             dl += 1
             if not backend_download(it, raw, status_cb=None):
@@ -1515,6 +1682,14 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             raw_dir.rmdir()
     except Exception:
         pass
+    if accepted:
+        platform_counts = {}
+        for record in accepted:
+            platform = str(record.get("platform") or "tiktok").lower()
+            platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        _status(status_cb, f"Bucket {bucket_id}: accepted platform mix - "
+                           + ", ".join(f"{count} {'X' if platform == 'twitter' else platform.title()}"
+                                       for platform, count in sorted(platform_counts.items())))
     return accepted
 
 
@@ -1543,16 +1718,10 @@ def scrape_clips(
     raw_dir = out_dir / "_raw"
     out_dir.mkdir(parents=True, exist_ok=True)
     platforms = platforms or ["tiktok", "instagram"]
-    # Apify is the preferred path when configured: real TikTok keyword search +
-    # watermark-free download. yt-dlp (cookies) is the fallback.
-    if apify_active():
-        _status(status_cb, "Scrape: using Apify TikTok search (watermark-free).")
-        return _scrape_via_apify(out_dir, terms, count, script_text, script_relevancy,
-                                 per_clip_seconds, lead_query, status_cb, cancel_check)
     # TikTok-only via yt-dlp; a cookie connection is mandatory for that path.
     if not cookies_active():
-        _status(status_cb, "Scrape: not connected. Set an Apify token, or connect TikTok "
-                           "(pick your signed-in browser) in the scrape settings, and try again.")
+        _status(status_cb, "Scrape: not connected. Connect TikTok (Settings -> Connect TikTok) "
+                           "and try again.")
         return []
     _status(status_cb, "Scrape: connected — pulling real clips from TikTok hashtags.")
     ffmpeg, ffprobe = _ffmpeg_tools()
