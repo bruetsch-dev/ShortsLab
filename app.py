@@ -1,14 +1,60 @@
 import argparse
+import datetime
+import faulthandler
 import html
 import json
 import os
 import re
+import sys
 import threading
 import time
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# --------------------------------------------------------------------------- crash logging
+# The launcher runs the app with a hidden window and no stderr redirection, so a crash used to
+# vanish with no trace. Persist everything: faulthandler dumps native faults (onnxruntime/opencv
+# segfaults, C-level aborts) and the excepthooks below capture uncaught exceptions in ANY thread
+# (the job workers are daemon threads - their uncaught errors would otherwise be silent).
+_CRASH_LOG = Path(__file__).resolve().parent / "logs" / "crash.log"
+try:
+    _CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _CRASH_FH = open(_CRASH_LOG, "a", buffering=1, encoding="utf-8", errors="replace")
+    faulthandler.enable(file=_CRASH_FH, all_threads=True)
+except Exception:
+    _CRASH_FH = None
+
+
+def _log_crash(kind, exc_type, exc_value, exc_tb, thread_name=None):
+    try:
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        who = f" [{thread_name}]" if thread_name else ""
+        header = f"\n===== {kind}{who} @ {stamp} =====\n"
+        body = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        (_CRASH_FH or sys.stderr).write(header + body)
+        if _CRASH_FH:
+            _CRASH_FH.flush()
+    except Exception:
+        pass
+
+
+def _main_excepthook(exc_type, exc_value, exc_tb):
+    _log_crash("UNCAUGHT (main)", exc_type, exc_value, exc_tb)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _thread_excepthook(args):
+    _log_crash("UNCAUGHT (thread)", args.exc_type, args.exc_value, args.exc_traceback,
+               thread_name=getattr(args.thread, "name", None))
+
+
+sys.excepthook = _main_excepthook
+try:
+    threading.excepthook = _thread_excepthook   # Python 3.8+
+except Exception:
+    pass
 
 import agent_core
 import pipeline
@@ -157,7 +203,7 @@ def brand_header(back=False):
         f'{back_html}'
         '<div class="brand">'
         '<img class="brand-mark" src="/static/app_icon.png" alt="" width="52" height="52">'
-        f'<div><h1>Shortslab</h1>{STEPS_HTML}</div>'
+        f'<div><h1>Shortslab</h1></div>'
         '</div>'
         '</div>'
         f'{top_nav()}'
@@ -451,9 +497,169 @@ def project_form_state(project_dir):
     return normalized
 
 
+_LAB_W, _LAB_H = 384, 1012          # one-side canvas (flat front-view)
+
+
+def _lab_scene_inner():
+    """Inner SVG markup for ONE side of a flat FRONT-VIEW pixel-art laboratory in the blue/white/
+    grey clinical style: a framed wall poster, two loaded wall shelves (reagent bottles, jars,
+    Erlenmeyer flask + beaker with blue liquid, test-tube racks), a dark-topped counter over a
+    two-door base cabinet, a microscope + a test-tube rack on the bench, and a tiled floor. Drawn
+    on a 384x1012 canvas; the opposite screen edge just mirrors this. Colours are baked in (they
+    read on both themes - dark outlines + blue pop on the light parchment, white bodies + blue pop
+    on the dark canvas); overall subtlety comes from the ::before opacity."""
+    OUT = "#39435c"       # dark navy outline (the pixel-sticker edge)
+    WH = "#f7f9fc"        # white equipment body
+    WH2 = "#e7ecf3"       # off-white / label plate / shaded face
+    GR = "#d6dce6"        # light grey (shelf plank, cabinet trim)
+    GRD = "#c0c9d6"       # darker grey (edges, handles, brackets)
+    CT = "#333b4d"        # dark counter top / rack base / microscope
+    BL = "#3b7ae0"        # primary blue accent (caps, liquid, labels)
+    BLD = "#2757ad"       # deep blue
+    BLL = "#c3d8f6"       # pale blue (water body)
+    FL = "#dfe4ec"        # floor tile grid line
+    S = []
+
+    def r(x, y, w, h, f, rx=0, st=OUT, sw=3):
+        S.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{rx}" fill="{f}" stroke="{st}" stroke-width="{sw}"/>')
+
+    def rn(x, y, w, h, f, rx=0):     # fill only, no stroke
+        S.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{rx}" fill="{f}"/>')
+
+    def ln(x1, y1, x2, y2, st=OUT, sw=3):
+        S.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{st}" stroke-width="{sw}" stroke-linecap="round"/>')
+
+    def cr(cx, cy, rd, f, st=OUT, sw=3):
+        S.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{rd:.1f}" fill="{f}" stroke="{st}" stroke-width="{sw}"/>')
+
+    def pg(pts, f, st=OUT, sw=3):
+        pp = " ".join(f"{a:.1f},{b:.1f}" for a, b in pts)
+        S.append(f'<polygon points="{pp}" fill="{f}" stroke="{st}" stroke-width="{sw}" stroke-linejoin="round"/>')
+
+    # ---------- item drawers (x = left, by = bottom baseline) ----------
+    def bottle(x, by, w, h, cap=BL):
+        bt = by - h
+        r(x, bt + w * 0.30, w, h - w * 0.30, WH, rx=6)                    # body
+        nw = w * 0.46
+        r(x + (w - nw) / 2, bt + w * 0.05, nw, w * 0.32, WH, rx=2)        # neck
+        r(x + (w - nw) / 2 - 3, bt - 3, nw + 6, w * 0.18 + 3, cap, rx=3)  # cap
+        r(x + w * 0.15, by - h * 0.52, w * 0.70, h * 0.32, WH2, rx=2)     # label plate
+        ln(x + w * 0.26, by - h * 0.42, x + w * 0.74, by - h * 0.42, BL, 4)
+        ln(x + w * 0.26, by - h * 0.31, x + w * 0.60, by - h * 0.31, GRD, 4)
+
+    def jar(x, by, w, h, cap=BLD):
+        bt = by - h
+        r(x, bt + w * 0.20, w, h - w * 0.20, WH, rx=5)                    # body
+        r(x - 3, bt, w + 6, w * 0.26, cap, rx=3)                          # wide screw cap
+        r(x + w * 0.18, by - h * 0.5, w * 0.64, h * 0.30, WH2, rx=2)      # label
+
+    def beaker(x, by, w, h):
+        bt = by - h
+        r(x, bt, w, h, WH, rx=3)                                          # glass
+        rn(x + 3, by - h * 0.52, w - 6, h * 0.52 - 3, BLL)               # water body
+        rn(x + 3, by - h * 0.52, w - 6, 5, BL)                            # water surface line
+        for i in range(1, 4):                                            # graduation ticks
+            ln(x + w * 0.60, bt + h * 0.2 * i, x + w * 0.82, bt + h * 0.2 * i, BLD, 2)
+        ln(x - 4, bt, x + w * 0.34, bt, OUT, 3)                          # pour lip
+
+    def flask(x, by, w, h):                                              # Erlenmeyer
+        bt = by - h
+        nw = w * 0.28
+        pg([(x, by), (x + w, by), (x + w * 0.64, bt + h * 0.30), (x + w * 0.36, bt + h * 0.30)], WH)  # cone
+        pg([(x + w * 0.16, by - 4), (x + w * 0.84, by - 4), (x + w * 0.60, by - h * 0.34), (x + w * 0.40, by - h * 0.34)], BLL, st="none", sw=0)  # liquid
+        r(x + (w - nw) / 2, bt, nw, h * 0.34, WH, rx=2)                   # neck
+        ln(x + (w - nw) / 2 - 3, bt + h * 0.08, x + (w + nw) / 2 + 3, bt + h * 0.08, OUT, 3)  # rim ring
+
+    def rack(x, by, w, h, n=4):
+        bt = by - h
+        gap = w / n
+        for i in range(n):                                               # test tubes
+            tx = x + gap * i + gap * 0.5
+            r(tx - 6, bt, 12, h * 0.82, WH, rx=4)
+            rn(tx - 3, by - h * 0.55, 6, h * 0.22, BL)
+        r(x, by - h * 0.30, w, h * 0.30, CT, rx=3)                       # rack base
+        rn(x + 4, by - h * 0.30 + 3, w - 8, 5, "#4a566e")               # base highlight
+
+    def microscope(x, by, s):
+        r(x, by - s * 0.14, s, s * 0.14, WH, rx=4)                       # foot
+        r(x + s * 0.16, by - s * 0.9, s * 0.26, s * 0.78, WH, rx=4)      # pillar
+        pg([(x + s * 0.42, by - s * 0.86), (x + s * 0.9, by - s * 0.66),
+            (x + s * 0.84, by - s * 0.5), (x + s * 0.36, by - s * 0.7)], CT)  # angled body
+        cr(x + s * 0.9, by - s * 0.62, s * 0.1, BL)                      # eyepiece
+        r(x + s * 0.34, by - s * 0.36, s * 0.2, s * 0.12, CT, rx=2)      # stage
+        r(x + s * 0.4, by - s * 0.5, s * 0.1, s * 0.16, GRD, rx=2)       # objective
+
+    def scale(x, by, w, h):
+        r(x, by - h * 0.46, w, h * 0.46, WH, rx=5)                       # body
+        r(x + w * 0.14, by - h, w * 0.72, h * 0.5, WH2, rx=3)            # weighing pan
+        r(x + w * 0.2, by - h * 0.38, w * 0.4, h * 0.16, BL, rx=2)       # display
+
+    def poster(x, y, w, h):
+        r(x, y, w, h, WH, rx=4)                                          # frame
+        rn(x + 7, y + 7, w - 14, h - 14, WH2)                            # mat
+        pg([(x + w * 0.42, y + h * 0.18), (x + w * 0.58, y + h * 0.18),
+            (x + w * 0.72, y + h * 0.6), (x + w * 0.28, y + h * 0.6)], WH, BL, 4)  # flask icon
+        rn(x + w * 0.34, y + h * 0.44, w * 0.32, h * 0.16, BL)           # icon liquid
+        ln(x + w * 0.44, y + h * 0.12, x + w * 0.56, y + h * 0.12, BL, 4)
+        for i in range(3):
+            ln(x + w * 0.22, y + h * 0.72 + i * (h * 0.09), x + w * 0.78, y + h * 0.72 + i * (h * 0.09), GRD, 3)
+
+    def shelf(y):
+        r(0, y, 372, 15, GR)                                             # plank
+        rn(0, y + 12, 372, 4, GRD)                                       # front shadow
+        for bx in (26, 320):                                            # brackets
+            pg([(bx, y + 15), (bx + 24, y + 15), (bx, y + 42)], GRD)
+
+    # ================= compose the side (top -> bottom) =================
+    poster(40, 62, 176, 150)
+    shelf(300)
+    bottle(34, 300, 68, 104); jar(122, 300, 62, 86); jar(200, 300, 52, 70, cap=BL)
+    shelf(492)
+    flask(28, 492, 96, 112); beaker(142, 492, 60, 98); rack(216, 492, 120, 96, n=4)
+    r(0, 690, 374, 30, CT, rx=3)                                         # counter top
+    rn(5, 693, 364, 5, "#4a566e")                                       # counter highlight
+    r(10, 720, 356, 190, WH, rx=5)                                       # cabinet body
+    ln(10, 744, 366, 744, GRD, 3)                                        # top drawer seam
+    ln(188, 750, 188, 902, GRD, 3)                                       # door seam
+    r(167, 802, 9, 44, GRD, rx=3); r(201, 802, 9, 44, GRD, rx=3)         # door handles
+    r(28, 910, 320, 22, GRD, rx=2)                                       # kickplate
+    microscope(38, 690, 122)
+    rack(206, 690, 128, 100, n=4)
+    rn(0, 932, 384, 80, WH2)                                             # floor base
+    for fy in (932, 964, 996):
+        ln(0, fy, 384, fy, FL, 2)
+    for fx in (52, 130, 208, 286, 360):
+        ln(fx, 932, fx, 1012, FL, 2)
+    return "".join(S)
+
+
+def _lab_scene_uri(mirror=False):
+    """Wrap the front-view side scene into an SVG data URI; `mirror` flips it for the other edge."""
+    inner = _lab_scene_inner()
+    if mirror:
+        inner = f'<g transform="translate({_LAB_W},0) scale(-1,1)">{inner}</g>'
+    svg = (f"<svg xmlns='http://www.w3.org/2000/svg' width='{_LAB_W}' height='{_LAB_H}' "
+           f"viewBox='0 0 {_LAB_W} {_LAB_H}'>{inner}</svg>")
+    return "url(\"data:image/svg+xml," + urllib.parse.quote(svg) + "\")"
+
+
+_LAB_L = _lab_scene_uri(mirror=False)   # left-edge lab furniture
+_LAB_R = _lab_scene_uri(mirror=True)    # mirrored, right edge
+
+
 def app_style():
-    return """
-    <style>
+    return ("""
+    <style>""" + f"""
+      /* flat front-view pixel-art LAB furniture framing the LEFT + RIGHT edges (centre stays clean) */
+      body::before {{
+        content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+        background-image: {_LAB_L}, {_LAB_R};
+        background-repeat: no-repeat, no-repeat;
+        background-position: left bottom, right bottom;
+        background-size: auto 96vh, auto 96vh;
+        opacity: .3;
+      }}
+      .theme-dark body::before {{ opacity: .26; }}""" + """
       /* ===== OVERWORLD — pixel-art neo-brutalist editorial on warm parchment ===== */
       :root {
         color-scheme: light;
@@ -1218,12 +1424,14 @@ def app_style():
       .output-actions .button { width: auto; flex: 1; padding: 10px 12px; }
       .media-inline { width: 100%; max-height: 260px; border-radius: var(--r-md); background: var(--bg-base); border: 1px solid var(--line); object-fit: contain; }
       .asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
-      .asset-card { display: grid; gap: 12px; align-content: start; padding: 14px; }
+      /* min-width:0 so a long unbreakable title (e.g. SFX MASTER - SHORT_..._TIMELINE_...) can't
+         force the card wider than its grid column and overflow into the neighbour */
+      .asset-card { display: grid; gap: 12px; align-content: start; padding: 14px; min-width: 0; }
       .asset-card .asset-figure { display: block; padding: 0; margin: 0; border: 0; background: none; box-shadow: none; width: 100%; border-radius: var(--r-md); overflow: hidden; cursor: zoom-in; }
       .asset-card .asset-figure::after { display: none; }
       .asset-thumb { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); }
-      .asset-body { display: grid; gap: 6px; }
-      .asset-body h2 { margin: 0; font-size: 17px; line-height: 1.2; }
+      .asset-body { display: grid; gap: 6px; min-width: 0; }
+      .asset-body h2 { margin: 0; font-size: 17px; line-height: 1.2; overflow-wrap: anywhere; word-break: break-word; }
       .asset-sub { color: var(--faint); font-size: 12px; }
       .asset-meta { display: flex; gap: 6px; flex-wrap: wrap; }
       .asset-pill { border: 1px solid var(--line); background: var(--bg-input); padding: 4px 11px; border-radius: var(--r-full); font-size: 11px; font-weight: 600; color: var(--muted); }
@@ -1345,6 +1553,43 @@ def app_style():
         border: 1px dashed var(--line-strong); border-radius: var(--r-md); color: var(--faint);
         background: repeating-linear-gradient(45deg, rgba(255,255,255,.012) 0 12px, transparent 12px 24px);
       }
+      /* animated loading screen for the asset browser + timeline library (not a bare text line) */
+      .media-loading {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 18px; min-height: 240px; padding: 48px 24px; text-align: center;
+        border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+        background: repeating-linear-gradient(45deg, rgba(255,255,255,.012) 0 12px, transparent 12px 24px);
+      }
+      .media-loading .ml-spinner {
+        width: 48px; height: 48px; border-radius: 50%;
+        border: 4px solid var(--line-strong); border-top-color: var(--accent);
+        animation: ml-spin .8s linear infinite;
+      }
+      @keyframes ml-spin { to { transform: rotate(360deg); } }
+      .media-loading .ml-text {
+        font-family: var(--pixel); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+      }
+      .media-loading .ml-text::after { content: "\\2026"; display: inline-block; width: 1.2em; text-align: left; animation: ml-dots 1.1s steps(4, end) infinite; }
+      @keyframes ml-dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+      .media-loading .ml-bar { width: min(240px, 70%); height: 8px; border: 1px solid var(--line-strong); border-radius: 6px; overflow: hidden; background: var(--bg-input); }
+      .media-loading .ml-bar > i { display: block; height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: ml-slide 1.1s ease-in-out infinite; }
+      @keyframes ml-slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+      /* full-screen loading overlay for slow PAGE navigations (Assets, Timeline editor, ...) -
+         an in-page loading screen is impossible during a full navigation, so we cover the old
+         page until the new one arrives */
+      #nav-loading {
+        position: fixed; inset: 0; z-index: 3000; display: none;
+        align-items: center; justify-content: center; flex-direction: column; gap: 18px;
+        background: color-mix(in srgb, var(--bg-base) 78%, transparent);
+        backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+      }
+      #nav-loading.show { display: flex; animation: nav-fade .14s var(--ease) both; }
+      @keyframes nav-fade { from { opacity: 0; } to { opacity: 1; } }
+      #nav-loading .ml-spinner { width: 54px; height: 54px; border: 4px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%; animation: ml-spin .8s linear infinite; }
+      #nav-loading .ml-bar { width: min(260px, 60vw); height: 8px; border: 1px solid var(--line-strong); border-radius: 6px; overflow: hidden; background: var(--bg-input); }
+      #nav-loading .ml-bar > i { display: block; height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: ml-slide 1.1s ease-in-out infinite; }
+      #nav-loading .ml-text { font-family: var(--pixel); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text); }
+      #nav-loading .ml-text::after { content: "\\2026"; display: inline-block; width: 1.2em; text-align: left; animation: ml-dots 1.1s steps(4, end) infinite; }
       body { overflow-x: hidden; }
       @media (max-width: 820px) {
         .top { display: flex; flex-direction: column; align-items: stretch; gap: 14px; }
@@ -1358,7 +1603,7 @@ def app_style():
         .run-mode-btn { min-width: 0; }
       }
     </style>
-    """
+    """)
 
 
 def app_script():
@@ -1370,6 +1615,48 @@ def app_script():
           document.documentElement.classList.toggle("theme-dark", dark);
           try { localStorage.setItem("shortslab-theme", dark ? "dark" : "light"); } catch (e) {}
         };
+        // ===== full-screen loading overlay for slow PAGE navigations (Assets / Timeline / ...) =====
+        // Those are full server-rendered navigations (1-2s): the browser shows the OLD page frozen
+        // until the new one arrives, so an in-page loader is impossible. We cover it here instead.
+        (function () {
+          var overlay = null, showTimer = null;
+          function build() {
+            if (overlay) return overlay;
+            overlay = document.createElement("div");
+            overlay.id = "nav-loading";
+            overlay.innerHTML = '<div class="ml-spinner"></div><div class="ml-bar"><i></i></div><div class="ml-text">Loading</div>';
+            (document.body || document.documentElement).appendChild(overlay);
+            return overlay;
+          }
+          function show(label) {
+            clearTimeout(showTimer);
+            // small delay so an instant/cached load never flashes the overlay
+            showTimer = setTimeout(function () {
+              var o = build();
+              o.querySelector(".ml-text").textContent = label || "Loading";
+              o.classList.add("show");
+            }, 110);
+          }
+          function hide() { clearTimeout(showTimer); if (overlay) overlay.classList.remove("show"); }
+          window.showNavLoading = show;
+          document.addEventListener("click", function (e) {
+            if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            var a = e.target.closest("a[href]");
+            if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
+            var href = a.getAttribute("href") || "";
+            if (!href || href.charAt(0) === "#" || href.indexOf("javascript:") === 0) return;
+            var u; try { u = new URL(a.href, location.href); } catch (err) { return; }
+            if (u.origin !== location.origin) return;
+            if (u.pathname === location.pathname && u.search === location.search && u.hash) return; // in-page anchor
+            var label = u.pathname.indexOf("/timeline") === 0 ? "Opening timeline editor"
+                      : u.pathname.indexOf("/assets") === 0 ? "Loading assets"
+                      : "Loading";
+            show(label);
+          }, true);
+          // restored from bfcache / navigation cancelled -> clear it
+          window.addEventListener("pageshow", hide);
+          window.addEventListener("pagehide", hide);
+        })();
         // ===== Onboarding wizard: headline types, then script -> visual -> voice+speaker -> main =====
         var WIZ_INTRO = "What are we creating today\\u2026?";
         var wizCur = null;
@@ -1764,9 +2051,9 @@ def app_script():
             var url = htmlEscape(item.url);
             var path = htmlEscape(item.path);
             var preview = item.type === "video"
-              ? '<video src="' + url + '" muted preload="metadata"></video>'
+              ? '<video data-lazy-src="' + url + '" muted preload="none" playsinline></video>'
               : item.type === "image"
-                ? '<img src="' + url + '" alt="' + name + '">'
+                ? '<img loading="lazy" src="' + url + '" alt="' + name + '">'
                 : '<div class="media-audio-tile">' + htmlEscape(item.type || "file") + '</div>';
             return [
               '<article class="media-tile">',
@@ -1798,6 +2085,13 @@ def app_script():
             }).join('');
             return '<div class="media-tabs">' + tabs + '</div>' + panels;
           }
+          window.mediaLoadingHTML = function (label) {
+            return '<div class="media-loading" role="status" aria-live="polite">'
+              + '<div class="ml-spinner"></div>'
+              + '<div class="ml-bar"><i></i></div>'
+              + '<div class="ml-text">' + htmlEscape(label || "Loading media") + '</div>'
+              + '</div>';
+          };
           function loadProjectMedia(slug) {
             if (!mediaBox) return;
             if (!slug) {
@@ -1807,7 +2101,7 @@ def app_script():
             mediaBox.dataset.slug = slug;
             var mediaHint = document.getElementById("project-media-hint");
             if (mediaHint) mediaHint.style.display = 'none';
-            mediaBox.innerHTML = '<div class="hint">Loading media previews...</div>';
+            mediaBox.innerHTML = window.mediaLoadingHTML("Loading media previews");
             fetch("/project-media?slug=" + encodeURIComponent(slug))
               .then(function (response) {
                 if (!response.ok) throw new Error("Could not load media previews.");
@@ -1820,6 +2114,7 @@ def app_script():
                 }
                 mediaBox.innerHTML = renderProjectMedia(data.media);
                 setupMediaTabs(mediaBox);
+                window.LazyVideo.observe(mediaBox);
               })
               .catch(function (err) {
                 mediaBox.innerHTML = '<div class="hint">' + (err.message || "Could not load media previews.") + '</div>';
@@ -2284,8 +2579,12 @@ def app_script():
           var progress = document.getElementById("job-progress-wrap");
           if (progress && data.progress_html) progress.outerHTML = data.progress_html;
           var log = document.getElementById("job-log");
-          if (log && typeof data.log_text === "string") {
+          if (log && typeof data.log_text === "string"
+              && log.getAttribute("data-last-log") !== data.log_text) {
+            // only rewrite the <pre> when the text actually changed - re-setting a big log
+            // every poll forced a full reflow and froze the page
             log.textContent = data.log_text;
+            log.setAttribute("data-last-log", data.log_text);
           }
           var outputs = document.getElementById("job-outputs");
           if (outputs && typeof data.outputs_html === "string") outputs.innerHTML = data.outputs_html;
@@ -2304,6 +2603,7 @@ def app_script():
               setupMediaTabs(media);
               setupReplacementForms(media);
               activateMediaTab(media, tabId);
+              window.LazyVideo.observe(media);
               sidebar = media.querySelector(".media-sidebar");
               if (sidebar) sidebar.scrollTop = scrollTop;
             }
@@ -2410,14 +2710,51 @@ def app_script():
           box.classList.add("open");
         });
 
+        // ===== LAZY VIDEO: a media page can hold 100+ clips. Loading every <video> at once
+        // exhausts the browser's media-element/decoder budget and CRASHES the renderer tab
+        // ("Aw Snap"/Edge crash). Only videos scrolled into view get a src; those scrolled far
+        // out release it again, capping live decoders to what's on screen. =====
+        window.LazyVideo = (function () {
+          var io = null;
+          function load(v) {
+            var s = v.getAttribute("data-lazy-src");
+            if (s && v.getAttribute("src") !== s) { v.setAttribute("src", s); }
+          }
+          function unload(v) {
+            if (!v.getAttribute("src")) return;
+            try { v.pause(); } catch (e) {}
+            v.removeAttribute("src");
+            try { v.load(); } catch (e) {}   // free the decoder + network handle
+          }
+          function ensureIO() {
+            if (io || !("IntersectionObserver" in window)) return io;
+            io = new IntersectionObserver(function (entries) {
+              entries.forEach(function (en) { en.isIntersecting ? load(en.target) : unload(en.target); });
+            }, { root: null, rootMargin: "800px 0px", threshold: 0.01 });
+            return io;
+          }
+          return {
+            observe: function (root) {
+              var vids = (root || document).querySelectorAll("video[data-lazy-src]");
+              var o = ensureIO();
+              if (!o) { Array.prototype.forEach.call(vids, load); return; }  // no IO -> load all
+              Array.prototype.forEach.call(vids, function (v) { o.observe(v); });
+            },
+            ensure: load   // force-load one clip (e.g. on hover) before play
+          };
+        })();
+
         document.addEventListener("mouseover", function (event) {
           var tile = event.target.closest(".media-tile");
           if (!tile) return;
           var vid = tile.querySelector("video");
-          if (vid && vid.paused) {
-            vid.muted = true;
-            var pr = vid.play();
-            if (pr && pr.catch) pr.catch(function () {});
+          if (vid) {
+            window.LazyVideo.ensure(vid);   // make sure it has a src before playing
+            if (vid.paused) {
+              vid.muted = true;
+              var pr = vid.play();
+              if (pr && pr.catch) pr.catch(function () {});
+            }
           }
         });
         document.addEventListener("mouseout", function (event) {
@@ -2442,6 +2779,7 @@ def app_script():
           setupUiSounds();
           playDoneSoundOnce();
           setupJobPolling();
+          window.LazyVideo.observe(document);   // lazy-load the media-grid videos
           if (typeof setupToggleSections === "function") setupToggleSections();
           if (typeof syncClipSource === "function") syncClipSource();
           if (typeof renderTermChips === "function") renderTermChips();
@@ -2613,7 +2951,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
           </button>
           <button type="button" class="modemenu-card" onclick="selectMode('visual')">
-            <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">Visual Master</span></span>
+            <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">VFX Master</span></span>
             <span class="mm-desc">Upload a Short and Opus 4.8 adds intelligent animated red arrows + fitting SFX.</span>
           </button>
           <button type="button" class="modemenu-card" onclick="selectMode('viraltrans')">
@@ -3282,6 +3620,9 @@ def start_sfx_job(fields, files):
                 else:
                     JOBS[job_id]["status"] = "done"
                     JOBS[job_id]["result"] = result
+                    # the enhanced upload now lives in a real project -> timeline editor works
+                    if result.get("project_dir"):
+                        JOBS[job_id]["project_dir"] = result["project_dir"]
         except Exception as exc:
             with JOB_LOCK:
                 if cancel_event.is_set() or isinstance(exc, RunCancelled):
@@ -4002,9 +4343,13 @@ def media_preview_markup(kind, path, replaceable=False, queued=False, input_name
     resolved = str(path.resolve())
     label = "Replace" if replaceable else kind.title()
     if is_video_path(path):
-        preview = f'<video src="{link_for(path)}" muted preload="metadata"></video>'
+        # lazy: no eager src -> the LazyVideo observer attaches it only when scrolled into
+        # view (a page can hold 100+ clips; loading them all crashes the browser renderer)
+        poster = path.with_suffix(".poster.jpg")
+        poster_attr = f' poster="{link_for(poster)}"' if poster.exists() else ""
+        preview = f'<video data-lazy-src="{link_for(path)}"{poster_attr} muted preload="none" playsinline></video>'
     elif is_image_path(path):
-        preview = f'<img src="{link_for(path)}" alt="{esc(path.name)}">'
+        preview = f'<img loading="lazy" src="{link_for(path)}" alt="{esc(path.name)}">'
     elif is_audio_path(path):
         preview = '<div class="media-audio-tile">Audio</div>'
     else:
@@ -4211,7 +4556,11 @@ def project_media_payload(project_dir):
     }
 
 
-def visible_log_text(logs):
+def visible_log_text(logs, limit=600):
+    """Render the log to text, capped to the last ``limit`` lines. A long scrape produces
+    thousands of lines; the poller re-sets the whole <pre> every second, and reflowing a
+    giant element froze the page ("Diese Seite antwortet nicht"). Only the tail matters -
+    the box auto-scrolls to the bottom - so send just the last ``limit`` lines."""
     lines = []
     for line in logs:
         if isinstance(line, str) and line.startswith("PREVIEW_IMAGE|"):
@@ -4222,6 +4571,9 @@ def visible_log_text(logs):
         if isinstance(line, str) and line.startswith("PROJECT_DIR|"):
             continue
         lines.append(str(line))
+    if limit and len(lines) > limit:
+        hidden = len(lines) - limit
+        lines = [f"... ({hidden} earlier line(s) hidden) ..."] + lines[-limit:]
     return chr(10).join(lines)
 
 
@@ -4367,10 +4719,10 @@ def asset_card(summary):
     if thumb and Path(thumb).exists() and is_image_path(thumb):
         thumb_html = (
             f'<button class="asset-figure preview-button" type="button" data-preview-src="{link_for(thumb)}" data-preview-title="{esc(summary["title"])}">'
-            f'<img class="asset-thumb" src="{link_for(thumb)}" alt="{esc(summary["title"])}"></button>'
+            f'<img class="asset-thumb" loading="lazy" src="{link_for(thumb)}" alt="{esc(summary["title"])}"></button>'
         )
     elif has_video:
-        thumb_html = f'<div class="asset-figure"><video class="asset-thumb" preload="metadata" muted src="{link_for(summary["video"])}"></video></div>'
+        thumb_html = f'<div class="asset-figure"><video class="asset-thumb" preload="none" muted data-lazy-src="{link_for(summary["video"])}"></video></div>'
     else:
         thumb_html = '<div class="asset-figure"><div class="asset-thumb"></div></div>'
 
@@ -4429,6 +4781,44 @@ TIMELINE_SKELETON = """
         <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"><span id="tl-rw-replace-label">replace selected media</span></label>
         <label class="tl-chk"><input type="checkbox" id="tl-rw-recut" checked> reorder &amp; recut</label>
         <label class="tl-chk" title="Creates a fresh take with the saved voice, then force-aligns captions and clip cuts to it"><input type="checkbox" id="tl-rw-revoice"> regenerate speech + retime</label>
+        <button type="button" class="button secondary tl-rework-btn" id="tl-script-btn" title="Edit the spoken script, then re-voice and recut - unchanged lines keep their media">&#128221; Change script</button>
+      </div>
+    </div>
+    <div class="tl-script-overlay" id="tl-script-modal" hidden>
+      <div class="tl-script-box panel">
+        <h2>&#128221; Change the script</h2>
+        <div class="hint">Edit the narration below (one spoken line per row). Lines you leave
+          UNCHANGED keep their current media. Changed or new lines get a fresh voiceover and
+          media &mdash; matched from this project's existing clips first, then TikTok/X for
+          whatever is still missing &mdash; and the whole Short is retimed and re-rendered.</div>
+        <textarea id="tl-script-text" spellcheck="false"></textarea>
+        <div class="tl-script-hookbar">
+          <button type="button" class="button secondary" id="tl-script-markhook" title="Select the opening line(s) in the script above, then click to mark them as the hook (spoken with the hook pause)">&#9733; Mark hook</button>
+          <button type="button" class="button secondary" id="tl-script-clearhook">Clear</button>
+          <span class="tl-script-hookstatus" id="tl-script-hookstatus"></span>
+        </div>
+        <div class="tl-script-voicebar">
+          <label>Narrator</label>
+          <input type="text" id="tl-script-speaker" placeholder="Speaker name" title="Persona name used in the TTS prompt (e.g. Narrator)">
+          <select id="tl-script-voice" title="Gemini TTS voice for the fresh voiceover"></select>
+          <select id="tl-script-ttsmodel" title="TTS model quality">
+            <option value="flash">Flash TTS (cheaper)</option>
+            <option value="pro">Pro TTS (higher quality)</option>
+          </select>
+        </div>
+        <div class="tl-script-densitybar">
+          <label>Clips</label>
+          <div class="tl-density-seg" id="tl-script-density" title="How many clips the video uses: Few = longer holds / slower cuts, Many = fast-paced montage with more cuts">
+            <button type="button" data-density="few">Few</button>
+            <button type="button" data-density="medium" class="on">Medium</button>
+            <button type="button" data-density="many">Many</button>
+          </div>
+          <span class="tl-density-hint" id="tl-script-density-hint"></span>
+        </div>
+        <div class="tl-script-actions">
+          <button type="button" class="button secondary" id="tl-script-cancel">Cancel</button>
+          <button type="button" class="button primary" id="tl-script-run">&#127908; Re-voice &amp; recut</button>
+        </div>
       </div>
     </div>
     <div class="tl-meta">
@@ -4571,8 +4961,8 @@ TIMELINE_SKELETON = """
       </div>
       <span class="tl-lib-hint">drag onto the timeline</span>
     </div>
-    <div class="tl-lib-body" id="tl-lib-media"><div class="tl-lib-loading">Loading media…</div></div>
-    <div class="tl-lib-body" id="tl-lib-sfx" hidden><div class="tl-lib-loading">Loading sounds…</div></div>
+    <div class="tl-lib-body" id="tl-lib-media"><div class="media-loading" role="status"><div class="ml-spinner"></div><div class="ml-bar"><i></i></div><div class="ml-text">Loading media</div></div></div>
+    <div class="tl-lib-body" id="tl-lib-sfx" hidden><div class="media-loading" role="status"><div class="ml-spinner"></div><div class="ml-bar"><i></i></div><div class="ml-text">Loading sounds</div></div></div>
   </div>
 </div>
 """
@@ -4589,6 +4979,28 @@ TIMELINE_ASSETS = """
   .tl-save-btn { font-size:13.5px; padding:9px 14px; }
   .tl-save-btn.tl-unsaved { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); color:var(--text); }
   .tl-rework-group { display:flex; align-items:center; gap:8px 12px; flex-wrap:wrap; padding-left:12px; margin-left:4px; border-left:1px solid var(--line-strong); }
+  /* Change-script modal (scope everything - the global button rule is full-width) */
+  .tl-script-overlay { position:fixed; inset:0; z-index:900; background:rgba(5,8,14,.72); display:flex; align-items:center; justify-content:center; padding:4vh 16px; }
+  .tl-script-overlay[hidden] { display:none; }
+  .tl-script-box { width:min(760px, 94vw); max-height:88vh; display:flex; flex-direction:column; gap:12px; }
+  .tl-script-box textarea { flex:1 1 auto; min-height:320px; max-height:56vh; resize:vertical; font-family:var(--mono); font-size:13.5px; line-height:1.55; }
+  .tl-script-actions { display:flex; justify-content:flex-end; gap:10px; }
+  .tl-script-actions .button { width:auto; min-width:0; margin:0; padding:10px 18px; }
+  .tl-script-hookbar { display:flex; align-items:center; gap:10px; }
+  .tl-script-hookbar .button { width:auto; min-width:0; margin:0; padding:7px 12px; font-size:12px; }
+  .tl-script-hookstatus { flex:1 1 auto; min-width:0; font-size:12px; font-weight:700; color:var(--warning); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tl-script-hookstatus.off { color:var(--muted); font-weight:600; }
+  .tl-script-voicebar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .tl-script-voicebar label { margin:0; font-size:12px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .tl-script-voicebar input { flex:1 1 140px; min-width:120px; width:auto; margin:0; padding:8px 10px; font-size:13px; }
+  .tl-script-voicebar select { flex:1 1 170px; min-width:150px; width:auto; margin:0; padding:8px 10px; font-size:13px; }
+  .tl-script-densitybar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .tl-script-densitybar label { margin:0; font-size:12px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .tl-density-seg { display:inline-flex; border:1px solid var(--line-strong); border-radius:var(--r-sm); overflow:hidden; }
+  .tl-density-seg button { width:auto; min-width:0; margin:0; border:0; border-radius:0; padding:7px 16px; font-size:12.5px; font-weight:700; background:var(--bg-input); color:var(--muted); box-shadow:none; }
+  .tl-density-seg button + button { border-left:1px solid var(--line-strong); }
+  .tl-density-seg button.on { background:var(--accent); color:#fff; }
+  .tl-density-hint { font-size:12px; color:var(--muted); font-weight:600; }
   .tl-rework-btn { font-size:13px; padding:9px 14px; }
   .tl-chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:#c9d2cf; margin:0; cursor:pointer; }
   .tl-chk input { margin:0; }
@@ -4715,6 +5127,9 @@ TIMELINE_ASSETS = """
   .tl-lib-item.dragging { opacity:.5; }
   .tl-lib-item img, .tl-lib-item video { display:block; width:100%; aspect-ratio:9/14; object-fit:cover; background:var(--bg-base); pointer-events:none; }
   .tl-lib-item .tl-lib-name { padding:4px 7px; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tl-lib-item .tl-lib-proj { padding:0 7px 5px; font-size:9.5px; font-weight:700; color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-transform:uppercase; letter-spacing:.03em; }
+  .tl-lib-item .tl-lib-proj[data-current="1"] { color:var(--muted); }
+  .tl-sublib-search { width:100%; margin:0 0 10px; padding:8px 11px; font-size:12.5px; box-sizing:border-box; }
   .tl-lib-sound { display:flex; align-items:center; gap:8px; padding:9px 11px; }
   .tl-lib-sound .tl-lib-ico { flex:0 0 auto; color:var(--accent); }
   .tl-lib-vidwrap { position:relative; }
@@ -5544,6 +5959,85 @@ TIMELINE_ASSETS = """
       .catch(function(){ btn.disabled=false; btn.innerHTML=old; alert('Could not start render.'); });
   });
 
+  // ---- Change script: edit narration -> fresh voiceover + recut (unchanged lines keep media)
+  var scriptModal=document.getElementById('tl-script-modal');
+  var scriptHook = model.hook_text || '';
+  function normWs(t){ return String(t||'').replace(/\\s+/g,' ').trim(); }
+  function syncHookStatus(){
+    var el=document.getElementById('tl-script-hookstatus');
+    var text=(document.getElementById('tl-script-text').value||'');
+    if(!scriptHook){ el.textContent='No hook marked - the whole script is spoken as one take.'; el.classList.add('off'); return; }
+    var inScript = normWs(text).toLowerCase().indexOf(normWs(scriptHook).toLowerCase())>-1;
+    el.classList.toggle('off', !inScript);
+    el.textContent = (inScript ? '★ Hook: ' : '⚠ Hook no longer in the script: ')
+      + scriptHook.slice(0,90) + (scriptHook.length>90?'…':'');
+  }
+  document.getElementById('tl-script-btn').addEventListener('click', function(){
+    document.getElementById('tl-script-text').value = model.script_text || '';
+    scriptHook = model.hook_text || '';
+    // narrator: prefill from the project's saved run settings
+    document.getElementById('tl-script-speaker').value = model.speaker_name || 'Narrator';
+    var vsel=document.getElementById('tl-script-voice');
+    vsel.innerHTML=(model.tts_voices||[]).map(function(v){
+      return '<option value="'+esc(v)+'"'+(v===model.tts_voice?' selected':'')+'>'+esc(v)+'</option>';
+    }).join('') || '<option value="">(default voice)</option>';
+    document.getElementById('tl-script-ttsmodel').value = (model.tts_model==='flash')?'flash':'pro';
+    setDensity(model.clip_density || 'medium');
+    syncHookStatus();
+    scriptModal.hidden=false;
+    document.getElementById('tl-script-text').focus();
+  });
+  // clip density: Few / Medium / Many -> how many clips the recut uses
+  var scriptDensity = 'medium';
+  var DENSITY_HINT = {few:'Fewer, longer clips - slower, cinematic cuts.',
+                      medium:'One clip per sentence (default pacing).',
+                      many:'More, shorter clips - fast-paced montage.'};
+  function setDensity(d){
+    scriptDensity = (['few','medium','many'].indexOf(d)!==-1)?d:'medium';
+    Array.prototype.forEach.call(document.querySelectorAll('#tl-script-density button'),function(b){
+      b.classList.toggle('on', b.getAttribute('data-density')===scriptDensity);
+    });
+    document.getElementById('tl-script-density-hint').textContent = DENSITY_HINT[scriptDensity]||'';
+  }
+  document.getElementById('tl-script-density').addEventListener('click', function(e){
+    var b=e.target.closest('button[data-density]'); if(b) setDensity(b.getAttribute('data-density'));
+  });
+  document.getElementById('tl-script-markhook').addEventListener('click', function(){
+    var ta=document.getElementById('tl-script-text');
+    var sel=ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+    if(!sel){ alert('Select the opening line(s) inside the script first, then click ★ Mark hook.'); return; }
+    scriptHook=sel; syncHookStatus();
+  });
+  document.getElementById('tl-script-clearhook').addEventListener('click', function(){ scriptHook=''; syncHookStatus(); });
+  document.getElementById('tl-script-text').addEventListener('input', syncHookStatus);
+  document.getElementById('tl-script-cancel').addEventListener('click', function(){ scriptModal.hidden=true; });
+  scriptModal.addEventListener('pointerdown', function(e){ if(e.target===scriptModal) scriptModal.hidden=true; });
+  document.getElementById('tl-script-run').addEventListener('click', function(){
+    var text=(document.getElementById('tl-script-text').value||'').trim();
+    if(!text){ alert('The script is empty.'); return; }
+    var speaker=(document.getElementById('tl-script-speaker').value||'').trim();
+    var voice=document.getElementById('tl-script-voice').value||'';
+    var ttsModel=document.getElementById('tl-script-ttsmodel').value||'pro';
+    var voiceUnchanged = speaker===(model.speaker_name||'') && voice===(model.tts_voice||'')
+                         && ttsModel===(model.tts_model||'pro');
+    if(text===(model.script_text||'').trim() && scriptHook===(model.hook_text||'') && voiceUnchanged){
+      if(!confirm('Nothing changed - regenerate the voiceover and re-render anyway?')) return;
+    }
+    if(scriptHook && normWs(text).toLowerCase().indexOf(normWs(scriptHook).toLowerCase())===-1){
+      if(!confirm('The marked hook is not part of the script anymore - continue WITHOUT a hook?')) return;
+      scriptHook='';
+    }
+    var btn=this; btn.disabled=true; btn.textContent='Starting…';
+    fetch('/timeline-rescript',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({slug:slug, script:text, hook_text:scriptHook,
+                             speaker_name:speaker, tts_voice:voice, tts_model:ttsModel,
+                             clip_density:scriptDensity})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job){ dirty=false; window.location.href=d.job; }
+        else { btn.disabled=false; btn.innerHTML='\\uD83C\\uDFA4 Re-voice & recut'; alert((d&&d.error)||'Could not start.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83C\\uDFA4 Re-voice & recut'; alert('Could not start.'); });
+  });
+
   document.getElementById('tl-rework').addEventListener('click', function(){
     var doReplace=document.getElementById('tl-rw-replace').checked;
     var doRecut=document.getElementById('tl-rw-recut').checked;
@@ -5610,7 +6104,7 @@ TIMELINE_ASSETS = """
       });
     });
     fetch('/timeline-library?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
-      renderMediaLib(document.getElementById('tl-lib-media'), (d&&d.media)||[]);
+      renderMediaLib(document.getElementById('tl-lib-media'), (d&&d.media)||[], (d&&d.global_media)||[]);
       renderSfxLib(document.getElementById('tl-lib-sfx'), (d&&d.sfx)||[]);
     }).catch(function(){
       document.getElementById('tl-lib-media').innerHTML='<div class="tl-lib-loading">Could not load media.</div>';
@@ -5633,11 +6127,14 @@ TIMELINE_ASSETS = """
     var el=document.createElement('div'); el.className='tl-lib-item'; el.draggable=true;
     if(kind==='media'){
       if(it.type==='video'){
-        el.innerHTML='<div class="tl-lib-vidwrap"><video src="'+esc(it.url)+'" muted preload="metadata" playsinline></video></div>'
-          +'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+        // lazy src (no eager load) - a library with 100+ clips otherwise crashes the renderer
+        var poster=it.poster?(' poster="'+esc(it.poster)+'"'):'';
+        var sub=it.project?('<div class="tl-lib-proj"'+(it.current?' data-current="1"':'')+' title="'+esc(it.project)+'">'+esc(it.project)+'</div>'):'';
+        el.innerHTML='<div class="tl-lib-vidwrap"><video data-lazy-src="'+esc(it.url)+'"'+poster+' muted preload="none" playsinline></video></div>'
+          +'<div class="tl-lib-name">'+esc(it.name)+'</div>'+sub;
         var vid=el.querySelector('video');
         // Keep the lightweight muted hover preview, but no play/pause control overlays the media.
-        el.addEventListener('mouseenter', function(){ vid.muted=true; vid.play().catch(function(){}); });
+        el.addEventListener('mouseenter', function(){ if(window.LazyVideo)window.LazyVideo.ensure(vid); vid.muted=true; vid.play().catch(function(){}); });
         el.addEventListener('mouseleave', function(){ vid.pause(); try{ vid.currentTime=0; }catch(e){} });
       } else {
         el.innerHTML='<img src="'+esc(it.url)+'" alt="">'+'<div class="tl-lib-name">'+esc(it.name)+'</div>';
@@ -5656,24 +6153,41 @@ TIMELINE_ASSETS = """
     el.addEventListener('dragend', function(){ el.classList.remove('dragging'); });
     return el;
   }
-  function renderMediaLib(box, items){
+  function renderMediaLib(box, items, globalItems){
     if(!box) return;
-    if(!items.length){ box.innerHTML='<div class="tl-lib-loading">No project media.</div>'; return; }
-    // Primary tabs by TYPE: Videos (mp4), Images (pictures), Declined (passed-over scraped clips).
-    var groups={videos:[], images:[], declined:[]};
+    globalItems = globalItems || [];
+    if(!items.length && !globalItems.length){ box.innerHTML='<div class="tl-lib-loading">No project media.</div>'; return; }
+    // Primary tabs by TYPE: Videos (mp4), Images (pictures), Declined (passed-over scraped
+    // clips), and All projects (scraped footage from EVERY project, newest first).
+    var groups={videos:[], images:[], declined:[], global:globalItems};
     items.forEach(function(it){
       if(it.kind==='declined'){ groups.declined.push(it); }
       else if(it.type==='video'){ groups.videos.push(it); }
       else { groups.images.push(it); }
     });
-    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['declined','\\uD83D\\uDEAB Declined']];
+    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['declined','\\uD83D\\uDEAB Declined'],['global','\\uD83C\\uDF10 All projects']];
     var keys=defs.filter(function(d){ return groups[d[0]].length; });
-    box.innerHTML='<div class="tl-sublib-tabs"></div><div class="tl-sublib-grid"></div>';
+    box.innerHTML='<div class="tl-sublib-tabs"></div><input type="text" class="tl-sublib-search" placeholder="Filter clips\\u2026" hidden><div class="tl-sublib-grid"></div>';
     var tabsEl=box.querySelector('.tl-sublib-tabs'), gridEl=box.querySelector('.tl-sublib-grid');
-    function show(k){
-      Array.prototype.forEach.call(tabsEl.children,function(t){ t.classList.toggle('active', t.getAttribute('data-k')===k); });
-      gridEl.innerHTML=''; (groups[k]||[]).forEach(function(it){ gridEl.appendChild(libItemEl(it,'media')); });
+    var searchEl=box.querySelector('.tl-sublib-search');
+    var curKey=null;
+    function draw(k, q){
+      q=(q||'').toLowerCase().trim();
+      gridEl.innerHTML='';
+      (groups[k]||[]).forEach(function(it){
+        if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.project||'').toLowerCase().indexOf(q)===-1) return;
+        gridEl.appendChild(libItemEl(it,'media'));
+      });
+      if(window.LazyVideo) window.LazyVideo.observe(gridEl);   // only visible clips get a src
     }
+    function show(k){
+      curKey=k;
+      Array.prototype.forEach.call(tabsEl.children,function(t){ t.classList.toggle('active', t.getAttribute('data-k')===k); });
+      // the "All projects" tab can hold hundreds of clips -> give it a filter box
+      searchEl.hidden = (k!=='global'); searchEl.value='';
+      draw(k, '');
+    }
+    searchEl.addEventListener('input', function(){ draw(curKey, this.value); });
     keys.forEach(function(d,i){ var k=d[0]; var t=document.createElement('button'); t.type='button'; t.className='tl-sublib-tab'+(i?'':' active'); t.setAttribute('data-k',k); t.textContent=d[1]+' ('+groups[k].length+')'; t.addEventListener('click',function(){show(k);}); tabsEl.appendChild(t); });
     if(keys.length) show(keys[0][0]);
   }
@@ -5877,7 +6391,45 @@ def timeline_library_payload(slug):
                     "kind": "declined", "name": path.name, "path": key,
                     "url": link_for(path), "type": "video",
                 })
-    return {"media": media, "sfx": global_sfx_library()}
+    return {"media": media, "sfx": global_sfx_library(),
+            "global_media": all_projects_scraped_media(current_slug=slug)}
+
+
+def all_projects_scraped_media(current_slug=None, limit=5000):
+    """EVERY accepted scraped clip across ALL projects (newest first) so the timeline library
+    can offer footage from OTHER projects for reuse. Includes scraped_/manual_/replaced_/
+    timeline_replaced_ clips; excludes derived files (speed_/capblur_/recovered_) and the
+    per-project _candidates/_declined/_raw working folders (top-level *.mp4 only). The high
+    limit is just a runaway guard - it shows all of them (lazy-loaded, so count doesn't matter)."""
+    root = agent_core.PROJECTS_DIR
+    if not root.exists():
+        return []
+    keep_prefixes = ("scraped_", "manual_", "replaced_", "timeline_replaced_")
+    skip_prefixes = ("speed_", "capblur_", "recovered_")
+    rows = []
+    for proj in root.iterdir():
+        if not proj.is_dir() or proj.name.startswith("_"):
+            continue
+        clip_dir = proj / "seedance 2.0"
+        if not clip_dir.exists():
+            continue
+        title = project_title_from_files(proj) or proj.name
+        is_current = (proj.name == current_slug)
+        for path in clip_dir.glob("*.mp4"):
+            name = path.name
+            if name.startswith(skip_prefixes) or not name.startswith(keep_prefixes):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            rows.append((mtime, {
+                "kind": "global", "name": name, "path": str(path.resolve()),
+                "url": link_for(path), "type": "video",
+                "project": title, "project_slug": proj.name, "current": is_current,
+            }))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [item for _, item in rows[:limit]]
 
 
 def timeline_model(slug):
@@ -6092,7 +6644,45 @@ def timeline_model(slug):
         "voice_url": voice_url,
         "music_url": music_url,
         "clip_source": str(config.get("clip_source") or "generate"),
+        "script_text": _project_script_text(project_dir, config),
+        "hook_text": str(_project_run_form(project_dir).get("hook_text") or "").strip(),
+        "speaker_name": str(_project_run_form(project_dir).get("speaker_name") or "").strip()
+                        or pipeline.DEFAULT_TTS_SPEAKER,
+        "tts_voice": str(_project_run_form(project_dir).get("tts_voice") or "").strip()
+                     or pipeline.DEFAULT_TTS_VOICE,
+        "tts_model": str(_project_run_form(project_dir).get("tts_model") or "").strip()
+                     or pipeline.DEFAULT_TTS_MODEL,
+        "tts_voices": list(pipeline.GEMINI_TTS_VOICES),
+        "clip_density": str(config.get("clip_density")
+                            or _project_run_form(project_dir).get("clip_density")
+                            or "medium").strip().lower(),
     }
+
+
+def _project_run_form(project_dir):
+    """The saved run settings (speaker/voice/hook/...) of the project's last run."""
+    try:
+        run_form = json.loads((project_dir / "input" / "run_form.json")
+                              .read_text(encoding="utf-8"))
+        return run_form if isinstance(run_form, dict) else {}
+    except Exception:
+        return {}
+
+
+def _project_script_text(project_dir, config):
+    """Current spoken script for the timeline Script editor: the saved script.txt when
+    present, else the scenes' voice lines joined one per line."""
+    try:
+        path = project_dir / "input" / "script.txt"
+        if path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                return text
+    except Exception:
+        pass
+    return "\n".join(str(s.get("exact_voice_text") or s.get("script") or "").strip()
+                     for s in (config.get("scenes") or [])
+                     if str(s.get("exact_voice_text") or s.get("script") or "").strip())
 
 
 def start_timeline_job(slug, edits):
@@ -6180,6 +6770,72 @@ def start_timeline_social_replace_job(slug, scene_ids):
 
     threading.Thread(target=worker, daemon=True).start()
     return job_id
+
+
+def start_timeline_rescript_job(slug, new_script, hook_text=None, voice_settings=None,
+                                clip_density="medium"):
+    """Timeline editor 'Change script': new voiceover + recut, reusing existing media for
+    unchanged lines and finding media (project pool first, then TikTok/X) for the rest."""
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued script change: fresh voiceover + recut."],
+            "log_times": [time.time()], "result": None, "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": str(agent_core.PROJECTS_DIR / slug),
+            "created_at": time.time(), "job_kind": "timeline",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            result = agent_core.rescript_and_recut(
+                slug, new_script, hook_text=hook_text, voice_settings=voice_settings,
+                clip_density=clip_density, status_cb=status_cb, cancel_event=cancel_event)
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = result
+        except (RunCancelled, pipeline.PipelineCancelled):
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _persist_job_error(agent_core.PROJECTS_DIR / slug, "timeline-rescript", exc, tb)
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}\n\n{tb}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def _persist_job_error(project_dir, kind, exc, tb):
+    """Write a failed job's traceback next to the project AND into logs/crash.log, so the cause
+    survives even if the app dies before the browser can show it (the launcher discards stderr)."""
+    try:
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        blob = f"===== {kind} FAILED @ {stamp} =====\n{exc}\n\n{tb}\n"
+        try:
+            Path(project_dir).mkdir(parents=True, exist_ok=True)
+            (Path(project_dir) / "last_job_error.txt").write_text(blob, encoding="utf-8")
+        except Exception:
+            pass
+        if _CRASH_FH:
+            _CRASH_FH.write("\n" + blob)
+            _CRASH_FH.flush()
+    except Exception:
+        pass
 
 
 def start_timeline_revoice_job(slug, replace_scene_ids=None):
@@ -6414,7 +7070,9 @@ def render_done_view(job, job_id):
     proj = job.get("project_dir")
     tslug = Path(proj).name if proj and Path(proj).exists() else None
     tl_btn = ""
-    if tslug and job.get("job_kind") != "sfx":
+    if tslug:
+        # sfx jobs included: the SFX Master now writes a real project, so every added
+        # sound can be moved/replaced/deleted in the timeline editor
         tl_btn = (f'<a class="button" href="/timeline?slug={urllib.parse.quote(tslug)}">'
                   f'&#127902; Open timeline editor</a>')
     return f"""
@@ -6458,7 +7116,7 @@ def job_page(job_id):
         )
     timeline_html = ""
     proj = job.get("project_dir")
-    if proj and Path(proj).exists() and job.get("job_kind") != "sfx":
+    if proj and Path(proj).exists():
         tslug = Path(proj).name
         timeline_html = f'<a class="button" href="/timeline?slug={urllib.parse.quote(tslug)}">&#127902; Timeline editor</a>'
     speech_html = ""
@@ -7313,6 +7971,35 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_bytes(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"), "application/json; charset=utf-8")
             return
+        if parsed.path == "/timeline-rescript":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            new_script = str(data.get("script", "") or "").strip()
+            if not slug or not safe_project_dir(slug):
+                self.send_bytes(json.dumps({"ok": False, "error": "Unknown project."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            if not new_script:
+                self.send_bytes(json.dumps({"ok": False, "error": "The script is empty."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            hook_text = data.get("hook_text")
+            if hook_text is not None:
+                hook_text = str(hook_text)
+            voice_settings = {key: str(data.get(key)).strip()
+                              for key in ("speaker_name", "tts_voice", "tts_model")
+                              if data.get(key) is not None and str(data.get(key)).strip()}
+            clip_density = str(data.get("clip_density") or "medium").strip().lower()
+            if clip_density not in ("few", "medium", "many"):
+                clip_density = "medium"
+            job_id = start_timeline_rescript_job(slug, new_script, hook_text=hook_text,
+                                                 voice_settings=voice_settings,
+                                                 clip_density=clip_density)
+            self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={job_id}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
         if parsed.path == "/timeline-rework":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -7479,12 +8166,26 @@ def launch_browser(host, port):
     webbrowser.open(url)
 
 
+class QuietServer(ThreadingHTTPServer):
+    """Suppress the full traceback wall for ROUTINE client disconnects. Every hover-play /
+    seek on a media-heavy page aborts a video Range request mid-transfer, which the stock
+    server prints as a scary multi-frame traceback - the console then looks like the app
+    is crashing nonstop while nothing is actually wrong."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, TimeoutError)):
+            return                      # browser cancelled a media request - routine
+        super().handle_error(request, client_address)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7865)
     args = parser.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = QuietServer((args.host, args.port), Handler)
     print(f"Autonomous Shorts Agent running at http://{args.host}:{args.port}")
     import threading
     # threading.Thread(target=launch_browser, args=(args.host, args.port), daemon=True).start()

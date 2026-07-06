@@ -67,11 +67,47 @@ try {
     # CIM unavailable or nothing to kill
 }
 
+$logDir = Join-Path $appDir "logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+$outLog = Join-Path $logDir "server.out.log"
+$errLog = Join-Path $logDir "server.err.log"
+
+# ======================= NATIVE APP WINDOW (preferred, no browser) =======================
+# Shortslab runs in its OWN window (WebView2 via pywebview) - not a browser tab, no address bar.
+# run_native.py starts the HTTP server AND the window in ONE process; closing the window quits
+# the app. Only fall through to the browser flow below if pywebview / WebView2 is unavailable.
+# Set SHORTSLAB_NO_NATIVE=1 to force the browser flow.
+py -c "import webview" *> $null
+$hasWebview = ($LASTEXITCODE -eq 0)
+if ($hasWebview -and (-not $env:SHORTSLAB_NO_NATIVE) -and (Test-Path (Join-Path $appDir "run_native.py"))) {
+    # kill a leftover native instance so we don't stack windows / double-bind the port
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*run_native.py*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 300
+    } catch {}
+    Start-Process `
+        -FilePath "py" `
+        -ArgumentList @("-X", "faulthandler", "-B", "run_native.py", "--host", "127.0.0.1", "--port", [string]$port) `
+        -WorkingDirectory $appDir `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $outLog `
+        -RedirectStandardError $errLog
+    exit 0
+}
+
+# ======================= BROWSER FALLBACK (pywebview not available) =======================
+# Capture the server's stdout/stderr so a crash (native fault, MemoryError, Playwright/onnxruntime
+# abort) leaves a trace instead of vanishing with the hidden window. -X faulthandler dumps C-level
+# faults; the app also writes logs/crash.log itself.
 $pyProcess = Start-Process `
     -FilePath "py" `
-    -ArgumentList @("-B", "app.py", "--host", "127.0.0.1", "--port", [string]$port) `
+    -ArgumentList @("-X", "faulthandler", "-B", "app.py", "--host", "127.0.0.1", "--port", [string]$port) `
     -WorkingDirectory $appDir `
     -WindowStyle Hidden `
+    -RedirectStandardOutput $outLog `
+    -RedirectStandardError $errLog `
     -PassThru
 
 
@@ -92,16 +128,26 @@ if (-not $ready) {
     throw "Could not reach $url. Check server.err.log in this folder."
 }
 
+# Open the app in a standalone app-window (--app, no browser chrome - it looks like its OWN app,
+# not a browser tab). PREFER CHROME over Edge: Edge's renderer kept crashing on media-heavy pages
+# and it nags with sign-in/sync flyouts. Set SHORTSLAB_BROWSER to a full exe path to force one.
 $browserCandidates = @()
+if ($env:SHORTSLAB_BROWSER) { $browserCandidates += $env:SHORTSLAB_BROWSER }
+if ($env:ProgramFiles) {
+    $browserCandidates += Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"
+}
+if (${env:ProgramFiles(x86)}) {
+    $browserCandidates += Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"
+}
+if ($env:LocalAppData) {
+    $browserCandidates += Join-Path $env:LocalAppData "Google\Chrome\Application\chrome.exe"
+}
+# Edge as the fallback (always present on Windows) so the app still opens if Chrome isn't installed.
 if (${env:ProgramFiles(x86)}) {
     $browserCandidates += Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"
 }
 if ($env:ProgramFiles) {
     $browserCandidates += Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe"
-    $browserCandidates += Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"
-}
-if ($env:LocalAppData) {
-    $browserCandidates += Join-Path $env:LocalAppData "Google\Chrome\Application\chrome.exe"
 }
 
 $browser = $browserCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1

@@ -64,3 +64,8 @@ _archive_merged/
 scripts/_*.py
 /_*.py
 twitter-profile/
+
+# App crash + server logs
+logs/
+projects/*/last_job_error.txt
+projects/*/config/project_before_rescript.json

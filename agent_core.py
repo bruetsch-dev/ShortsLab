@@ -4841,6 +4841,29 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                  "swipe_whoosh": ["bright_whoosh", "whoosh_hit_combo"],
                  "bright_whoosh": ["swipe_whoosh", "caption_pop"]}
 
+    # CONTENT GUARDRAILS: a bell/gong or musical jingle that slipped into a cut category via
+    # the feature fallback must never fire as a transition ("random death dong"), and horror/
+    # scream-type files never fire at all. Checked by NAME (the user's own file names) plus a
+    # tonality hint from the scanner records.
+    _NEVER_RE = re.compile(r"scream|horror|creepy|jumpscare|siren|alarm|gun|explos", re.I)
+    _NOT_ON_CUTS_RE = re.compile(r"bell|gong|dong|church|choir|chant|song|music|melod|bgm|"
+                                 r"anthem|hymn|jingle|guitar|piano|violin|orchestr", re.I)
+    _CUT_CATS = {"swipe_whoosh", "bright_whoosh", "whoosh_hit_combo", "caption_pop",
+                 "notification_ding", "camera_flash", "idea_reveal", "flash_blink", "ui_click"}
+
+    def _file_ok(cand, cat):
+        rec = rec_by_path.get(str(cand)) or {}
+        name = str(rec.get("file") or Path(str(cand)).name)
+        if _NEVER_RE.search(name):
+            return False
+        if cat in _CUT_CATS:
+            if _NOT_ON_CUTS_RE.search(name):
+                return False
+            # strongly tonal + bass-heavy = melodic hit, not a neutral cut sound
+            if rec and rec.get("low_ratio", 0) > 0.55 and rec.get("centroid", 9999) < 900:
+                return False
+        return True
+
     def pick(cat):                                    # rotate variations, honor the per-file cap
         files = lib.get(cat) or []
         if not files:
@@ -4849,7 +4872,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         j = rot.get(cat, 0)
         for step in range(len(files)):
             cand = files[(j + step) % len(files)]
-            if use_count.get(str(cand), 0) < cap:
+            if use_count.get(str(cand), 0) < cap and _file_ok(cand, cat):
                 rot[cat] = j + step + 1
                 use_count[str(cand)] = use_count.get(str(cand), 0) + 1
                 return cand
@@ -6868,26 +6891,48 @@ def apply_timeline_edits_to_config(config, edits, slug):
             for scene in sorted(scenes, key=lambda row: float(row.get("start", 0) or 0))
         ]
     # newly added clips dragged in from the library
+    project_dir = PROJECTS_DIR / slug
     added_by_id = {}
     for a in (edits.get("added") or []):
         aid = str(a.get("id") or "")
         if not aid:
             continue
         asset = a.get("path") or ""
+        is_clip = (a.get("kind") == "clip")
+        clip_name = Path(a["clip"]).name if a.get("clip") else None
+        # A clip dragged from the "All projects" tab (or any external path) lives in ANOTHER
+        # project's folder - copy it into THIS project so the render resolves it and it can't
+        # break if the source project is deleted. Video clips resolve by basename in
+        # seedance 2.0/, so the copied name IS the clip name.
+        try:
+            src = Path(asset)
+            if is_clip and src.is_absolute() and src.is_file():
+                clip_dir = project_dir / "seedance 2.0"
+                already_here = (clip_dir.resolve() == src.parent.resolve())
+                if not already_here:
+                    clip_dir.mkdir(parents=True, exist_ok=True)
+                    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", src.stem)[:28]
+                    key = hashlib.sha1(str(src.resolve()).encode("utf-8", "ignore")).hexdigest()[:8]
+                    dest = clip_dir / f"imported_{safe}_{key}{src.suffix.lower() or '.mp4'}"
+                    if not dest.exists():
+                        shutil.copy2(src, dest)
+                    asset = dest.name
+                    clip_name = dest.name
+        except Exception:
+            pass
         added_by_id[aid] = {
             "id": aid,
             "name": a.get("label") or "Added clip",
             "caption": "",
             "asset": asset,
-            "clip": Path(a["clip"]).name if a.get("clip") else None,
-            "seedance": bool(a.get("kind") == "clip"),
+            "clip": clip_name,
+            "seedance": bool(is_clip),
             "added": True,
         }
     removed = {str(x) for x in (edits.get("removed") or [])}
     # In-editor "Replace media": scene_id -> chosen library media. The new media is copied into the
     # project and the scene points at it, KEEPING the scene's existing duration (so the new clip is
     # cut to the replaced clip's length by the normal per-scene trim).
-    project_dir = PROJECTS_DIR / slug
     replaced_by_id = {}
     for r in (edits.get("replaced") or []):
         rid = str(r.get("id") or "")
@@ -7450,15 +7495,20 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
             "audio": str(audio_path)}
 
 
-def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None):
+def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None,
+                                   include_project_pool=False, output_tag="timeline_social_replace"):
     """Search fresh TikTok/X footage for only the marked timeline scenes, then render.
 
     This is deliberately separate from a full same-script rerun: unmarked media remains intact,
     and every replacement must pass the normal download-quality and semantic vision gates.
+    With ``include_project_pool`` the EXISTING project clips join the candidate pool (used by
+    the script-change flow: reuse footage already on disk first, scrape only what's missing) -
+    in that mode a disconnected backend degrades to pool-only matching instead of failing.
     """
     config = load_project_config(slug)
     project_dir = PROJECTS_DIR / slug
-    if str(config.get("clip_source") or "").lower() != "scrape":
+    is_scrape = str(config.get("clip_source") or "").lower() == "scrape"
+    if not is_scrape and not include_project_pool:
         raise RuntimeError("Targeted social replacement is only available for TikTok/X scrape projects.")
     wanted = {str(value) for value in (scene_ids or []) if str(value)}
     indexed_targets = [(index, scene) for index, scene in enumerate(config.get("scenes") or [])
@@ -7470,8 +7520,12 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     except Exception as exc:
         raise RuntimeError("TikTok/X scraper is unavailable.") from exc
     platforms = clip_scraper.normalize_platforms(config.get("scrape_platforms") or "tiktok,x")
-    if not clip_scraper.backend_active(platforms):
+    backend_up = is_scrape and clip_scraper.backend_active(platforms)
+    if not backend_up and not include_project_pool:
         raise RuntimeError("TikTok/X is not connected. Connect at least one selected source first.")
+    if not backend_up and include_project_pool:
+        log(status_cb, "Scrape backend not connected - matching against the project's existing "
+                       "media only.")
 
     def cancelled():
         return bool(cancel_event and cancel_event.is_set())
@@ -7511,13 +7565,15 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_dir = project_dir / "seedance 2.0" / "_candidates" / f"timeline_replace_{stamp}"
     candidate_statuses = []
-    got = clip_scraper.scrape_bucket(
-        out_dir, queries[:32], min(40, max(8, len(target_scenes) * 6)),
-        bucket_id=f"timeline_replace_{stamp}", tier="timeline_replace",
-        bucket_terms=" ".join(lines)[:500], per_clip_seconds=per_clip,
-        status_cb=status_cb, cancel_check=cancelled, candidate_statuses=candidate_statuses,
-        min_likes=MIN_CLIP_LIKES, search_sort="MOST_LIKED", platforms=platforms,
-        deadline=time.monotonic() + 900.0) or []
+    got = []
+    if backend_up:
+        got = clip_scraper.scrape_bucket(
+            out_dir, queries[:32], min(40, max(8, len(target_scenes) * 6)),
+            bucket_id=f"timeline_replace_{stamp}", tier="timeline_replace",
+            bucket_terms=" ".join(lines)[:500], per_clip_seconds=per_clip,
+            status_cb=status_cb, cancel_check=cancelled, candidate_statuses=candidate_statuses,
+            min_likes=MIN_CLIP_LIKES, search_sort="MOST_LIKED", platforms=platforms,
+            deadline=time.monotonic() + 900.0) or []
     if cancelled():
         raise pipeline.PipelineCancelled("Timeline replacement cancelled.")
     pool, clip_meta = [], {}
@@ -7536,8 +7592,45 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
             "text_heaviness": item.get("text_heaviness", 0.0),
             "rapid_internal_cut_count": item.get("rapid_internal_cut_count", 0),
         }
+    if include_project_pool:
+        # existing project footage joins the pool: reuse before (re)downloading
+        used_now = {str(scene.get("clip") or "") for scene in (config.get("scenes") or [])}
+        pool_dir = project_dir / "seedance 2.0"
+        existing = []
+        for pattern in ("scraped_*.mp4", "manual_*.mp4", "timeline_replaced_*.mp4",
+                        "replaced_*.mp4", "rescript_*.mp4"):
+            existing.extend(pool_dir.glob(pattern))
+        try:
+            existing.extend((pool_dir / "_candidates").rglob("cand_*.mp4"))
+        except Exception:
+            pass
+        seen_pool = {str(Path(p).resolve()) for p in pool}
+        added_pool = 0
+        for p in existing:
+            if p.name.startswith(("speed_", "capblur_")) or p.name in used_now:
+                continue
+            key = str(p.resolve())
+            if key in seen_pool:
+                continue
+            seen_pool.add(key)
+            pool.append(p)
+            clip_meta[str(p)] = {
+                "bucket_id": "existing_project_media", "tier": "existing",
+                "source_query": "", "platform": "existing", "clip_id": p.stem,
+                "caption": "", "likes": 0, "black_bar_score": 0.0,
+                "text_heaviness": 0.0, "rapid_internal_cut_count": 0,
+            }
+            added_pool += 1
+            if added_pool >= 40:              # keep the vision matcher affordable
+                break
+        if added_pool:
+            log(status_cb, f"Candidate pool: +{added_pool} existing project clip(s) offered "
+                           "for reuse before new downloads.")
     if not pool:
-        raise RuntimeError("TikTok/X returned no clean candidates for the marked scenes.")
+        raise RuntimeError("TikTok/X returned no clean candidates for the marked scenes."
+                           if backend_up else
+                           "No existing project media available to match the changed lines - "
+                           "connect TikTok/X and rerun.")
     try:
         relevancy = int(config.get("script_relevancy") or 85)
     except (TypeError, ValueError):
@@ -7562,6 +7655,9 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
         updated["clip"] = dest.name
         updated["asset"] = dest.name
         updated["seedance"] = True
+        # fresh media -> the old speed/blur source chain no longer applies
+        updated.pop("timeline_speed_src", None)
+        updated.pop("caption_blur_src", None)
         meta = clip_meta.get(str(source)) or {}
         updated["scrape_source"] = meta.get("platform", "tiktok")
         updated["scrape_clip_id"] = meta.get("clip_id") or str(source)
@@ -7571,7 +7667,7 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
                        f"({meta.get('platform', 'tiktok')}).")
 
     config["timeline_editor_render"] = True
-    config["output_basename"] = f"{slug}_timeline_social_replace_{stamp}"
+    config["output_basename"] = f"{slug}_{output_tag}_{stamp}"
     attach_cancel_event(config, {"_cancel_event": cancel_event} if cancel_event else {})
     config_path = project_dir / "config" / "project.json"
     tmp = config_path.with_suffix(".json.tmp")
@@ -7581,6 +7677,304 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     output = pipeline.render_video(config)
     return {"title": config.get("title", slug), "project_dir": str(project_dir),
             "video": str(output), "replaced_scenes": len(matches)}
+
+
+def _split_script_lines(script, density="medium"):
+    """Split the script into scene lines - one scene = one clip. ``density`` controls HOW MANY
+    clips the recut uses:
+      - "few"    : merge adjacent sentences into longer holds (roughly half the clips)
+      - "medium" : one scene per sentence (default)
+      - "many"   : also break long sentences at commas/clauses (roughly 1.5-2x the clips)
+    """
+    density = str(density or "medium").strip().lower()
+    sentences = []
+    for raw in str(script or "").replace("\r", "").split("\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        for part in re.split(r"(?<=[.!?…。！？])\s+", raw):
+            part = part.strip()
+            if part:
+                sentences.append(part)
+    if not sentences:
+        return []
+
+    if density == "many":
+        out = []
+        for sentence in sentences:
+            # break at internal clause boundaries, but only into pieces of >= 4 words so we
+            # never make one-word clips
+            frags = [f.strip(" ,;:—–-")
+                     for f in re.split(r"(?<=[,;:—–])\s+", sentence)]
+            frags = [f for f in frags if len(f.split()) >= 4]
+            out.extend(frags if len(frags) >= 2 else [sentence])
+        return out
+
+    if density == "few":
+        # merge consecutive sentences until a chunk reaches ~20 words -> fewer, longer clips
+        out, chunk = [], ""
+        for sentence in sentences:
+            candidate = (chunk + " " + sentence).strip() if chunk else sentence
+            if chunk and len(candidate.split()) > 20:
+                out.append(chunk)
+                chunk = sentence
+            else:
+                chunk = candidate
+        if chunk:
+            out.append(chunk)
+        return out
+
+    return sentences   # medium: one scene per sentence
+
+
+def rescript_and_recut(slug, new_script, hook_text=None, voice_settings=None,
+                       clip_density="medium", status_cb=None, cancel_event=None):
+    """Timeline editor 'Change script', made ATOMIC: rebuilding the scene list overwrites the
+    project's config with clip-less scenes BEFORE the media search/render - so a run that dies
+    or is interrupted mid-way used to leave the project permanently broken (empty scenes in the
+    editor). This wrapper snapshots every file the rebuild touches, keeps a survivable backup on
+    disk, and restores everything on ANY failure so the project is left exactly as it was."""
+    project_dir = PROJECTS_DIR / slug
+    snapshot_targets = [
+        project_dir / "config" / "project.json",
+        project_dir / "config" / "timeline_edits.json",
+        project_dir / "input" / "script.txt",
+        project_dir / "input" / "run_form.json",
+        project_dir / "input" / "audio_analysis.json",
+        project_dir / "input" / "voiceover.wav",
+        project_dir / "input" / "voiceover_dehiss.wav",
+        project_dir / "input" / "hook.wav",
+        project_dir / "input" / "body.wav",
+    ]
+    snapshot = {p: (p.read_bytes() if p.exists() else None) for p in snapshot_targets}
+    # a copy that survives even a hard process kill (the in-memory restore below cannot run then)
+    survive_backup = project_dir / "config" / "project_before_rescript.json"
+    try:
+        cfg_bytes = snapshot.get(project_dir / "config" / "project.json")
+        if cfg_bytes:
+            survive_backup.write_bytes(cfg_bytes)
+    except Exception:
+        pass
+
+    def _restore():
+        for path, data in snapshot.items():
+            try:
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(data)
+            except Exception:
+                pass
+
+    try:
+        result = _rescript_and_recut_impl(
+            slug, new_script, hook_text=hook_text, voice_settings=voice_settings,
+            clip_density=clip_density, status_cb=status_cb, cancel_event=cancel_event)
+        try:
+            survive_backup.unlink(missing_ok=True)   # success -> the backup is no longer needed
+        except Exception:
+            pass
+        return result
+    except BaseException as exc:
+        # cancellation arrives as pipeline.PipelineCancelled OR app.py's RunCancelled (which is
+        # not importable here) via status_cb - match by name so an undefined name can't shadow it
+        cancelled = isinstance(exc, pipeline.PipelineCancelled) \
+            or type(exc).__name__ == "RunCancelled"
+        if cancelled:
+            log(status_cb, "Script change cancelled - restoring the project to its previous state.")
+        else:
+            log(status_cb, f"Script change failed ({exc}) - restoring the project to its previous "
+                           "state so nothing is lost.")
+        _restore()
+        raise
+
+
+def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=None,
+                             clip_density="medium", status_cb=None, cancel_event=None):
+    """The actual rebuild (see rescript_and_recut for the atomic snapshot/restore wrapper).
+    ``hook_text`` marks the opening line(s) so the fresh voiceover keeps the hook + pause
+    delivery (empty string clears the hook); ``voice_settings`` may override
+    speaker_name / tts_voice / tts_model for the new take; ``clip_density`` (few/medium/many)
+    controls how finely the script is cut into scenes = how many clips the video uses."""
+    new_script = clean_text(new_script or "")
+    if not new_script:
+        raise RuntimeError("The new script is empty.")
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    density = str(clip_density or "medium").strip().lower()
+    if density not in ("few", "medium", "many"):
+        density = "medium"
+    lines = _split_script_lines(new_script, density=density)
+    if not lines:
+        raise RuntimeError("Could not split the new script into spoken lines.")
+    log(status_cb, f"Clip density '{density}': {len(lines)} scene(s)/clip(s) from the script.")
+    config["clip_density"] = density
+
+    def _norm(text):
+        return re.sub(r"[\W_]+", "", str(text or "").casefold())
+
+    old_pool = [scene for scene in (config.get("scenes") or [])]
+    old_norms = [(_norm(scene.get("exact_voice_text") or scene.get("script") or ""), scene)
+                 for scene in old_pool]
+    taken = set()
+
+    def _claim_scene_for(line_norm):
+        """Old scene whose text equals the line - or, because the original run often cut
+        lines into FRAGMENT scenes, the longest old fragment contained in the line (or
+        containing it). Each old scene is reused at most once."""
+        best_index, best_len = None, 0
+        for idx, (norm, _scene) in enumerate(old_norms):
+            if idx in taken or not norm:
+                continue
+            if norm == line_norm:
+                best_index, best_len = idx, len(norm) * 10   # exact beats containment
+                break
+            if len(norm) >= 12 and (norm in line_norm or line_norm in norm):
+                if len(norm) > best_len:
+                    best_index, best_len = idx, len(norm)
+        if best_index is None:
+            return None
+        taken.add(best_index)
+        return old_norms[best_index][1]
+
+    new_scenes, used_ids, kept, added = [], set(), 0, 0
+    for index, line in enumerate(lines):
+        matched_scene = _claim_scene_for(_norm(line))
+        if matched_scene is not None and matched_scene.get("clip"):
+            scene = dict(matched_scene)           # unchanged line -> keeps its media + tuning
+            kept += 1
+        else:
+            # rough spoken-duration estimate so the retimer weights the new line sensibly
+            est = max(1.2, min(8.0, 0.34 * len(line.split())))
+            scene = {"id": None, "name": f"Scene {index + 1:02d}", "seedance": True,
+                     "clip": None, "asset": None, "render_caption": True,
+                     "start": 0.0, "end": round(est, 2)}
+            added += 1
+        scene["script"] = line
+        scene["exact_voice_text"] = line
+        scene["voice_line"] = line
+        sid = str(scene.get("id") or "")
+        if not sid or sid in used_ids:
+            sid = f"rs{index + 1:02d}"
+            while sid in used_ids:
+                sid += "x"
+            scene["id"] = sid
+        used_ids.add(sid)
+        new_scenes.append(scene)
+    log(status_cb, f"Script update: {len(lines)} line(s) - {kept} keep their media, "
+                   f"{added} need media.")
+    config["scenes"] = new_scenes
+    # per-event SFX tuning refers to the OLD cut layout; keep only custom sounds whose
+    # scene survived the rewrite
+    config.pop("sfx_overrides", None)
+    config["custom_sfx"] = [row for row in (config.get("custom_sfx") or [])
+                            if str(row.get("scene_id")) in used_ids]
+
+    input_dir = project_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    (input_dir / "script.txt").write_text(new_script, encoding="utf-8")
+    # hook: the voiceover regen splits hook+body from run_form["hook_text"], so the marked
+    # hook must land there BEFORE regenerate_timeline_speech reads the form back from disk
+    if hook_text is not None:
+        hook_clean = clean_text(hook_text).strip()
+        if hook_clean and re.sub(r"\s+", " ", hook_clean).casefold() not in \
+                re.sub(r"\s+", " ", new_script).casefold():
+            log(status_cb, "Marked hook is not part of the new script anymore - continuing "
+                           "without a hook.")
+            hook_clean = ""
+        if hook_clean:
+            log(status_cb, f"Hook marked for the fresh voiceover: {hook_clean[:70]!r}")
+    run_form_path = input_dir / "run_form.json"
+    try:
+        run_form = json.loads(run_form_path.read_text(encoding="utf-8")) \
+            if run_form_path.exists() else {}
+        if not isinstance(run_form, dict):
+            run_form = {}
+        run_form["script"] = new_script
+        run_form["clip_density"] = density
+        if hook_text is not None:
+            run_form["hook_text"] = hook_clean
+        # narrator override: the voiceover regen reads speaker/voice/model from this form
+        for key in ("speaker_name", "tts_voice", "tts_model"):
+            value = str((voice_settings or {}).get(key) or "").strip()
+            if not value:
+                continue
+            if key == "tts_voice" and value not in pipeline.GEMINI_TTS_VOICES:
+                log(status_cb, f"Unknown TTS voice {value!r} - keeping the saved one.")
+                continue
+            if key == "tts_model" and value not in ("flash", "pro"):
+                continue
+            if str(run_form.get(key) or "") != value:
+                log(status_cb, f"Narrator setting changed: {key} -> {value}")
+            run_form[key] = value
+        run_form_path.write_text(json.dumps(run_form, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+    except Exception:
+        pass
+    config_path = project_dir / "config" / "project.json"
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, config_path)
+    # CRITICAL: the saved editor edits (order/durations/sfx...) refer to the OLD scene ids -
+    # load_project_config applies them on every load and would FILTER the rebuilt scene list
+    # down to whatever old ids survived. Keep only scene-independent prefs.
+    edits_path = project_dir / "config" / "timeline_edits.json"
+    old_edits = {}
+    try:
+        if edits_path.exists():
+            old_edits = json.loads(edits_path.read_text(encoding="utf-8"))
+    except Exception:
+        old_edits = {}
+    kept_edits = {key: old_edits[key] for key in ("volumes", "captions")
+                  if isinstance(old_edits, dict) and key in old_edits}
+    edits_path.write_text(json.dumps(kept_edits, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+
+    # fresh voiceover from the new script + retime the rebuilt scene list to it
+    regenerate_timeline_speech(slug, status_cb=status_cb, cancel_event=cancel_event,
+                               render=False)
+
+    # snap scene boundaries EXACTLY to the aligned sentences when they map 1:1
+    config = load_project_config(slug)
+    try:
+        analysis = json.loads((input_dir / "audio_analysis.json").read_text(encoding="utf-8"))
+        rows = [row for row in (analysis.get("sentence_timestamps") or [])
+                if str(row.get("text") or "").strip()]
+        if len(rows) == len(config.get("scenes") or []):
+            for scene, row in zip(config["scenes"], rows):
+                scene["start"] = round(float(row.get("start", scene.get("start", 0))), 3)
+                scene["end"] = round(float(row.get("end", scene.get("end", 0))), 3)
+            tmp = config_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(tmp, config_path)
+            log(status_cb, "Scene cuts snapped exactly to the new spoken lines.")
+    except Exception:
+        pass
+
+    missing = [str(scene.get("id", index))
+               for index, scene in enumerate(config.get("scenes") or [])
+               if not scene.get("clip")]
+    if missing:
+        log(status_cb, f"Finding media for {len(missing)} changed/new line(s) - existing "
+                       "project clips first, then TikTok/X for the rest...")
+        return replace_timeline_scrape_scenes(
+            slug, missing, status_cb=status_cb, cancel_event=cancel_event,
+            include_project_pool=True, output_tag="rescript")
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    config["timeline_editor_render"] = True
+    config["output_basename"] = f"{slug}_rescript_{stamp}"
+    attach_cancel_event(config, {"_cancel_event": cancel_event} if cancel_event else {})
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, config_path)
+    log(status_cb, "All lines kept their media - rendering with the fresh voiceover...")
+    output = pipeline.render_video(config)
+    return {"title": config.get("title", slug), "project_dir": str(project_dir),
+            "video": str(output), "rescript_lines": len(lines)}
 
 
 def run_project(form, status_cb=None):

@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -362,6 +363,148 @@ def mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, st
     return out_path
 
 
+def refine_segments_with_llm(segments, phrases, reasoning_model=None, status_cb=None):
+    """FILE-LEVEL intelligence pass: show the reasoning model每 placed event (time, current
+    file, why) plus the actual library files (name + seconds + category) and let it veto or
+    swap picks that do not FIT - e.g. a church bell as a transition or a melodic hit on a
+    calm sentence. Keeps the plan unchanged when the model is unavailable."""
+    if not segments or not os.environ.get("WAVESPEED_API_KEY"):
+        return segments
+    try:
+        import sfx_library
+        data = sfx_library.build_library(status_cb=None)
+    except Exception:
+        return segments
+    usable = [r for r in data.get("records", []) if r.get("usable")]
+    if not usable:
+        return segments
+    by_name = {r["file"]: r for r in usable}
+    catalog = [{"file": r["file"], "seconds": round(float(r.get("trim_len") or r.get("duration") or 1.0), 2),
+                "category": r.get("estimated_category", "")} for r in usable][:90]
+    events = [{"i": i, "t": round(float(s["start"]), 2), "file": Path(str(s["path"])).name,
+               "category": s.get("category", ""), "reason": str(s.get("reason", ""))[:60]}
+              for i, s in enumerate(segments)]
+    transcript = " | ".join(f"{round(float(p.get('start', 0)), 1)}s {p.get('text', '')}"
+                            for p in (phrases or []))[:2200]
+    prompt = (
+        "You are reviewing the sound-effect plan for a finished short vertical video.\n"
+        "For every event decide: keep, drop, or replace its FILE with a better-fitting one from "
+        "the library list. Judge by the file NAME + length and the spoken context at that time.\n"
+        "Hard rules:\n"
+        "- Cut/transition slots need SHORT NEUTRAL sounds (whoosh/click/pop/ding <=1.2s). "
+        "NEVER bells, gongs, church/choir, musical jingles or melodic hits on a plain cut.\n"
+        "- Dramatic hits only where the transcript actually has a reveal/shock/punchline.\n"
+        "- Never use scary/horror/scream files. Prefer variety over repeating one file.\n"
+        "- When nothing in the library fits an event, drop it (silence beats a wrong sound).\n\n"
+        "Return STRICT JSON only: {\"events\":[{\"i\":number,\"action\":\"keep|drop|replace\","
+        "\"file\":\"name-when-replacing\"}]}\n\n"
+        f"Planned events: {json.dumps(events, ensure_ascii=False)}\n"
+        f"Library files: {json.dumps(catalog, ensure_ascii=False)}\n"
+        f"Timed transcript: {transcript}"
+    )
+    payload = {
+        "model": reasoning_model or "anthropic/claude-opus-4.8",
+        "messages": [
+            {"role": "system", "content": "You are an expert short-form sound designer. Return compact valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2, "max_tokens": 3000, "response_format": {"type": "json_object"},
+    }
+    try:
+        log(status_cb, "Reviewing every SFX pick with the reasoning model (file-level fit)...")
+        data_resp = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, payload, timeout=180)
+        plan = agent_core.extract_json_object(data_resp["choices"][0]["message"]["content"])
+        rows = plan.get("events") if isinstance(plan, dict) else None
+        if not isinstance(rows, list):
+            return segments
+    except Exception as exc:
+        log(status_cb, f"SFX review pass unavailable ({exc}); keeping the heuristic plan.")
+        return segments
+    out, dropped, swapped = [], 0, 0
+    actions = {int(r.get("i", -1)): r for r in rows if isinstance(r, dict)}
+    for i, seg in enumerate(segments):
+        act = actions.get(i) or {}
+        action = str(act.get("action", "keep")).lower()
+        if action == "drop":
+            dropped += 1
+            continue
+        if action == "replace":
+            rec = by_name.get(str(act.get("file", "")).strip())
+            if rec and rec.get("use_path") and Path(rec["use_path"]).exists():
+                seg = dict(seg)
+                seg["path"] = Path(rec["use_path"])
+                seg["duration"] = round(min(float(seg["duration"]),
+                                            float(rec.get("trim_len") or seg["duration"])), 3)
+                seg["reason"] = (str(seg.get("reason", "")) + " (model swap)").strip()
+                swapped += 1
+        out.append(seg)
+    log(status_cb, f"SFX review: kept {len(out)}, swapped {swapped}, dropped {dropped}.")
+    return out or segments
+
+
+def _write_timeline_project(video_path, segments, scenes, duration, ffmpeg, enhanced_out,
+                            status_cb=None):
+    """Create a REAL project for the enhanced upload so the timeline editor can open it:
+    the video is split at the detected cuts into per-scene clips, the original audio becomes
+    the voice track, and every placed sound lands in config['custom_sfx'] - fully editable
+    (move / replace / delete / volume) and re-renderable through the normal pipeline."""
+    base = re.sub(r"[^a-z0-9_]+", "_", video_path.stem.lower()).strip("_")[:36] or "upload"
+    slug = f"sfxmaster_{base}_{time.strftime('%H%M%S')}"
+    pdir = agent_core.PROJECTS_DIR / slug
+    clip_dir = pdir / "seedance 2.0"
+    for d in (clip_dir, pdir / "input", pdir / "config", pdir / "renders"):
+        d.mkdir(parents=True, exist_ok=True)
+    # original audio -> the voice track the renderer lays back over the (muted) segments
+    _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path), "-vn",
+          "-ar", "48000", "-ac", "2", str(pdir / "input" / "voiceover.wav")], timeout=300)
+    log(status_cb, f"Timeline project: splitting the video into {len(scenes)} segment clip(s)...")
+    cfg_scenes = []
+    for k, sc in enumerate(scenes):
+        start, end = float(sc.get("start", 0.0)), float(sc.get("end", 0.0))
+        seg_dur = max(0.15, end - start)
+        name = f"seg_{k:02d}.mp4"
+        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.3f}",
+              "-i", str(video_path), "-t", f"{seg_dur:.3f}", "-an",
+              "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+              str(clip_dir / name)], timeout=600)
+        cfg_scenes.append({
+            "id": f"{k + 1:02d}", "name": f"Segment {k + 1:02d}",
+            "script": sc.get("script", ""), "exact_voice_text": sc.get("exact_voice_text", ""),
+            "start": round(start, 3), "end": round(end, 3),
+            "clip": name, "asset": name, "seedance": True,
+            "seedance_start_trim": 0.0, "render_caption": False,
+        })
+    custom = []
+    for i, seg in enumerate(segments):
+        at = float(seg["start"])
+        scene = next((s for s in cfg_scenes if s["start"] <= at < s["end"]), cfg_scenes[-1])
+        custom.append({
+            "id": f"sfxm-{i:03d}", "scene_id": scene["id"],
+            "path": str(seg["path"]), "offset": round(max(0.0, at - scene["start"]), 3),
+            "duration": round(float(seg["duration"]), 3), "volume": float(seg["volume"]),
+            "enabled": True, "label": Path(str(seg["path"])).stem.replace("_", " "),
+        })
+    config = {
+        "project_slug": slug, "title": f"SFX Master - {video_path.stem}"[:70],
+        "duration": round(float(duration), 3),
+        "scenes": cfg_scenes, "custom_sfx": custom,
+        "sfx_enabled": False,               # re-renders mix ONLY the editable custom_sfx
+        "render_captions": False, "animated_captions": False,
+        "use_seedance_clips": True, "seedance_clip_start_trim": 0.0,
+        "background_music_choice": "none", "audio_master_gain": 1.0,
+        "sfx_master_source": str(video_path),
+    }
+    (pdir / "config" / "project.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        shutil.copy2(enhanced_out, pdir / "renders" / Path(enhanced_out).name)
+    except Exception:
+        pass
+    log(status_cb, f"Timeline project ready: {slug} (open it in the timeline editor to "
+                   "move/replace/delete the added sounds).")
+    return slug
+
+
 def _scenes_from_cuts_and_phrases(cuts, phrases, duration):
     """Build the `scenes` list that `agent_core.place_editor_sfx` expects from an uploaded video's
     detected hard cuts + timed transcript. Each cut is a real edit point (a scene boundary); the
@@ -450,8 +593,23 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
         raise RuntimeError("No sound effects placed - your soundeffects/ library has no usable clips. "
                            "Drop SFX files into the soundeffects/ folder and try again.")
 
+    # FILE-LEVEL review: the reasoning model vetoes/swaps picks that don't fit the moment
+    # (no bells/melodic hits on plain cuts, no repeats, drop instead of wrong sound).
+    segments = refine_segments_with_llm(segments, phrases, reasoning_model=reasoning_model,
+                                        status_cb=status_cb)
+
     mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
     log(status_cb, "SFX enhancement complete.")
+
+    # Make the result EDITABLE: build a real project (segment clips + original audio as the
+    # voice track + every sound as custom_sfx) so the timeline editor can open it.
+    timeline_slug = None
+    try:
+        timeline_slug = _write_timeline_project(video_path, segments, scenes, duration,
+                                                ffmpeg, out_path, status_cb=status_cb)
+    except Exception as exc:
+        log(status_cb, f"Timeline project could not be created ({exc}); the enhanced video "
+                       "is still fine.")
 
     # Write the plan + a readable report next to the output.
     plan_path = out_path.with_name(out_path.stem + "_plan.json")
@@ -475,4 +633,6 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
         "sfx_plan": str(plan_path),
         "sfx_event_count": len(segments),
         "plan_source": plan_source,
+        "timeline_slug": timeline_slug,
+        "project_dir": str(agent_core.PROJECTS_DIR / timeline_slug) if timeline_slug else None,
     }

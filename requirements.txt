@@ -16,3 +16,6 @@ json-repair
 yt-dlp
 playwright
 rapidocr-onnxruntime
+
+# Native desktop window (WebView2) - launcher prefers this over a browser
+pywebview

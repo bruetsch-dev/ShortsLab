@@ -128,10 +128,13 @@ def _cookies_to_netscape(cookies):
 def export_cookies_txt(path=None, cookies=None):
     path = Path(path or COOKIES_TXT)
     if cookies is None:
-        sess = _SESSION[0]
-        if sess is None:
+        # sess.cookies() is a Playwright call - it MUST run on the worker thread, or it
+        # touches the sync-Playwright context from the wrong thread and the whole process
+        # dies with greenlet "Cannot switch to a different thread". _merge_backend_cookies
+        # calls this from the TikTok/main thread, so route it through the executor.
+        cookies = _session_cookies_threadsafe()
+        if cookies is None:
             return str(path) if path.exists() else None
-        cookies = sess.cookies()
     if not _has_session_cookie(cookies):
         return str(path) if path.exists() else None
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,6 +425,23 @@ def _executor():
             _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="xscrape")
         return _EXECUTOR
+
+
+def _on_worker_thread():
+    return threading.current_thread().name.startswith("xscrape")
+
+
+def _session_cookies_threadsafe():
+    """Read the session cookies ON the worker thread (None when no session). Any Playwright
+    call from another thread crashes the process with a greenlet cross-thread error."""
+    if _on_worker_thread():                 # already there - a future would deadlock
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    def _get():
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    try:
+        return _executor().submit(_get).result(timeout=30)
+    except Exception:
+        return None
 
 
 def _session_on_worker(status_cb=None):
