@@ -181,6 +181,7 @@ def login(status_cb=None, timeout_s=300):
                   "--no-default-browser-check", "--window-position=160,80"])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _tt._place_window_visible(ctx, 160, 80)   # force ON-SCREEN even if a scrape saved it off-screen
             try:
                 page.goto("https://x.com/login", timeout=60000)
             except Exception:
@@ -317,6 +318,8 @@ class Session:
         self._ctx = self._p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
             viewport={"width": 1280, "height": 900}, args=args)
+        # CDP-force off-screen (persistent profile may restore an on-screen position), then hide.
+        _tt._park_window_offscreen(self._ctx, "TWITTER_WINDOW_VISIBLE")
         for _wait in (0.4, 1.2, 2.0):
             time.sleep(_wait)
             if _tt._hide_offscreen_from_taskbar():

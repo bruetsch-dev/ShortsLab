@@ -184,6 +184,7 @@ def login(status_cb=None, timeout_s=300):
                   "--no-default-browser-check", "--window-position=120,60"])
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _place_window_visible(ctx, 120, 60)   # force ON-SCREEN even if a scrape saved it off-screen
             try:
                 page.goto("https://www.tiktok.com/login", timeout=60000)
             except Exception:
@@ -303,6 +304,47 @@ def _hide_offscreen_from_taskbar():
     return found[0]
 
 
+def _park_window_offscreen(ctx, env_visible="TIKTOK_WINDOW_VISIBLE"):
+    """Force the persistent context's OS window FAR off-screen via CDP. `--window-position` is only
+    a hint for a fresh profile - a persistent profile RESTORES the last saved window bounds, so after
+    an interactive login (which showed the window on-screen) the scrape window reappears on-screen
+    and blinks in the taskbar. CDP `Browser.setWindowBounds` overrides that regardless of the saved
+    bounds; then `_hide_offscreen_from_taskbar()` (which keys on the -2400,-2400 band) can strip the
+    taskbar button. Best-effort + silent."""
+    if os.environ.get(env_visible, "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        cdp = ctx.new_cdp_session(page)
+        info = cdp.send("Browser.getWindowForTarget") or {}
+        wid = info.get("windowId")
+        if wid is not None:
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {
+                "left": -2400, "top": -2400, "width": 1280, "height": 900, "windowState": "normal"}})
+    except Exception:
+        pass
+
+
+def _place_window_visible(ctx, left=120, top=60, width=1280, height=900):
+    """Force the persistent context's window ON-SCREEN + focused via CDP, overriding any off-screen
+    bounds the profile saved from a previous BACKGROUND scrape - otherwise an interactive login could
+    open invisibly at -2400,-2400 and the user could never sign in. Best-effort + silent."""
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        cdp = ctx.new_cdp_session(page)
+        info = cdp.send("Browser.getWindowForTarget") or {}
+        wid = info.get("windowId")
+        if wid is not None:
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {
+                "left": left, "top": top, "width": width, "height": height, "windowState": "normal"}})
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _kill_stale_profile_processes():
     """Windows only: force-kill any Chromium process still holding PROFILE_DIR open. Needed
     because a crashed run / cross-thread-poisoned session / killed process can leave the browser
@@ -371,7 +413,9 @@ class Session:
                 self._p = None
             raise
         if not self.headless:
-            # remove the taskbar button of the off-screen window (it kept blinking for attention)
+            # CDP-force the window off-screen first (a persistent profile can restore an on-screen
+            # position from a prior interactive login), THEN strip its blinking taskbar button.
+            _park_window_offscreen(self._ctx, "TIKTOK_WINDOW_VISIBLE")
             for _wait in (0.4, 1.2, 2.0):
                 time.sleep(_wait)
                 if _hide_offscreen_from_taskbar():
