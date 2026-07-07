@@ -91,7 +91,34 @@ def main():
 
     _set_taskbar_identity()
     icon = _app_icon()
-    webview.create_window("Shortslab", url, width=1440, height=920, min_size=(1024, 680))
+
+    class _NativeApi:
+        """Exposed to the page as window.pywebview.api. WebView2 does not act on <a download>
+        links, so the in-page "Download" button calls save_file() to get a real Save-As dialog."""
+        def save_file(self, src_path):
+            import os
+            import shutil
+            try:
+                if not src_path or not os.path.isfile(src_path):
+                    return {"ok": False, "error": "file not found"}
+                windows = getattr(webview, "windows", None) or []
+                win = windows[0] if windows else None
+                name = os.path.basename(src_path)
+                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+                start_dir = downloads if os.path.isdir(downloads) else os.path.expanduser("~")
+                dest = win.create_file_dialog(webview.SAVE_DIALOG, directory=start_dir,
+                                              save_filename=name) if win else None
+                if not dest:
+                    return {"ok": False, "cancelled": True}
+                if isinstance(dest, (list, tuple)):
+                    dest = dest[0]
+                shutil.copy2(src_path, dest)
+                return {"ok": True, "dest": str(dest)}
+            except Exception as exc:  # pragma: no cover - GUI dialog path
+                return {"ok": False, "error": str(exc)}
+
+    webview.create_window("Shortslab", url, js_api=_NativeApi(),
+                          width=1440, height=920, min_size=(1024, 680))
     # edgechromium = the WebView2 engine (already installed); pywebview auto-falls-back otherwise.
     # icon = the Shortslab icon for the window + taskbar (so it's not the python.exe logo).
     start_kwargs = {"gui": "edgechromium"}

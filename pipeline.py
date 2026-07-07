@@ -597,6 +597,16 @@ def _caption_word_weight(word):
     return weight
 
 
+_CAPTION_EDGE_PUNCT = " \t\r\n.,;:\"'()[]{}…“”‘’"
+
+
+def _caption_display_word(word):
+    """Viral single-word captions read cleanest WITHOUT trailing sentence punctuation
+    ("UNREAL." -> "UNREAL", "countries," -> "countries"). Strip surrounding . , ; : quotes /
+    brackets / ellipsis but KEEP ? ! and internal apostrophes/hyphens (don't, word-by-word)."""
+    return (word or "").strip(_CAPTION_EDGE_PUNCT)
+
+
 def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None):
     """Turn a spoken line into timed caption chunks (1-`max_words` words each).
 
@@ -609,7 +619,7 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
     spans = []
     if word_times:
         for wt in word_times:
-            word = (wt.get("word") or "").strip()
+            word = _caption_display_word(wt.get("word") or "")
             if not word:
                 continue
             start = max(0.0, float(wt.get("start", 0.0)))
@@ -620,7 +630,7 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
             })
     else:
         text = (text or "").strip()
-        raw_words = [w for w in re.split(r"\s+", text) if w.strip()] if text else []
+        raw_words = [c for c in (_caption_display_word(w) for w in re.split(r"\s+", text)) if c] if text else []
         if raw_words:
             words = [w.upper() if uppercase else w for w in raw_words]
             weights = [_caption_word_weight(w) for w in raw_words]
@@ -2534,6 +2544,10 @@ def ai_content_sfx_segments(config):
 
 
 def build_sfx_segments(config, has_speech=False):
+    # Master "voice only / no SFX" switch (timeline editor): mutes EVERYTHING - content, transition,
+    # generated, AND the user-added custom_sfx + overlay-appearance SFX - so the render is voice-only.
+    if not bool(config.get("render_sfx_enabled", True)):
+        return []
     explicit_segments = custom_sfx_segments(config) + overlay_appearance_sfx_segments(config)
     if not bool(config.get("sfx_enabled", True)):
         return explicit_segments
@@ -2907,9 +2921,27 @@ def render_video(config, basename=None):
             else:
                 previous_identity = None
 
-    writer = cv2.VideoWriter(str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError("OpenCV could not open MP4 writer.")
+    # Encode frames by PIPING raw RGB straight into libx264 (ffmpeg): no OpenCV mp4v intermediate
+    # encode AND no re-encode afterwards (the audio mux below just COPIES this stream). This drops a
+    # whole video-encode pass + the intermediate decode. Falls back to the OpenCV writer if ffmpeg
+    # is unavailable. Same preset/crf as before, so output quality is unchanged.
+    ffmpeg = find_ffmpeg()
+    enc_proc = writer = None
+    piped = bool(ffmpeg)
+    if piped:
+        enc_cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pixel_format", "rgb24",
+            "-video_size", f"{width}x{height}", "-framerate", str(fps), "-i", "-",
+            "-an", "-vf", "format=yuv420p", "-c:v", "libx264",
+            "-preset", str(config.get("render_preset", "medium")),
+            "-crf", str(config.get("crf", 18)), str(intermediate),
+        ]
+        enc_proc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
+    else:
+        writer = cv2.VideoWriter(str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError("OpenCV could not open MP4 writer.")
 
     clip_paths = {}
     try:
@@ -2998,7 +3030,10 @@ def render_video(config, basename=None):
             base = Image.alpha_composite(img.convert("RGBA"), vignette).convert("RGB")
             base = draw_smart_overlays(base, scene, shot, shot_p, frame_no, width, height, config)
             base = draw_kinetic_annotations(base, scene, p, frame_no, width, height, config)
-            if scene_renders_caption(config, scene):
+            # LEGACY static full-line caption. It must NOT run alongside the animated word-by-word
+            # captions below, or every frame gets BOTH (a full sentence near the top + the moving
+            # words) = the duplicate caption. Only draw it when the animated captions are off.
+            if scene_renders_caption(config, scene) and not captions_enabled:
                 draw_caption(
                     base,
                     scene.get("caption", ""),
@@ -3020,19 +3055,42 @@ def render_video(config, basename=None):
                     config,
                     is_hook=(scene_id == first_scene_id),
                 )
-            writer.write(cv2.cvtColor(np.array(base), cv2.COLOR_RGB2BGR))
+            if piped:
+                frame = np.asarray(base, dtype=np.uint8)
+                if frame.shape[:2] != (height, width):   # ffmpeg rawvideo needs exact WxH bytes
+                    frame = np.asarray(base.resize((width, height)), dtype=np.uint8)
+                enc_proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            else:
+                writer.write(cv2.cvtColor(np.array(base), cv2.COLOR_RGB2BGR))
     finally:
         clip_paths = {scene_id: clip.path for scene_id, clip in clips.items()}
-        writer.release()
+        if piped:
+            try:
+                if enc_proc.stdin:
+                    enc_proc.stdin.close()
+            except Exception:
+                pass
+            enc_proc.wait()
+        elif writer is not None:
+            writer.release()
         for clip in clips.values():
             clip.release()
+    if piped and enc_proc.returncode not in (0, None):
+        raise RuntimeError(f"ffmpeg frame encode failed (exit {enc_proc.returncode}).")
 
     ffmpeg = find_ffmpeg()
     ffprobe = find_ffprobe(ffmpeg)
     speech_audio_enabled = bool(config.get("speech_audio_in_final", False))
     audio_path = Path(config.get("audio_path", "")) if speech_audio_enabled and config.get("audio_path") else None
     if audio_path and not audio_path.exists():
+        status_log(status_cb, f"WARNING: voiceover file is missing ({audio_path}); the render will have NO voice.")
         audio_path = None
+    # Make the "why is there no voice?" reason explicit in the job log instead of silently dropping it.
+    if not audio_path:
+        if speech_audio_enabled:
+            status_log(status_cb, "WARNING: speech_audio_in_final is ON but no usable voiceover was found -> rendering WITHOUT voice.")
+        elif config.get("audio_path") or config.get("timing_audio_path"):
+            status_log(status_cb, "Note: a voiceover exists but speech_audio_in_final is OFF -> voice is used for timing only, not mixed into the final video.")
     seedance_segments = []
     if (not audio_path or bool(config.get("mix_seedance_audio_with_speech", False))) and ffmpeg:
         seedance_segments = seedance_audio_segments(config, clip_paths, ffprobe=ffprobe)
@@ -3073,18 +3131,16 @@ def render_video(config, basename=None):
             cmd += ["-stream_loop", "-1", "-i", str(background_music["path"])]
         if not audio_path and not seedance_segments and not sfx_segments and not background_music:
             cmd += ["-an"]
-        cmd += [
-            "-r",
-            str(fps),
-            "-vf",
-            f"scale={width}:{height},format=yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            str(config.get("crf", 18)),
-        ]
+        if piped:
+            # the frames were already libx264-encoded via the pipe above; just COPY the video stream
+            # (no second encode) and mux the audio onto it.
+            cmd += ["-c:v", "copy"]
+        else:
+            cmd += [
+                "-r", str(fps),
+                "-vf", f"scale={width}:{height},format=yuv420p",
+                "-c:v", "libx264", "-preset", "medium", "-crf", str(config.get("crf", 18)),
+            ]
         if audio_path and not seedance_segments and not sfx_segments and not background_music:
             cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest"]
         elif seedance_segments or sfx_segments or background_music:

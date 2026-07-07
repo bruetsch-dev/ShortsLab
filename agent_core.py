@@ -6944,6 +6944,10 @@ def apply_timeline_edits_to_config(config, edits, slug):
                    if d.get("speed") is not None}
     blur_by_id = {str(d.get("id")): bool(d.get("blur_captions")) for d in (edits.get("scenes") or [])
                   if d.get("blur_captions") is not None}
+    # CapCut-style per-clip source in-point ("cut front") -> the renderer reads it via
+    # seedance_clip_start_trim(config, scene) = scene["seedance_start_trim"].
+    trim_by_id = {str(d.get("id")): d.get("source_trim") for d in (edits.get("scenes") or [])
+                  if d.get("source_trim") is not None}
     overlays_by_id = {}
     for row in (edits.get("overlays") or []):
         sid = str(row.get("scene_id") or "") if isinstance(row, dict) else ""
@@ -7007,6 +7011,11 @@ def apply_timeline_edits_to_config(config, edits, slug):
             dur = float(scene.get("end", 0)) - float(scene.get("start", 0))
         dur = max(0.5, min(20.0, dur or 1.0))
         scene = dict(scene)
+        if sid in trim_by_id:
+            try:
+                scene["seedance_start_trim"] = max(0.0, round(float(trim_by_id[sid]), 3))
+            except (TypeError, ValueError):
+                pass
         if sid in overlays_by_id:
             scene["overlays"] = overlays_by_id[sid]
         # apply an in-editor media replacement for this scene (copy the chosen file into the project
@@ -7161,6 +7170,11 @@ def apply_timeline_edits_to_config(config, edits, slug):
     if "captions" in edits:
         config["render_captions"] = bool(edits["captions"])
 
+    # Master "Sound FX" switch: off = render the voice only (mutes content/transition/generated AND
+    # the user-added custom_sfx + overlay SFX). pipeline.build_sfx_segments honours render_sfx_enabled.
+    if "sfx_on" in edits:
+        config["render_sfx_enabled"] = bool(edits["sfx_on"])
+
     # Per-event SFX edits (each transition and content effect tuned individually).
     overrides = dict(config.get("sfx_overrides") or {})
     custom_sfx = []
@@ -7197,7 +7211,10 @@ def apply_timeline_edits_to_config(config, edits, slug):
             overrides[eid] = entry
     if overrides:
         config["sfx_overrides"] = overrides
-        config["sfx_enabled"] = True
+        # NOTE: do NOT force sfx_enabled=True here. That silently re-enabled the auto-SFX planner
+        # on projects that deliberately disabled it (e.g. an SFX-Master project = sfx_enabled False,
+        # meant to mix ONLY the editable custom_sfx), so random auto transition SFX appeared in the
+        # render that were never shown in the timeline editor. Respect the project's sfx_enabled.
     if "sfx" in edits or "transitions" in edits:
         # always replace: deleting an added sound must not leave the stale one behind
         config["custom_sfx"] = custom_sfx
@@ -7228,6 +7245,31 @@ def save_timeline_edits(slug, edits):
             "saved": True, "edits_file": str(edits_path)}
 
 
+def ensure_timeline_voice(config, project_dir, status_cb=None):
+    """WYSIWYG guarantee for timeline renders: the editor PREVIEWS the sequence with the project's
+    narration (voice_url = configured audio_path -> input/voiceover_dehiss.wav -> input/voiceover.wav),
+    so the render must include that SAME voice - otherwise a timeline re-render comes out "music/SFX
+    only, no voice" whenever the loaded config's audio_path is missing/stale. Resolve the voice file
+    the same way the preview does and set it as the render's voice track."""
+    project_dir = Path(project_dir)
+    ap = str(config.get("audio_path") or "").strip()
+    candidates = ([Path(ap)] if ap else []) + [
+        project_dir / "input" / name for name in ("voiceover_dehiss.wav", "voiceover.wav")
+    ]
+    for vp in candidates:
+        try:
+            if vp.exists():
+                config["audio_path"] = str(vp.resolve())
+                config["speech_audio_in_final"] = True
+                log(status_cb, f"Timeline render: voice track = {vp.name} (matching the editor preview).")
+                return str(vp.resolve())
+        except OSError:
+            continue
+    if config.get("speech_audio_in_final"):
+        log(status_cb, "Timeline render: no voiceover file found for this project; rendering without voice.")
+    return None
+
+
 def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     """Re-render a project from the timeline editor's edits."""
     config = load_project_config(slug)
@@ -7236,6 +7278,7 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
         config["_cancel_event"] = cancel_event
     apply_timeline_edits_to_config(config, edits, slug)
     config["timeline_editor_render"] = True
+    ensure_timeline_voice(config, project_dir, status_cb=status_cb)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     config["output_basename"] = f"{slug}_timeline_{stamp}"

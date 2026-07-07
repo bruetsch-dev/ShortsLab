@@ -633,33 +633,49 @@ def _lab_scene_inner():
     return "".join(S)
 
 
-def _lab_scene_uri(mirror=False):
-    """Wrap the front-view side scene into an SVG data URI; `mirror` flips it for the other edge."""
+def _lab_window_svg(w=1600, h=1000):
+    """Compose the FULL-WINDOW front-view lab: the side scene at the left edge + a mirrored copy at
+    the right edge (centre left transparent/clean), a faint full-width tiled floor, and a ceiling
+    light fixture up top. Returned as a plain SVG string (transparent background) - it is rasterised
+    to a small PNG (static/lab_bg.png) that the page then upscales with image-rendering:pixelated so
+    the whole window reads as chunky pixel art."""
+    OUT, WH, FL = "#39435c", "#f7f9fc", "#dfe4ec"
     inner = _lab_scene_inner()
-    if mirror:
-        inner = f'<g transform="translate({_LAB_W},0) scale(-1,1)">{inner}</g>'
-    svg = (f"<svg xmlns='http://www.w3.org/2000/svg' width='{_LAB_W}' height='{_LAB_H}' "
-           f"viewBox='0 0 {_LAB_W} {_LAB_H}'>{inner}</svg>")
-    return "url(\"data:image/svg+xml," + urllib.parse.quote(svg) + "\")"
-
-
-_LAB_L = _lab_scene_uri(mirror=False)   # left-edge lab furniture
-_LAB_R = _lab_scene_uri(mirror=True)    # mirrored, right edge
+    sc = h / _LAB_H
+    s = []
+    # full-width faint tiled floor band across the bottom
+    s.append(f'<rect x="0" y="{h-58:.0f}" width="{w}" height="58" fill="#eef1f6"/>')
+    for fx in range(0, w + 1, 92):
+        s.append(f'<line x1="{fx}" y1="{h-58:.0f}" x2="{fx}" y2="{h}" stroke="{FL}" stroke-width="2"/>')
+    s.append(f'<line x1="0" y1="{h-30:.0f}" x2="{w}" y2="{h-30:.0f}" stroke="{FL}" stroke-width="2"/>')
+    # ceiling light fixture (top centre)
+    cx0, cx1 = w * 0.42, w * 0.58
+    s.append(f'<rect x="{cx0:.0f}" y="12" width="{cx1-cx0:.0f}" height="34" rx="8" fill="{WH}" stroke="{OUT}" stroke-width="3"/>')
+    s.append(f'<rect x="{cx0+16:.0f}" y="20" width="{cx1-cx0-32:.0f}" height="18" rx="6" fill="#eef3fb"/>')
+    # left + right furniture, scaled to full height
+    s.append(f'<g transform="translate(0,0) scale({sc:.4f})">{inner}</g>')
+    s.append(f'<g transform="translate({w},0) scale({-sc:.4f},{sc:.4f})">{inner}</g>')
+    return (f"<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' "
+            f"viewBox='0 0 {w} {h}'>{''.join(s)}</svg>")
 
 
 def app_style():
     return ("""
-    <style>""" + f"""
-      /* flat front-view pixel-art LAB furniture framing the LEFT + RIGHT edges (centre stays clean) */
-      body::before {{
+    <style>""" + """
+      /* full-window pixel-art LAB backdrop (rasterised low-res PNG upscaled -> chunky pixels; the
+         scene centre is transparent so the working area stays clean) */
+      body::before {
         content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
-        background-image: {_LAB_L}, {_LAB_R};
-        background-repeat: no-repeat, no-repeat;
-        background-position: left bottom, right bottom;
-        background-size: auto 96vh, auto 96vh;
-        opacity: .3;
-      }}
-      .theme-dark body::before {{ opacity: .26; }}""" + """
+        background-image: url("/static/lab_bg.png");
+        background-repeat: no-repeat; background-position: center bottom;
+        background-size: cover;
+        image-rendering: pixelated;
+        opacity: .12;
+        transform: translateY(7vh);   /* sit the lab art a bit lower, away from the header */
+      }
+      .theme-dark body::before { opacity: .14; }
+      /* the lab backdrop is distracting behind the timeline editor - hide it there */
+      body.page-timeline::before { display: none; }""" + """
       /* ===== OVERWORLD — pixel-art neo-brutalist editorial on warm parchment ===== */
       :root {
         color-scheme: light;
@@ -956,22 +972,27 @@ def app_style():
       /* bounded like the wizard steps: 4 big cards fit fully at normal viewports; on a very short
          window the menu scrolls WITHIN itself instead of page-scrolling. Padding gives the cards'
          hover shadow room so overflow:auto doesn't clip it. */
-      .wiz-modemenu { max-width: 900px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
-      .modemenu-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+      .wiz-modemenu { max-width: 980px; margin: 8px auto 0; max-height: calc(100vh - 255px); overflow: hidden auto; padding: 4px 12px 14px; }
+      /* two labelled rows: "make a new video" (creation modes) and "polish a finished video" (Masters) */
+      .modemenu-group + .modemenu-group { margin-top: 18px; }
+      .modemenu-grouplabel { font-family: var(--pixel); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 9px 3px; }
+      .modemenu-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
       /* scoped under .modemenu-cards (0,2,0) so display:flex BEATS the global button rule
          (button:not(.preview-button) is 0,1,1 and was forcing display:block -> the icon/title/desc
          spans rendered inline and collided with the title's underline). */
-      .modemenu-cards .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 150px; padding: 18px 22px 20px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
+      .modemenu-cards .modemenu-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; width: 100%; min-height: 138px; padding: 15px 17px 16px; background: var(--bg-raised); border: 2px solid var(--ink); border-radius: var(--r-md); box-shadow: var(--sh-2); cursor: pointer; transition: transform .1s var(--ease), box-shadow .1s var(--ease), background .1s var(--ease); }
       .modemenu-cards .modemenu-card .mm-desc { display: block; }
       /* ICON sits NEXT TO the title on one row; the dashed rule separates that head from the subtitle */
-      .modemenu-cards .modemenu-card .mm-head { display: flex; align-items: center; gap: 10px; width: 100%; margin: 2px 0 14px; padding-bottom: 14px; border-bottom: 2px dashed var(--line-strong); }
+      .modemenu-cards .modemenu-card .mm-head { display: flex; align-items: center; gap: 9px; width: 100%; margin: 1px 0 11px; padding-bottom: 11px; border-bottom: 2px dashed var(--line-strong); }
       .modemenu-card::after { display: none; }
       .modemenu-card:hover { transform: translate(-2px,-2px); border-color: var(--ink); background: var(--bg-input); box-shadow: 8px 8px 0 var(--ink); }
       .modemenu-card:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
       .modemenu-card .mm-ico { font-size: 28px; line-height: 1; flex: 0 0 auto; }
-      .modemenu-card .mm-title { font-family: var(--display); font-size: 13px; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-      .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.5; }
-      @media (max-width: 640px) { .modemenu-cards { grid-template-columns: 1fr; } }
+      /* the display font (Press Start 2P) is wide + cards are now 3-across, so titles WRAP instead of truncating */
+      .modemenu-card .mm-title { font-family: var(--display); font-size: 10.5px; line-height: 1.55; color: var(--ink); text-shadow: 2px 2px 0 rgba(232,71,43,.22); letter-spacing: .2px; white-space: normal; overflow-wrap: anywhere; min-width: 0; }
+      .modemenu-card .mm-desc { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--muted); line-height: 1.45; }
+      @media (max-width: 820px) { .modemenu-cards { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+      @media (max-width: 540px) { .modemenu-cards { grid-template-columns: 1fr; } }
       @media (max-width: 1120px) {
         /* not enough side room: pin to the bottom corners instead */
         .wiz-topnav .button { position: fixed; top: auto; bottom: 16px; transform: none; }
@@ -1342,6 +1363,19 @@ def app_style():
       #job-root .log-box::-webkit-scrollbar { display: none; }
       #job-root #media-sidebar-container { min-height: 0; overflow-y: auto; scrollbar-width: none; }
       #job-root #media-sidebar-container::-webkit-scrollbar { display: none; }
+      /* Timeline-editor render: just a clean animated progress bar, vertically centred */
+      #job-root[data-minimal="1"] .tl-render-top { display: flex; align-items: center; justify-content: space-between; padding: 8px 2px 0; }
+      #job-root[data-minimal="1"] .tl-render-brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-size: 15px; color: var(--ink); }
+      #job-root[data-minimal="1"] .tl-render-brand img { image-rendering: pixelated; border-radius: 6px; }
+      #job-root[data-minimal="1"] .tl-render-center { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 8px; }
+      .tl-render-progress { width: min(640px, 92%); text-align: center; }
+      .tl-render-title { font-family: var(--display); font-size: clamp(15px, 2.6vw, 24px); color: var(--ink); margin-bottom: 20px; }
+      .tl-render-bar { position: relative; height: 16px; border: 2px solid var(--ink); border-radius: 999px; overflow: hidden; background: var(--bg-input); box-shadow: var(--sh-1); }
+      .tl-render-bar span { position: absolute; top: 0; bottom: 0; width: 38%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); animation: tlrenderbar 1.15s cubic-bezier(.5,.05,.5,.95) infinite; }
+      @keyframes tlrenderbar { 0% { left: -40%; } 100% { left: 102%; } }
+      .tl-render-sub { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+      .tl-render-sub strong { color: var(--ink); font-family: var(--mono); }
+      @media (prefers-reduced-motion: reduce) { .tl-render-bar span { animation-duration: 2.4s; } }
       .preview-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
       .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); transition: transform .18s ease, filter .18s ease; }
       .preview:hover img { transform: scale(1.012); filter: contrast(1.04) saturate(1.02); }
@@ -1639,6 +1673,33 @@ def app_script():
           }
           function hide() { clearTimeout(showTimer); if (overlay) overlay.classList.remove("show"); }
           window.showNavLoading = show;
+          // Reliable "Download" that works in the NATIVE window too (WebView2 ignores <a download>):
+          // prefer the pywebview Save-As dialog, else copy the render into the Downloads folder.
+          function saveRenderServer(pathEnc, done) {
+            fetch("/save-render?path=" + pathEnc).then(function (r) { return r.json(); }).then(function (r) {
+              if (r && r.ok) done("Saved to Downloads", true); else done("Save failed", false);
+            }).catch(function () { done("Save failed", false); });
+          }
+          window.saveRender = function (pathEnc, btn) {
+            function done(msg, ok) {
+              if (!btn) return;
+              var orig = btn.getAttribute("data-label") || btn.textContent;
+              btn.setAttribute("data-label", orig);
+              btn.textContent = (ok ? "✓ " : "⚠ ") + msg; btn.disabled = true;
+              setTimeout(function () { btn.textContent = orig; btn.disabled = false; }, 3500);
+            }
+            try {
+              if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
+                window.pywebview.api.save_file(decodeURIComponent(pathEnc)).then(function (r) {
+                  if (r && r.ok) done("Saved", true);
+                  else if (r && r.cancelled) { /* user cancelled the dialog */ }
+                  else saveRenderServer(pathEnc, done);
+                }).catch(function () { saveRenderServer(pathEnc, done); });
+                return;
+              }
+            } catch (e) {}
+            saveRenderServer(pathEnc, done);
+          };
           document.addEventListener("click", function (e) {
             if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
             var a = e.target.closest("a[href]");
@@ -2801,7 +2862,7 @@ def app_script():
     """
 
 
-def page(title, body, refresh=None):
+def page(title, body, refresh=None, body_class=""):
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     icons = (
         '<link rel="manifest" href="/manifest.webmanifest">'
@@ -2820,7 +2881,7 @@ def page(title, body, refresh=None):
                   'document.documentElement.classList.add("theme-dark");}catch(e){}</script>')
     return f"""<!doctype html>
     <html lang="en" translate="no"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google" content="notranslate">{theme_boot}{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
-    <body><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
+    <body{f' class="{esc(body_class)}"' if body_class else ""}><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
 
 
 def parse_content_disposition(value):
@@ -2933,31 +2994,39 @@ def form_page(clear=False, open_load=False, load_slug=""):
         <div id="wiz-headline" class="wiz-headline"><span class="wiz-type" id="wiz-type" aria-live="polite"></span></div>
 
       <div class="wiz-modemenu" id="wiz-modemenu" data-step="0" style="display:none;">
-        <div class="modemenu-cards">
-          <button type="button" class="modemenu-card" onclick="selectMode('visuals')">
-            <span class="mm-head"><span class="mm-ico">&#127916;</span><span class="mm-title">Visuals From Script</span></span>
-            <span class="mm-desc">Create a full visual video from a voice script using the existing app pipeline.</span>
-          </button>
-          <button type="button" class="modemenu-card" onclick="selectMode('reddit')">
-            <span class="mm-head"><span class="mm-ico">&#128172;</span><span class="mm-title">Reddit Story Mode</span></span>
-            <span class="mm-desc">Generate a Reddit-style story video with Minecraft parkour background and AI voiceover.</span>
-          </button>
-          <button type="button" class="modemenu-card" onclick="selectMode('sfx')">
-            <span class="mm-head"><span class="mm-ico">&#128266;</span><span class="mm-title">SFX Master</span></span>
-            <span class="mm-desc">Upload a finished Short and add editor sound effects with the local SFX library.</span>
-          </button>
-          <button type="button" class="modemenu-card" onclick="selectMode('captions')">
-            <span class="mm-head"><span class="mm-ico">&#128172;&#65039;</span><span class="mm-title">Caption Master</span></span>
-            <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
-          </button>
-          <button type="button" class="modemenu-card" onclick="selectMode('visual')">
-            <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">VFX Master</span></span>
-            <span class="mm-desc">Upload a Short and Opus 4.8 adds intelligent animated red arrows + fitting SFX.</span>
-          </button>
-          <button type="button" class="modemenu-card" onclick="selectMode('viraltrans')">
-            <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">Viral Transformation</span></span>
-            <span class="mm-desc">Pick one topic - the agents create concept, scenes, AI clips, captions, audio and the final Short fully autonomously.</span>
-          </button>
+        <div class="modemenu-group">
+          <div class="modemenu-grouplabel">&#9679; Make a new video</div>
+          <div class="modemenu-cards">
+            <button type="button" class="modemenu-card" onclick="selectMode('visuals')">
+              <span class="mm-head"><span class="mm-ico">&#127916;</span><span class="mm-title">A Video from a Script</span></span>
+              <span class="mm-desc">Turn a voice script into a full visual Short with the app pipeline.</span>
+            </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('viraltrans')">
+              <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">A Viral Short from a Topic</span></span>
+              <span class="mm-desc">Give one topic - the agents write, film, caption and voice it fully autonomously.</span>
+            </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('reddit')">
+              <span class="mm-head"><span class="mm-ico">&#128172;</span><span class="mm-title">A Reddit Story Video</span></span>
+              <span class="mm-desc">A Reddit-style story over Minecraft parkour with an AI voiceover.</span>
+            </button>
+          </div>
+        </div>
+        <div class="modemenu-group">
+          <div class="modemenu-grouplabel">&#9679; Polish a finished video &middot; Masters</div>
+          <div class="modemenu-cards">
+            <button type="button" class="modemenu-card" onclick="selectMode('sfx')">
+              <span class="mm-head"><span class="mm-ico">&#128266;</span><span class="mm-title">Sound Effects</span></span>
+              <span class="mm-desc">Upload a finished Short and add editor SFX from the local library.</span>
+            </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('visual')">
+              <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">Visual Effects</span></span>
+              <span class="mm-desc">Upload a Short - Opus 4.8 adds animated red arrows + fitting SFX.</span>
+            </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('captions')">
+              <span class="mm-head"><span class="mm-ico">&#128172;&#65039;</span><span class="mm-title">Captions</span></span>
+              <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -4144,6 +4213,16 @@ def compute_step_view(status, logs, log_times=None, job_kind=None):
 def render_progress(status, logs, created_at=None, log_times=None, job_kind=None):
     _percent, activity = progress_state(status, logs)
     elapsed = format_duration(time.time() - float(created_at or time.time()))
+    # Timeline-editor renders show ONLY a clean animated bar - no per-step console chips.
+    if job_kind == "timeline" and status not in {"done", "error", "cancelled"}:
+        label = "Cancelling render&hellip;" if status == "cancelling" else "Rendering your Short&hellip;"
+        return f"""
+    <div id="job-progress-wrap" class="progress-wrap tl-render-progress">
+      <div class="tl-render-title">{label}</div>
+      <div class="tl-render-bar"><span></span></div>
+      <div class="tl-render-sub"><span>{esc(activity)}</span><strong>{esc(elapsed)}</strong></div>
+    </div>
+    """
     steps = compute_step_view(status, logs, log_times=log_times, job_kind=job_kind)
     chips = []
     for step in steps:
@@ -4776,6 +4855,7 @@ TIMELINE_SKELETON = """
       <button type="button" class="button secondary tl-save-btn" id="tl-save" title="Save timeline changes">&#128190; Save</button>
       <button type="button" class="button primary tl-render-btn" id="tl-render">&#11015; Render</button>
       <label class="tl-cap-toggle tl-render-cap-choice"><input type="checkbox" id="tl-captions"><span>Render with captions</span></label>
+      <label class="tl-cap-toggle tl-render-cap-choice" title="Off = render with the voice only, no sound effects (content, transition, cut and added sounds are all muted)"><input type="checkbox" id="tl-sfx-toggle"><span>Sound&nbsp;FX</span></label>
       <div class="tl-rework-group">
         <button type="button" class="button tl-rework-btn" id="tl-rework">&#129302; Agent rework</button>
         <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"><span id="tl-rw-replace-label">replace selected media</span></label>
@@ -5061,12 +5141,16 @@ TIMELINE_ASSETS = """
   .tl-track { position:relative; margin-top:6px; background:var(--bg-base); border:1px solid var(--line); border-radius:var(--r-md); }
   .tl-clips-track { height:96px; }
   .tl-ovtrack, .tl-cap, .tl-aud, .tl-trtrack, .tl-sfx { height:40px; }
+  .tl-track.tl-muted { opacity:.32; filter:grayscale(.6); }
   .tl-clip { position:absolute; top:4px; bottom:4px; border:2px solid var(--line-strong); border-radius:var(--r-md); overflow:hidden; cursor:grab; background:var(--bg-overlay); background-size:cover; background-position:center; touch-action:none; box-shadow:var(--sh-1); }
   .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
   .tl-clip.dragging { opacity:.8; cursor:grabbing; z-index:9; }
   .tl-clip .tl-badge { position:absolute; top:5px; left:6px; font-size:11px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; background:rgba(0,0,0,.45); padding:1px 6px; border-radius:5px; }
   .tl-clip .tl-clip-label { position:absolute; left:0; right:0; bottom:0; padding:4px 8px; font-size:11px; font-weight:800; color:#fff; background:linear-gradient(transparent, rgba(0,0,0,.85)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .tl-clip .tl-handle { position:absolute; top:0; right:0; bottom:0; width:13px; cursor:ew-resize; background:linear-gradient(90deg, transparent, rgba(124,92,255,.6)); }
+  /* left handle trims the SOURCE in-point ("cut front", CapCut-style); only on video clips */
+  .tl-clip .tl-handle-l { position:absolute; top:0; left:0; bottom:0; width:13px; cursor:ew-resize; z-index:6; background:linear-gradient(90deg, rgba(47,111,214,.6), transparent); }
+  .tl-clip.trimmed-front::after { content:"\\2702"; position:absolute; top:5px; left:16px; font-size:10px; color:#fff; text-shadow:0 1px 3px #000; z-index:5; }
   .tl-seam { position:absolute; top:0; bottom:0; width:0; border-left:2px dashed rgba(124,92,255,.4); z-index:3; pointer-events:none; }
   .tl-ovitem { position:absolute; top:6px; bottom:6px; min-width:42px; padding:0 8px; display:flex; align-items:center; overflow:hidden; white-space:nowrap; box-sizing:border-box; border-radius:7px; border:1px solid rgba(237,47,37,.8); background:rgba(237,47,37,.16); color:var(--text); font-size:11px; font-weight:700; cursor:pointer; }
   .tl-ovitem.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
@@ -5075,6 +5159,18 @@ TIMELINE_ASSETS = """
   .tl-trans.selected .tl-diamond { background:var(--accent); border-color:#fff; }
   .tl-trans.disabled .tl-diamond { background:var(--faint); border-color:var(--line-strong); }
   .tl-trans:hover .tl-diamond { transform:rotate(45deg) scale(1.18); }
+  /* hover a clip boundary in the Cut-SFX row to reveal a "+" that adds a transition sound there */
+  .tl-trans-slot { position:absolute; top:0; bottom:0; width:30px; transform:translateX(-50%); z-index:5; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+  .tl-trans-add { width:22px; height:22px; border-radius:50%; border:2px solid var(--accent); background:var(--bg-raised); color:var(--accent); font-size:16px; font-weight:900; line-height:1; display:flex; align-items:center; justify-content:center; opacity:0; transform:scale(.55); transition:opacity .12s var(--ease), transform .12s var(--ease); box-shadow:var(--sh-1); pointer-events:none; }
+  .tl-trans-slot:hover .tl-trans-add, .tl-trans-slot.menu-open .tl-trans-add { opacity:1; transform:scale(1); }
+  .tl-trans-slot.menu-open .tl-trans-add { background:var(--accent); color:var(--accent-ink); }
+  .tl-trans-menu { position:fixed; z-index:60; width:242px; max-height:300px; overflow-y:auto; background:var(--bg-raised); border:2px solid var(--ink); border-radius:var(--r-md); box-shadow:var(--sh-3); padding:6px; }
+  .tl-trans-menu .tl-tm-title { font-family:var(--pixel); font-size:9px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); padding:4px 6px 7px; }
+  .tl-trans-menu .tl-tm-item { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:6px; cursor:pointer; font-size:12px; color:var(--text); }
+  .tl-trans-menu .tl-tm-item:hover { background:var(--accent-subtle); }
+  .tl-trans-menu .tl-tm-play { flex:0 0 auto; width:22px; height:22px; border-radius:5px; border:1px solid var(--line-strong); background:var(--bg-input); color:var(--text); font-size:9px; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+  .tl-trans-menu .tl-tm-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tl-trans-menu .tl-tm-empty { padding:12px 8px; color:var(--faint); font-size:12px; text-align:center; }
   .tl-capbar { position:absolute; top:7px; bottom:7px; border-radius:7px; background:var(--accent-subtle); border:1px solid rgba(124,92,255,.4); display:flex; align-items:center; padding-left:9px; color:var(--text); font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; }
   .tl-capbar.off { opacity:.3; }
   .tl-audbar { position:absolute; top:7px; bottom:7px; left:0; right:0; border-radius:7px; background:rgba(111,211,255,.12); border:1px solid rgba(111,211,255,.3); }
@@ -5105,7 +5201,7 @@ TIMELINE_ASSETS = """
   .tl-lib-tab::after { display:none; }
   .tl-lib-tab.active { border-color:var(--accent); background:var(--accent-subtle); color:var(--text); }
   .tl-lib-hint { color:var(--faint); font-size:12px; }
-  .tl-lib-body { display:block; max-height:380px; overflow-y:auto; padding:2px; }
+  .tl-lib-body { display:block; max-height:720px; overflow-y:auto; padding:2px; }
   .tl-sublib-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; position:sticky; top:0; background:var(--bg-raised); padding-bottom:6px; z-index:2; }
   .tl-sublib-tab { width:auto; min-width:0; padding:5px 10px; font-family:var(--pixel); font-size:9px; text-transform:uppercase; background:var(--bg-input); border:2px solid var(--ink); color:var(--ink); border-radius:var(--r-sm); box-shadow:none; }
   .tl-sublib-tab::after { display:none; }
@@ -5164,6 +5260,7 @@ TIMELINE_ASSETS = """
   var sfx = (model.sfx||[]).map(function(s){ return Object.assign({}, s); });
   var volumes = Object.assign({voice:1, music:0}, model.volumes||{});
   var captionsOn = !!model.captions;
+  var sfxOn = model.sfx_on !== false;   // master "render sound FX" switch; off = voice only
   var captionTrack = (model.caption_track||[]).filter(function(row){return row&&String(row.text||'').trim();});
   var captionMaxWords = Math.max(1, Math.min(6, +(model.caption_max_words||3)));
   var captionUppercase = model.caption_uppercase !== false;
@@ -5182,7 +5279,7 @@ TIMELINE_ASSETS = """
   var hist = [], hIdx = -1;
   function snapshotState(){
     return JSON.stringify({scenes:scenes, transitions:transitions, sfx:sfx, volumes:volumes,
-                           captionsOn:captionsOn, markedReplace:markedReplace, replacedMap:replacedMap});
+                           captionsOn:captionsOn, sfxOn:sfxOn, markedReplace:markedReplace, replacedMap:replacedMap});
   }
   function pushHistory(){
     var snap = snapshotState();
@@ -5195,10 +5292,11 @@ TIMELINE_ASSETS = """
     try{
       var st = JSON.parse(snap);
       scenes = st.scenes; transitions = st.transitions; sfx = st.sfx;
-      volumes = st.volumes; captionsOn = st.captionsOn;
+      volumes = st.volumes; captionsOn = st.captionsOn; if(st.sfxOn!==undefined) sfxOn = st.sfxOn;
       markedReplace = st.markedReplace || {}; replacedMap = st.replacedMap || {};
       sel = null; selectedClipIds=[]; clipSelectionAnchor=null; showPane(null); layout();
       var ct = document.getElementById('tl-captions'); if (ct) ct.checked = captionsOn;
+      var sfxt = document.getElementById('tl-sfx-toggle'); if (sfxt) sfxt.checked = sfxOn;
       dirty = true; var b = document.getElementById('tl-save'); if (b) b.classList.add('tl-unsaved');
       // the restored timeline may have a different clip at the playhead - resync the player
       if (typeof seekTo === 'function') seekTo(Math.min(clock, totalDur()));
@@ -5269,16 +5367,18 @@ TIMELINE_ASSETS = """
     vis.forEach(function(s, i){
       var w=s.dur*SCALE;
       var b=document.createElement('div');
-      b.className='tl-clip'+(selectedClipIds.indexOf(s.id)!==-1?' selected':'')+(markedReplace[s.id]?' marked-replace':'');
+      b.className='tl-clip'+(selectedClipIds.indexOf(s.id)!==-1?' selected':'')+(markedReplace[s.id]?' marked-replace':'')+((s.clip && +(s.source_trim||0) > +(model.default_source_trim||0)+0.01)?' trimmed-front':'');
       b.style.left=x+'px'; b.style.width=w+'px'; b.setAttribute('data-id', s.id);
       if(s.poster) b.style.backgroundImage='url('+s.poster+')';
       var badge=(s.clip?'\\u25B6 ':'')+(s.speaker?'\\uD83C\\uDFA4 ':'');
       var repTag=markedReplace[s.id]?'<span class="tl-replace-tag">REPLACE</span>':'';
       var markCls='tl-clip-mark'+(markedReplace[s.id]?' on':'');
-      b.innerHTML='<span class="'+markCls+'" title="Mark this media for the agent to replace"></span><span class="tl-badge">'+badge+s.dur.toFixed(1)+'s</span>'+repTag+'<span class="tl-clip-label">'+esc(s.label)+'</span><span class="tl-handle"></span>';
+      var leftHandle=s.clip?'<span class="tl-handle-l" title="Trim the clip start - cut off the front (CapCut-style)"></span>':'';
+      b.innerHTML='<span class="'+markCls+'" title="Mark this media for the agent to replace"></span>'+leftHandle+'<span class="tl-badge">'+badge+s.dur.toFixed(1)+'s</span>'+repTag+'<span class="tl-clip-label">'+esc(s.label)+'</span><span class="tl-handle" title="Trim the clip end - cut off the back"></span>';
       (function(scn){ b.querySelector('.tl-clip-mark').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); ev.preventDefault(); if(markedReplace[scn.id]) delete markedReplace[scn.id]; else markedReplace[scn.id]=true; layout(); markDirty(); }); })(s);
       b.querySelector('.tl-handle').addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startResize(ev, s); });
-      b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')||ev.target.classList.contains('tl-clip-mark')) return; startClipDrag(ev, s, b); });
+      var lh=b.querySelector('.tl-handle-l'); if(lh) lh.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); startTrimFront(ev, s); });
+      b.addEventListener('pointerdown', function(ev){ if(ev.target.classList.contains('tl-handle')||ev.target.classList.contains('tl-handle-l')||ev.target.classList.contains('tl-clip-mark')) return; startClipDrag(ev, s, b); });
       (function(scn){ b.addEventListener('contextmenu', function(ev){ ev.preventDefault(); ev.stopPropagation(); openClipMenu(ev.clientX, ev.clientY, scn); }); })(s);
       if(replacedMap[s.id]){ var rt=document.createElement('span'); rt.className='tl-replace-tag'; rt.style.background='var(--accent)'; rt.textContent='REPLACED'; b.appendChild(rt); }
       clipsEl.appendChild(b);
@@ -5302,16 +5402,25 @@ TIMELINE_ASSETS = """
     });
     trEl.innerHTML='';
     vis.forEach(function(s, i){
-      if(i===0) return;
+      if(i===0) return;                          // no boundary before the first clip
+      var atSec=startOf(s.id), bx=atSec*SCALE;
+      // hover-to-reveal "+" that adds a transition sound exactly at this cut
+      var slot=document.createElement('div');
+      slot.className='tl-trans-slot'; slot.style.left=bx+'px';
+      slot.title='Add a transition sound at this cut';
+      slot.innerHTML='<span class="tl-trans-add">+</span>';
+      (function(at, slotEl){ slot.addEventListener('click', function(ev){ ev.stopPropagation(); openTransMenu(ev.clientX, ev.clientY, at, slotEl); }); })(atSec, slot);
+      trEl.appendChild(slot);
+      // the existing transition diamond, only when a transition record exists for this boundary
       var tr=transitions.filter(function(t){ return t.scene_id===s.id; })[0];
-      if(!tr) return;
-      var bx=startOf(s.id)*SCALE;
-      var node=document.createElement('div');
-      node.className='tl-trans'+(sel&&sel.type==='trans'&&sel.id===tr.id?' selected':'')+(tr.enabled===false?' disabled':'');
-      node.style.left=bx+'px'; node.style.top='50%'; node.title='Transition between clips';
-      node.innerHTML='<span class="tl-diamond"></span>';
-      node.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); selectTrans(tr.id); });
-      trEl.appendChild(node);
+      if(tr){
+        var node=document.createElement('div');
+        node.className='tl-trans'+(sel&&sel.type==='trans'&&sel.id===tr.id?' selected':'')+(tr.enabled===false?' disabled':'');
+        node.style.left=bx+'px'; node.style.top='50%'; node.title='Transition between clips';
+        node.innerHTML='<span class="tl-diamond"></span>';
+        node.addEventListener('pointerdown', function(ev){ ev.stopPropagation(); selectTrans(tr.id); });
+        trEl.appendChild(node);
+      }
     });
     sfxEl.innerHTML='';
     sfx.forEach(function(fx){
@@ -5332,6 +5441,9 @@ TIMELINE_ASSETS = """
     capEl.innerHTML = total>0 ? ('<div class="tl-capbar'+(captionsOn?'':' off')+'" style="left:0;width:'+(total*SCALE)+'px">Captions '+(captionsOn?'on':'off')+'</div>') : '';
     voiceEl.innerHTML='<div class="tl-audbar"></div>';
     document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+vis.length+' clips';
+    // "Sound FX" off -> dim the SFX + Cut-SFX rows so it's clear they won't be in the render
+    if(sfxEl) sfxEl.classList.toggle('tl-muted', !sfxOn);
+    if(trEl) trEl.classList.toggle('tl-muted', !sfxOn);
     updatePlayhead();
   }
 
@@ -5342,6 +5454,30 @@ TIMELINE_ASSETS = """
     function up(){
       document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up);
       if(s.dur!==startDur) markDirty();      // one history entry per resize gesture
+    }
+    document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
+  }
+
+  // CapCut-style "cut front": drag the LEFT edge to trim the clip's source in-point. The out-point
+  // is kept fixed (source_trim grows, dur shrinks by the same amount), so following clips ripple.
+  function startTrimFront(ev, s){
+    ev.preventDefault();
+    var startX=ev.clientX, startTrim=+(s.source_trim||0), startDur=s.dur, rate=Math.max(.01,+(s.source_speed||1)), changed=false;
+    function move(e){
+      var dt=(e.clientX-startX)/SCALE;             // timeline seconds the left edge moved right
+      var maxDt=startDur-0.5;                       // keep >=0.5s of the clip
+      var minDt=-(startTrim/rate);                  // can't pull the in-point before the source start
+      dt=Math.max(minDt, Math.min(maxDt, dt));
+      s.source_trim=+((startTrim+dt*rate).toFixed(3));
+      s.dur=+((startDur-dt).toFixed(2));
+      changed=true; layout();
+      // show the new first frame of this clip while dragging
+      if(!RENDER_MODE){ clock=startOf(s.id)||0; showScene(sceneAt(clock),true); updatePlayhead(); }
+      if(sel&&sel.type==='clip'&&sel.id===s.id) syncInspector();
+    }
+    function up(){
+      document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up);
+      if(changed) markDirty();                      // one history entry per trim gesture
     }
     document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
   }
@@ -5368,6 +5504,57 @@ TIMELINE_ASSETS = """
       else selectFx(fx.id);
     }
     document.addEventListener('pointermove',mv); document.addEventListener('pointerup',up);
+  }
+
+  // Add a library sound as a new SFX at an absolute timeline position (used by drops + the
+  // per-cut transition "+" popup). Keeps the sound scene-relative so the backend resolves it
+  // through the same added:true / custom_sfx round-trip as a dropped sound.
+  function addSfxAt(it, atSec, opts){
+    opts=opts||{};
+    var vis=visible(), best=vis.length?vis[0].id:null, acc=0;
+    for(var i=0;i<vis.length;i++){ if(atSec < acc+vis[i].dur){ best=vis[i].id; break; } acc+=vis[i].dur; }
+    if(best===null) return null;
+    var off=Math.max(0, atSec-(startOf(best)||0));
+    var nf={ id:'sfx-'+Date.now(), scene_id:best, label:it.name, category:it.category||opts.category||'transition',
+             offset:+off.toFixed(2), duration:it.duration||1.0, volume:opts.volume==null?0.3:opts.volume,
+             enabled:true, added:true, path:it.path, url:it.url||'' };
+    sfx.push(nf); layout(); markDirty();
+    if(opts.select!==false) selectFx(nf.id);
+    return nf;
+  }
+
+  // The per-cut "add transition sound" popup: transition-ish sounds ranked first, each previewable.
+  var transMenuEl=null;
+  function closeTransMenu(){
+    if(transMenuEl){ transMenuEl.remove(); transMenuEl=null; }
+    var open=document.querySelector('.tl-trans-slot.menu-open'); if(open) open.classList.remove('menu-open');
+    document.removeEventListener('pointerdown', transMenuOutside, true);
+    document.removeEventListener('keydown', transMenuKey, true);
+  }
+  function transMenuOutside(ev){ if(transMenuEl && !transMenuEl.contains(ev.target)) closeTransMenu(); }
+  function transMenuKey(ev){ if(ev.key==='Escape') closeTransMenu(); }
+  function openTransMenu(x, y, atSec, slotEl){
+    closeTransMenu();
+    if(slotEl) slotEl.classList.add('menu-open');
+    var rankKeys=['whoosh','transition','swish','swoosh','swoop','riser','impact','hit','boom','cut','swipe','whip','woosh'];
+    function score(it){ var c=((it.category||'')+' '+(it.name||'')).toLowerCase(); for(var k=0;k<rankKeys.length;k++){ if(c.indexOf(rankKeys[k])!==-1) return k; } return 999; }
+    var list=libSounds.map(function(it,idx){ return {it:it,idx:idx,sc:score(it)}; }).sort(function(a,b){ return a.sc-b.sc || a.idx-b.idx; });
+    var menu=document.createElement('div'); menu.className='tl-trans-menu';
+    menu.innerHTML='<div class="tl-tm-title">Add transition sound @ '+Number(atSec).toFixed(2)+'s</div>';
+    if(!list.length){ menu.innerHTML+='<div class="tl-tm-empty">No sounds loaded yet - open the Sound&nbsp;FX library once.</div>'; }
+    list.forEach(function(row){
+      var it=row.it, item=document.createElement('div'); item.className='tl-tm-item';
+      item.innerHTML='<span class="tl-tm-play" title="Preview">\\u25B6</span><span class="tl-tm-name">'+esc(it.name)+'</span>';
+      item.querySelector('.tl-tm-play').addEventListener('click', function(ev){ ev.stopPropagation(); if(!it.url) return; try{ var a=new Audio(it.url); a.volume=.5; a.play().catch(function(){}); }catch(e){} });
+      item.addEventListener('click', function(){ addSfxAt(it, atSec, {category:'transition'}); closeTransMenu(); });
+      menu.appendChild(item);
+    });
+    document.body.appendChild(menu);
+    var mw=menu.offsetWidth, mh=menu.offsetHeight;
+    menu.style.left=Math.max(8, Math.min(x, window.innerWidth-mw-8))+'px';
+    menu.style.top=Math.max(8, Math.min(y+10, window.innerHeight-mh-8))+'px';
+    transMenuEl=menu;
+    setTimeout(function(){ document.addEventListener('pointerdown', transMenuOutside, true); document.addEventListener('keydown', transMenuKey, true); }, 0);
   }
 
   function startClipDrag(ev, s, block){
@@ -5607,6 +5794,15 @@ TIMELINE_ASSETS = """
     }
     return null;
   }
+  // Strip surrounding sentence punctuation from a caption word ("UNREAL." -> "UNREAL"); keep ? ! and
+  // internal apostrophes/hyphens. Must match pipeline._caption_display_word so preview == render.
+  function cleanCaptionWord(w){
+    var P=' .,;:"\\'()[]{}\\u2026\\u201c\\u201d\\u2018\\u2019'; w=String(w||'');
+    var s=0,e=w.length;
+    while(s<e && P.indexOf(w.charAt(s))>-1)s++;
+    while(e>s && P.indexOf(w.charAt(e-1))>-1)e--;
+    return w.slice(s,e);
+  }
   function captionAt(t){
     if(!captionsOn)return '';
     for(var i=0;i<captionTrack.length;i++){
@@ -5619,7 +5815,7 @@ TIMELINE_ASSETS = """
         for(var j=0;j<timings.length;j++){if(local>=+(timings[j].start||0))idx=j;else break;}
       }else idx=Math.min(words.length-1,Math.floor(((t-start)/Math.max(.05,end-start))*words.length));
       var group=Math.floor(idx/captionMaxWords)*captionMaxWords;
-      var text=words.slice(group,group+captionMaxWords).join(' ');
+      var text=words.slice(group,group+captionMaxWords).map(cleanCaptionWord).filter(Boolean).join(' ');
       return captionUppercase?text.toUpperCase():text;
     }
     return '';
@@ -5718,6 +5914,8 @@ TIMELINE_ASSETS = """
     curIdx=info.idx; var s=info.scene;
     if(s.clip){
       pimg.style.display='none'; pvid.style.display='block';
+      // show a still frame (poster) instead of a black box while the video decodes/seeks
+      if(s.poster) pvid.setAttribute('poster', s.poster); else pvid.removeAttribute('poster');
       try{
         if(pvid.getAttribute('src')!==s.clip){pvid.src=s.clip;pvid.load();}
         syncPreviewVideo(info,true);
@@ -5772,6 +5970,7 @@ TIMELINE_ASSETS = """
     return st === null ? (t.at != null ? t.at : null) : st;
   }
   function fireSfxBetween(t0, t1){
+    if(!sfxOn) return;   // "Sound FX" off -> preview the voice-only mix, matching the render
     function fire(list, absFn){
       list.forEach(function(f){
         if (f.enabled === false || f.deleted) return;
@@ -5925,11 +6124,14 @@ TIMELINE_ASSETS = """
   var capToggle=document.getElementById('tl-captions');
   capToggle.checked=captionsOn;
   capToggle.addEventListener('change', function(){ captionsOn=this.checked; layout(); renderPreviewCaption(clock); markDirty(); });
+  var sfxToggle=document.getElementById('tl-sfx-toggle');
+  if(sfxToggle){ sfxToggle.checked=sfxOn;
+    sfxToggle.addEventListener('change', function(){ sfxOn=this.checked; layout(); markDirty(); }); }
 
   function collectEdits(){
     var vis=visible();
     return {
-      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions};}),
+      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined)};}),
       order: vis.map(function(s){return s.id;}),
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
       added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
@@ -5938,6 +6140,7 @@ TIMELINE_ASSETS = """
       overlays: scenes.map(function(s){return {scene_id:s.id,items:(s.overlays||[])};}),
       volumes: volumes,
       captions: captionsOn,
+      sfx_on: sfxOn,
       transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:(t.deleted?false:t.enabled), start_abs:(t.start_abs!=null?t.start_abs:null), path_override:t.path_override||null};}),
       sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null};})
     };
@@ -6491,8 +6694,11 @@ def timeline_model(slug):
     # SFX events (split into boundary transitions vs. content), each individually editable.
     overrides = config.get("sfx_overrides") or {}
     # Scrape renders intentionally skip the generic keyword SFX plan and use ai_content_sfx.
-    # Do the same here so the editor never shows sounds that are not in the actual render.
-    plan = ([] if config.get("clip_source") == "scrape"
+    # Projects with the auto-SFX planner OFF (sfx_enabled False, e.g. an SFX-Master project that
+    # mixes only its editable custom_sfx) must NOT show auto transition/content events either -
+    # otherwise the editor showed sounds that the render doesn't add (or the reverse). Match the
+    # renderer: no auto plan when scrape mode or sfx_enabled is off.
+    plan = ([] if (config.get("clip_source") == "scrape" or not bool(config.get("sfx_enabled", True)))
             else pipeline.sfx_event_plan(config, has_speech=True))
     start_by_id = {s["id"]: s["start"] for s in scenes}
     def _ev_url(ev):
@@ -6634,6 +6840,7 @@ def timeline_model(slug):
         "transitions": transitions,
         "sfx": content,
         "captions": captions_on,
+        "sfx_on": bool(config.get("render_sfx_enabled", True)),
         "caption_track": caption_track,
         "caption_max_words": int(config.get("caption_max_words", 3) or 3),
         "caption_uppercase": bool(config.get("caption_uppercase", True)),
@@ -7056,7 +7263,7 @@ def timeline_page(slug):
     header = brand_header(back=True)
     model_tag = '<script id="timeline-model" type="application/json">' + json.dumps(model) + '</script>'
     body = header + model_tag + TIMELINE_SKELETON.replace("__SLUG__", esc(slug)) + TIMELINE_ASSETS
-    return page("Timeline Editor", body)
+    return page("Timeline Editor", body, body_class="page-timeline")
 
 
 def render_done_view(job, job_id):
@@ -7084,7 +7291,7 @@ def render_done_view(job, job_id):
         </div>
         <div class="done-actions">
           {tl_btn}
-          <a class="button secondary" href="{vurl}" download>&#11015; Download</a>
+          <button type="button" class="button secondary" onclick="saveRender('{urllib.parse.quote(str(Path(video).resolve()))}', this)">&#11015; Download</button>
           <a class="button secondary" href="/">New project</a>
         </div>
       </div>
@@ -7144,6 +7351,24 @@ def job_page(job_id):
             </form>
           </details>
         </section>"""
+    # Timeline-editor render: a clean animated progress bar only - no console log, no media sidebar,
+    # and NO redundant "Rendering" heading / "running" status pill (the animated bar already says it).
+    # Keep the Shortslab identity so the app doesn't look like it got replaced by a bare status page.
+    if job.get("job_kind") == "timeline" and status not in {"done", "error", "cancelled"}:
+        minimal = f"""
+    <div id="job-root" data-status="{esc(status)}" data-job-id="{esc(job_id)}" data-minimal="1">
+      <div class="tl-render-top">
+        <span class="tl-render-brand"><img src="/static/app_icon.png" alt="" width="30" height="30">Shortslab</span>
+        <div class="job-actions">{cancel_html}</div>
+      </div>
+      <div class="tl-render-center">
+        {progress_html}
+        <div id="job-outputs">{result_html}</div>
+        <div id="job-error">{error_html}</div>
+      </div>
+    </div>
+    """
+        return page("Shortslab", minimal)
     body = f"""
     <div id="job-root" data-status="{esc(status)}" data-job-id="{esc(job_id)}">
       <div class="job-head">
@@ -7488,6 +7713,7 @@ class Handler(BaseHTTPRequestHandler):
             "app_icon.png": "image/png",
             "favicon.ico": "image/x-icon",
             "start_icon.ico": "image/x-icon",
+            "lab_bg.png": "image/png",
         }
         if name not in allowed:
             self.send_error(404)
@@ -7616,6 +7842,32 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # Range-capable streaming so videos/audio play and seek in the browser.
             self.serve_file_ranged(resolved)
+        elif parsed.path == "/save-render":
+            # Reliable "Download" for the native window: the WebView2 control does not act on
+            # <a download> links, so copy the file server-side into the user's Downloads folder
+            # (this machine == the app host) and report where it landed.
+            resolved = safe_requested_path(urllib.parse.parse_qs(parsed.query).get("path", [""])[0])
+            if not resolved or resolved.is_dir():
+                self.send_bytes(json.dumps({"ok": False, "error": "file not found"}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+                return
+            try:
+                import shutil
+                downloads = Path.home() / "Downloads"
+                if not downloads.is_dir():
+                    downloads = Path.home()
+                dest = downloads / resolved.name
+                if dest.exists():
+                    stem, suffix, i = dest.stem, dest.suffix, 1
+                    while (downloads / f"{stem}_{i}{suffix}").exists():
+                        i += 1
+                    dest = downloads / f"{stem}_{i}{suffix}"
+                shutil.copy2(resolved, dest)
+                self.send_bytes(json.dumps({"ok": True, "name": dest.name, "dest": str(dest)}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            except Exception as exc:
+                self.send_bytes(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"),
+                                "application/json; charset=utf-8")
         elif parsed.path == "/view":
             query = urllib.parse.parse_qs(parsed.query)
             resolved = safe_requested_path(query.get("path", [""])[0])
