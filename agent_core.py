@@ -7682,14 +7682,57 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
         target_scenes, pool, project_dir, reasoning_model=reasoning_model,
         status_cb=status_cb, understanding=understanding, clip_meta=clip_meta,
         min_script_match_score=adaptive_script_match_threshold(relevancy, 0))
-    unmatched = [lines[index] for index, match in enumerate(matches) if match is None]
-    if unmatched:
-        raise RuntimeError("No semantically matching clean TikTok/X replacement for: "
-                           + "; ".join(text[:80] for text in unmatched))
+    # GRACEFUL FALLBACK - never abort the whole rescript over unmatched lines. A marked line often
+    # has no clip clear the STRICT semantic bar (very common when the rescript split the script into
+    # short fragments like "tie. No" / "rolled-up sleeves. No" that no footage can literally depict).
+    # Instead of raising, such a scene KEEPS its existing clip (already vetted + on-theme for this
+    # project), or borrows the closest freshly-scraped candidate we downloaded. Only a scene with
+    # literally nothing available stays None and is skipped below. "Take what we have" > stopping.
+    def _resolve_existing_clip(scene_cfg):
+        for cand in (scene_cfg.get("clip"), scene_cfg.get("asset")):
+            name = str(cand or "").strip()
+            if not name:
+                continue
+            for base in (project_dir / "seedance 2.0", project_dir):
+                p = base / name
+                if p.exists():
+                    return p
+            p = Path(name)
+            if p.is_absolute() and p.exists():
+                return p
+        return None
+
+    unmatched_idx = [index for index, match in enumerate(matches) if match is None]
+    if unmatched_idx:
+        borrow = [Path(it["path"]) for it in got
+                  if it.get("path") and Path(it["path"]).exists()]
+        kept = borrowed = still_blank = 0
+        for index in unmatched_idx:
+            scene_index, _scene = indexed_targets[index]
+            existing = _resolve_existing_clip(config["scenes"][scene_index])
+            if existing is not None:
+                matches[index] = existing               # keep the clip the scene already has
+                kept += 1
+            elif borrow:
+                matches[index] = borrow.pop(0)          # best-effort: closest scraped clip
+                borrowed += 1
+            else:
+                still_blank += 1                        # truly nothing - leave the scene untouched
+        log(status_cb,
+            f"Timeline replacement: {len(unmatched_idx)} line(s) had no clean clip clear the semantic "
+            f"bar - kept {kept} existing clip(s)"
+            + (f", used {borrowed} closest scraped clip(s)" if borrowed else "")
+            + (f", left {still_blank} unchanged" if still_blank else "")
+            + " (continuing instead of stopping).")
 
     for local_index, ((scene_index, scene), source) in enumerate(zip(indexed_targets, matches)):
+        if source is None:
+            continue                                    # nothing available - leave this scene as-is
         sid = str(scene.get("id", scene_index))
         source = Path(source)
+        current_clip = str((config["scenes"][scene_index] or {}).get("clip") or "").strip()
+        if current_clip and source.name == current_clip:
+            continue                                    # 'kept' fallback: scene already uses this clip
         suffix = source.suffix.lower() if source.suffix else ".mp4"
         key = hashlib.sha1(str(source.resolve()).encode("utf-8", "ignore")).hexdigest()[:10]
         dest = project_dir / "seedance 2.0" / f"timeline_replaced_{sid}_{key}{suffix}"

@@ -41,7 +41,7 @@
   "out_web_images": false,
   "out_wikimedia": false,
   "out_gpt_images": false,
-  "out_video_clips": false,
+  "out_video_clips": true,
   "out_sfx": true,
   "out_transition_sfx": true,
   "out_background_music": false,

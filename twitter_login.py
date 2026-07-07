@@ -300,6 +300,9 @@ class Session:
         self._p = None
         self._ctx = None
         self._status_cb = status_cb
+        self._pids = set()
+        self._hide_stop = threading.Event()
+        self._watcher = None
         self._open()
 
     def _open(self):
@@ -307,7 +310,8 @@ class Session:
         self._p = sync_playwright().start()
         args = ["--disable-blink-features=AutomationControlled", "--no-first-run",
                 "--no-default-browser-check", "--mute-audio"]
-        if os.environ.get("TWITTER_WINDOW_VISIBLE", "").strip().lower() not in ("1", "true", "yes"):
+        visible = os.environ.get("TWITTER_WINDOW_VISIBLE", "").strip().lower() in ("1", "true", "yes")
+        if not visible:
             # same off-screen trick as TikTok: headed (X also degrades headless sessions) but
             # parked far off-screen with anti-throttle flags; taskbar button stripped below.
             args += ["--window-position=-2400,-2400", "--window-size=1280,900",
@@ -318,12 +322,23 @@ class Session:
         self._ctx = self._p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
             viewport={"width": 1280, "height": 900}, args=args)
-        # CDP-force off-screen (persistent profile may restore an on-screen position), then hide.
-        _tt._park_window_offscreen(self._ctx, "TWITTER_WINDOW_VISIBLE")
-        for _wait in (0.4, 1.2, 2.0):
-            time.sleep(_wait)
-            if _tt._hide_offscreen_from_taskbar():
-                break
+        if not visible:
+            # CDP-force off-screen (persistent profile may restore an on-screen position), then hide.
+            _tt._park_window_offscreen(self._ctx, "TWITTER_WINDOW_VISIBLE")
+            for _wait in (0.4, 1.2, 2.0):
+                time.sleep(_wait)
+                if _tt._hide_offscreen_from_taskbar():
+                    break
+            # ROBUST, CDP-independent enforcement by browser PID + a watcher for the whole session
+            # (this is the real fix for windows that kept showing in the taskbar - see tiktok_login).
+            for _ in range(6):
+                self._pids = _tt._profile_pids(PROFILE_DIR)
+                if self._pids:
+                    break
+                time.sleep(0.5)
+            if self._pids:
+                _tt._enforce_offscreen_hidden(self._pids)
+                self._watcher = _tt._spawn_taskbar_watcher(self._pids, self._hide_stop)
 
     def cookies(self):
         try:
@@ -406,6 +421,10 @@ class Session:
         return collected[:max(0, int(want))]
 
     def close(self):
+        try:
+            self._hide_stop.set()           # stop the taskbar-hide watcher
+        except Exception:
+            pass
         try:
             if self._ctx:
                 self._ctx.close()

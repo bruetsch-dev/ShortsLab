@@ -81,7 +81,9 @@ JOB_LOCK = threading.Lock()
 # time per platform. busy = a login window is open and we're waiting for the user to sign in.
 TIKTOK_LOGIN = {"busy": False, "thread": None}
 TWITTER_LOGIN = {"busy": False, "thread": None}
+HIGGSFIELD_LOGIN = {"busy": False, "thread": None, "error": ""}
 TIKTOK_LOCK = threading.Lock()
+HIGGSFIELD_LOCK = threading.Lock()
 STATIC_DIR = ROOT / "static"
 UI_STATE_PATH = ROOT / "ui_state.json"
 UI_TEXT_DEFAULTS = {
@@ -1752,6 +1754,7 @@ def app_script():
           if (mode === "captions") { window.location.href = "/captions"; return; }
           if (mode === "visual") { window.location.href = "/visual"; return; }
           if (mode === "viraltrans") { window.location.href = "/viraltrans"; return; }
+          if (mode === "longform") { window.location.href = "/longform"; return; }
           wizGoto(1);   // Visuals From Script -> existing script workflow
         };
         function wizTypeIntro(cb) {
@@ -3009,6 +3012,10 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <span class="mm-head"><span class="mm-ico">&#128172;</span><span class="mm-title">A Reddit Story Video</span></span>
               <span class="mm-desc">A Reddit-style story over Minecraft parkour with an AI voiceover.</span>
             </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('longform')">
+              <span class="mm-head"><span class="mm-ico">&#127912;</span><span class="mm-title">A Longform Image Set</span></span>
+              <span class="mm-desc">Upload a prompt list - Higgsfield renders one 16:9 FLUX.2 Pro image per line, named by timestamp.</span>
+            </button>
           </div>
         </div>
         <div class="modemenu-group">
@@ -3481,6 +3488,117 @@ def caption_page():
     return page("Caption master", body)
 
 
+def longform_page():
+    try:
+        import higgsfield_login
+        hf_avail = higgsfield_login.available()
+        hf_ready = higgsfield_login.is_ready()
+    except Exception:
+        hf_avail = hf_ready = False
+    body = f"""
+    {brand_header()}
+    <form method="post" action="/longform-run" enctype="multipart/form-data">
+      <section class="stack">
+        <div class="panel accent">
+          <label>Prompt list (.txt)</label>
+          <label class="filepick" for="lf-file"><span class="filepick-btn">&#128193; Choose prompt .txt</span><span class="filepick-name" id="lf-file-name">No file chosen</span></label>
+          <input type="file" name="prompt_file" id="lf-file" class="filepick-input" accept=".txt,text/plain" required onchange="var n=document.getElementById('lf-file-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
+          <div class="hint">One prompt per line, each starting with its timestamp, e.g. <code>[0:06] a doodle cartoon of ...</code>. Each finished image is saved as that timestamp (<code>[0-06].png</code>). Blank lines are ignored.</div>
+        </div>
+
+        <div class="panel">
+          <label>Higgsfield account {help_tip("Images are rendered on YOUR logged-in Higgsfield account (FLUX.2 Pro, unlimited on your plan) - no API key. Click Connect, a browser window opens, log in to Higgsfield once, and the session is saved for future runs.")}</label>
+          <div class="tiktok-connect" id="hf-connect">
+            <span class="tt-status {'on' if hf_ready else 'off'}" id="hf-status-dot"></span>
+            <span class="tt-text" id="hf-status-text">{'Higgsfield connected' if hf_ready else 'Higgsfield not connected'}</span>
+            <button type="button" class="button secondary tt-btn" id="hf-login-btn" onclick="connectHiggsfield()">{'Reconnect' if hf_ready else '&#128279; Connect Higgsfield'}</button>
+          </div>
+          {('' if hf_avail else '<div class="conn-warn">&#9888; Browser engine missing. Run: pip install playwright &amp;&amp; playwright install chromium</div>')}
+        </div>
+
+        <div class="panel">
+          <label>Image model</label>
+          <select name="model">
+            <option value="FLUX.2 Pro" selected>FLUX.2 Pro (unlimited)</option>
+            <option value="FLUX.2 Flex">FLUX.2 Flex</option>
+            <option value="Soul">Soul</option>
+          </select>
+          <div class="hint">FLUX.2 Pro is the default per your plan's 365-day unlimited access.</div>
+        </div>
+        <div class="panel">
+          <label>Aspect ratio</label>
+          <select name="aspect">
+            <option value="16:9" selected>16:9 (landscape / longform)</option>
+            <option value="9:16">9:16 (vertical)</option>
+            <option value="1:1">1:1 (square)</option>
+          </select>
+        </div>
+        <div class="panel">
+          <label>Images in flight {help_tip("How many generations to keep running at once on your Higgsfield account. Your plan allows up to 4 concurrent.")}</label>
+          <select name="concurrency">
+            <option value="4" selected>4 at a time</option>
+            <option value="3">3 at a time</option>
+            <option value="2">2 at a time</option>
+            <option value="1">1 at a time</option>
+          </select>
+        </div>
+
+        <button type="submit">Generate images</button>
+      </section>
+
+      <section class="stack">
+        <div class="loaded-media-panel">
+          <h2 style="margin-bottom: 12px;">How it works</h2>
+          <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
+            <li><strong>Parse</strong> &mdash; every non-blank line becomes one prompt, keyed by its <code>[m:ss]</code> timestamp.</li>
+            <li><strong>Generate</strong> &mdash; each prompt is sent to your logged-in Higgsfield (FLUX.2 Pro, 16:9), a few in flight at once.</li>
+            <li><strong>Auto-download</strong> &mdash; each finished image is saved named by its timestamp (<code>[0-06].png</code>).</li>
+          </ol>
+          <div class="hint" style="margin-top: 16px;">Output lands in <code>projects/_longform/&lt;file&gt;/</code>.</div>
+        </div>
+      </section>
+    </form>
+    <script>
+      (function () {{
+        var HF_AVAIL = {str(bool(hf_avail)).lower()};
+        var pollTimer = null;
+        function render(st) {{
+          var dot = document.getElementById("hf-status-dot");
+          var txt = document.getElementById("hf-status-text");
+          var btn = document.getElementById("hf-login-btn");
+          if (st && st.ready) {{
+            if (dot) dot.className = "tt-status on";
+            if (txt) txt.textContent = "Higgsfield connected";
+            if (btn) {{ btn.innerHTML = "Reconnect"; btn.disabled = false; }}
+          }} else {{
+            if (dot) dot.className = "tt-status off" + (st && st.busy ? " busy" : "");
+            if (txt) txt.textContent = st && st.busy
+              ? "Log in to Higgsfield in the opened window…"
+              : (st && st.error ? ("Login failed: " + st.error) : "Higgsfield not connected");
+            if (btn) {{ btn.disabled = !!(st && st.busy); }}
+          }}
+        }}
+        function poll() {{
+          fetch("/higgsfield-status").then(function (r) {{ return r.json(); }}).then(function (st) {{
+            render(st);
+            if (st && st.busy) {{ pollTimer = setTimeout(poll, 2000); }}
+            else if (pollTimer) {{ clearTimeout(pollTimer); pollTimer = null; }}
+          }}).catch(function () {{}});
+        }}
+        window.connectHiggsfield = function () {{
+          if (HF_AVAIL === false) {{ alert("Browser engine missing — run: pip install playwright && playwright install chromium"); return; }}
+          var btn = document.getElementById("hf-login-btn");
+          if (btn) btn.disabled = true;
+          fetch("/higgsfield-login", {{ method: "POST" }}).then(function (r) {{ return r.json(); }})
+            .then(function () {{ poll(); }})
+            .catch(function () {{ if (btn) btn.disabled = false; }});
+        }};
+      }})();
+    </script>
+    """
+    return page("Longform Image Set", body)
+
+
 def save_upload(file_info, job_id):
     if not file_info or not file_info.get("data") or not file_info.get("filename"):
         return ""
@@ -3882,6 +4000,105 @@ def start_caption_job(fields, files):
     return job_id
 
 
+def start_longform_job(fields, files):
+    """Longform Image Set: parse an uploaded prompt .txt (one '[m:ss] prompt' per line) and
+    generate one 16:9 FLUX.2 Pro image per line on the user's logged-in Higgsfield account,
+    saving each finished image named by its timestamp (e.g. '[0-06].png')."""
+    import higgsfield_login
+    job_id = str(int(time.time() * 1000))
+    fields = dict(fields)
+    txt_path = save_upload(files.get("prompt_file"), job_id)
+    model = (fields.get("model") or higgsfield_login.DEFAULT_MODEL).strip()
+    aspect = (fields.get("aspect") or higgsfield_login.DEFAULT_ASPECT).strip()
+    try:
+        concurrency = max(1, min(4, int(fields.get("concurrency", 4) or 4)))
+    except (TypeError, ValueError):
+        concurrency = 4
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "longform",
+        }
+
+    def fail(msg):
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = msg
+            JOBS[job_id]["logs"].append(f"Error: {msg}")
+        return job_id
+
+    if not txt_path:
+        return fail("No prompt .txt uploaded.")
+    try:
+        text = Path(txt_path).read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return fail(f"Could not read the prompt file: {exc}")
+    items = higgsfield_login.parse_prompt_lines(text)
+    if not items:
+        return fail("No prompts found - each line must start with a timestamp like [0:06].")
+    # keep filename stems unique within the run (duplicate timestamps would otherwise overwrite)
+    seen = {}
+    for it in items:
+        key = it["key"]
+        if key in seen:
+            seen[key] += 1
+            it["key"] = f"{key}_{seen[key]}"
+        else:
+            seen[key] = 1
+    if not higgsfield_login.is_ready():
+        return fail("Higgsfield is not connected. Open the Longform page and click Connect Higgsfield first.")
+
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(txt_path).stem).strip("_") or "longform"
+    out_dir = agent_core.PROJECTS_DIR / "_longform" / stem
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            status_cb(f"Parsed {len(items)} prompt(s). Output -> {out_dir}")
+            status_cb("Opening your Higgsfield session (window stays hidden)...")
+            results = higgsfield_login.generate_batch(
+                items, out_dir, concurrency=concurrency, aspect=aspect, model=model, ext="png",
+                status_cb=status_cb, cancel_check=cancel_event.is_set)
+            ok = [r for r in results if r.get("path")]
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["logs"].append(
+                        f"Done. {len(ok)}/{len(items)} image(s) saved to {out_dir}.")
+                    JOBS[job_id]["result"] = {"project_dir": str(out_dir),
+                                              "images_done": len(ok), "images_total": len(items)}
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
 def cancel_job(job_id):
     with JOB_LOCK:
         job = JOBS.get(job_id)
@@ -4213,14 +4430,28 @@ def compute_step_view(status, logs, log_times=None, job_kind=None):
 def render_progress(status, logs, created_at=None, log_times=None, job_kind=None):
     _percent, activity = progress_state(status, logs)
     elapsed = format_duration(time.time() - float(created_at or time.time()))
-    # Timeline-editor renders show ONLY a clean animated bar - no per-step console chips.
-    if job_kind == "timeline" and status not in {"done", "error", "cancelled"}:
-        label = "Cancelling render&hellip;" if status == "cancelling" else "Rendering your Short&hellip;"
+    # Timeline-editor + longform-image runs show ONLY a clean animated bar - no per-step chips
+    # (they have no fixed pipeline steps; a longform run is just N image generations).
+    if job_kind in ("timeline", "longform") and status not in {"done", "error", "cancelled"}:
+        if job_kind == "longform":
+            label = "Cancelling&hellip;" if status == "cancelling" else "Generating images&hellip;"
+        else:
+            label = "Cancelling render&hellip;" if status == "cancelling" else "Rendering your Short&hellip;"
         return f"""
     <div id="job-progress-wrap" class="progress-wrap tl-render-progress">
       <div class="tl-render-title">{label}</div>
       <div class="tl-render-bar"><span></span></div>
       <div class="tl-render-sub"><span>{esc(activity)}</span><strong>{esc(elapsed)}</strong></div>
+    </div>
+    """
+    # Terminal-state longform view: a clean summary, never the run-pipeline step chips.
+    if job_kind == "longform":
+        title = ("Images generated" if status == "done"
+                 else "Cancelled" if status == "cancelled" else "Stopped with an error")
+        return f"""
+    <div id="job-progress-wrap" class="progress-wrap">
+      <div class="elapsed-line"><span>{title}</span><strong>{esc(elapsed)}</strong></div>
+      <div class="progress-current">{esc(activity)}</div>
     </div>
     """
     steps = compute_step_view(status, logs, log_times=log_times, job_kind=job_kind)
@@ -4758,6 +4989,32 @@ def existing_report_path(report, key):
     return path if path.exists() else None
 
 
+def project_edited_mtime(project_dir):
+    """Most-recent EDIT time for a project. A folder's own mtime does NOT change when a file inside
+    it is edited in place (e.g. a rescript / timeline save rewriting config/project.json), so a plain
+    folder-mtime sort looks stale. Take the newest of the signals that actually move on an edit:
+    the folder, the config + report + run_form JSON, and the newest render output."""
+    times = []
+    try:
+        times.append(project_dir.stat().st_mtime)
+    except OSError:
+        pass
+    for rel in ("config/project.json", "review/agent_report.json", "input/run_form.json"):
+        p = project_dir / rel
+        try:
+            if p.exists():
+                times.append(p.stat().st_mtime)
+        except OSError:
+            pass
+    newest_render = latest_media(project_dir / "renders", {".mp4", ".webm"})
+    if newest_render:
+        try:
+            times.append(Path(newest_render).stat().st_mtime)
+        except OSError:
+            pass
+    return max(times) if times else 0.0
+
+
 def project_summary(project_dir):
     report = read_project_report(project_dir)
     video = existing_report_path(report, "video") or latest_media(project_dir / "renders", {".mp4", ".webm"})
@@ -4771,11 +5028,13 @@ def project_summary(project_dir):
     created_at = report.get("created_at")
     if not created_at:
         created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(project_dir.stat().st_mtime))
+    edited_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(project_edited_mtime(project_dir)))
     failed = not bool(video)
     return {
         "title": report.get("title") or project_title_from_files(project_dir),
         "slug": project_dir.name,
         "created_at": created_at,
+        "edited_at": edited_at,
         "project_dir": project_dir,
         "video": video,
         "scene_review": scene_review,
@@ -4817,8 +5076,11 @@ def asset_card(summary):
     <article class="panel asset-card">
       {thumb_html}
       <div class="asset-body">
-        <h2>{esc(summary["title"])}</h2>
-        <div class="asset-sub">{esc(summary["created_at"])}</div>
+        <div class="asset-titlerow">
+          <h2>{esc(summary["title"])}</h2>
+          <button type="button" class="asset-rename" title="Rename title" aria-label="Rename title" onclick="renameAsset('{esc(slug)}', this)">&#9998;</button>
+        </div>
+        <div class="asset-sub">Edited {esc(summary.get("edited_at") or summary["created_at"])}</div>
         <div class="asset-meta">
           <span class="asset-pill">{summary["web_images"]} web</span>
           <span class="asset-pill">{summary["gpt_images"]} GPT</span>
@@ -4833,10 +5095,46 @@ def asset_card(summary):
     """
 
 
+def rename_project_title(slug, title):
+    """Set a project's display title. Writes it to review/agent_report.json (highest precedence in
+    project_title_from_files), plus config/project.json and input/run_form.json when they exist, so
+    the new title shows everywhere the app reads a title from. Atomic per file."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return {"ok": False, "error": "Project not found."}
+    title = " ".join(str(title or "").split())[:200].strip()
+    if not title:
+        return {"ok": False, "error": "Title cannot be empty."}
+    targets = [
+        (project_dir / "review" / "agent_report.json", True),   # create if missing (top precedence)
+        (project_dir / "config" / "project.json", False),
+        (project_dir / "input" / "run_form.json", False),
+    ]
+    wrote = False
+    for path, create in targets:
+        if not path.exists() and not create:
+            continue
+        data = read_json_file(path) if path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["title"] = title
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+            wrote = True
+        except Exception as exc:                # noqa: BLE001
+            return {"ok": False, "error": f"Could not write {path.name}: {exc}"}
+    if not wrote:
+        return {"ok": False, "error": "No writable project metadata to rename."}
+    return {"ok": True, "title": title, "slug": project_dir.name}
+
+
 def assets_page():
     projects_dir = agent_core.PROJECTS_DIR
     projects = [p for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.exists() else []
-    projects.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    projects.sort(key=project_edited_mtime, reverse=True)   # most recently EDITED first
     count = len(projects)
     cards = "".join(asset_card(project_summary(project)) for project in projects)
     if not cards:
@@ -4844,6 +5142,36 @@ def assets_page():
     body = f"""
     {brand_header()}
     <section class="asset-grid">{cards}</section>
+    <style>
+      .asset-titlerow {{ display: flex; align-items: flex-start; gap: 8px; }}
+      .asset-titlerow h2 {{ flex: 1 1 auto; min-width: 0; margin: 0; }}
+      .asset-rename {{ flex: 0 0 auto; background: transparent; border: 1px solid var(--line);
+        color: var(--faint); border-radius: var(--r-sm); cursor: pointer; font-size: 13px;
+        line-height: 1; padding: 4px 7px; transition: color .15s, border-color .15s, background .15s; }}
+      .asset-rename:hover {{ color: var(--accent); border-color: var(--accent); background: var(--bg-overlay); }}
+    </style>
+    <script>
+      window.renameAsset = function (slug, btn) {{
+        try {{ if (typeof playClick === "function") playClick(); }} catch (e) {{}}
+        var card = btn.closest(".asset-card");
+        var h2 = card ? card.querySelector("h2") : null;
+        var cur = h2 ? h2.textContent.trim() : "";
+        var next = window.prompt("New title for this project:", cur);
+        if (next === null) return;
+        next = next.trim();
+        if (!next || next === cur) return;
+        btn.disabled = true;
+        fetch("/rename-project", {{ method: "POST", headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ slug: slug, title: next }}) }})
+          .then(function (r) {{ return r.json(); }})
+          .then(function (res) {{
+            btn.disabled = false;
+            if (res && res.ok) {{ if (h2) h2.textContent = res.title || next; }}
+            else {{ alert((res && res.error) || "Rename failed."); }}
+          }})
+          .catch(function () {{ btn.disabled = false; alert("Rename failed."); }});
+      }};
+    </script>
     """
     return page("Asset Library", body)
 
@@ -7542,6 +7870,59 @@ def start_twitter_login():
     th.start()
 
 
+def higgsfield_status_payload():
+    """JSON status for the Connect-Higgsfield control: available / ready / busy."""
+    try:
+        import higgsfield_login
+        avail = higgsfield_login.available()
+        ready = higgsfield_login.is_ready()
+    except Exception:
+        avail = ready = False
+    with HIGGSFIELD_LOCK:
+        busy = bool(HIGGSFIELD_LOGIN.get("busy"))
+        err = HIGGSFIELD_LOGIN.get("error") or ""
+    return json.dumps({"available": avail, "ready": ready, "busy": busy, "error": err}).encode("utf-8")
+
+
+def start_higgsfield_login():
+    """Open the headed Higgsfield login window in a background thread (one at a time)."""
+    try:
+        import higgsfield_login
+    except Exception:
+        return
+    if not higgsfield_login.available():
+        return
+    with HIGGSFIELD_LOCK:
+        if HIGGSFIELD_LOGIN.get("busy"):
+            return
+        HIGGSFIELD_LOGIN["busy"] = True
+        HIGGSFIELD_LOGIN["error"] = ""
+
+    def _run():
+        err = ""
+        try:
+            ok = higgsfield_login.login(status_cb=lambda m: print("[higgsfield-login]", m), timeout_s=300)
+            if not ok:
+                err = "Login window closed or timed out before sign-in completed."
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            err = f"{exc.__class__.__name__}: {exc}"
+            print("[higgsfield-login] error:", err)
+        finally:
+            with HIGGSFIELD_LOCK:
+                HIGGSFIELD_LOGIN["busy"] = False
+                HIGGSFIELD_LOGIN["thread"] = None
+                HIGGSFIELD_LOGIN["error"] = err
+
+    print("[higgsfield-login] launching login browser window...")
+
+    th = threading.Thread(target=_run, daemon=True)
+    with HIGGSFIELD_LOCK:
+        HIGGSFIELD_LOGIN["thread"] = th
+    th.start()
+
+
 def content_type_for(path):
     suffix = Path(path).suffix.lower()
     if suffix == ".ico":
@@ -7782,6 +8163,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(viraltrans_page())
         elif parsed.path == "/captions":
             self.send_bytes(caption_page())
+        elif parsed.path == "/longform":
+            self.send_bytes(longform_page())
         elif parsed.path == "/timeline":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             self.send_bytes(timeline_page(slug))
@@ -7826,6 +8209,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(twitter_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/tiktok-status":
             self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/higgsfield-status":
+            self.send_bytes(higgsfield_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/job":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
             self.send_bytes(job_page(job_id))
@@ -7936,6 +8321,26 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             start_twitter_login()
             self.send_bytes(twitter_status_payload(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/higgsfield-login":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            start_higgsfield_login()
+            self.send_bytes(higgsfield_status_payload(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/rename-project":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = rename_project_title(data.get("slug"), data.get("title"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/ui-state":
             length = int(self.headers.get("Content-Length", "0"))
@@ -8372,6 +8777,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fields, files = {}, {}
             job_id = start_caption_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
+            self.end_headers()
+            return
+        if parsed.path == "/longform-run":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                fields, files = parse_multipart(content_type, body)
+            else:
+                fields, files = {}, {}
+            job_id = start_longform_job(fields, files)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()

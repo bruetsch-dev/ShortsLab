@@ -64,6 +64,8 @@ _archive_merged/
 scripts/_*.py
 /_*.py
 twitter-profile/
+higgsfield-profile/
+higgsfield-profile-*/
 
 # App crash + server logs
 logs/

@@ -304,6 +304,111 @@ def _hide_offscreen_from_taskbar():
     return found[0]
 
 
+def _profile_pids(profile_dir):
+    """PIDs of the chrome.exe process(es) holding `profile_dir` open. The BROWSER process (the one
+    launched with --user-data-dir=<profile>) owns the top-level window, so matching windows by these
+    PIDs reliably identifies OUR scrape window regardless of where it currently sits on screen."""
+    if os.name != "nt":
+        return set()
+    try:
+        marker = str(profile_dir).replace("'", "''")
+        cmd = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" -ErrorAction Stop | "
+               f"Where-Object {{ $_.CommandLine -and $_.CommandLine -like '*{marker}*' }} | "
+               "Select-Object -ExpandProperty ProcessId")
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return {int(x) for x in (out.stdout or "").split() if x.strip().isdigit()}
+    except Exception:
+        return set()
+
+
+def _enforce_offscreen_hidden(pids):
+    """CDP-INDEPENDENT hide: for every top-level window owned by one of `pids`, force it far
+    off-screen (SetWindowPos) AND strip its taskbar button (WS_EX_TOOLWINDOW). This is the fix for
+    the case where the CDP `Browser.setWindowBounds` park silently failed - then the window stays at
+    the profile's restored ON-screen position, the -2400 band never matches, and the window shows in
+    the taskbar. Matching by PID (our profile's browser) means we only ever touch OUR window, never
+    the user's real Chrome. Idempotent: once parked + restyled, every later call is a no-op."""
+    if os.name != "nt" or not pids:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    SW_HIDE, SW_SHOWNA = 0, 8
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
+    GW_OWNER = 4
+    acted = [False]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _lp):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in pids:
+                return True
+            if user32.GetWindow(hwnd, GW_OWNER):    # owned popup/dialog, not the main window
+                return True
+            # Safety against (rare) PID recycling: only ever touch a real Chromium top-level window
+            # (class "Chrome_WidgetWin_1"), never some unrelated app that inherited a freed PID.
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, buf, 64)
+            if "Chrome_WidgetWin" not in buf.value:
+                return True
+            acted[0] = True
+            if not user32.IsIconic(hwnd):
+                rect = ctypes.wintypes.RECT()
+                # Park at -3200 (not -2400): on a >100% display Windows virtualizes the coordinate
+                # DOWN (e.g. 125% scaling turns -2400 into -1920), which could leave part of the
+                # window on a monitor. -3200 stays fully off-screen even after that scaling. The
+                # "already parked" guard uses a loose -1500 so the watcher never re-moves it (no
+                # flicker) once it has landed off-screen.
+                if (user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                        and not (rect.left <= -1500 and rect.top <= -1500)):
+                    user32.SetWindowPos(hwnd, 0, -3200, -3200, 0, 0,
+                                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if not (style & WS_EX_TOOLWINDOW):
+                user32.ShowWindow(hwnd, SW_HIDE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                      (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+                user32.ShowWindow(hwnd, SW_SHOWNA)
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        return False
+    return acted[0]
+
+
+def _spawn_taskbar_watcher(pids, stop_event, interval=0.7):
+    """Keep OUR off-screen scrape window(s) off-screen AND out of the taskbar for the whole session.
+    Defends against the persistent profile restoring an on-screen position or the site re-showing the
+    window after the initial hide (the reason the one-shot hide kept 'coming back'). Cheap: after the
+    first pass every call is a no-op until something re-shows the window. Daemon; stops on stop_event."""
+    def _loop():
+        while not stop_event.is_set():
+            try:
+                _enforce_offscreen_hidden(pids)
+            except Exception:
+                pass
+            stop_event.wait(interval)
+    t = threading.Thread(target=_loop, name="taskbar-hide", daemon=True)
+    t.start()
+    return t
+
+
 def _park_window_offscreen(ctx, env_visible="TIKTOK_WINDOW_VISIBLE"):
     """Force the persistent context's OS window FAR off-screen via CDP. `--window-position` is only
     a hint for a fresh profile - a persistent profile RESTORES the last saved window bounds, so after
@@ -374,6 +479,9 @@ class Session:
         self._ctx = None
         self._status_cb = status_cb
         self.headless = _HEADLESS_SEARCH if headless is None else bool(headless)
+        self._pids = set()
+        self._hide_stop = threading.Event()
+        self._watcher = None
         self._open()
 
     def _open(self):
@@ -412,7 +520,8 @@ class Session:
                     pass
                 self._p = None
             raise
-        if not self.headless:
+        visible = os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() in ("1", "true", "yes")
+        if not self.headless and not visible:
             # CDP-force the window off-screen first (a persistent profile can restore an on-screen
             # position from a prior interactive login), THEN strip its blinking taskbar button.
             _park_window_offscreen(self._ctx, "TIKTOK_WINDOW_VISIBLE")
@@ -420,6 +529,19 @@ class Session:
                 time.sleep(_wait)
                 if _hide_offscreen_from_taskbar():
                     break
+            # ROBUST enforcement (CDP-independent): identify our window by the profile's browser PID
+            # and force it off-screen + out of the taskbar, then keep enforcing for the whole session.
+            # This catches the failure the band-based hide above cannot: a CDP park that silently
+            # failed leaves the window ON-screen (and in the taskbar), where the -2400 band never
+            # matches. THIS is why the windows kept showing.
+            for _ in range(6):
+                self._pids = _profile_pids(PROFILE_DIR)
+                if self._pids:
+                    break
+                time.sleep(0.5)
+            if self._pids:
+                _enforce_offscreen_hidden(self._pids)
+                self._watcher = _spawn_taskbar_watcher(self._pids, self._hide_stop)
 
     def cookies(self):
         try:
@@ -570,6 +692,10 @@ class Session:
             pass
 
     def close(self):
+        try:
+            self._hide_stop.set()           # stop the taskbar-hide watcher
+        except Exception:
+            pass
         try:
             if self._ctx:
                 self._ctx.close()
