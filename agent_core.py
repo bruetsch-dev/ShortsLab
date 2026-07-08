@@ -2332,7 +2332,20 @@ class WaveSpeedBalanceError(RuntimeError):
     instead of silently blank-falling-back for half an hour."""
 
 
+class PaidAPIBlockedError(RuntimeError):
+    """Raised when SHORTSLAB_NO_PAID_API=1 (no-cost test mode) and code tries to
+    contact a paid endpoint. Tests set this env var so any accidental paid call
+    fails immediately instead of spending credit."""
+
+
+def assert_paid_api_allowed(what="paid API"):
+    if os.environ.get("SHORTSLAB_NO_PAID_API", "") == "1":
+        raise PaidAPIBlockedError(
+            f"NO_PAID_API_TEST_MODE: blocked call to {what} (SHORTSLAB_NO_PAID_API=1)")
+
+
 def post_json_url(url, payload, timeout=75):
+    assert_paid_api_allowed(url)
     # Thinking models (Gemini 2.x/3.x, GLM, Qwen, DeepSeek...) spend output tokens
     # on internal reasoning; a low max_tokens then yields EMPTY content
     # (finish_reason=length). Give those a generous ceiling so the actual JSON
@@ -2509,6 +2522,38 @@ def should_run_final_semantic_rescore(current_threshold, floor_threshold, remain
     return float(floor_threshold) < float(current_threshold) - 0.01
 
 
+def normalize_social_query_output(value):
+    """Normalize planner query fields without ever splitting a phrase on whitespace."""
+    if isinstance(value, (list, tuple)):
+        candidates = list(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        candidates = None
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    candidates = parsed
+            except Exception:
+                pass
+        if candidates is None:
+            candidates = re.split(r"(?:\r?\n|\s*[\u00b7\u2022]\s*)+", raw)
+    else:
+        return []
+    out, seen = [], set()
+    for value in candidates:
+        if not isinstance(value, (str, int, float)):
+            continue
+        query = re.sub(r"^\s*(?:[-*\u2022]+|\d+[.)])\s*", "", str(value))
+        query = " ".join(query.strip(" ,;:|").split())
+        key = query.casefold()
+        if query and key not in seen:
+            seen.add(key); out.append(query)
+    return out
+
+
 def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, reasoning_model=None, status_cb=None, understanding=None):
     """Let the Reasoning Agent derive TikTok b-roll search queries straight from the
     voice script (concrete places/objects/actions per scene), plus the scroll-stop hook
@@ -2566,7 +2611,7 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
         log(status_cb, "Scrape: Reasoning Agent deriving search terms from the voice script...")
         data = post_json_url(WAVESPEED_LLM_API, payload, timeout=120)
         plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
-        queries = [str(q).strip() for q in (plan.get("queries") or []) if str(q).strip()]
+        queries = normalize_social_query_output(plan.get("queries"))
         hook = str(plan.get("hook_query") or "").strip() or SCRAPE_WOMAN_HOOK
         if queries:
             return {"hook_query": hook, "queries": queries[:16]}
@@ -2613,7 +2658,7 @@ def llm_scene_scrape_queries(lines, understanding=None, reasoning_model=None, st
                 line_index = int(group.get("line_index", fallback_index))
             except (TypeError, ValueError):
                 line_index = fallback_index
-            queries = [str(q).strip() for q in (group.get("queries") or []) if str(q).strip()]
+            queries = normalize_social_query_output(group.get("queries"))
             if queries:
                 normalized.append((line_index, queries[:4]))
         if normalized:
@@ -2626,7 +2671,7 @@ def llm_scene_scrape_queries(lines, understanding=None, reasoning_model=None, st
                         flattened.append(queries[query_index])
             return flattened[:32]
         # Backward compatibility if a model returns the older flat schema.
-        return [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()][:32]
+        return normalize_social_query_output(data.get("queries"))[:32]
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Scrape retry: query generation skipped ({exc.__class__.__name__}).")
         return []
@@ -2661,7 +2706,7 @@ HOOK_PRESENTER_QUERIES = {
                 "Miyu Kishi TikTok dance"],
 }
 HOOK_MIN_LIKES = 20_000
-MIN_CLIP_LIKES = 10_000     # every scraped clip needs at least 10K likes
+MIN_CLIP_LIKES = 0          # body footage is quality/semantic ranked; only the hook keeps 20K+
 HOOK_PRESENTER_TARGET = ("young adult Japanese female creator with at least 20,000 likes on the source video, "
                          "dancing or playfully acting cute to camera with Miyu Kishi / Saaki-Sakii-style hook energy, "
                          "expressive face, clean vertical frame; NOT anime/CGI/screen-recording, not a child, "
@@ -2748,6 +2793,11 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
                 if 0 <= scene_id < len(scenes) and scene_id not in normalized_ids:
                     normalized_ids.append(scene_id)
             bucket["used_by_scene_ids"] = normalized_ids
+            tiers = bucket.get("query_tiers") if isinstance(bucket.get("query_tiers"), dict) else {}
+            bucket["query_tiers"] = {
+                tier: normalize_social_query_output(tiers.get(tier))
+                for tier in ("exact", "semantic", "broad", "hashtag")
+            }
         if not buckets:
             return {}
         hook = {
@@ -3037,7 +3087,8 @@ def find_reusable_social_clips(project_dir, title, script, understanding=None,
 
 
 def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seconds, script_relevancy,
-                       cookies, cancel_check, status_cb=None, script_text=""):
+                       cookies, cancel_check, status_cb=None, script_text="",
+                       search_sort="MOST_LIKED"):
     """Tiered, widening per-bucket scrape that drives clip_scraper.scrape_bucket with the EXACT
     bucket queries (NO build_queries/script-derived expansion). Each candidate passes a metadata
     pre-download filter, then black-bar/fake-vertical + text-heavy rejection. Returns
@@ -3089,6 +3140,17 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
             break
         bucket_terms = " ".join([bucket.get("primary_subject", ""), bucket.get("action", ""),
                                  bucket.get("visual_goal", "")])
+        # X is not a second TikTok search. Give it only 2-4 explicit proof/action phrases
+        # built from subject + action + location. Lifestyle/emotion buckets stay TikTok-only.
+        x_bucket_queries = []
+        if intent in ("specific_action", "proof_like_social_clip"):
+            subject_action_location = " ".join(str(bucket.get(key) or "").strip()
+                                                 for key in ("primary_subject", "action", "location")).strip()
+            exact_queries = normalize_social_query_output(
+                (bucket.get("query_tiers") or {}).get("exact"))
+            x_candidates = ([subject_action_location] if subject_action_location else []) + exact_queries
+            x_bucket_queries = [q for q in normalize_social_query_output(x_candidates)
+                                if clip_scraper.is_valid_x_query(q)][:4]
         if is_hook:
             log(status_cb, f"Hook Finder: searching 20K+ like Japanese cute/dance creator clips "
                            f"(Miyu Kishi / Saaki-Sakii style)...")
@@ -3100,7 +3162,7 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
                 log(status_cb, f"Bucket {bid}: time budget ({BUCKET_TIME_BUDGET_S:.0f}s) reached with "
                                f"{got} clip(s); moving on so other scenes still get footage.")
                 break
-            qs = [str(q).strip() for q in (bucket.get("query_tiers", {}).get(tier) or []) if str(q).strip()]
+            qs = normalize_social_query_output(bucket.get("query_tiers", {}).get(tier))
             if not qs:
                 continue
             log(status_cb, f"  [{bid} · {tier}] searching {', '.join(platforms)}: "
@@ -3113,8 +3175,9 @@ def scrape_social_plan(plan, project_dir, clip_scraper, platforms, per_clip_seco
                     status_cb=status_cb, cancel_check=cancel_check, seen_ids=seen_ids,
                     query_perf=query_perf, candidate_statuses=candidate_statuses,
                     min_likes=HOOK_MIN_LIKES if is_hook else MIN_CLIP_LIKES,
-                    search_sort="MOST_LIKED", platforms=platforms,
-                    deadline=bucket_deadline) or []
+                    search_sort=search_sort, platforms=platforms,
+                    deadline=bucket_deadline, search_intent=intent,
+                    x_queries=x_bucket_queries) or []
             except Exception as exc:  # noqa: BLE001
                 log(status_cb, f"Bucket {bid}: {tier} tier search failed ({exc.__class__.__name__}).")
                 got_dicts = []
@@ -7546,7 +7609,8 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
 
 
 def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None,
-                                   include_project_pool=False, output_tag="timeline_social_replace"):
+                                   include_project_pool=False, output_tag="timeline_social_replace",
+                                   reasoning_model_override=None):
     """Search fresh TikTok/X footage for only the marked timeline scenes, then render.
 
     This is deliberately separate from a full same-script rerun: unmarked media remains intact,
@@ -7586,8 +7650,9 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     title = str(config.get("title") or slug)
     full_script = " ".join(str(scene.get("exact_voice_text") or scene.get("script") or "")
                            for scene in (config.get("scenes") or []))
-    reasoning_model = str((config.get("wavespeed") or {}).get("reasoning_model")
+    reasoning_model = str(reasoning_model_override or (config.get("wavespeed") or {}).get("reasoning_model")
                           or "openai/gpt-5.5")
+    config.setdefault("wavespeed", {})["reasoning_model"] = reasoning_model
     understanding = {}
     try:
         understanding = json.loads((project_dir / "input" / "script_understanding.json").read_text(
@@ -7603,7 +7668,12 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     queries = llm_scene_scrape_queries(lines, understanding=understanding,
                                        reasoning_model=reasoning_model, status_cb=status_cb)
     if not queries:
-        queries = [clean_text(line)[:100] for line in lines if clean_text(line)]
+        # Derive compact search phrases; never send full narration lines to a backend.
+        queries = []
+        for line in lines:
+            terms = important_terms(clean_text(line), 5, SEARCH_NOISE)
+            if len(terms) >= 2:
+                queries.append("Japan " + " ".join(terms))
     if not queries:
         raise RuntimeError("Could not derive social search queries for the marked scenes.")
     try:
@@ -7617,13 +7687,17 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     candidate_statuses = []
     got = []
     if backend_up:
+        # A targeted timeline replacement is its own scrape run; do not inherit query
+        # dedupe or a prior run's X-unavailable state.
+        clip_scraper.reset_backend_search_health()
         got = clip_scraper.scrape_bucket(
             out_dir, queries[:32], min(40, max(8, len(target_scenes) * 6)),
             bucket_id=f"timeline_replace_{stamp}", tier="timeline_replace",
             bucket_terms=" ".join(lines)[:500], per_clip_seconds=per_clip,
             status_cb=status_cb, cancel_check=cancelled, candidate_statuses=candidate_statuses,
-            min_likes=MIN_CLIP_LIKES, search_sort="MOST_LIKED", platforms=platforms,
-            deadline=time.monotonic() + 900.0) or []
+            min_likes=MIN_CLIP_LIKES,
+            search_sort=str(config.get("scrape_sort") or "MOST_LIKED"), platforms=platforms,
+            deadline=time.monotonic() + 900.0, search_intent="specific_action") or []
     if cancelled():
         raise pipeline.PipelineCancelled("Timeline replacement cancelled.")
     pool, clip_meta = [], {}
@@ -8455,6 +8529,9 @@ def run_project(form, status_cb=None):
         if p.strip()
     ] or ["tiktok", "x"]
     scrape_terms = str(form.get("scrape_terms", "") or "").strip()
+    scrape_sort = str(form.get("scrape_sort", "MOST_LIKED") or "MOST_LIKED").strip().upper()
+    if scrape_sort not in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "RELEVANCE"}:
+        scrape_sort = "MOST_LIKED"
     try:
         script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 70)))))
     except (TypeError, ValueError):
@@ -8479,6 +8556,7 @@ def run_project(form, status_cb=None):
         log(status_cb, f"Clip source: SCRAPE — pulling real clips from {', '.join(scrape_platforms)} "
                        f"(style terms: {scrape_terms or 'from script'}; script relevancy {script_relevancy}%). "
                        "AI image generation is disabled; scraped footage fills the video layer.")
+        log(status_cb, "Scrape result order: " + scrape_sort.lower().replace("_", " ") + ".")
     output_toggles = {
         "web_images": out_web, "wikimedia": out_wiki, "gpt_images": out_gpt,
         "video_clips": out_clips, "sfx": out_sfx, "transition_sfx": out_tr_sfx,
@@ -8679,7 +8757,8 @@ def run_project(form, status_cb=None):
                     # `config` is not built yet here; give V2 a minimal config to read the title from
                     # and stash its result on. The scene fields it writes go onto scenes_override
                     # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
-                    _v2cfg = {"title": title, "voice_speed": 1.20}
+                    _v2cfg = {"title": title, "voice_speed": 1.20,
+                              "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE")}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
                         _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
@@ -8743,9 +8822,10 @@ def run_project(form, status_cb=None):
                                            "searching only because the saved pool is still too small.")
                     if first_search_plan["buckets"] or first_search_plan["hook"]:
                         (fresh_pool, fresh_meta, fresh_perf, _fresh_scene_bucket, fresh_hooks,
-                         fresh_statuses, _fresh_summary) = scrape_social_plan(
+                        fresh_statuses, _fresh_summary) = scrape_social_plan(
                             first_search_plan, project_dir, clip_scraper, scrape_platforms, per_clip,
-                            script_relevancy, _cookies, _cancel, status_cb=status_cb, script_text=script)
+                            script_relevancy, _cookies, _cancel, status_cb=status_cb,
+                            script_text=script, search_sort=scrape_sort)
                         pool.extend(fresh_pool)
                         hook_pool.extend(fresh_hooks)
                         clip_meta.update(fresh_meta)
@@ -8771,7 +8851,7 @@ def run_project(form, status_cb=None):
                     _splan = llm_scrape_plan(script, title, visual_script, script_relevancy,
                                              reasoning_model=reasoning_model, status_cb=status_cb,
                                              understanding=script_understanding)
-                    _flat_queries = [q for q in (_splan.get("queries") or []) if str(q).strip()]
+                    _flat_queries = clip_scraper.normalize_query_list(_splan.get("queries"))
                     _flat_queries += [q.strip() for q in re.split(r"[,\n]", scrape_terms or "")
                                       if q.strip()]
                     _fallback_dicts = clip_scraper.scrape_bucket(
@@ -8780,7 +8860,7 @@ def run_project(form, status_cb=None):
                         bucket_id="fallback", tier="flat", bucket_terms=str(script)[:200],
                         per_clip_seconds=per_clip, status_cb=status_cb, cancel_check=_cancel,
                         candidate_statuses=candidate_statuses, min_likes=MIN_CLIP_LIKES,
-                        search_sort="MOST_LIKED", platforms=scrape_platforms,
+                        search_sort=scrape_sort, platforms=scrape_platforms,
                         deadline=time.monotonic() + 180.0) or []
                     for d in _fallback_dicts:
                         p = d.get("path")
@@ -8805,7 +8885,7 @@ def run_project(form, status_cb=None):
                             bucket_id="fallback_hook", tier="flat", bucket_terms=hook_q,
                             per_clip_seconds=per_clip, status_cb=status_cb, cancel_check=_cancel,
                             candidate_statuses=candidate_statuses, min_likes=HOOK_MIN_LIKES,
-                            search_sort="MOST_LIKED", platforms=scrape_platforms,
+                            search_sort=scrape_sort, platforms=scrape_platforms,
                             deadline=time.monotonic() + 180.0) or []
                         for d in _hd:
                             if d.get("path"):
@@ -8982,7 +9062,7 @@ def run_project(form, status_cb=None):
                             status_cb=status_cb, cancel_check=_cancel, seen_ids=retry_seen_ids,
                             query_perf=query_perf, candidate_statuses=candidate_statuses,
                             min_likes=MIN_CLIP_LIKES,
-                            search_sort="MOST_LIKED", platforms=scrape_platforms,
+                            search_sort=scrape_sort, platforms=scrape_platforms,
                             deadline=time.monotonic() + 180.0) or []
                     else:
                         log(status_cb, "   no new retry terms returned; re-scoring the existing pool "
@@ -9633,6 +9713,7 @@ def run_project(form, status_cb=None):
     config["clip_source"] = clip_source
     config["scrape_platforms"] = scrape_platforms
     config["scrape_terms"] = scrape_terms
+    config["scrape_sort"] = scrape_sort
     config["script_relevancy"] = script_relevancy
     log(status_cb, f"Seedance model selected: {seedance_model_choice}.")
     log(status_cb, f"Background music: {'enabled' if background_music_enabled else 'disabled'}.")

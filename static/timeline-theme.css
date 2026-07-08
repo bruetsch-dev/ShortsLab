@@ -1,0 +1,138 @@
+/* Timeline Editor - visual shell override to match the chat UI theme.
+   Loaded ONLY on /timeline. Remaps the legacy CSS variables (parchment/blue brutalist)
+   to the chat shell's deep-dark + #39ff14 palette. NO selectors from the editor's own
+   layout/behavior are touched - colors, radii, shadows and fonts only.
+   Theme follows the chat preference (localStorage "sl-chat-theme"); the header toggle
+   is rewired by a small inline script to flip the same preference. */
+
+:root, html.theme-dark {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --display: Inter, ui-sans-serif, system-ui, sans-serif;
+  --pixel: Inter, ui-sans-serif, system-ui, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+
+  --ink: rgba(255, 255, 255, 0.14);
+  --bg-base: #090b0a;
+  --bg-raised: rgba(25, 28, 25, 0.92);
+  --bg-overlay: rgba(35, 38, 35, 0.94);
+  --bg-input: #181a18;
+  --text: #f1f3f1;
+  --muted: #a0a6a0;
+  --faint: #646a64;
+
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  --accent: #39ff14;
+  --accent-hover: #50ff31;
+  --accent-active: #2fe20e;
+  --accent-subtle: rgba(57, 255, 20, 0.12);
+  --accent-fg: #062b00;
+  --accent-ink: #062b00;
+  --accent-2: #ef665c;
+  --success: #52d273;
+  --warning: #e6b450;
+  --danger: #ef665c;
+
+  --bg: var(--bg-base); --bg-panel: var(--bg-raised); --bg-panel-2: var(--bg-overlay);
+  --accent-3: var(--danger); --go: var(--accent);
+
+  --r-sm: 8px; --r-md: 12px; --r-lg: 16px; --r-full: 99px;
+  --radius: var(--r-lg); --radius-sm: var(--r-md);
+
+  /* kill the hard brutalist offset shadows -> soft depth */
+  --sh-1: 0 1px 10px rgba(0, 0, 0, 0.35);
+  --sh-2: 0 4px 18px rgba(0, 0, 0, 0.40);
+  --sh-3: 0 8px 30px rgba(0, 0, 0, 0.45);
+  --shadow: var(--sh-1);
+  --blur: blur(12px);
+}
+
+/* light variant = the chat shell's light palette */
+html.chat-light, html.chat-light.theme-dark {
+  color-scheme: light;
+  --ink: rgba(16, 24, 16, 0.20);
+  --bg-base: #f6f8f5;
+  --bg-raised: #ffffff;
+  --bg-overlay: #f0f4ef;
+  --bg-input: #ffffff;
+  --text: #151a15;
+  --muted: #596159;
+  --faint: #858d85;
+  --line: rgba(16, 24, 16, 0.10);
+  --line-strong: rgba(16, 24, 16, 0.20);
+  --accent: #1ea312;
+  --accent-hover: #178a0c;
+  --accent-active: #147a0a;
+  --accent-subtle: rgba(36, 184, 26, 0.10);
+  --accent-fg: #ffffff;
+  --accent-ink: #ffffff;
+  --sh-1: 0 1px 8px rgba(20, 30, 20, 0.10);
+  --sh-2: 0 4px 14px rgba(20, 30, 20, 0.12);
+  --sh-3: 0 8px 24px rgba(20, 30, 20, 0.14);
+}
+
+/* page chrome: deep-dark canvas with the subtle green glow (replaces the pixel-lab bg) */
+body.page-timeline {
+  background:
+    radial-gradient(circle at 65% 30%, rgba(39, 255, 31, 0.06), transparent 45%),
+    var(--bg-base) !important;
+  color: var(--text);
+}
+body.page-timeline::before, body.page-timeline::after { display: none !important; }
+html.chat-light body.page-timeline {
+  background:
+    radial-gradient(circle at 65% 30%, rgba(31, 178, 22, 0.05), transparent 45%),
+    var(--bg-base) !important;
+}
+
+/* soften panel chrome (borders were bold ink) */
+body.page-timeline .panel {
+  border-color: var(--line) !important;
+  backdrop-filter: blur(12px);
+}
+body.page-timeline .panel h2 {
+  letter-spacing: -0.01em;
+  text-transform: none;
+}
+
+/* buttons: green primary, quiet secondaries, no hard offset hover-jumps */
+body.page-timeline button:hover, body.page-timeline .button:hover {
+  transform: none !important;
+}
+body.page-timeline .tl-render-btn {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: var(--accent-fg) !important;
+}
+body.page-timeline .tl-render-btn:hover { background: var(--accent-hover) !important; }
+
+/* editor header: ONLY the back button remains - no brand title bar, no New project /
+   Assets buttons, no theme switch (the editor follows the chat theme automatically) */
+body.page-timeline .top {
+  border-bottom: 0 !important;
+  padding: 4px 0 0 !important;
+  margin-bottom: 4px !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  min-height: 0 !important;
+}
+body.page-timeline .brand { display: none !important; }
+body.page-timeline .nav-actions { display: none !important; }
+body.page-timeline .back-arrow {
+  width: 38px; height: 38px;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
+  background: var(--bg-raised) !important;
+  color: var(--text) !important;
+  box-shadow: none !important;
+}
+body.page-timeline .back-arrow:hover {
+  border-color: var(--line-strong) !important;
+  background: var(--bg-overlay) !important;
+  transform: none !important;
+}
+
+/* selection + focus states pick up the accent automatically via the vars above */
+body.page-timeline ::selection { background: var(--accent-subtle); }

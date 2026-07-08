@@ -164,7 +164,18 @@ class TikTokScrapeLogicTests(unittest.TestCase):
             items = clip_scraper.backend_search("query", 8)
         self.assertEqual([i["id"] for i in items], ["tw1", "tk1"])
 
-    def test_download_selection_balances_tiktok_and_x(self):
+    def test_backend_search_forwards_user_sort_to_x(self):
+        import concurrent.futures
+        future = concurrent.futures.Future()
+        future.set_result([])
+        with mock.patch.object(clip_scraper, "twitter_backend_ready", return_value=True), \
+             mock.patch.object(clip_scraper.twitter_login, "search_async",
+                               return_value=future) as search:
+            clip_scraper.backend_search(
+                "Tokyo station incident", 8, sort="MOST_VIEWED", platforms=["x"])
+        self.assertEqual(search.call_args.kwargs["sort"], "MOST_VIEWED")
+
+    def test_download_selection_uses_global_rank_not_forced_platform_balance(self):
         scored = []
         for index in range(8):
             scored.append((10.0 - index, {"id": f"tk{index}"},
@@ -176,7 +187,105 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         selected = clip_scraper.balanced_platform_candidates(
             scored, 6, {"tiktok", "twitter"})
         self.assertEqual([row[2]["platform"] for row in selected],
-                         ["tiktok", "twitter", "tiktok", "twitter", "tiktok", "twitter"])
+                         ["tiktok", "tiktok", "tiktok", "tiktok", "twitter", "tiktok"])
+
+    def test_query_normalization_preserves_complete_phrases(self):
+        self.assertEqual(
+            clip_scraper.normalize_query_list("Japanese students cleaning classroom"),
+            ["Japanese students cleaning classroom"],
+        )
+        self.assertEqual(
+            clip_scraper.normalize_query_list('["night train commuters", "駅 終電"]'),
+            ["night train commuters", "駅 終電"],
+        )
+        self.assertEqual(
+            clip_scraper.normalize_query_list("Tokyo vending machine · konbini breakfast"),
+            ["Tokyo vending machine", "konbini breakfast"],
+        )
+        self.assertEqual(
+            clip_scraper.normalize_query_list(["Tokyo train", "tokyo train", "Tokyo train"]),
+            ["Tokyo train"],
+        )
+
+    def test_x_query_validation_rejects_script_fragments_but_accepts_visual_phrases(self):
+        self.assertFalse(clip_scraper.is_valid_x_query("First;"))
+        self.assertFalse(clip_scraper.is_valid_x_query("for"))
+        self.assertTrue(clip_scraper.is_valid_x_query("Japanese students cleaning classroom"))
+        self.assertTrue(clip_scraper.is_valid_x_query("終電 サラリーマン"))
+        # Bucket terms may be raw narration and must never become a backend query.
+        self.assertEqual(
+            clip_scraper.x_queries_for_search(
+                ["Japanese students cleaning classroom"],
+                bucket_terms="First, I will explain why you love it.",
+                search_intent="specific_action",
+            ),
+            ["Japanese students cleaning classroom"],
+        )
+
+    def test_five_valid_x_zero_searches_trigger_one_health_check_across_buckets(self):
+        clip_scraper.reset_backend_search_health()
+        health = mock.Mock(return_value={"ok": False})
+        common = (
+            mock.patch.object(clip_scraper, "backend_active", return_value=True),
+            mock.patch.object(clip_scraper, "_ffmpeg_tools", return_value=("ffmpeg", "ffprobe")),
+            mock.patch.object(clip_scraper, "backend_search", return_value=[]),
+            mock.patch.object(clip_scraper.twitter_login, "health_check", health),
+        )
+        with common[0], common[1], common[2], common[3]:
+            clip_scraper.scrape_bucket(
+                Path(tempfile.gettempdir()) / "x-query-test-a",
+                ["Japan train delay", "Tokyo station incident", "commuter reaction video"],
+                1, platforms=["x"], search_intent="specific_action")
+            clip_scraper.scrape_bucket(
+                Path(tempfile.gettempdir()) / "x-query-test-b",
+                ["students cleaning classroom", "vending machine restocking", "train passenger event"],
+                1, platforms=["x"], search_intent="specific_action")
+        health.assert_called_once()
+        clip_scraper.reset_backend_search_health()
+
+    def test_invalid_x_queries_are_reported_without_backend_calls(self):
+        clip_scraper.reset_backend_search_health()
+        perf = []
+        with mock.patch.object(clip_scraper, "backend_active", return_value=True), \
+             mock.patch.object(clip_scraper, "backend_search") as search:
+            result = clip_scraper.scrape_bucket(
+                Path(tempfile.gettempdir()) / "x-invalid-query-test",
+                ["First;", "for"], 1, platforms=["x"], query_perf=perf,
+                search_intent="specific_action")
+        self.assertEqual(result, [])
+        search.assert_not_called()
+        self.assertEqual([row["status"] for row in perf],
+                         ["invalid_query", "invalid_query"])
+
+    def test_tiktok_and_x_receive_separate_query_sets(self):
+        clip_scraper.reset_backend_search_health()
+        calls = []
+        def search(query, _want, **kwargs):
+            calls.append((next(iter(kwargs["platforms"])), query))
+            return []
+        with mock.patch.object(clip_scraper, "backend_active", return_value=True), \
+             mock.patch.object(clip_scraper, "_ffmpeg_tools", return_value=("ffmpeg", "ffprobe")), \
+             mock.patch.object(clip_scraper, "backend_search", side_effect=search):
+            clip_scraper.scrape_bucket(
+                Path(tempfile.gettempdir()) / "separate-social-query-test",
+                ["かわいい 東京 日常"], 1, platforms=["tiktok", "x"],
+                search_intent="specific_action",
+                x_queries=["Tokyo station passenger incident"])
+        self.assertIn(("tiktok", "かわいい 東京 日常"), calls)
+        self.assertIn(("twitter", "Tokyo station passenger incident"), calls)
+        self.assertNotIn(("twitter", "かわいい 東京 日常"), calls)
+        clip_scraper.reset_backend_search_health()
+
+    def test_body_has_no_like_floor_but_hook_keeps_twenty_thousand(self):
+        self.assertEqual(agent_core.MIN_CLIP_LIKES, 0)
+        self.assertEqual(agent_core.HOOK_MIN_LIKES, 20_000)
+
+    def test_timeline_ui_exposes_smaller_player_rework_model_and_search_sort(self):
+        self.assertIn("height:clamp(260px,38vh,390px)", app.TIMELINE_SKELETON)
+        self.assertIn('id="tl-rw-model"', app.TIMELINE_SKELETON)
+        page_html = app.form_page(clear=True)
+        self.assertIn('name="scrape_sort"', page_html)
+        self.assertIn('value="MOST_VIEWED"', page_html)
 
     def test_caption_gate_rejects_instead_of_blurring(self):
         self.assertFalse(clip_scraper.is_captioned_candidate(1.5, False))

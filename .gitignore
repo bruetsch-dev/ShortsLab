@@ -84,3 +84,6 @@ static/*.bak
 
 # third-party skill pack (reinstall via: npx ui-ux-pro-max-cli init --ai claude)
 .claude/skills/
+
+# per-session chat UI state
+chat_session.json

@@ -1437,7 +1437,15 @@ def build_video_prompt(config, scene):
     return "\n".join(part for part in [base, f"Style: {style}", constraints] if part)[:1800]
 
 
+def _assert_paid_api_allowed(what="paid API"):
+    # NO_PAID_API_TEST_MODE: tests set SHORTSLAB_NO_PAID_API=1 so any accidental
+    # paid call fails immediately instead of spending credit.
+    if os.environ.get("SHORTSLAB_NO_PAID_API", "") == "1":
+        raise RuntimeError(f"NO_PAID_API_TEST_MODE: blocked call to {what} (SHORTSLAB_NO_PAID_API=1)")
+
+
 def api_key():
+    _assert_paid_api_allowed("WaveSpeed (pipeline.api_key)")
     key = os.environ.get("WAVESPEED_API_KEY", "").strip()
     if not key:
         raise RuntimeError("WAVESPEED_API_KEY is not set. Set it only as an environment variable.")
@@ -1445,6 +1453,7 @@ def api_key():
 
 
 def request_json(method, url, key, payload=None, timeout=180):
+    _assert_paid_api_allowed(url)
     data = None
     headers = {"Authorization": f"Bearer {key}"}
     if payload is not None:

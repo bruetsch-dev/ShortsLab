@@ -93,14 +93,17 @@ SCRAPE_V2_CONFIG = {
 # Tier-aware like floors: an exact-action query may keep a niche clip with almost no likes; broad
 # discovery tiers still want some traction. Likes are a WEAK popularity signal in V2, never a
 # hard relevance gate. X floors are quartered downstream (structurally lower engagement).
+# Relevance-first V2 does NOT gate footage on likes (likes are a weak relevance signal, and a
+# like-gate skews toward big Western viral clips even for a Japanese query). All floors are 0;
+# ranking still uses engagement as a small (~7%) tie-breaker, never a hard cutoff.
 LIKE_FLOORS_V2 = {
     "exact_action": 0,
     "action_location": 0,
-    "semantic_action": 250,
-    "native_vlog": 500,
-    "broad_context": 2_000,
-    "hashtag": 3_000,
-    "creator_style": 5_000,
+    "semantic_action": 0,
+    "native_vlog": 0,
+    "broad_context": 0,
+    "hashtag": 0,
+    "creator_style": 0,
 }
 V2_QUERY_TIERS = ["exact_action", "action_location", "semantic_action",
                   "native_vlog", "broad_context", "hashtag", "creator_style"]
@@ -1306,14 +1309,19 @@ def _item_to_source(item, query: SearchQueryV2):
         query=query.query, query_tier=query.tier, raw_item=item)
 
 
-def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids, state, status_cb):
-    """Run a batch of SearchQueryV2 through the dual backend, dedupe by source_id, relevance-rank."""
+def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids, state, status_cb,
+                    sort="RELEVANCE"):
+    """Run a batch of SearchQueryV2 through the dual backend, dedupe by source_id, relevance-rank.
+
+    ``sort`` is the backend result order (RELEVANCE | MOST_LIKED | MOST_VIEWED | MOST_RECENT).
+    Default RELEVANCE = TikTok's own topical order, which returns far more on-topic Japanese
+    footage for a Japanese query than MOST_LIKED (which surfaces big Western viral clips)."""
     ranked_all = []
     plat_counts, creator_counts = {}, {}
     for q in queries:
         if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
             break
-        items = clip_scraper.backend_search(q.query, 12, status_cb=status_cb, sort="MOST_LIKED",
+        items = clip_scraper.backend_search(q.query, 12, status_cb=status_cb, sort=sort,
                                             platforms=platforms, deadline=deadline) or []
         state["queries_executed"] = state.get("queries_executed", 0) + 1
         state["raw_results"] = state.get("raw_results", 0) + len(items)
@@ -1485,6 +1493,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     V1-compatible 7-tuple. Stashes assignments + debug report on config['_scrape_v2']. Loops until
     enough final usable segments exist for every scene or a budget is hit."""
     cfg = SCRAPE_V2_CONFIG
+    # Backend result order chosen by the user (default RELEVANCE = TikTok's topical order, which
+    # returns far more on-topic Japanese footage than MOST_LIKED's Western viral bias).
+    sort_mode = str(config.get("scrape_sort") or config.get("search_sort") or "RELEVANCE").upper()
+    if sort_mode not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"):
+        sort_mode = "RELEVANCE"
     t0 = time.monotonic()
     deadline = t0 + cfg["max_total_scrape_time_seconds"]
     clip_scraper.set_cookies(cookies)
@@ -1523,7 +1536,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         batch_q = query_queue[:BATCH]
         query_queue = query_queue[BATCH:]
         _log(status_cb, "Scrape V2: searching %s ... (%d queries queued)" % (batch_q[0].tier, len(query_queue)))
-        sources = _search_sources(batch_q, platforms, cancel_check, deadline, seen_source_ids, state, status_cb)
+        sources = _search_sources(batch_q, platforms, cancel_check, deadline, seen_source_ids, state,
+                                  status_cb, sort=sort_mode)
         _log(status_cb, "Scrape V2: ranking %d source video(s) by relevance..." % len(sources))
         segs = _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline,
                                      state, status_cb, cfg["max_downloaded_analysis_videos"])

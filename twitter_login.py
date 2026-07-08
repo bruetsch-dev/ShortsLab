@@ -49,7 +49,8 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _LOCALE = os.environ.get("TWITTER_LOCALE", "ja-JP").strip() or "ja-JP"
 
-_SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0}
+_SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0, "captcha": 0,
+                 "timeline_responses": 0, "health_checks": 0, "unavailable": 0}
 _EXECUTOR = None
 _EXEC_LOCK = threading.Lock()
 _SESSION = [None]                       # only ever touched from the executor thread
@@ -60,7 +61,8 @@ def search_stats():
 
 
 def reset_search_stats():
-    _SEARCH_STATS.update(searches=0, items=0, login_wall=0)
+    _SEARCH_STATS.update(searches=0, items=0, login_wall=0, captcha=0,
+                         timeline_responses=0, health_checks=0, unavailable=0)
 
 
 def _status(cb, msg):
@@ -278,6 +280,11 @@ def _extract_video_tweets(payload):
             likes = int(legacy.get("favorite_count") or 0)
         except (TypeError, ValueError):
             likes = 0
+        views_node = node.get("views") if isinstance(node.get("views"), dict) else {}
+        try:
+            views = int(views_node.get("count") or legacy.get("view_count") or 0)
+        except (TypeError, ValueError):
+            views = 0
         items.append({
             "id": tid,
             "desc": str(legacy.get("full_text") or ""),
@@ -286,7 +293,8 @@ def _extract_video_tweets(payload):
             "_platform": "twitter",           # scaled like-gate + reporting
             "video": {"width": int(oi.get("width") or 0), "height": int(oi.get("height") or 0),
                       "duration": int(vi.get("duration_millis") or 0)},
-            "stats": {"diggCount": likes},
+            "stats": {"diggCount": likes, "playCount": views},
+            "createTime": int(tid) if tid.isdigit() else 0,
             "author": {"uniqueId": sn, "nickname": sn},
             "hashtags": tags,
         })
@@ -346,7 +354,8 @@ class Session:
         except Exception:
             return []
 
-    def search(self, query, want=12, status_cb=None, max_scrolls=6, timeout_s=None):
+    def search(self, query, want=12, status_cb=None, max_scrolls=6, timeout_s=None,
+               sort="MOST_LIKED"):
         cb = status_cb or self._status_cb
         query = str(query or "").strip()
         if not query:
@@ -355,6 +364,7 @@ class Session:
                     if timeout_s is not None else None)
         _tt._hide_offscreen_from_taskbar()
         collected, seen = [], set()
+        timeline_seen = [False]
 
         def _absorb(payload):
             for it in _extract_video_tweets(payload):
@@ -368,6 +378,9 @@ class Session:
         def _on_response(resp):
             try:
                 if "SearchTimeline" in resp.url or "/search/adaptive" in resp.url:
+                    if not timeline_seen[0]:
+                        timeline_seen[0] = True
+                        _SEARCH_STATS["timeline_responses"] += 1
                     _absorb(resp.json())
             except Exception:
                 pass
@@ -401,6 +414,8 @@ class Session:
                     low = (page.content() or "").lower()
                     if "log in" in low and "sign up" in low:
                         _SEARCH_STATS["login_wall"] += 1
+                    if "captcha" in low or "arkose" in low or "verify your identity" in low:
+                        _SEARCH_STATS["captcha"] += 1
                 except Exception:
                     pass
         finally:
@@ -415,9 +430,14 @@ class Session:
                 export_cookies_txt(cookies=self.cookies())
             except Exception:
                 pass
-        collected.sort(key=lambda item: int((item.get("stats") or {}).get("diggCount") or 0),
-                       reverse=True)
-        _status(cb, f"X search {query!r}: collected {len(collected)} video tweet(s).")
+        sort_mode = str(sort or "MOST_LIKED").upper()
+        metric = "diggCount" if sort_mode == "MOST_LIKED" else "playCount"
+        if sort_mode in {"MOST_LIKED", "MOST_VIEWED"}:
+            collected.sort(key=lambda item: int((item.get("stats") or {}).get(metric) or 0),
+                           reverse=True)
+        elif sort_mode == "MOST_RECENT":
+            collected.sort(key=lambda item: int(item.get("createTime") or item.get("id") or 0),
+                           reverse=True)
         return collected[:max(0, int(want))]
 
     def close(self):
@@ -476,25 +496,47 @@ def _session_on_worker(status_cb=None):
     return _SESSION[0]
 
 
-def _search_on_worker(query, want, status_cb, timeout_s=None):
+def _search_on_worker(query, want, status_cb, timeout_s=None, sort="MOST_LIKED"):
     sess = _session_on_worker(status_cb)
     if sess is None:
         return []
     try:
-        return sess.search(query, want=want, status_cb=status_cb, timeout_s=timeout_s) or []
+        return sess.search(query, want=want, status_cb=status_cb, timeout_s=timeout_s,
+                           sort=sort) or []
     except Exception as exc:  # noqa: BLE001
         _status(status_cb, f"X search failed ({exc.__class__.__name__}: {exc}).")
         return []
 
 
-def search_async(query, want=12, status_cb=None, timeout_s=None):
+def search_async(query, want=12, status_cb=None, timeout_s=None, sort="MOST_LIKED"):
     """Run a logged-in X video search on the dedicated worker thread. Returns a Future
     resolving to a list of normalized items; resolves to [] when not logged in."""
     if not is_ready():
         f = concurrent.futures.Future()
         f.set_result([])
         return f
-    return _executor().submit(_search_on_worker, query, int(want), status_cb, timeout_s)
+    return _executor().submit(_search_on_worker, query, int(want), status_cb, timeout_s, sort)
+
+
+def health_check(timeout_s=45):
+    """API-free session/search-timeline check using a known broad video query."""
+    _SEARCH_STATS["health_checks"] += 1
+    before = search_stats()
+    try:
+        items = search_async("Japan viral video", want=3, status_cb=lambda _m: None,
+                             timeout_s=timeout_s, sort="MOST_RECENT").result(
+                                 timeout=max(5, timeout_s + 5)) or []
+    except Exception:
+        items = []
+    after = search_stats()
+    login_problem = after.get("login_wall", 0) > before.get("login_wall", 0)
+    captcha = after.get("captcha", 0) > before.get("captcha", 0)
+    timeline = after.get("timeline_responses", 0) > before.get("timeline_responses", 0)
+    ok = bool(items or (timeline and not login_problem and not captcha))
+    if not ok:
+        _SEARCH_STATS["unavailable"] += 1
+    return {"ok": ok, "items": len(items), "timeline_response": timeline,
+            "login_wall": login_problem, "captcha": captcha}
 
 
 def close_session():

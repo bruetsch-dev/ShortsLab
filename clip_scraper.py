@@ -258,6 +258,94 @@ def backend_name(platforms=None):
 # Queries already searched THIS RUN (normalized). Buckets, tiers and retry rounds routinely
 # produce near-duplicate queries - re-searching them costs ~5-15s each for zero new clips.
 _SEEN_QUERIES = set()
+_X_ZERO_STREAK = 0
+_X_UNAVAILABLE = False
+X_QUERY_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "for", "to", "of", "in", "on", "at",
+    "with", "from", "will", "would", "could", "first", "next", "then", "many",
+    "its", "it's", "this", "that", "love", "speech", "it", "is", "are", "was",
+}
+X_QUERY_INTENTS = {"specific_action", "proof_like_social_clip", "specific_proof",
+                   "event_object", "exact_action", "viral_incident"}
+_X_PROOF_TERMS = {
+    "incident", "event", "reaction", "viral", "rule", "law", "service", "machine",
+    "vending", "train", "station", "product", "restocking", "worker", "passenger",
+    "students", "cleaning", "classroom", "salaryman", "commuter", "convenience store",
+    "transport", "delay", "disruption", "self checkout", "proof",
+}
+
+
+def normalize_query_list(value):
+    """Return complete query phrases without ever whitespace-splitting a phrase/string."""
+    if isinstance(value, (list, tuple, set)):
+        candidates = list(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        candidates = None
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    candidates = parsed
+            except Exception:
+                pass
+        if candidates is None:
+            candidates = re.split(r"(?:\r?\n|\s*[\u00b7\u2022]\s*)+", raw)
+    else:
+        return []
+    out, seen = [], set()
+    for candidate in candidates:
+        if not isinstance(candidate, (str, int, float)):
+            continue
+        query = re.sub(r"^\s*(?:[-*\u2022]+|\d+[.)])\s*", "", str(candidate))
+        query = re.sub(r"^[\s,;:|]+|[\s,;:|]+$", "", query)
+        query = " ".join(query.split())
+        key = _norm_query(query)
+        if query and key and key not in seen:
+            seen.add(key); out.append(query)
+    return out
+
+
+def meaningful_query_tokens(query):
+    return [token for token in re.findall(r"[^\W_]+(?:['’-][^\W_]+)?", str(query), re.UNICODE)
+            if token.casefold() not in X_QUERY_STOPWORDS and len(token) > 1]
+
+
+def is_valid_x_query(query):
+    query = " ".join(str(query or "").split()).strip(" ,;:|")
+    if not query or len(query) > 180:
+        return False
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", query):
+        return len(re.sub(r"\s+", "", query).lstrip("#")) >= 2
+    tokens = meaningful_query_tokens(query)
+    if len(tokens) < 2:
+        return bool(query.startswith("#") and len(query) >= 4)
+    return True
+
+
+def x_query_is_suitable(query, search_intent=""):
+    if not is_valid_x_query(query):
+        return False
+    if str(search_intent or "").strip().lower() in X_QUERY_INTENTS:
+        return True
+    low = str(query).casefold()
+    return any(term in low for term in _X_PROOF_TERMS)
+
+
+def x_queries_for_search(value, bucket_terms="", search_intent="", limit=4):
+    # ``bucket_terms`` can contain the raw voice script. It is deliberately not promoted
+    # to a query: only explicit planner/user query phrases may reach X.
+    candidates = normalize_query_list(value)
+    out, seen = [], set()
+    for query in candidates:
+        key = _norm_query(query)
+        if x_query_is_suitable(query, search_intent) and key not in seen:
+            seen.add(key); out.append(query)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿]")
 
 
@@ -292,7 +380,10 @@ def backend_search_health(platforms=None):
 
 
 def reset_backend_search_health():
+    global _X_ZERO_STREAK, _X_UNAVAILABLE
     _SEEN_QUERIES.clear()               # fresh run -> allow every query once again
+    _X_ZERO_STREAK = 0
+    _X_UNAVAILABLE = False
     for mod in (tiktok_login, twitter_login):
         if mod is not None:
             try:
@@ -359,12 +450,18 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
                 if "tiktok" in selected and tiktok_backend_ready() else False)
     x_future = None
     if "twitter" in selected and twitter_backend_ready():
-        # X searches on its worker thread while the TikTok search runs on the TikTok worker
-        x_future = twitter_login.search_async(
-            query, want=int(want), status_cb=status_cb, timeout_s=remaining)
+        # X ONLY receives full, valid visual phrases. Isolated script tokens ("will", "First",
+        # "for", ...) are never sent - they can only waste searches and return noise. TikTok is
+        # far more tolerant, so it still runs the raw query.
+        if is_valid_x_query(query):
+            x_future = twitter_login.search_async(
+                query, want=int(want), status_cb=lambda _message: None, timeout_s=remaining,
+                sort=sort)
+        else:
+            _status(status_cb, f"X: skipped malformed query {query!r} (not a valid search phrase).")
     items = []
     if tt_ready:
-        items = tiktok_login.search_sync(query, want=int(want), status_cb=status_cb,
+        items = tiktok_login.search_sync(query, want=int(want), status_cb=lambda _message: None,
                                          sort=sort, timeout_s=remaining) or []
     if x_future is not None:
         try:
@@ -382,12 +479,10 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             if ck:
                 set_cookies(ck)    # make sure yt-dlp has x.com cookies for these downloads
             items.extend(x_items)
-    if str(sort or "").upper() == "MOST_LIKED":
-        items.sort(key=lambda item: int((_item_meta(item) or {}).get("likes") or 0), reverse=True)
-    platforms_found = sorted({(_item_meta(item) or {}).get("platform", "tiktok") for item in items})
-    _status(status_cb, f"Social search {query!r}: {len(items)} result(s) from "
-                       f"{', '.join(platforms_found) if platforms_found else 'selected backends'} "
-                       "ranked by likes.")
+    sort_mode = str(sort or "MOST_LIKED").upper()
+    metric = {"MOST_VIEWED": "views", "MOST_RECENT": "created_at"}.get(sort_mode, "likes")
+    if sort_mode in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"}:
+        items.sort(key=lambda item: int((_item_meta(item) or {}).get(metric) or 0), reverse=True)
     return items
 
 
@@ -1000,6 +1095,18 @@ def _item_meta(item):
         ))
     except (TypeError, ValueError):
         m["likes"] = 0
+    try:
+        m["views"] = int(float(
+            item.get("playCount") or item.get("play_count") or item.get("viewCount")
+            or stats.get("playCount") or stats.get("play_count") or stats.get("viewCount") or 0
+        ))
+    except (TypeError, ValueError):
+        m["views"] = 0
+    try:
+        m["created_at"] = int(float(item.get("createTime") or item.get("create_time")
+                                     or item.get("created_at") or 0))
+    except (TypeError, ValueError):
+        m["created_at"] = 0
     m["platform"] = str(item.get("_platform") or "tiktok")
     return m
 
@@ -1173,40 +1280,11 @@ def is_captioned_candidate(text_heaviness, persistent_caption_shape=False):
 
 
 def balanced_platform_candidates(scored, limit, selected_platforms=None):
-    """Pick the most-liked candidates within each requested platform without TikTok crowd-out.
-
-    ``scored`` rows are ``(rank_score, item, metadata, clip_id)`` and are already sorted best
-    first. With TikTok and X active, alternate their best rows; use either side to fill shortages.
-    """
+    """Keep the globally strongest rows; never force an artificial TikTok/X quota."""
     limit = max(0, int(limit or 0))
     rows = list(scored or [])
-    if not limit:
-        return []
-    requested = normalize_platforms(selected_platforms)
-    if not {"tiktok", "twitter"}.issubset(requested):
-        return rows[:limit]
-    grouped = {"tiktok": [], "twitter": []}
-    remainder = []
-    for row in rows:
-        try:
-            platform = str((row[2] or {}).get("platform") or "tiktok").lower()
-        except Exception:
-            platform = "tiktok"
-        if platform in grouped:
-            grouped[platform].append(row)
-        else:
-            remainder.append(row)
-    if not grouped["tiktok"] or not grouped["twitter"]:
-        return rows[:limit]
-    chosen = []
-    while len(chosen) < limit and (grouped["tiktok"] or grouped["twitter"]):
-        for platform in ("tiktok", "twitter"):
-            if grouped[platform] and len(chosen) < limit:
-                chosen.append(grouped[platform].pop(0))
-    leftovers = grouped["tiktok"] + grouped["twitter"] + remainder
-    leftovers.sort(key=lambda row: row[0], reverse=True)
-    chosen.extend(leftovers[:max(0, limit - len(chosen))])
-    return chosen[:limit]
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return rows[:limit] if limit else []
 
 
 # watermark patterns of AI-art accounts, matched against OCR-READ on-screen text
@@ -1404,34 +1482,57 @@ def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=N
 def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_terms="",
                   per_clip_seconds=DEFAULT_CLIP_SECONDS, status_cb=None, cancel_check=None,
                   seen_ids=None, query_perf=None, candidate_statuses=None, min_likes=0,
-                  search_sort="MOST_LIKED", platforms=None, deadline=None):
+                  search_sort="MOST_LIKED", platforms=None, deadline=None,
+                  search_intent="", x_queries=None):
     """Search the EXACT given bucket queries (NO script-derived expansion via build_queries),
     pre-filter by metadata, download, then reject fake-vertical/black-bar and text-heavy clips.
     Returns accepted dicts: {path, meta, query, tier, clip_id, black_bar_score, text_heaviness,
     is_fake_vertical}. Records per-query stats in query_perf and per-candidate status rows in
     candidate_statuses (lists, if provided). Uses the logged-in TikTok session backend."""
-    queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
+    global _X_ZERO_STREAK, _X_UNAVAILABLE
+    queries = normalize_query_list(queries)
     selected_platforms = normalize_platforms(platforms)
     if not backend_active(selected_platforms) or not queries:
         return []
-    # Search discipline: JAPANESE queries first (native terms index this content far better than
-    # the English variants), and NEVER re-run a query already searched this run - buckets, tiers
-    # and retry rounds routinely produce near-duplicates that would burn 5-15s each for nothing.
-    ordered = _jp_first(queries)
+    # TikTok and X use separate query strategies. X only receives validated proof/event/action
+    # phrases; raw script tokens and generic lifestyle queries never reach its backend.
+    tiktok_queries = _jp_first(queries) if "tiktok" in selected_platforms else []
+    x_source_queries = queries if x_queries is None else normalize_query_list(x_queries)
+    x_queries = x_queries_for_search(x_source_queries, bucket_terms=bucket_terms,
+                                     search_intent=search_intent, limit=4) \
+        if "twitter" in selected_platforms else []
+    invalid_x = [q for q in x_source_queries if not is_valid_x_query(q)]
+    if invalid_x:
+        _status(status_cb, f"X: skipped {len(invalid_x)} malformed quer"
+                           f"{'y' if len(invalid_x) == 1 else 'ies'} generated from script tokens.")
+        if query_perf is not None:
+            query_perf.extend({"query": q, "bucket_id": bucket_id, "tier": tier,
+                               "platform": "twitter", "status": "invalid_query",
+                               "raw_results": 0} for q in invalid_x)
+    prefer_x = str(search_intent or "").lower() in X_QUERY_INTENTS
+    search_jobs = []
+    max_queries = max(len(tiktok_queries), len(x_queries))
+    platform_order = ("twitter", "tiktok") if prefer_x else ("tiktok", "twitter")
+    for index in range(max_queries):
+        for platform in platform_order:
+            source = x_queries if platform == "twitter" else tiktok_queries
+            if index < len(source):
+                search_jobs.append((platform, source[index]))
     # dedupe NAMESPACE: retry rounds may re-run a main-phase query once (the pool state has
     # changed by then), but never repeat within their own phase.
     _ns = "retry" if str(tier or "").startswith("retry") else "main"
     fresh, dup = [], 0
-    for q in ordered:
-        if f"{_ns}|{_norm_query(q)}" in _SEEN_QUERIES:
+    for platform, q in search_jobs:
+        key = f"{_ns}|{platform}|{_norm_query(q)}"
+        if key in _SEEN_QUERIES:
             dup += 1
             continue
-        fresh.append(q)
+        fresh.append((platform, q))
     if dup:
         _status(status_cb, f"Scrape: skipped {dup} duplicate quer{'y' if dup == 1 else 'ies'} "
                            "(already searched this run).")
-    queries = fresh
-    if not queries:
+    search_jobs = fresh
+    if not search_jobs:
         return []
     out_dir = Path(out_dir)
     raw_dir = out_dir / "_raw"
@@ -1444,7 +1545,7 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     accepted = []
     # Do not let the first query monopolize the whole pool.  Search at least three
     # variants (when available), taking a bounded number from each before widening.
-    diversity_slots = min(5, len(queries), max(1, int(want)))
+    diversity_slots = min(5, len(search_jobs), max(1, int(want)))
     per_query_quota = max(1, (int(want) + diversity_slots - 1) // diversity_slots)
 
     def _reject(raw):
@@ -1588,19 +1689,38 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     # but the per-clip ffmpeg/OpenCV gauntlet runs in a small pool so the next download
     # proceeds while earlier clips are still being scored and normalized.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    search_summary = {"tiktok": {"queries": 0, "items": 0},
+                      "twitter": {"queries": 0, "items": 0}}
     try:
-      for qidx, q in enumerate(queries):
+      for qidx, (search_platform, q) in enumerate(search_jobs):
         if ((cancel_check and cancel_check()) or len(accepted) >= want
                 or (deadline is not None and time.monotonic() >= deadline)):
             break
+        if search_platform == "twitter" and _X_UNAVAILABLE:
+            continue
         query_stop = min(int(want), len(accepted) + per_query_quota)
-        _SEEN_QUERIES.add(f"{_ns}|{_norm_query(q)}")
+        _SEEN_QUERIES.add(f"{_ns}|{search_platform}|{_norm_query(q)}")
         # collect a LARGE candidate pool per search - the accept target is what must survive
         # the gates, not what the search is allowed to return.
         items = backend_search(q, max(12, want * 3), status_cb=status_cb,
-                               sort=search_sort, platforms=selected_platforms,
+                               sort=search_sort, platforms={search_platform},
                                deadline=deadline) or []
         raw_n = len(items)
+        search_summary[search_platform]["queries"] += 1
+        search_summary[search_platform]["items"] += raw_n
+        if search_platform == "twitter":
+            _X_ZERO_STREAK = _X_ZERO_STREAK + 1 if raw_n == 0 else 0
+            if _X_ZERO_STREAK >= 5 and twitter_login is not None:
+                try:
+                    health = twitter_login.health_check(timeout_s=40)
+                except Exception:
+                    health = {"ok": False}
+                if not health.get("ok"):
+                    _X_UNAVAILABLE = True
+                    _status(status_cb, "X: backend health check failed after 5 valid zero-result "
+                                       "queries; skipping further X searches this run.")
+                else:
+                    _X_ZERO_STREAK = 0
         meta_rej = dl = vert = clean = acc = 0
         meta_reasons = {}
         # Phase A (serial): metadata-filter ALL items first, then download in RANK order
@@ -1608,7 +1728,7 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         # Overshoot the quota because some downloads will fail the parallel analysis below.
         need = max(0, (query_stop - len(accepted)) * 2 + 4)
         scored = []
-        for it in items:
+        for item_index, it in enumerate(items):
             ok, reason, m = pre_download_candidate_filter(
                 it, bucket_terms, seen_ids, min_likes=min_likes)
             cid = m.get("id") or m.get("url") or f"{bucket_id}:{q}:{raw_n}:{len(scored)}"
@@ -1618,6 +1738,14 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                 _cstat(q, cid, "pre_download_rejected", reason,
                        {"platform": m.get("platform"), "likes": m.get("likes", 0)})
                 continue
+            sort_mode = str(search_sort or "MOST_LIKED").upper()
+            if sort_mode == "MOST_VIEWED":
+                m["rank_score"] = math.log10(int(m.get("views") or 0) + 1) - float(m.get("penalty") or 0)
+            elif sort_mode == "MOST_RECENT":
+                m["rank_score"] = float(m.get("created_at") or 0)
+            elif sort_mode == "RELEVANCE":
+                # Preserve the backend's relevance order through the metadata gate.
+                m["rank_score"] = -float(item_index)
             scored.append((float(m.get("rank_score", 0.0)), it, m, cid))
         scored.sort(key=lambda r: r[0], reverse=True)
         scored = balanced_platform_candidates(scored, need, selected_platforms)
@@ -1663,6 +1791,7 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                 _cstat(res["query"], cid, res["status"], res["reason"], res.get("extra"))
         if query_perf is not None:
             query_perf.append({"query": q, "bucket_id": bucket_id, "tier": tier,
+                               "platform": search_platform,
                                "sort": str(search_sort or "MOST_LIKED").upper(),
                                "raw_results": raw_n, "metadata_rejected": meta_rej,
                                "downloadable": dl, "vertical_hq": vert, "text_clean": clean,
@@ -1675,6 +1804,12 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     finally:
         # On cancel, drop queued clips but let the (max 3) running ffmpeg jobs finish.
         executor.shutdown(wait=True, cancel_futures=True)
+    for platform, summary in search_summary.items():
+        if summary["queries"]:
+            label = "X" if platform == "twitter" else "TikTok"
+            _status(status_cb, f"{label}: searched {summary['queries']} quer"
+                               f"{'y' if summary['queries'] == 1 else 'ies'} | "
+                               f"found {summary['items']} raw video{'s' if summary['items'] != 1 else ''}.")
     try:
         if raw_dir.exists():
             for f in raw_dir.glob("*"):

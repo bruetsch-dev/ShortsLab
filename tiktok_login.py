@@ -653,17 +653,24 @@ class Session:
         _SEARCH_STATS["items"] += len(collected)
         if collected:
             self._refresh_cookies_quietly()
-        if str(sort or "").upper() == "MOST_LIKED":
-            def _likes(item):
-                stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
-                    item.get("stats") if isinstance(item.get("stats"), dict) else {})
+        sort_mode = str(sort or "MOST_LIKED").upper()
+        def _metric(item, names):
+            stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
+                item.get("stats") if isinstance(item.get("stats"), dict) else {})
+            for name in names:
                 try:
-                    return int(item.get("diggCount") or item.get("digg_count")
-                               or item.get("likeCount") or stats.get("diggCount")
-                               or stats.get("digg_count") or stats.get("likeCount") or 0)
+                    value = item.get(name) or stats.get(name)
+                    if value is not None:
+                        return int(float(value))
                 except (TypeError, ValueError):
-                    return 0
-            collected.sort(key=_likes, reverse=True)
+                    pass
+            return 0
+        if sort_mode == "MOST_LIKED":
+            collected.sort(key=lambda item: _metric(item, ("diggCount", "digg_count", "likeCount")), reverse=True)
+        elif sort_mode == "MOST_VIEWED":
+            collected.sort(key=lambda item: _metric(item, ("playCount", "play_count", "viewCount")), reverse=True)
+        elif sort_mode == "MOST_RECENT":
+            collected.sort(key=lambda item: _metric(item, ("createTime", "create_time")), reverse=True)
         _status(cb, f"TikTok search {query!r}: collected {len(collected)} candidate item(s).")
         return collected[:max(0, int(want))]
 
