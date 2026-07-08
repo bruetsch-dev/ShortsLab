@@ -6167,6 +6167,13 @@ TIMELINE_ASSETS = """
     document.getElementById('tl-insp-clip').hidden = which!=='clip';
     document.getElementById('tl-insp-fx').hidden = which!=='fx';
     document.getElementById('tl-insp-overlay').hidden = which!=='overlay';
+    // The inspector is a floating popup now (no fixed slot). Sounds/visuals open it on
+    // selection (it is their only editor); clips open it via right-click "Open inspector".
+    var insp=document.getElementById('tl-inspector');
+    if(insp){
+      if(!which) insp.classList.remove('open');
+      else if(which!=='clip') insp.classList.add('open');
+    }
   }
   function selectClip(id,rangeSelect){
     var vis=visible();
@@ -6864,7 +6871,8 @@ TIMELINE_ASSETS = """
     clipMenuEl.style.top=Math.max(8,Math.min(y,window.innerHeight-h-8))+'px';
   }
   function openClipMenu(x, y, scn){
-    var items=[['Replace media\\u2026', function(){ startReplacePick(scn); }],
+    var items=[['Open inspector', function(){ selectClip(scn.id); document.getElementById('tl-inspector').classList.add('open'); }],
+               ['Replace media\\u2026', function(){ if(playing) stop(); startReplacePick(scn); }],
                ['Remove clip', function(){ scn.removed=true; if(sel&&sel.id===scn.id){ sel=null; showPane(null);} layout(); markDirty(); }]];
     if(replacedMap[scn.id]) items.push(['Undo replace', function(){ delete replacedMap[scn.id]; layout(); markDirty(); }]);
     showContextMenu(x,y,items);
@@ -7121,13 +7129,29 @@ TIMELINE_ASSETS = """
   body.page-timeline .top { position:absolute; top:12px; left:14px; z-index:40; margin:0; padding:0; }
   #timeline-root {
     flex:1 1 auto; min-height:0; display:grid; gap:12px; align-content:stretch;
-    grid-template-columns: minmax(340px, 1.5fr) minmax(230px, 300px);
+    grid-template-columns: minmax(280px, 400px) 1fr;
     grid-template-rows: auto minmax(0, 1fr) minmax(140px, 1.15fr);
     grid-template-areas: "toolbar toolbar" "stagearea library" "tracks tracks";
   }
   #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding-left:54px; }
+  /* player alone on the left; the LIBRARY takes the whole former inspector column */
   #timeline-root .tl-grid.tl-top { grid-area:stagearea; margin:0; min-height:0;
-    grid-template-columns: minmax(220px,1fr) minmax(200px,1fr); align-content:start; }
+    grid-template-columns: 1fr; align-content:start; }
+  /* inspector: floating popup (no fixed slot). Opens on sound/visual selection or via
+     right-click on a clip -> "Open inspector". */
+  #timeline-root .tl-inspector { display:none; }
+  #timeline-root .tl-inspector.open {
+    display:block; position:fixed; top:64px; right:16px; z-index:160;
+    width:min(330px, 92vw); max-height:calc(100vh - 84px); overflow-y:auto;
+    background:var(--bg-raised); border:1px solid var(--line-strong);
+    box-shadow:var(--sh-3); border-radius:14px;
+  }
+  #timeline-root .tl-inspector .tl-insp-close {
+    position:absolute; top:8px; right:8px; width:26px; height:26px; padding:0;
+    border-radius:8px; border:1px solid var(--line); background:transparent;
+    color:var(--muted) !important; font-size:13px; line-height:1; cursor:pointer;
+  }
+  #timeline-root .tl-inspector .tl-insp-close:hover { color:var(--danger) !important; border-color:var(--danger); }
   #timeline-root .tl-library { grid-area:library; margin:0; min-height:0;
     display:flex; flex-direction:column; }
   #timeline-root .tl-library .tl-lib-body { flex:1 1 auto; min-height:0; overflow-y:auto; }
@@ -7186,6 +7210,17 @@ TIMELINE_ASSETS = """
   if(sb) sb.addEventListener('click', function(){
     document.querySelectorAll('.tl-pop').forEach(function(p){ p.setAttribute('hidden',''); });
   }, true);
+  /* floating inspector: close button + Escape */
+  var insp=document.getElementById('tl-inspector');
+  if(insp){
+    var x=document.createElement('button'); x.type='button'; x.className='tl-insp-close';
+    x.textContent='✕'; x.setAttribute('aria-label','Close inspector');
+    x.addEventListener('click', function(){ insp.classList.remove('open'); });
+    insp.insertBefore(x, insp.firstChild);
+    document.addEventListener('keydown', function(e){
+      if(e.key==='Escape') insp.classList.remove('open');
+    });
+  }
 })();
 </script>
 """

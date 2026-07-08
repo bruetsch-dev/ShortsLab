@@ -97,7 +97,17 @@ body.page-timeline .panel h2 {
   text-transform: none;
 }
 
-/* buttons: green primary, quiet secondaries, no hard offset hover-jumps */
+/* buttons: green primary, quiet secondaries, no hard offset hover-jumps.
+   Legacy rules colored some button TEXT with var(--ink) (black in the old parchment theme);
+   our remap turned --ink into a 14%-alpha border color, leaving text nearly invisible while
+   the buttons still worked. Force readable text; disabled state dims via opacity only. */
+body.page-timeline button, body.page-timeline .button {
+  color: var(--text) !important;
+}
+body.page-timeline button:disabled, body.page-timeline .button:disabled {
+  color: var(--muted) !important;
+  opacity: .45;
+}
 body.page-timeline button:hover, body.page-timeline .button:hover {
   transform: none !important;
 }

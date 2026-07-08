@@ -7231,8 +7231,12 @@ def apply_timeline_edits_to_config(config, edits, slug):
     if "music" in volumes:
         set_volume("background_music_volume", volumes["music"])
         set_volume("background_music_volume_with_speech", volumes["music"])
+        # The mixer volume only ADJUSTS the bed loudness - it must never ENABLE music the
+        # project didn't have. (The editor's default music volume was >0, so every timeline
+        # render silently attached an auto-picked track even when the run had no music.)
         try:
-            config["background_music_enabled"] = float(volumes["music"]) > 0.0
+            if float(volumes["music"]) <= 0.0:
+                config["background_music_enabled"] = False
         except (TypeError, ValueError):
             pass
 
@@ -9618,8 +9622,17 @@ def run_project(form, status_cb=None):
     config["wavespeed"]["video_enable_web_search"] = seedance_model_choice in ("seedance-2.0", "seedance-2.0-fast")
     config["wavespeed"]["image_model"] = image_model_choice  # resolved before plan_config
     config["wavespeed"]["reasoning_model"] = form.get("reasoning_model", "openai/gpt-5.5")
+    # The music PICKER is the single source of truth: "None" means NO background music, even
+    # when the "Background music" output toggle is on. Previously the toggle alone enabled the
+    # mood-based auto-pick in generate mode, silently attaching a bed the user never chose.
+    _bg_choice0 = (str(form.get("background_music_choice") or "").strip()
+                   if isinstance(form, dict) else "")
+    _bg_picked = bool(_bg_choice0) and _bg_choice0.lower() not in ("none", "off", "auto_none", "")
+    background_music_enabled = bool(background_music_enabled and _bg_picked)
     config["background_music_enabled"] = background_music_enabled
     config["background_music_user_enabled"] = background_music_enabled
+    if background_music_enabled and _bg_choice0.lower() != "auto":
+        config["background_music_file"] = _bg_choice0
     config["sfx_generation_enabled"] = form_flag(form, "generate_missing_sfx", True)
     # apply the remaining output toggles onto the render config
     config["output_toggles"] = output_toggles
