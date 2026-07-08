@@ -8227,8 +8227,33 @@ def job_status_payload(job_id):
                          if job.get("project_dir") and Path(job["project_dir"]).exists() else ""),
         "speech_audio_url": (link_for(Path(job["speech_audio"]))
                              if status == "awaiting_approval" and job.get("speech_audio") else ""),
+        "assigned_media": _assigned_media_payload(job),
     }
     return json.dumps(payload).encode("utf-8")
+
+
+def _assigned_media_payload(job, cap=60):
+    """ONLY the clips currently assigned to scenes (the run's actual choices) - the chat shell
+    renders these in its own clean grid instead of the full grouped media wall."""
+    project_dir = project_dir_for_job(job)
+    if not project_dir:
+        return []
+    items = []
+    try:
+        for kind, path in project_media_files(project_dir):
+            if kind != "assigned":
+                continue
+            items.append({
+                "name": path.name,
+                "url": link_for(path),
+                "path": str(path.resolve()),
+                "type": "video" if is_video_path(path) else "image",
+            })
+            if len(items) >= cap:
+                break
+    except Exception:
+        return []
+    return items
 
 
 def music_list_payload():

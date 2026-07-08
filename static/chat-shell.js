@@ -146,7 +146,11 @@ function renderAll() {
   chat.innerHTML = "";
   renderTopbar();
   if (S.view === "assets") { renderAssetsView(); setComposer("off"); scrollDown(); return; }
-  if (!S.flow) { renderModeMenu(); setComposer("off"); scrollDown(); return; }
+  if (!S.flow) {
+    // an active job renders even without a flow (e.g. reattached via deep link)
+    if (S.jobId) { renderJobSection(); scrollDown(); return; }
+    renderModeMenu(); setComposer("off"); scrollDown(); return;
+  }
 
   ({ script: renderScriptFlow, viraltrans: renderViralFlow, reddit: renderRedditFlow,
      longform: renderLongformFlow, sfx: () => renderMasterFlow("sfx"),
@@ -901,10 +905,12 @@ function renderProjectFlow() {
 }
 async function loadProject(slug) {
   try {
+    showLoading(T.project_loaded + "...");
     // Detach the previous completed job so its "Your short is ready" card cannot leak
     // into the newly selected project's deterministic render.
     S.jobId = null; S.jobStatus = "";
     announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = "";
+    lastAssignedKey = "";
     history.replaceState(null, "", "/?project=" + encodeURIComponent(slug));
     const d = await jget("/project-preset?slug=" + encodeURIComponent(slug));
     S.projectSlug = d.slug; S.projectTitle = d.title || d.slug;
@@ -920,8 +926,9 @@ async function loadProject(slug) {
     S._projInfo = (pl.projects || []).find(p => p.slug === slug) || {};
     S.flow = "project"; S.step = "summary"; S.completed = [];
     S.view = "chat";
+    hideLoading();
     renderAll(); persist();
-  } catch (e) { errorCard(T.err_generic, String(e)); }
+  } catch (e) { hideLoading(); errorCard(T.err_generic, String(e)); }
 }
 async function continueProject(slug) {
   const d = await jpost("/resume-project", { slug });
@@ -935,38 +942,70 @@ async function continueProject(slug) {
 /* ------------------------------------------------------------------ job experience */
 function startJob(jobId) {
   S.jobId = jobId; S.jobStatus = "running"; S.draft = false;
-  announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = "";
+  announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = ""; lastAssignedKey = "";
   history.replaceState(null, "", "/job?id=" + encodeURIComponent(jobId));
   renderAll(); persist();
 }
+/* deterministic typewriter for assistant bubbles (visual only; text is template-fixed) */
+const REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function typeInto(node, text) {
+  if (REDUCED || text.length > 160) { node.textContent = text; return; }
+  node.textContent = ""; node.classList.add("typing");
+  let i = 0;
+  const tick = () => {
+    node.textContent = text.slice(0, ++i);
+    if (i < text.length) setTimeout(tick, 14);
+    else node.classList.remove("typing");
+  };
+  tick();
+}
+function typedMsg(container, text) {
+  const m = el("div", "msg assistant");
+  m.appendChild(el("div", "who", "Shortslab"));
+  const b = el("div", "bubble"); m.appendChild(b);
+  (container || chat).appendChild(m);
+  typeInto(b, text);
+  scrollDown();
+  return m;
+}
+
 function renderJobSection() {
-  msgA(esc(T.project_started), "job-start");
+  typedMsg(chat, T.project_started);
+  // ---- hero progress card: pulsing status, prominent activity + elapsed, step chips
   const c = card("prog-card"); c.id = "job-card";
   const head = el("div", "prog-head");
-  head.appendChild(el("b", "", "Creating"));
+  const dot = el("span", "status-pulse"); dot.id = "job-dot";
+  head.appendChild(dot);
+  head.appendChild(el("b", "", "Creating your Short"));
+  head.appendChild(el("span", "spacer"));
   const badge = el("span", "tb-badge run", esc(S.jobStatus || "running")); badge.id = "job-badge";
   head.appendChild(badge);
   const cancelB = btn(T.cancel_process, cancelJob, "danger small"); cancelB.id = "job-cancel";
   head.appendChild(cancelB);
   c.appendChild(head);
   const prog = el("div", "prog-embed"); prog.id = "job-progress"; c.appendChild(prog);
-  // deterministic phase messages land here
+  // deterministic phase messages land here (typed, chatbot-style)
   const events = el("div"); events.id = "job-events"; chat.appendChild(events);
   // speech approval placeholder
   const speech = el("div"); speech.id = "job-speech"; chat.appendChild(speech);
-  // technical logs
-  const tcard = card(); tcard.id = "job-tech-card";
-  const tbtn = btn(T.show_tech, () => {
+  // assigned footage grid (ONLY the clips chosen for scenes)
+  const mwrap = el("div"); mwrap.id = "job-media"; chat.appendChild(mwrap);
+  // technical console (terminal-styled, collapsible)
+  const tcard = card("term-card"); tcard.id = "job-tech-card";
+  const thead = el("div", "term-head");
+  const tbtn = el("button", "term-toggle");
+  tbtn.innerHTML = `<span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
+    <span class="term-title">${esc(T.show_tech)}</span><span class="term-chev">▾</span>`;
+  tbtn.addEventListener("click", () => {
     const lg = $("job-log");
-    const vis = lg.hasAttribute("hidden");
-    if (vis) { lg.removeAttribute("hidden"); tbtn.textContent = T.hide_tech; }
-    else { lg.setAttribute("hidden", ""); tbtn.textContent = T.show_tech; }
-  }, "ghost small");
-  tcard.appendChild(tbtn);
+    const show = lg.hasAttribute("hidden");
+    if (show) { lg.removeAttribute("hidden"); tcard.classList.add("open"); lg.scrollTop = lg.scrollHeight; }
+    else { lg.setAttribute("hidden", ""); tcard.classList.remove("open"); }
+    tbtn.querySelector(".term-title").textContent = show ? T.hide_tech : T.show_tech;
+  });
+  thead.appendChild(tbtn); tcard.appendChild(thead);
   const lg = el("pre", "tech-log"); lg.id = "job-log"; lg.setAttribute("hidden", "");
   tcard.appendChild(lg);
-  // media review container
-  const mwrap = el("div"); mwrap.id = "job-media"; chat.appendChild(mwrap);
   // outputs / result container
   const owrap = el("div"); owrap.id = "job-out"; chat.appendChild(owrap);
   pollJob(); pollTimer = setInterval(pollJob, 2500);
@@ -974,26 +1013,80 @@ function renderJobSection() {
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
-/* deterministic event → message adapter (template text only) */
+/* deterministic event → message adapter (template text only; typed like a chatbot) */
 const PHASE_RULES = [
   [/speech (generation )?(complete|ready)|voiceover ready/i, "Speech generation completed."],
-  [/scraping|searching tiktok|social search/i, "Searching TikTok for relevant footage."],
-  [/(\d+)\s+(source )?video/i, null],
-  [/rendering (the )?final|final render/i, "Rendering the final video."],
+  [/scraping|searching tiktok|social search|scrape v2: searching/i, "Searching TikTok for relevant footage."],
+  [/rendering (the )?final|final render|rendering frames/i, "Rendering the final video."],
+  [/mixing audio|sound design|placing editor sfx/i, "Adding the sound design."],
 ];
 function announcePhases(logText) {
   const lines = (logText || "").split("\n").slice(-40);
   lines.forEach(line => {
     PHASE_RULES.forEach(([re, msg]) => {
-      const m = line.match(re);
-      if (!m) return;
-      const text = msg || line.trim();
-      if (announcedPhases.includes(text)) return;
+      if (!re.test(line)) return;
+      const text = msg;
+      if (!text || announcedPhases.includes(text)) return;
       announcedPhases.push(text);
       const evts = $("job-events");
-      if (evts) { const mm = el("div", "msg assistant"); mm.appendChild(el("div", "bubble", esc(text))); evts.appendChild(mm); }
+      if (evts) typedMsg(evts, text);
     });
   });
+}
+
+/* assigned footage grid: only the run's ACTUAL scene choices, clean fixed tiles */
+let lastAssignedKey = "";
+function renderAssignedMedia(items) {
+  const mw = $("job-media");
+  if (!mw) return;
+  const key = (items || []).map(i => i.url).join("|");
+  if (key === lastAssignedKey) return;
+  lastAssignedKey = key;
+  mw.innerHTML = "";
+  if (!items || !items.length) return;
+  typedMsg(mw, `Assigned footage — ${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes.`);
+  const c = el("div", "chat-card am-card");
+  const grid = el("div", "am-grid");
+  items.forEach(it => {
+    const t = el("div", "am-tile");
+    if (it.type === "video") {
+      const v = el("video"); v.muted = true; v.preload = "none"; v.setAttribute("playsinline", "");
+      v.dataset.src = it.url;
+      t.appendChild(v);
+      t.addEventListener("mouseenter", () => { if (!v.src) v.src = v.dataset.src; v.play().catch(() => {}); });
+      t.addEventListener("mouseleave", () => { try { v.pause(); } catch (e) {} });
+    } else {
+      const im = el("img"); im.loading = "lazy"; im.src = it.url; t.appendChild(im);
+    }
+    const x = el("button", "am-x", "✕");
+    x.title = "Exclude this clip from the run"; x.setAttribute("aria-label", "Exclude clip");
+    x.addEventListener("click", async (ev) => {
+      ev.stopPropagation(); x.disabled = true;
+      await fetch("/exclude-run-media", { method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ id: S.jobId, path: it.path }) });
+      t.classList.add("gone"); setTimeout(() => t.remove(), 250);
+    });
+    t.appendChild(x);
+    t.appendChild(el("span", "am-name", esc(it.name.replace(/^scraped_/, "").slice(0, 22))));
+    grid.appendChild(t);
+  });
+  c.appendChild(grid);
+  mw.appendChild(c);
+  loadVisibleAssigned(grid);
+}
+function loadVisibleAssigned(grid) {
+  // load first-frame posters lazily: give each on-screen tile a src (paused at 0)
+  if (!("IntersectionObserver" in window)) return;
+  const io = new IntersectionObserver(es => {
+    es.forEach(en => {
+      if (!en.isIntersecting) return;
+      const v = en.target.querySelector("video[data-src]");
+      if (v && !v.src) { v.src = v.dataset.src; v.currentTime = 0.05; }
+      io.unobserve(en.target);
+    });
+  }, { rootMargin: "300px 0px" });
+  grid.querySelectorAll(".am-tile").forEach(t => io.observe(t));
 }
 
 async function pollJob() {
@@ -1045,16 +1138,8 @@ async function pollJob() {
       sp.innerHTML = ""; delete sp.dataset.done;
     }
   }
-  // media review
-  const mw = $("job-media");
-  if (mw && (d.media_html || "") !== lastMediaHTML) {
-    lastMediaHTML = d.media_html || "";
-    mw.innerHTML = "";
-    if (lastMediaHTML && lastMediaHTML.trim()) {
-      const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", esc(T.media_review))); mw.appendChild(m);
-      const c = el("div", "chat-card embed", lastMediaHTML); mw.appendChild(c);
-    }
-  }
+  // assigned footage only (clean grid; the full grouped media wall stays on ?legacy_ui=1)
+  renderAssignedMedia(d.assigned_media || []);
   // outputs / done / error
   const ow = $("job-out");
   if (ow && (d.outputs_html || "") !== lastOutputsHTML) {
@@ -1199,6 +1284,7 @@ async function openProjectPicker() {
 }
 
 function showAssets(showHidden) {
+  showLoading(T.nav_assets + "...");
   S.view = "assets"; S.showHidden = !!showHidden; renderAll(); persist();
 }
 async function renderAssetsView() {
@@ -1209,6 +1295,7 @@ async function renderAssetsView() {
   chat.appendChild(head);
   const grid = el("div", "assets-grid"); chat.appendChild(grid);
   const d = await jget("/projects-list" + (S.showHidden ? "?hidden=1" : ""));
+  hideLoading();
   (d.projects || []).forEach(p => grid.appendChild(assetCard(p)));
   if (!(d.projects || []).length) chat.appendChild(el("div", "card-note", esc(T.no_projects)));
   const footer = el("div", "card-foot");
@@ -1285,7 +1372,10 @@ async function openTimelineNav() {
   if (S.projectSlug) {
     const d = await jget("/projects-list");
     const p = (d.projects || []).find(x => x.slug === S.projectSlug);
-    if (p && p.has_timeline) { location.href = "/timeline?slug=" + encodeURIComponent(S.projectSlug); return; }
+    if (p && p.has_timeline) {
+      showLoading(T.open_timeline + "...");
+      location.href = "/timeline?slug=" + encodeURIComponent(S.projectSlug); return;
+    }
     alert(T.no_timeline_yet); return;
   }
   // project picker filtered to timeline-capable projects
@@ -1300,7 +1390,10 @@ async function openTimelineNav() {
   withTl.forEach(p => {
     const b = el("button", "sb-proj");
     b.innerHTML = `<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
-    b.addEventListener("click", () => { location.href = "/timeline?slug=" + encodeURIComponent(p.slug); });
+    b.addEventListener("click", () => {
+      showLoading(T.open_timeline + "...");
+      location.href = "/timeline?slug=" + encodeURIComponent(p.slug);
+    });
     list.appendChild(b);
   });
 }
@@ -1444,7 +1537,11 @@ function btn(label, fn, cls) {
   return b;
 }
 function linkBtn(label, href, cls) {
-  const a = el("a", "btn " + (cls || ""), label); a.href = href; return a;
+  const a = el("a", "btn " + (cls || ""), label); a.href = href;
+  // the Timeline Editor is a heavier page - show the loading overlay while it opens
+  if (href.indexOf("/timeline") === 0)
+    a.addEventListener("click", () => showLoading(T.open_timeline + "..."));
+  return a;
 }
 function selectField(label, options, value, onChange) {
   const f = el("div", "fld");
@@ -1508,6 +1605,20 @@ function errorCard(title, detail) {
 }
 let _audio = null;
 function ensureAudio() { if (!_audio) { _audio = new Audio(); } return _audio; }
+
+/* ---- loading overlay (opening Assets, the Timeline Editor, a project ...) ---- */
+let _loadEl = null, _loadTimer = null;
+function showLoading(text) {
+  hideLoading();
+  _loadEl = el("div", "load-overlay");
+  _loadEl.innerHTML = `<div class="load-box"><span class="load-spin"></span><span>${esc(text || "Loading...")}</span></div>`;
+  document.body.appendChild(_loadEl);
+  _loadTimer = setTimeout(hideLoading, 15000);   // safety: never stuck forever
+}
+function hideLoading() {
+  if (_loadTimer) { clearTimeout(_loadTimer); _loadTimer = null; }
+  if (_loadEl) { _loadEl.remove(); _loadEl = null; }
+}
 
 /* legacy fragment shims: embedded server HTML may call these */
 window.saveRender = async function (encPath, btnEl) {
