@@ -111,6 +111,8 @@ UI_TEXT_DEFAULTS = {
     "scrape_terms": "",
     "background_music_choice": "none",
     "script_relevancy": "70",
+    "scraping_engine": "v2",
+    "sfx_amount": "medium",
     "scrape_cookies": "",
     "scrape_cookies_file": "",
 }
@@ -940,6 +942,10 @@ def app_style():
         border-radius: 999px; background: var(--accent); transition: transform var(--dur) var(--ease);
       }
       .seg-switch[data-src="scrape"] .seg-thumb { transform: translateX(100%); }
+      /* Scraping-engine toggle (data-eng): pure-CSS active state, v2 = left (default), v1 = right */
+      .seg-switch[data-eng="v1"] .seg-thumb { transform: translateX(100%); }
+      .seg-switch[data-eng="v2"] .seg-opt[data-eng="v2"],
+      .seg-switch[data-eng="v1"] .seg-opt[data-eng="v1"] { color: #fff; }
       /* AI model pickers (generate mode only) */
       .ai-models { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; margin-top: 10px; }
       @media (max-width: 560px) { .ai-models { grid-template-columns: 1fr; } }
@@ -2357,7 +2363,15 @@ def app_script():
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
           window.onClipToggle = function (cb) { window.setClipSource(cb.checked ? "scrape" : "generate"); };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_terms","background_music_choice"];
+          window.setScrapeEngine = function (eng) {
+            eng = (eng === "v1") ? "v1" : "v2";
+            var hid = document.getElementById("scraping-engine"); if (hid) hid.value = eng;
+            var seg = document.getElementById("engine-seg"); if (seg) seg.setAttribute("data-eng", eng);
+            try { if (typeof playClick === "function") playClick(); } catch (e) {}
+            var state = collectFormState();
+            if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
+          };
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -3091,6 +3105,13 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
             <input type="hidden" name="scrape_platforms" value="tiktok,x">
             <input type="hidden" name="influencer_hook" value="on">
+            <label class="scrape-lbl">Scraping engine {help_tip("V2 (Relevance-first) plans concrete visible situations, finds usable SEGMENTS anywhere inside a video, ranks by relevance (not likes) and matches per scene - fewer hard rejects, more on-topic footage. V1 (Legacy) is the original bucket + like-gated scrape. V2 is the default.")}</label>
+            <div class="seg-switch" id="engine-seg" data-eng="{esc((state.get('scraping_engine') or 'v2'))}" style="margin-bottom:10px;">
+              <span class="seg-thumb" aria-hidden="true"></span>
+              <button type="button" class="seg-opt" data-eng="v2" onclick="setScrapeEngine('v2')">&#9889; Scrape V2 &middot; Relevance-first</button>
+              <button type="button" class="seg-opt" data-eng="v1" onclick="setScrapeEngine('v1')">&#128230; Scrape V1 &middot; Legacy</button>
+            </div>
+            <input type="hidden" name="scraping_engine" id="scraping-engine" value="{esc((state.get('scraping_engine') or 'v2'))}">
             <div class="scrape-auto-note">&#129504; Search terms are derived automatically from your voice script and searched on every connected source (TikTok + X), ranked by likes. The opening hook is always a 20K+ like adult Japanese creator dancing or playing cute to camera. {help_tip("The agent creates native Japanese and English queries per visual bucket. TikTok and X run in parallel when connected; clips below the minimum-like gates are rejected before download.")}</div>
             <label class="scrape-lbl">Add your own terms (optional) {help_tip("Extra search terms on top of what the agent derives — they are ALWAYS included. Add English or Japanese words/hashtags (e.g. 原宿 ファッション). Press + or Enter to add.")}</label>
             <div class="chip-add">
@@ -3138,6 +3159,15 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <label class="otoggle"><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}><span>Transition SFX</span></label>
             <label class="otoggle"><input type="checkbox" name="out_background_music"{checked("out_background_music")}><span>Background music</span></label>
             <label class="otoggle"><input type="checkbox" name="out_captions"{checked("out_captions")}><span>Captions</span></label>
+            <label class="otoggle"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after speech</span></label>
+          </div>
+          <div class="cbar-cell" style="margin-top:10px;">
+            <span class="cbar-cap">SFX amount {help_tip("How dense the sound design is. Low = the previous sparse feel (~1 effect every 2-4s). Medium = lively, every cut + every emphasised word (~1 per 1.5-2.5s). High = hyper-edited TikTok density (~1 per 0.8-1.5s). Applies to normal runs and the timeline SFX engine.")}</span>
+            <select name="sfx_amount">
+              <option value="low"{' selected' if state.get("sfx_amount") == "low" else ""}>Low (sparse, subtle)</option>
+              <option value="medium"{' selected' if state.get("sfx_amount", "medium") == "medium" else ""}>Medium (lively, recommended)</option>
+              <option value="high"{' selected' if state.get("sfx_amount") == "high" else ""}>High (hyper-edited, dense)</option>
+            </select>
           </div>
         </div>
         </div>
@@ -3198,7 +3228,6 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <audio id="voice-audio" preload="none"></audio>
           <input type="hidden" name="mix_voice_in_final" value="on">
           <div class="checks" style="margin-top:18px;">
-            <label><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}> Halt after generating speech {help_tip("Pause the run right after the voiceover is generated so you can listen and approve or replace it on the run page, then continue.")}</label>
             <label><input type="checkbox" name="force_regenerate"{checked("force_regenerate")}> Fresh voice take (keep saved scrape) {help_tip("Generate a fresh voice take, but keep and re-check already downloaded TikTok/X media from the same script. This prevents a cancelled long scrape from being wasted.")}</label>
           </div>
         </div>
@@ -3327,8 +3356,17 @@ def sfx_page():
             <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
             <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
+            <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent detects scene changes, reads the timed transcript, and chooses sound effects from your local <code>soundeffects/</code> library.</div>
+        </div>
+        <div class="panel">
+          <label>SFX amount {help_tip("How dense the sound design is. Low = the previous sparse feel (~1 effect every 2-4s). Medium = lively, every cut + every emphasised word (~1 per 1.5-2.5s). High = hyper-edited TikTok density (~1 per 0.8-1.5s).")}</label>
+          <select name="sfx_amount">
+            <option value="low">Low (sparse, subtle)</option>
+            <option value="medium" selected>Medium (lively, recommended)</option>
+            <option value="high">High (hyper-edited, dense)</option>
+          </select>
         </div>
         <button type="submit">Add sound effects</button>
       </section>
@@ -3369,8 +3407,17 @@ def visual_page():
             <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
             <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
+            <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent looks at real frames + the timed transcript, finds the concrete on-screen target per punchy moment, and only then places an arrow at it.</div>
+        </div>
+        <div class="panel">
+          <label>Effect amount {help_tip("How dense the arrow pass is. Low = the previous feel (up to ~18 moments, arrows on ~2 of 3). Medium = more moments checked (~28), arrows on ~3 of 4. High = hyper-dense (~42 moments, an arrow on practically every concrete target).")}</label>
+          <select name="vfx_amount">
+            <option value="low">Low (sparse)</option>
+            <option value="medium" selected>Medium (dense, recommended)</option>
+            <option value="high">High (hyper-dense)</option>
+          </select>
         </div>
         <div class="panel">
           <label class="otoggle" style="margin:0;"><input type="checkbox" name="add_characters" value="on" checked><span>Add kawaii neko reactions (AI-directed)</span></label>
@@ -3766,6 +3813,9 @@ def start_sfx_job(fields, files):
     fields = dict(fields)
     video_path = save_upload(files.get("video_file"), job_id)
     reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
+    sfx_amount = str(fields.get("sfx_amount", "medium") or "medium").strip().lower()
+    if sfx_amount not in ("low", "medium", "high"):
+        sfx_amount = "medium"
     cancel_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -3798,7 +3848,8 @@ def start_sfx_job(fields, files):
         try:
             status_cb("Started.")
             result = sfx_agent.enhance_video_with_sfx(
-                video_path, reasoning_model=reasoning_model, status_cb=status_cb
+                video_path, reasoning_model=reasoning_model, status_cb=status_cb,
+                sfx_amount=sfx_amount,
             )
             with JOB_LOCK:
                 if cancel_event.is_set():
@@ -3830,6 +3881,9 @@ def start_visual_job(fields, files):
     video_path = save_upload(files.get("video_file"), job_id)
     reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
     add_characters = str(fields.get("add_characters", "")).lower() in ("on", "true", "1", "yes")
+    vfx_amount = str(fields.get("vfx_amount", "medium") or "medium").strip().lower()
+    if vfx_amount not in ("low", "medium", "high"):
+        vfx_amount = "medium"
     cancel_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -3857,7 +3911,7 @@ def start_visual_job(fields, files):
             status_cb("Started.")
             result = visual_agent.enhance_video_with_arrows(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb,
-                add_characters=add_characters)
+                add_characters=add_characters, vfx_amount=vfx_amount)
             with JOB_LOCK:
                 if cancel_event.is_set():
                     JOBS[job_id]["status"] = "cancelled"
@@ -5051,7 +5105,7 @@ def project_summary(project_dir):
     }
 
 
-def asset_card(summary):
+def asset_card(summary, hidden_view=False):
     thumb = summary.get("thumb")
     has_video = bool(summary.get("video") and Path(summary["video"]).exists())
     if thumb and Path(thumb).exists() and is_image_path(thumb):
@@ -5067,13 +5121,31 @@ def asset_card(summary):
     slug = summary["slug"]
     # "Check results" opens the final video if it exists, otherwise the project folder.
     results_href = view_for(summary["video"], "assets") if has_video else view_for(summary["project_dir"], "assets")
+    failed = bool(summary.get("failed"))
     if has_video:
+        primary_action = f'<a class="button asset-go" href="{results_href}">&#9654; Check results</a>'
         secondary_action = f'<a class="button secondary asset-timeline" href="/timeline?slug={esc(slug)}">&#127902; Edit</a>'
+    elif failed:
+        # Failed / incomplete run -> one-click CONTINUE (smart resume: reuse voiceover + existing
+        # media, fill only what is missing, then render). "Open" loads it into the form to edit first.
+        primary_action = (f'<button type="button" class="button asset-go" title="Continue this run from '
+                          f'where it stopped - reuses what is already done" '
+                          f'onclick="resumeAsset(\'{esc(slug)}\', this)">&#9654; Continue</button>')
+        secondary_action = f'<a class="button secondary" href="/?project={esc(slug)}">&#8635; Open</a>'
     else:
-        label = "Rerun failed" if summary.get("failed") else "Open"
-        secondary_action = f'<a class="button secondary" href="/?project={esc(slug)}">&#8635; {label}</a>'
+        primary_action = f'<a class="button asset-go" href="{results_href}">&#9654; Check results</a>'
+        secondary_action = f'<a class="button secondary" href="/?project={esc(slug)}">&#8635; Open</a>'
+    if hidden_view:
+        corner_btn = (f'<button type="button" class="asset-hide asset-unhide" title="Unhide - show in the '
+                      f'library again" aria-label="Unhide project" '
+                      f'onclick="setAssetHidden(\'{esc(slug)}\', false, this)">&#8634;</button>')
+    else:
+        corner_btn = (f'<button type="button" class="asset-hide" title="Hide from the library (does NOT '
+                      f'delete anything)" aria-label="Hide project" '
+                      f'onclick="setAssetHidden(\'{esc(slug)}\', true, this)">&#10005;</button>')
     return f"""
     <article class="panel asset-card">
+      {corner_btn}
       {thumb_html}
       <div class="asset-body">
         <div class="asset-titlerow">
@@ -5088,7 +5160,7 @@ def asset_card(summary):
         </div>
       </div>
       <div class="asset-primary">
-        <a class="button asset-go" href="{results_href}">&#9654; Check results</a>
+        {primary_action}
         {secondary_action}
       </div>
     </article>
@@ -5131,24 +5203,100 @@ def rename_project_title(slug, title):
     return {"ok": True, "title": title, "slug": project_dir.name}
 
 
-def assets_page():
+def resume_project(slug):
+    """Continue a failed/incomplete run from where it stopped: reload the project's saved run form
+    and continue the SAME project folder in smart (audit) mode - which reuses the existing voiceover
+    and already downloaded/generated media and only fills what is missing, then renders. Returns
+    {ok, job_id} or {ok:False, error[, fallback]}."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return {"ok": False, "error": "Project not found."}
+    run_form = read_json_file(project_dir / "input" / "run_form.json")
+    if not isinstance(run_form, dict) or not run_form:
+        # Older project without a saved run form - fall back to loading it into the form to re-run.
+        return {"ok": False, "error": "No saved run form for this project.",
+                "fallback": "/?project=" + urllib.parse.quote(project_dir.name)}
+    fields = {k: v for k, v in run_form.items() if not str(k).startswith("_")}
+    fields["loaded_project_source"] = project_dir.name      # continue THIS project folder
+    fields["slug"] = project_dir.name
+    fields["run_type"] = "audit"                            # smart: reuse existing + fill missing
+    fields.pop("initial_replace_media_path", None)
+    fields.pop("initial_remove_media_path", None)
+    try:
+        job_id = start_job(fields, {})
+    except Exception as exc:                                # noqa: BLE001
+        return {"ok": False, "error": f"Could not start: {exc}"}
+    return {"ok": True, "job_id": job_id}
+
+
+def is_project_hidden(project_dir):
+    """A project is HIDDEN from the library (not deleted) when it carries a `.hidden` marker file.
+    A dedicated marker is used instead of a config flag so nothing a run rewrites can clobber it."""
+    try:
+        return (Path(project_dir) / ".hidden").exists()
+    except OSError:
+        return False
+
+
+def set_project_hidden(slug, hidden):
+    """Hide/unhide a project by creating/removing its `.hidden` marker. Never deletes any media."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return {"ok": False, "error": "Project not found."}
+    marker = project_dir / ".hidden"
+    try:
+        if hidden:
+            marker.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+        elif marker.exists():
+            marker.unlink()
+    except Exception as exc:                    # noqa: BLE001
+        return {"ok": False, "error": f"Could not update visibility: {exc}"}
+    return {"ok": True, "slug": project_dir.name, "hidden": bool(hidden)}
+
+
+def assets_page(show_hidden=False):
     projects_dir = agent_core.PROJECTS_DIR
-    projects = [p for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.exists() else []
-    projects.sort(key=project_edited_mtime, reverse=True)   # most recently EDITED first
-    count = len(projects)
-    cards = "".join(asset_card(project_summary(project)) for project in projects)
+    all_projects = [p for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.exists() else []
+    all_projects.sort(key=project_edited_mtime, reverse=True)   # most recently EDITED first
+    hidden_projects = [p for p in all_projects if is_project_hidden(p)]
+    visible_projects = [p for p in all_projects if not is_project_hidden(p)]
+    shown = hidden_projects if show_hidden else visible_projects
+    cards = "".join(asset_card(project_summary(project), hidden_view=show_hidden) for project in shown)
     if not cards:
-        cards = '<section class="panel"><h2>No assets yet</h2><div class="hint">Finished runs and generated project folders will appear here.</div></section>'
+        empty = ("No hidden projects." if show_hidden
+                 else "Finished runs and generated project folders will appear here.")
+        cards = f'<section class="panel"><h2>{"No hidden projects" if show_hidden else "No assets yet"}</h2><div class="hint">{empty}</div></section>'
+    if show_hidden:
+        toggle = '<div class="asset-hidden-bar"><a class="button secondary" href="/assets">&#8592; Back to visible projects</a></div>'
+    elif hidden_projects:
+        toggle = (f'<div class="asset-hidden-bar"><a class="button secondary" href="/assets?show_hidden=1">'
+                  f'&#128065; Show hidden projects ({len(hidden_projects)})</a></div>')
+    else:
+        toggle = ""
     body = f"""
     {brand_header()}
     <section class="asset-grid">{cards}</section>
+    {toggle}
     <style>
+      .asset-card {{ position: relative; }}
       .asset-titlerow {{ display: flex; align-items: flex-start; gap: 8px; }}
       .asset-titlerow h2 {{ flex: 1 1 auto; min-width: 0; margin: 0; }}
-      .asset-rename {{ flex: 0 0 auto; background: transparent; border: 1px solid var(--line);
+      /* Selector must out-specify the global `button:not(.preview-button)` rule (0,1,1) which sets
+         width:100% + big padding - otherwise the icon button goes full-width and crushes the title. */
+      .asset-titlerow .asset-rename {{ flex: 0 0 auto; width: auto; min-width: 0; margin: 0;
+        padding: 5px 8px; background: var(--bg-input); border: 1px solid var(--line);
         color: var(--faint); border-radius: var(--r-sm); cursor: pointer; font-size: 13px;
-        line-height: 1; padding: 4px 7px; transition: color .15s, border-color .15s, background .15s; }}
-      .asset-rename:hover {{ color: var(--accent); border-color: var(--accent); background: var(--bg-overlay); }}
+        line-height: 1; box-shadow: none; transition: color .15s, border-color .15s, background .15s; }}
+      .asset-titlerow .asset-rename:hover {{ color: var(--accent); border-color: var(--accent);
+        background: var(--bg-overlay); box-shadow: none; transform: none; }}
+      .asset-card .asset-hide {{ position: absolute; top: 10px; right: 10px; z-index: 6; width: auto;
+        min-width: 0; margin: 0; padding: 3px 8px; background: var(--bg-input); border: 1px solid var(--line);
+        color: var(--faint); border-radius: var(--r-sm); cursor: pointer; font-size: 13px; line-height: 1;
+        box-shadow: none; opacity: .72; transition: color .15s, border-color .15s, background .15s, opacity .15s; }}
+      .asset-card .asset-hide:hover {{ opacity: 1; color: var(--danger, #c0392b); border-color: var(--danger, #c0392b);
+        background: var(--bg-overlay); box-shadow: none; transform: none; }}
+      .asset-card .asset-unhide:hover {{ color: var(--accent); border-color: var(--accent); }}
+      .asset-hidden-bar {{ display: flex; justify-content: center; margin: 22px 0 8px; }}
     </style>
     <script>
       window.renameAsset = function (slug, btn) {{
@@ -5170,6 +5318,35 @@ def assets_page():
             else {{ alert((res && res.error) || "Rename failed."); }}
           }})
           .catch(function () {{ btn.disabled = false; alert("Rename failed."); }});
+      }};
+      window.setAssetHidden = function (slug, hidden, btn) {{
+        try {{ if (typeof playClick === "function") playClick(); }} catch (e) {{}}
+        var card = btn.closest(".asset-card");
+        btn.disabled = true;
+        fetch("/hide-project", {{ method: "POST", headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ slug: slug, hidden: !!hidden }}) }})
+          .then(function (r) {{ return r.json(); }})
+          .then(function (res) {{
+            if (res && res.ok) {{
+              if (card) {{ card.style.transition = "opacity .2s"; card.style.opacity = "0";
+                setTimeout(function () {{ card.remove(); }}, 200); }}
+            }} else {{ btn.disabled = false; alert((res && res.error) || "Could not update visibility."); }}
+          }})
+          .catch(function () {{ btn.disabled = false; alert("Could not update visibility."); }});
+      }};
+      window.resumeAsset = function (slug, btn) {{
+        try {{ if (typeof playClick === "function") playClick(); }} catch (e) {{}}
+        btn.disabled = true;
+        var label = btn.innerHTML; btn.innerHTML = "Continuing…";
+        fetch("/resume-project", {{ method: "POST", headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ slug: slug }}) }})
+          .then(function (r) {{ return r.json(); }})
+          .then(function (res) {{
+            if (res && res.ok && res.job_id) {{ window.location.href = "/job?id=" + encodeURIComponent(res.job_id); }}
+            else if (res && res.fallback) {{ window.location.href = res.fallback; }}
+            else {{ btn.disabled = false; btn.innerHTML = label; alert((res && res.error) || "Could not continue this run."); }}
+          }})
+          .catch(function () {{ btn.disabled = false; btn.innerHTML = label; alert("Could not continue this run."); }});
       }};
     </script>
     """
@@ -7621,6 +7798,7 @@ def render_done_view(job, job_id):
           {tl_btn}
           <button type="button" class="button secondary" onclick="saveRender('{urllib.parse.quote(str(Path(video).resolve()))}', this)">&#11015; Download</button>
           <a class="button secondary" href="/">New project</a>
+          <a class="button secondary" href="/assets">Assets</a>
         </div>
       </div>
     </div>
@@ -8154,7 +8332,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/static/"):
             self.send_static_asset(Path(parsed.path).name)
         elif parsed.path == "/assets":
-            self.send_bytes(assets_page())
+            q = urllib.parse.parse_qs(parsed.query)
+            show_hidden = q.get("show_hidden", ["0"])[0] in ("1", "true", "yes")
+            self.send_bytes(assets_page(show_hidden=show_hidden))
         elif parsed.path == "/sfx":
             self.send_bytes(sfx_page())
         elif parsed.path == "/visual":
@@ -8340,6 +8520,26 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             result = rename_project_title(data.get("slug"), data.get("title"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/hide-project":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = set_project_hidden(data.get("slug"), bool(data.get("hidden")))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/resume-project":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = resume_project(data.get("slug"))
             self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/ui-state":

@@ -237,15 +237,16 @@ def logout():
 # --------------------------------------------------------------------------- search
 
 def _extract_items_from_payload(payload):
-    """Pull TikTok item objects out of a /api/search/* JSON response (both shapes)."""
+    """Pull TikTok item objects out of a /api/search/* OR /api/challenge/item_list JSON response."""
     items = []
     if not isinstance(payload, dict):
         return items
-    # video tab: {"item_list":[ item, ... ]}
-    for it in (payload.get("item_list") or []):
-        if isinstance(it, dict) and (it.get("id") or it.get("video")):
-            items.append(it)
-    # general tab: {"data":[ {"type":1,"item":{...}}, ... ]}
+    # video-search tab: {"item_list":[ item, ... ]}; hashtag/challenge page: {"itemList":[ item, ... ]}
+    for key in ("item_list", "itemList", "ItemList"):
+        for it in (payload.get(key) or []):
+            if isinstance(it, dict) and (it.get("id") or it.get("video")):
+                items.append(it)
+    # general-search tab: {"data":[ {"type":1,"item":{...}}, ... ]}
     for row in (payload.get("data") or []):
         if isinstance(row, dict):
             it = row.get("item") or row.get("aweme_info")
@@ -559,6 +560,12 @@ class Session:
         query = str(query or "").strip()
         if not query:
             return []
+        # A "#hashtag" query is routed to TikTok's DEDICATED hashtag/challenge page
+        # (/tag/<tag>), which indexes that tag's videos far better than typing "#tag" into
+        # general search. Its item feed arrives via /api/challenge/item_list instead of
+        # /api/search/.../full, so both the interceptor and the hydration fallback below branch on it.
+        is_tag = query.startswith("#")
+        tag = query.lstrip("#").strip() if is_tag else ""
         deadline = (time.monotonic() + max(0.1, float(timeout_s))
                     if timeout_s is not None else None)
         if not self.headless:
@@ -586,14 +593,17 @@ class Session:
         def _on_response(resp):
             try:
                 url = resp.url
-                if "/api/search/" in url and "/full" in url:
+                if ("/api/search/" in url and "/full" in url) or "/api/challenge/item_list" in url:
                     _absorb(resp.json())
             except Exception:
                 pass
 
         page.on("response", _on_response)
         try:
-            url = "https://www.tiktok.com/search/video?q=" + _quote(query)
+            if is_tag and tag:
+                url = "https://www.tiktok.com/tag/" + _quote(tag)
+            else:
+                url = "https://www.tiktok.com/search/video?q=" + _quote(query)
             try:
                 nav_ms = 45000 if deadline is None else max(
                     1000, min(45000, int((deadline - time.monotonic()) * 1000)))
@@ -622,7 +632,7 @@ class Session:
                 last_n = len(collected)
             # last-resort: parse the embedded hydration JSON if XHRs were blocked
             if not collected:
-                _absorb(self._hydration_items(page))
+                _absorb(self._hydration_items(page, is_tag=is_tag))
             # If we got nothing, is TikTok showing a login wall / captcha (session dead or
             # headless blocked)? Record it so the caller can fail fast with a clear message.
             if not collected:
@@ -668,7 +678,7 @@ class Session:
             except Exception:
                 pass
 
-    def _hydration_items(self, page):
+    def _hydration_items(self, page, is_tag=False):
         try:
             raw = page.evaluate(
                 "() => { const e = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');"
@@ -676,8 +686,14 @@ class Session:
             if not raw:
                 return {}
             data = json.loads(raw)
-            scope = (((data or {}).get("__DEFAULT_SCOPE__") or {})
-                     .get("webapp.search-detail") or {})
+            default = ((data or {}).get("__DEFAULT_SCOPE__") or {})
+            if is_tag:
+                # hashtag/challenge page embeds its feed under webapp.challenge-detail
+                scope = default.get("webapp.challenge-detail") or {}
+                rows = (scope.get("itemList") or scope.get("item_list")
+                        or scope.get("ItemList") or [])
+                return {"itemList": rows}
+            scope = default.get("webapp.search-detail") or {}
             rows = scope.get("data") or scope.get("item_list") or []
             return {"data": rows} if rows and isinstance(rows[0], dict) and "item" in rows[0] \
                 else {"item_list": rows}

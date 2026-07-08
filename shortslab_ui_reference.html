@@ -1,0 +1,561 @@
+<style>
+  :root{
+    --ground:#0a0e16; --surface:#121826; --surface-2:#0d1320; --raised:#161d2c;
+    --line:#232c3d; --line-soft:#1a2130; --text:#e7ecf3; --muted:#94a0b4; --faint:#6b7688;
+    --accent:#4a82e6; --accent-ink:#a9c6f6; --accent-soft:rgba(74,130,230,.13);
+    --cream:#e8e2cd; --good:#46c07a; --warn:#e0a844; --crit:#e0604e; --violet:#9b7ce0;
+    --mono:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --r:14px; --r-sm:8px; --maxw:1200px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --ground:#eef1f7; --surface:#ffffff; --surface-2:#f6f8fc; --raised:#ffffff;
+      --line:#dbe1ec; --line-soft:#e7ebf3; --text:#141d2b; --muted:#586374; --faint:#8b95a6;
+      --accent:#2f66d2; --accent-ink:#2f66d2; --accent-soft:rgba(47,102,210,.10);
+      --cream:#7a6b3f;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0a0e16; --surface:#121826; --surface-2:#0d1320; --raised:#161d2c;
+    --line:#232c3d; --line-soft:#1a2130; --text:#e7ecf3; --muted:#94a0b4; --faint:#6b7688;
+    --accent:#4a82e6; --accent-ink:#a9c6f6; --accent-soft:rgba(74,130,230,.13); --cream:#e8e2cd;
+  }
+  :root[data-theme="light"]{
+    --ground:#eef1f7; --surface:#ffffff; --surface-2:#f6f8fc; --raised:#ffffff;
+    --line:#dbe1ec; --line-soft:#e7ebf3; --text:#141d2b; --muted:#586374; --faint:#8b95a6;
+    --accent:#2f66d2; --accent-ink:#2f66d2; --accent-soft:rgba(47,102,210,.10); --cream:#7a6b3f;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--text);font-family:var(--sans);
+    line-height:1.6;-webkit-font-smoothing:antialiased;font-size:15px}
+  a{color:var(--accent-ink);text-decoration:none}
+  h1,h2,h3,h4{text-wrap:balance;line-height:1.2;margin:0}
+  ::selection{background:var(--accent-soft)}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px}
+
+  /* ---- top masthead ---- */
+  .mast{position:relative;overflow:hidden;border-bottom:1px solid var(--line);
+    background:
+      radial-gradient(120% 140% at 88% -10%, var(--accent-soft), transparent 60%),
+      linear-gradient(180deg,var(--surface-2),var(--ground));}
+  .mast-grid{position:absolute;inset:0;opacity:.5;
+    background-image:linear-gradient(var(--line-soft) 1px,transparent 1px),
+                     linear-gradient(90deg,var(--line-soft) 1px,transparent 1px);
+    background-size:26px 26px;mask-image:linear-gradient(180deg,#000,transparent 78%)}
+  .mast-in{position:relative;padding:52px 0 40px}
+  .badge{display:inline-flex;align-items:center;gap:12px;margin-bottom:22px}
+  .flask{width:44px;height:44px;flex:0 0 auto;image-rendering:pixelated;border-radius:9px;
+    border:2px solid #14110d;box-shadow:2px 2px 0 rgba(0,0,0,.35)}
+  .badge b{font-size:19px;letter-spacing:.02em}
+  .badge span{display:block;font:600 11px/1 var(--mono);color:var(--faint);
+    text-transform:uppercase;letter-spacing:.22em;margin-top:4px}
+  .mast h1{font-size:clamp(30px,5vw,50px);letter-spacing:-.02em;font-weight:800;max-width:16ch}
+  .mast h1 em{font-style:normal;color:var(--accent-ink)}
+  .mast p.sub{color:var(--muted);font-size:clamp(15px,2vw,18px);max-width:60ch;margin:18px 0 0}
+  .meta-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .tag{font:600 12px/1 var(--mono);color:var(--accent-ink);background:var(--accent-soft);
+    border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);
+    padding:7px 11px;border-radius:100px}
+  .tag.n{color:var(--muted);background:transparent;border-color:var(--line)}
+
+  /* ---- layout ---- */
+  .layout{display:grid;grid-template-columns:230px 1fr;gap:38px;
+    max-width:var(--maxw);margin:0 auto;padding:38px 22px 90px}
+  nav.toc{position:sticky;top:20px;align-self:start;font-size:13.5px}
+  nav.toc .toc-cap{font:700 11px/1 var(--mono);text-transform:uppercase;letter-spacing:.18em;
+    color:var(--faint);margin:0 0 12px 12px}
+  nav.toc ol{list-style:none;margin:0;padding:0;counter-reset:s}
+  nav.toc a{display:flex;gap:10px;align-items:baseline;color:var(--muted);padding:6px 12px;
+    border-radius:var(--r-sm);border-left:2px solid transparent}
+  nav.toc a:hover{color:var(--text);background:var(--surface)}
+  nav.toc a .num{font:600 11px/1 var(--mono);color:var(--faint);min-width:16px}
+
+  main{min-width:0}
+
+  section.screen{scroll-margin-top:18px;margin-bottom:16px;background:var(--surface);
+    border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .sc-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:20px 24px 0}
+  .route{font:600 12.5px/1 var(--mono);color:var(--accent-ink);background:var(--accent-soft);
+    border:1px solid color-mix(in srgb,var(--accent) 26%,transparent);padding:6px 10px;border-radius:7px}
+  .sc-head h2{font-size:22px;letter-spacing:-.01em}
+  .sc-body{padding:14px 24px 24px}
+  .lead{color:var(--muted);margin:6px 0 18px;max-width:72ch}
+
+  .grp{margin-top:22px}
+  .grp:first-child{margin-top:6px}
+  .grp > h3{font:700 12px/1 var(--mono);text-transform:uppercase;letter-spacing:.14em;
+    color:var(--text);padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--line-soft);
+    display:flex;align-items:center;gap:8px}
+  .grp > h3 .dot{width:7px;height:7px;border-radius:2px;background:var(--accent)}
+
+  ul.ctrls{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+  ul.ctrls > li{display:grid;grid-template-columns:104px 1fr;gap:14px;align-items:start;
+    padding:10px 8px;border-radius:9px}
+  ul.ctrls > li:hover{background:var(--surface-2)}
+  ul.ctrls b{font-weight:650;color:var(--text)}
+  ul.ctrls .d{color:var(--muted);font-size:14px}
+  ul.ctrls .d code{font:600 12.5px/1.4 var(--mono);background:var(--surface-2);color:var(--accent-ink);
+    padding:1px 6px;border-radius:5px;border:1px solid var(--line-soft)}
+  ul.ctrls .opts{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+  ul.ctrls .opts span{font:600 11.5px/1 var(--mono);color:var(--muted);background:var(--surface);
+    border:1px solid var(--line);padding:4px 7px;border-radius:5px}
+
+  /* control-type chip */
+  .ct{font:700 10.5px/1 var(--mono);text-transform:uppercase;letter-spacing:.06em;
+    padding:5px 7px;border-radius:5px;align-self:start;text-align:center;white-space:nowrap;
+    border:1px solid transparent}
+  .ct-btn{color:#fff;background:var(--accent);border-color:color-mix(in srgb,var(--accent) 60%,#000)}
+  .ct-sel{color:var(--accent-ink);background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
+  .ct-tgl{color:var(--good);background:color-mix(in srgb,var(--good) 13%,transparent);border-color:color-mix(in srgb,var(--good) 32%,transparent)}
+  .ct-sld{color:var(--violet);background:color-mix(in srgb,var(--violet) 14%,transparent);border-color:color-mix(in srgb,var(--violet) 32%,transparent)}
+  .ct-txt{color:var(--muted);background:var(--surface-2);border-color:var(--line)}
+  .ct-mod{color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,transparent);border-color:color-mix(in srgb,var(--warn) 32%,transparent)}
+  .ct-up{color:var(--cream);background:color-mix(in srgb,var(--cream) 12%,transparent);border-color:color-mix(in srgb,var(--cream) 30%,transparent)}
+  .ct-lnk{color:var(--muted);background:transparent;border-color:var(--line)}
+
+  .callout{display:flex;gap:12px;margin:20px 0 4px;padding:14px 16px;border-radius:var(--r-sm);
+    background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 24%,transparent);
+    font-size:14px;color:var(--text)}
+  .callout .k{font:700 11px/1.5 var(--mono);color:var(--accent-ink);text-transform:uppercase;letter-spacing:.1em;flex:0 0 auto}
+
+  .modes{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .mode{border:1px solid var(--line);border-radius:var(--r-sm);padding:15px 16px;background:var(--surface-2)}
+  .mode .mh{display:flex;align-items:center;gap:9px;font-weight:700;margin-bottom:5px}
+  .mode .mh .em{font-size:19px;line-height:1}
+  .mode .mr{font:600 11px/1 var(--mono);color:var(--faint);margin-left:auto}
+  .mode p{margin:0;color:var(--muted);font-size:13.5px}
+
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:2px 0 4px}
+  .flow .st{font:600 12.5px/1 var(--mono);padding:8px 11px;border-radius:7px;background:var(--surface-2);
+    border:1px solid var(--line);color:var(--text)}
+  .flow .ar{color:var(--faint);font-size:15px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 2px}
+  .legend .li{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted)}
+
+  footer{border-top:1px solid var(--line);color:var(--faint);font-size:13px;
+    padding:26px 22px;text-align:center}
+  footer code{font:600 12px/1 var(--mono);color:var(--muted)}
+
+  @media (max-width:860px){
+    .layout{grid-template-columns:1fr;gap:16px;padding-top:20px}
+    nav.toc{position:static;order:-1;background:var(--surface);border:1px solid var(--line);
+      border-radius:var(--r);padding:14px}
+    nav.toc ol{columns:2;gap:4px}
+    .modes{grid-template-columns:1fr}
+    ul.ctrls > li{grid-template-columns:1fr}
+    .ct{justify-self:start}
+  }
+  @media (prefers-reduced-motion:no-preference){
+    section.screen{transition:border-color .2s}
+  }
+</style>
+
+<div class="mast">
+  <div class="mast-grid"></div>
+  <div class="mast-in wrap">
+    <div class="badge">
+      <svg class="flask" viewBox="0 0 32 32" shape-rendering="crispEdges" aria-hidden="true">
+        <rect width="32" height="32" fill="#e8e2cd"/>
+        <path fill="#1a1714" d="M12 6h8v2h-1v2h1v2l2 3v1h1v9h-1v2H10v-2H9v-9h1v-1l2-3V10h-1V8h1z"/>
+        <path fill="#f7f4ee" d="M14 8h4v3l2 3v1h-8v-1l2-3z"/>
+        <rect x="10" y="18" width="12" height="6" fill="#46be6e"/>
+        <rect x="10" y="22" width="12" height="2" fill="#2c9652"/>
+        <rect x="14" y="19" width="2" height="2" fill="#e04030"/>
+        <rect x="24" y="8" width="2" height="2" fill="#3b74d9"/><rect x="23" y="9" width="1" height="1" fill="#3b74d9"/><rect x="26" y="9" width="1" height="1" fill="#3b74d9"/><rect x="24" y="7" width="1" height="1" fill="#3b74d9"/><rect x="24" y="10" width="1" height="1" fill="#3b74d9"/>
+      </svg>
+      <div><b>Shortslab</b><span>UI-Referenz</span></div>
+    </div>
+    <h1>Alles, was der Nutzer <em>sieht</em> — vollständig kartiert.</h1>
+    <p class="sub">Eine detaillierte Karte der gesamten Oberfläche: die Shell, das Modus-Menü, das Erstellungs-Panel mit allen Reglern, die Run-Seite, das Timeline-Studio, die Asset-Bibliothek und die vier Master-/Autopilot-Werkzeuge. Jeder Button, jedes Dropdown, jeder Regler und jedes Modal.</p>
+    <div class="meta-row">
+      <span class="tag">10 Bildschirme</span>
+      <span class="tag n">Python-ThreadingHTTPServer</span>
+      <span class="tag n">Server-gerendertes HTML</span>
+      <span class="tag n">Dark &amp; Light</span>
+      <span class="tag n">natives Fenster (WebView2)</span>
+    </div>
+  </div>
+</div>
+
+<div class="layout">
+  <nav class="toc" aria-label="Inhalt">
+    <p class="toc-cap">Bildschirme</p>
+    <ol>
+      <li><a href="#shell"><span class="num">00</span>Globale Shell</a></li>
+      <li><a href="#modes"><span class="num">01</span>Modus-Menü</a></li>
+      <li><a href="#create"><span class="num">02</span>Erstellen-Panel</a></li>
+      <li><a href="#run"><span class="num">03</span>Run- / Job-Seite</a></li>
+      <li><a href="#done"><span class="num">04</span>Fertig-Bildschirm</a></li>
+      <li><a href="#timeline"><span class="num">05</span>Timeline-Studio</a></li>
+      <li><a href="#assets"><span class="num">06</span>Asset-Bibliothek</a></li>
+      <li><a href="#masters"><span class="num">07</span>Master-Werkzeuge</a></li>
+      <li><a href="#auto"><span class="num">08</span>Autopilot-Modi</a></li>
+      <li><a href="#cross"><span class="num">09</span>Übergreifend</a></li>
+    </ol>
+    <p class="toc-cap" style="margin-top:20px">Legende</p>
+    <div class="legend" style="flex-direction:column;gap:7px;padding-left:12px">
+      <span class="li"><span class="ct ct-btn">Btn</span>Button / Aktion</span>
+      <span class="li"><span class="ct ct-sel">Sel</span>Dropdown</span>
+      <span class="li"><span class="ct ct-tgl">Tgl</span>Schalter / Checkbox</span>
+      <span class="li"><span class="ct ct-sld">Sld</span>Regler</span>
+      <span class="li"><span class="ct ct-txt">Txt</span>Texteingabe</span>
+      <span class="li"><span class="ct ct-mod">Mod</span>Modal / Popup</span>
+      <span class="li"><span class="ct ct-up">Up</span>Datei-Upload</span>
+    </div>
+  </nav>
+
+  <main>
+
+    <!-- 00 SHELL -->
+    <section class="screen" id="shell">
+      <div class="sc-head"><span class="route">jede Seite</span><h2>Globale Shell</h2></div>
+      <div class="sc-body">
+        <p class="lead">Ein einheitlicher Kopf auf jeder Seite: links die Marke, rechts die Navigation. Das ganze App läuft in einem eigenen nativen Windows-Fenster mit dem Pixel-Labor-Icon in der Taskleiste.</p>
+        <div class="grp">
+          <h3><span class="dot"></span>Kopfzeile &amp; Navigation</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-lnk">Marke</span><div><b>Shortslab-Logo</b><span class="d">Pixel-Erlenmeyerkolben-Badge + Wortmarke „Shortslab“, links oben, klickt nicht.</span></div></li>
+            <li><span class="ct ct-lnk">Zurück</span><div><b>Pfeil zurück</b><span class="d">Nur im Timeline-Studio: dezenter Zurück-Pfeil ganz links (Browser-History bzw. → Assets).</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>New project</b><span class="d">Startet ein leeres Formular mit Standardwerten (verwirft die zuletzt geladene Sitzung). <code>/?new=1</code></span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Assets</b><span class="d">Öffnet die Projekt-/Asset-Bibliothek. <code>/assets</code></span></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Theme-Umschalter</b><span class="d">Sonne/Mond-Knopf: wechselt zwischen Dunkel- und Hell-Modus, wird gespeichert.</span></div></li>
+          </ul>
+        </div>
+        <div class="callout"><span class="k">Atmosphäre</span><div>Glas-Panels, blauer Akzent, animierter blauer Hintergrund. Jeder Button spielt einen dezenten Klick-Sound; Hover- und Erscheinungs-Animationen (respektiert „reduzierte Bewegung“ nicht explizit — reine CSS-Deko).</div></div>
+      </div>
+    </section>
+
+    <!-- 01 MODES -->
+    <section class="screen" id="modes">
+      <div class="sc-head"><span class="route">/ · Schritt 0</span><h2>Modus-Menü — „What are we creating today?“</h2></div>
+      <div class="sc-body">
+        <p class="lead">Der Einstieg. Sieben Karten in zwei Gruppen: ein neues Video bauen, oder ein fertiges Video nachbearbeiten. Die Wahl bestimmt, welcher Bildschirm/Workflow geöffnet wird.</p>
+        <div class="grp">
+          <h3><span class="dot"></span>Ein neues Video machen</h3>
+          <div class="modes">
+            <div class="mode"><div class="mh"><span class="em">🎬</span>A Video from a Script<span class="mr">/</span></div><p>Voice-Skript → vollständiger visueller Short über die App-Pipeline (der Hauptweg).</p></div>
+            <div class="mode"><div class="mh"><span class="em">🧪</span>A Viral Short from a Topic<span class="mr">/viraltrans</span></div><p>Ein Thema eingeben — Agenten schreiben, filmen, betiteln und vertonen alles autonom.</p></div>
+            <div class="mode"><div class="mh"><span class="em">💬</span>A Reddit Story Video<span class="mr">/reddit</span></div><p>Reddit-Story über Minecraft-Parkour mit KI-Voiceover.</p></div>
+            <div class="mode"><div class="mh"><span class="em">🎨</span>A Longform Image Set<span class="mr">/longform</span></div><p>Prompt-Liste hochladen — Higgsfield rendert pro Zeile ein 16:9 FLUX.2-Pro-Bild.</p></div>
+          </div>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>Ein fertiges Video polieren · Masters</h3>
+          <div class="modes">
+            <div class="mode"><div class="mh"><span class="em">🔊</span>Sound Effects<span class="mr">/sfx</span></div><p>Fertigen Short hochladen — Editor-SFX aus der lokalen Bibliothek werden gesetzt.</p></div>
+            <div class="mode"><div class="mh"><span class="em">➜</span>Visual Effects<span class="mr">/visual</span></div><p>Short hochladen — Opus 4.8 setzt animierte rote Pfeile + passende SFX.</p></div>
+            <div class="mode"><div class="mh"><span class="em">💬️</span>Captions<span class="mr">/captions</span></div><p>Video hochladen, virale Wort-für-Wort-Untertitel voll lokal einbrennen.</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 CREATE -->
+    <section class="screen" id="create">
+      <div class="sc-head"><span class="route">/</span><h2>Erstellen-Panel — „A Video from a Script“</h2></div>
+      <div class="sc-body">
+        <p class="lead">Der zentrale Bildschirm. Oben die kompakte Einstellungsleiste (Create-Bar), darunter das Skript, die Stimme und der optionale Sprecher. Alles wird lokal gespeichert und beim nächsten Start wiederhergestellt.</p>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Create-Bar · Kopfzeile</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>Preset speichern 💾</b><span class="d">Speichert Sprecher, Modelle, Sprecherbild, Visual Direction und alle Schalter als benanntes Preset.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Preset laden 📂</b><span class="d">Öffnet Popup mit deinen gespeicherten Presets + dem eingebauten „🇯🇵 Facts about Japan“.</span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Reasoning model</b><span class="d">Das Planungs-/Agentenmodell für den Lauf.</span><div class="opts"><span>Claude Fable 5</span><span>Claude Sonnet 5</span><span>Claude Opus 4.8</span><span>GPT-5.5</span><span>Gemini 3.5 Flash</span><span>Gemini 3.1 Pro Preview</span></div></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Clip source · Woher die Bewegtbilder kommen</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-tgl">Seg</span><div><b>AI Generate ⚙️ / Scrape TikTok + X 🎞️</b><span class="d">Umschalter. „Generate“ = KI-Video/Bilder; „Scrape“ = echte TikTok/X-Clips im passenden Stil, geschnitten. Scrape deaktiviert die KI-Bild-Ausgaben.</span></div></li>
+          </ul>
+          <div class="callout"><span class="k">bei Generate</span><div>Zwei Modelle erscheinen:</div></div>
+          <ul class="ctrls">
+            <li><span class="ct ct-sel">Sel</span><div><b>Video model</b><div class="opts"><span>Seedance 2.0</span><span>Seedance 2.0 Fast</span><span>Seedance 1.5 Pro</span><span>LTX-2.3</span><span>Happy Horse 1.1</span></div></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Image model</b><div class="opts"><span>GPT-Image-2 (best)</span><span>Nano-Banana-2 (cheap)</span></div></div></li>
+          </ul>
+          <div class="callout"><span class="k">bei Scrape</span><div>Die Scrape-Einstellungen klappen auf:</div></div>
+          <ul class="ctrls">
+            <li><span class="ct ct-tgl">Seg</span><div><b>Scraping engine</b><span class="d">V2 (Relevance-first, Standard) plant konkrete sichtbare Situationen, findet nutzbare Segmente irgendwo im Video, rankt nach Relevanz statt Likes. V1 = alter Bucket-/Like-Gate-Scrape.</span></div></li>
+            <li><span class="ct ct-txt">Txt</span><div><b>Eigene Terme (Chips)</b><span class="d">Zusatz-Suchbegriffe (immer inkludiert). Mit <code>+</code> / Enter hinzufügen, als Chips angezeigt. Automatische Terme kommen aus dem Skript.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Connect TikTok 🔗</b><span class="d">Öffnet ein Login-Fenster (eigenes TikTok-Konto, kein API-Key). Statuspunkt zeigt „connected / not connected“.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Connect X 🔗</b><span class="d">Optionale zweite Quelle: X/Twitter wird parallel durchsucht. Statuspunkt.</span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Background music</b><span class="d">Optionales Bett unter der Stimme.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Musik-Vorschau ▶</b><span class="d">Spielt den gewählten Track vor dem Generieren an.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Outputs · Pipeline-Teile an/aus</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-tgl">Tgl</span><div><b>8 Ausgabe-Schalter</b><span class="d">Jeder Teil kann einzeln aus. „Aus“ = wird komplett übersprungen.</span><div class="opts"><span>Web images</span><span>Wikimedia images</span><span>Generated images</span><span>Video clips</span><span>Sound effects</span><span>Transition SFX</span><span>Background music</span><span>Captions</span></div></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Halt after speech</b><span class="d">Pausiert den Lauf direkt nach der Stimme, damit du sie auf der Run-Seite abnimmst oder ersetzt. <em>(neu hierher verschoben)</em></span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>SFX amount</b><span class="d">Dichte des Sounddesigns (wirkt auf normale Läufe + Timeline). <em>(neu)</em></span><div class="opts"><span>Low (sparse)</span><span>Medium (lively)</span><span>High (hyper-edited)</span></div></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>⚡ Create Short</b><span class="d">Startet den Lauf → wechselt zur Run-Seite. Der Agent entscheidet automatisch Voll- vs. Smart-Lauf.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Skript</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-txt">Txt</span><div><b>Skript-Feld</b><span class="d">Der gesprochene Text; daraus entsteht das Voiceover (Gemini TTS). Der markierte Hook wird farblich inline hervorgehoben.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>★ Mark hook / Clear</b><span class="d">Markiert die Eröffnungszeile(n) als Hook (zuerst gesprochen, dann Pause).</span></div></li>
+            <li><span class="ct ct-sld">Sld</span><div><b>Script relevancy</b><span class="d">Nur im Scrape-Modus: wie streng die Clips dem Skript folgen (0–100%).</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Stimme &amp; Sprecher</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-sel">Sel</span><div><b>TTS voice</b><span class="d">30 Gemini-Stimmen, jede mit Tonlabel (z. B. Charon — Informative, Kore — Firm, Sulafat — Warm).</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Stimme vorhören ▶</b><span class="d">~10-Sekunden-Vorschau der gewählten Stimme.</span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>TTS model</b><div class="opts"><span>Gemini 2.5 Flash (cheaper)</span><span>Gemini 2.5 Pro (higher quality)</span></div></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Fresh voice take</b><span class="d">Frische Stimme, aber bereits gescrapte Medien behalten (verhindert Verlust bei Abbruch).</span></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Sprecher-Video (Panel-Schalter)</b><span class="d">An = die Hook-Zeile wird von einem lippensynchronen Talking-Head gesprochen (InfiniteTalk).</span></div></li>
+            <li><span class="ct ct-up">Up</span><div><b>Sprecher-Galerie / Upload</b><span class="d">Gesicht aus dem „speaker images“-Ordner wählen oder hochladen.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Geladenes Projekt · Zusatz-Aktionen</h3>
+          <p class="lead" style="margin-top:0">Nur sichtbar, wenn ein Projekt aus den Assets geladen wurde:</p>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>🎞 Open timeline editor</b><span class="d">Öffnet das Timeline-Studio für dieses Projekt.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Lauf-Modus (5 Buttons)</b><span class="d">Was der Re-Run tun soll.</span><div class="opts"><span>Normal run</span><span>Recut existing</span><span>New web images</span><span>Regenerate clips</span><span>Recreate hook</span></div></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03 RUN -->
+    <section class="screen" id="run">
+      <div class="sc-head"><span class="route">/job?id=…</span><h2>Run- / Job-Seite</h2></div>
+      <div class="sc-body">
+        <p class="lead">Live-Ansicht eines laufenden Auftrags. Aktualisiert sich per Polling. Zeigt Status, Fortschritt, Konsole und rechts die Medien-Seitenleiste.</p>
+        <div class="grp">
+          <h3><span class="dot"></span>Kopf &amp; Aktionen</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-lnk">Status</span><div><b>Status-Pill</b><span class="d">running · done · error · cancelling · cancelled — farbcodiert.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>New project / Assets</b><span class="d">Zurück zum Start bzw. zur Bibliothek.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Cancel</b><span class="d">Bricht den laufenden Auftrag ab.</span></div></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>Fortschritt &amp; Sprach-Abnahme</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-lnk">Progress</span><div><b>Schritt-Fortschrittsbalken</b><span class="d">Button-artige Balken pro Schritt mit Laufzeit; grün wenn fertig.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Voice: Approve / Replace</b><span class="d">Bei „Halt after speech“: den generierten Voiceover anhören und annehmen oder neu generieren.</span></div></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>Konsole &amp; Medien-Seitenleiste</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>Hide logs</b><span class="d">Blendet die scrollende Konsole (Live-Log) ein/aus.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Medien: Replace / Accept / Delete / Exclude</b><span class="d">Pro erzeugtem/gescraptem Clip: ersetzen (Agent), akzeptieren, löschen oder aus dem Lauf ausschließen.</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 04 DONE -->
+    <section class="screen" id="done">
+      <div class="sc-head"><span class="route">Job · done</span><h2>Fertig-Bildschirm — „✓ Your Short is ready“</h2></div>
+      <div class="sc-body">
+        <p class="lead">Wenn der Render fertig ist: das finale 9:16-Video groß, darunter die Aktionen.</p>
+        <ul class="ctrls">
+          <li><span class="ct ct-lnk">Video</span><div><b>Finales Video</b><span class="d">Autoplay, stummgeschaltet, mit Player-Steuerung.</span></div></li>
+          <li><span class="ct ct-btn">Btn</span><div><b>🎞 Open timeline editor</b><span class="d">Zum Feinschliff / Re-Render.</span></div></li>
+          <li><span class="ct ct-btn">Btn</span><div><b>⏬ Download</b><span class="d">Kopiert das Video serverseitig in den Downloads-Ordner (WebView2-tauglich).</span></div></li>
+          <li><span class="ct ct-btn">Btn</span><div><b>New project</b><span class="d">Neuer Start.</span></div></li>
+          <li><span class="ct ct-btn">Btn</span><div><b>Assets</b><span class="d">Zur Bibliothek. <em>(neu hinzugefügt)</em></span></div></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 05 TIMELINE -->
+    <section class="screen" id="timeline">
+      <div class="sc-head"><span class="route">/timeline?slug=…</span><h2>Timeline-Studio</h2></div>
+      <div class="sc-body">
+        <p class="lead">Der CapCut-artige Editor, verfügbar sobald ein Projekt seinen ersten Render hat. Spiegelt exakt den letzten Render (Captions + Sound + SFX) und erlaubt Trimmen, Mischen, Neu-Anordnen und Re-Rendern.</p>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Werkzeugleiste</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>💾 Save</b><span class="d">Speichert Timeline-Änderungen (markiert ungespeicherten Zustand).</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>⏬ Render</b><span class="d">Rendert die bearbeitete Timeline neu.</span></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Render with captions · Sound FX</b><span class="d">Zwei Render-Schalter: mit Untertiteln / mit Soundeffekten.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>🤖 Agent rework</b><span class="d">Der Agent überarbeitet die Timeline.</span></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Rework-Optionen</b><span class="d">replace selected media · reorder &amp; recut · regenerate speech + retime.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>📝 Change script</b><span class="d">Öffnet das Skript-Modal (siehe unten).</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Historie &amp; Zoom</h3>
+          <div class="flow">
+            <span class="st">↶ Undo (Ctrl+Z)</span><span class="st">↷ Redo (Ctrl+Y)</span>
+            <span class="ar">·</span>
+            <span class="st">− Zoom out</span><span class="st">+ Zoom in</span><span class="st">FIT (F)</span>
+            <span class="ar">·</span><span class="st">Gesamtlänge</span>
+          </div>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Vorschau-Player</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-lnk">Stage</span><div><b>9:16-Vorschau</b><span class="d">Sequenz-Player mit Live-Captions, Overlay-Ebene (Pfeile/Nekos) und leerem Startzustand „Press play“.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>◀ −5s · ▶ Play/Pause · +5s ▶</b><span class="d">Transport-Steuerung + Zeitanzeige.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Inspector · drei Kontext-Panes</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-sld">Clip</span><div><b>Clip-Pane</b><span class="d">Dauer, Speed (0,5–2×), „Blur burned-in captions“ (OCR), „Remove clip“. Roter Streifen = Medium für Agenten-Ersatz markieren.</span></div></li>
+            <li><span class="ct ct-sld">SFX</span><div><b>Sound-Pane</b><span class="d">Enabled, Volume, Start, Sound tauschen, ▶ Preview, „Delete sound“.</span></div></li>
+            <li><span class="ct ct-sld">Visual</span><div><b>Overlay-Pane</b><span class="d">Pos X/Y, Scale, Pfeil-Stil (rot/gelb/weiß/neon), Rotation, Entrance (Pop/Bounce/Slide/Fade/None), Appear-Sound + Volume, Replay, Delete.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Spuren (Timeline)</h3>
+          <div class="flow">
+            <span class="st">Clips</span><span class="st">Visuals</span><span class="st">Captions</span><span class="st">Voice</span><span class="st">Cut&nbsp;SFX</span><span class="st">Sound&nbsp;FX</span>
+          </div>
+          <p class="lead" style="margin-top:12px">Playhead, Lineal, Drag-to-Reorder der Clips, Rechtsklick auf Clip → „Replace with library media“.</p>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>Audio-Mixer &amp; Bibliothek</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-sld">Sld</span><div><b>Mixer</b><span class="d">Voice-Volume + Music-Volume.</span></div></li>
+            <li><span class="ct ct-lnk">Tabs</span><div><b>Library</b><span class="d">Zwei Reiter: „Project media“ (alle gescrapten + abgelehnten Clips/Bilder) und „Sound FX“ (abspielbar). Per Drag-and-Drop auf die Timeline.</span></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>„Change script“-Modal</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-mod">Mod</span><div><b>Skript neu schreiben</b><span class="d">Textfeld + Mark hook/Clear + Sprechername + Voice + TTS-Model + Dichte (Few/Medium/Many) → „🎙 Re-voice &amp; recut“. Unveränderte Zeilen behalten ihr Medium.</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06 ASSETS -->
+    <section class="screen" id="assets">
+      <div class="sc-head"><span class="route">/assets</span><h2>Asset-Bibliothek</h2></div>
+      <div class="sc-body">
+        <p class="lead">Alle Projekte als Karten, nach zuletzt bearbeitet sortiert. Jede Karte zeigt Thumbnail, Titel und Zähler.</p>
+        <div class="grp">
+          <h3><span class="dot"></span>Projekt-Karte</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-lnk">Thumb</span><div><b>Vorschaubild / Video</b><span class="d">Klickbares Poster oder Lazy-Video.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>✎ Titel umbenennen</b><span class="d">Kleiner Stift neben dem Titel (Prompt-Dialog).</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>✕ Ausblenden</b><span class="d">Blendet das Projekt aus (löscht nichts). Ecke oben rechts.</span></div></li>
+            <li><span class="ct ct-lnk">Meta</span><div><b>Zähler-Pills</b><span class="d">„N web · N GPT · N clips“ + „Edited …“-Datum.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>▶ Check results / Continue</b><span class="d">Fertig → Ergebnis öffnen. Fehlgeschlagen → „Continue“ setzt den Lauf smart fort (nutzt Vorhandenes).</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>🎞 Edit / ↺ Open</b><span class="d">Timeline öffnen bzw. Projekt zurück ins Formular laden.</span></div></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>Ausgeblendete Projekte</h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>👁 Show hidden (N)</b><span class="d">Zeigt die ausgeblendeten Projekte; dort „↺ Unhide“ pro Karte.</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 07 MASTERS -->
+    <section class="screen" id="masters">
+      <div class="sc-head"><span class="route">/sfx · /visual · /captions</span><h2>Master-Werkzeuge · fertiges Video polieren</h2></div>
+      <div class="sc-body">
+        <p class="lead">Drei Upload-basierte Nachbearbeiter. Jeder nimmt einen fertigen MP4/MOV/WebM und gibt eine verbesserte Version + Original + JSON-Plan aus.</p>
+
+        <div class="grp">
+          <h3><span class="dot"></span>🔊 Sound Effects <span style="font:600 11px/1 var(--mono);color:var(--faint)">/sfx</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-up">Up</span><div><b>Video hochladen</b><span class="d">Bild wird verlustfrei kopiert, nur der Ton bekommt neue Effekte.</span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Planning agent</b><span class="d">inkl. <code>Gemini 3.1 Pro Preview</code>. <em>(neu)</em></span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>SFX amount</b><span class="d">Low / Medium / High — steuert Budget + KI-Instruktion. <em>(neu)</em></span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Add sound effects</b></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>➜ Visual Effects <span style="font:600 11px/1 var(--mono);color:var(--faint)">/visual</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-up">Up</span><div><b>Video hochladen</b><span class="d">Opus 4.8 setzt animierte rote Pfeile auf konkrete Subjekte + passende SFX.</span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Analysis agent</b><span class="d">inkl. <code>Gemini 3.1 Pro Preview</code>. <em>(neu)</em></span></div></li>
+            <li><span class="ct ct-sel">Sel</span><div><b>Effect amount</b><span class="d">Low / Medium / High — wie dicht die Pfeile gesetzt werden. <em>(neu)</em></span></div></li>
+            <li><span class="ct ct-tgl">Tgl</span><div><b>Add kawaii neko reactions</b><span class="d">Optionale Pixel-Katzen-Reaktionen.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>➜ Add intelligent arrows</b></div></li>
+          </ul>
+        </div>
+
+        <div class="grp">
+          <h3><span class="dot"></span>💬️ Captions <span style="font:600 11px/1 var(--mono);color:var(--faint)">/captions</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-up">Up</span><div><b>Video hochladen</b><span class="d">Brennt virale Wort-für-Wort-Untertitel ein — voll lokal (faster-whisper, keine APIs).</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 08 AUTO -->
+    <section class="screen" id="auto">
+      <div class="sc-head"><span class="route">/viraltrans · /reddit · /longform</span><h2>Autopilot- &amp; Spezial-Modi</h2></div>
+      <div class="sc-body">
+        <div class="grp">
+          <h3><span class="dot"></span>🧪 Viral Transformation <span style="font:600 11px/1 var(--mono);color:var(--faint)">/viraltrans</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>Themen-Chips</b><span class="d">Vorgefertigte Themen antippen — oder eigenes Thema tippen.</span></div></li>
+            <li><span class="ct ct-txt">Txt</span><div><b>Eigenes Thema</b></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>🧿 Generate</b><span class="d">Agenten machen alles autonom: Konzept → Szenen → GPT-Image-2 → Seedance → QA → Captions → Musik/SFX → MP4 + Metadaten.</span></div></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>💬 Reddit Story <span style="font:600 11px/1 var(--mono);color:var(--faint)">/reddit</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-btn">Btn</span><div><b>Find 5 Stories</b><span class="d">Sucht Reddit-Stories; eine auswählen.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Generate</b><span class="d">Story über Minecraft-Parkour mit KI-Voiceover.</span></div></li>
+          </ul>
+        </div>
+        <div class="grp">
+          <h3><span class="dot"></span>🎨 Longform Image Set <span style="font:600 11px/1 var(--mono);color:var(--faint)">/longform</span></h3>
+          <ul class="ctrls">
+            <li><span class="ct ct-up">Up</span><div><b>Prompt-Liste (.txt)</b><span class="d">Eine Zeile = ein Prompt.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Connect Higgsfield</b><span class="d">Login per Playwright.</span></div></li>
+            <li><span class="ct ct-btn">Btn</span><div><b>Generate</b><span class="d">Higgsfield rendert pro Zeile ein 16:9 FLUX.2-Pro-Bild, benannt nach Timestamp.</span></div></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 09 CROSS -->
+    <section class="screen" id="cross">
+      <div class="sc-head"><span class="route">übergreifend</span><h2>Übergreifende Elemente</h2></div>
+      <div class="sc-body">
+        <ul class="ctrls">
+          <li><span class="ct ct-mod">Mod</span><div><b>Preset-Popup</b><span class="d">Save / Save-as / Overwrite; listet eigene Presets + eingebautes „🇯🇵 Facts about Japan“.</span></div></li>
+          <li><span class="ct ct-lnk">?</span><div><b>Hilfe-Tooltips</b><span class="d">Kleine Fragezeichen an fast jedem Regler; Erklärung nur bei Hover/Fokus.</span></div></li>
+          <li><span class="ct ct-tgl">Tgl</span><div><b>Theme &amp; Zustand</b><span class="d">Dark/Light gespeichert; das gesamte Formular (Skript, Modelle, Schalter) wird lokal persistiert und beim Start wiederhergestellt.</span></div></li>
+          <li><span class="ct ct-lnk">Status</span><div><b>Connect-Statuspunkte</b><span class="d">TikTok / X / Higgsfield zeigen live „connected / not connected / busy“.</span></div></li>
+          <li><span class="ct ct-lnk">Native</span><div><b>App-Fenster &amp; Icon</b><span class="d">Eigenes Windows-Fenster (WebView2) mit dem Pixel-Labor-Icon in der Taskleiste; PWA-Manifest vorhanden.</span></div></li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  Shortslab — autonomer 9:16-Short-Generator · UI-Referenz aus <code>app.py</code> (server-gerendert) ·
+  Stand dieser Sitzung, inkl. SFX/VFX-Mengen, Gemini 3.1 Pro Preview, Assets-Button &amp; Pixel-Labor-Icon.
+</footer>

@@ -71,3 +71,16 @@ higgsfield-profile-*/
 logs/
 projects/*/last_job_error.txt
 projects/*/config/project_before_rescript.json
+
+# scrape trainer / benchmark artifacts (downloaded TikTok proxies + SQLite runs - large, per-machine)
+/scrape_training/
+/benchmark_runs/
+
+# icon backups
+static/*.bak
+
+# stray one-off scripts in the repo root
+/script_*.txt
+
+# third-party skill pack (reinstall via: npx ui-ux-pro-max-cli init --ai claude)
+.claude/skills/

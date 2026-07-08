@@ -88,6 +88,36 @@ def _video_props(path, ffprobe):
     return (w or 1080), (h or 1920), (fps if 1 < fps < 121 else 30.0), dur
 
 
+# User-selectable arrow/effect density. "low" matches the app's historical behaviour; medium/high
+# check MORE candidate moments AND tell the director to accept a larger share of them.
+VFX_AMOUNT_PROFILES = {
+    "low": {
+        "min_gap": 1.8, "cap": 18,
+        "direct": "give MOST moments (roughly 2 out of 3) a red arrow when a concrete target "
+                  "exists, and only skip a moment when there is genuinely nothing concrete on screen.",
+        "neko": "Use it on the strongest ~1 in 3 moments, else 'none'.",
+    },
+    "medium": {
+        "min_gap": 1.2, "cap": 28,
+        "direct": "give nearly every moment (roughly 3 out of 4) a red arrow when any concrete "
+                  "target exists - skipping should be the exception, not the rule.",
+        "neko": "Use it on the strongest ~1 in 2 moments, else 'none'.",
+    },
+    "high": {
+        "min_gap": 0.8, "cap": 42,
+        "direct": "this is a HYPER-dense edit: give practically EVERY moment (9 out of 10) a red "
+                  "arrow whenever anything concrete is visible - a face, object, sign, detail, "
+                  "anything. Only output 'none' when the frame is pure blur or empty background.",
+        "neko": "Be generous: use it on ~2 in 3 emotionally coloured moments, else 'none'.",
+    },
+}
+
+
+def vfx_amount_profile(amount):
+    return VFX_AMOUNT_PROFILES.get(str(amount or "low").strip().lower(),
+                                   VFX_AMOUNT_PROFILES["low"])
+
+
 def _candidate_times(cuts, phrases, duration, min_gap=1.8, cap=18):
     """Punchy moments worth directing: each visual cut + each phrase start. DENSE - the reference
     style wants an effect every few seconds, so we check many moments and let the AI pick."""
@@ -112,12 +142,13 @@ def _phrase_at(phrases, t):
 
 
 def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, status_cb=None,
-                    emotions=None):
+                    emotions=None, vfx_amount="low"):
     """One frame per candidate moment -> contact sheet -> the vision agent DIRECTS the edit.
     Returns (effect_events, char_events):
       effects  = {time, type: arrow, cx, cy, from, target, confidence}
       characters = {time, emotion, cx, cy}."""
     emotions = list(emotions or [])
+    profile = vfx_amount_profile(vfx_amount)
     if not os.environ.get("WAVESPEED_API_KEY") or not times:
         return ([], [])
     work = Path(video_path).parent / "_visual_frames"
@@ -138,9 +169,8 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             "ONE kawaii pixel cat reaction ('emotion'): pick from EXACTLY this list: "
             f"{', '.join(emotions)}. Match the feeling of the line (shocking->shocked, funny->laughing, "
             "sad->sad/crying, love/romance->love, confident->cool, creepy->scared, confusing->confused, "
-            "opinionated->angry, curious->thinking). Use it on the strongest ~1 in 3 moments, else "
-            "'none'. Give char_cx, char_cy (0-1) in an EMPTY corner away from the subject and the "
-            "caption band.\n")
+            "opinionated->angry, curious->thinking). " + profile["neko"] + " Give char_cx, char_cy "
+            "(0-1) in an EMPTY corner away from the subject and the caption band.\n")
     BATCH = 12
     for b0 in range(0, len(frames), BATCH):
         sub_f = frames[b0:b0 + BATCH]
@@ -156,8 +186,7 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
         prompt = (
             "You are the motion-graphics DIRECTOR for a loud, viral 'dark facts' documentary Short. Each "
             "tile is one frame at a punchy moment, with the words spoken then. This editing style is DENSE "
-            "and energetic: give MOST moments (roughly 2 out of 3) a red arrow when a concrete target "
-            "exists, and only skip a moment when there is genuinely nothing concrete on screen.\n"
+            f"and energetic ({str(vfx_amount).upper()} density): {profile['direct']}\n"
             "'effect' = 'arrow': a thick red arrow flies in and POINTS at the concrete subject that proves "
             "the line (face, person, object, sign, money, food, vehicle, crowd, shelf, screen, uniform, odd "
             "detail). Give the target centre cx, cy (0-1 within the tile) and 'from' = the side with empty "
@@ -438,7 +467,7 @@ def _overlay_sfx_segments(events, ffprobe, status_cb=None):
 
 
 def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, out_dir=None,
-                              add_characters=True):
+                              add_characters=True, vfx_amount="low"):
     video_path = Path(video_path)
     if not video_path.exists():
         raise RuntimeError("Uploaded video not found.")
@@ -462,12 +491,15 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     log(status_cb, "Detecting scene changes...")
     cuts = sfx_agent.detect_scene_cuts(video_path, ffmpeg)
     phrases = sfx_agent.transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
-    times = _candidate_times(cuts, phrases, duration)
-    log(status_cb, f"Directing {len(times)} punchy moment(s)...")
+    _prof = vfx_amount_profile(vfx_amount)
+    times = _candidate_times(cuts, phrases, duration,
+                             min_gap=_prof["min_gap"], cap=_prof["cap"])
+    log(status_cb, f"Directing {len(times)} punchy moment(s) (amount: {str(vfx_amount)})...")
 
     emotions = available_emotions() if add_characters else []
     effects, char_events = analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model,
-                                           status_cb=status_cb, emotions=emotions)
+                                           status_cb=status_cb, emotions=emotions,
+                                           vfx_amount=vfx_amount)
     n_arrow = len(effects)
     log(status_cb, f"Direction: {n_arrow} arrow(s)"
                    + (f", {len(char_events)} neko(s)." if emotions else "."))

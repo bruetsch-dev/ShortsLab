@@ -4940,8 +4940,15 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         return 0
     duration = max(float(config.get("duration", 0) or 0),
                    max((float(s.get("end", 0) or 0) for s in scenes), default=0.0)) or 1.0
-    mpm = max(8, int(config.get("editor_sfx_max_per_minute", 42) or 42))
-    budget = max(12, min(52, int(round(duration / 60.0 * mpm))))
+    # User-selectable SFX amount: low = the historical sparse feel, medium/high raise both the
+    # per-minute rate and the absolute cap. Explicit editor_sfx_max_per_minute still wins.
+    _amount = str(config.get("sfx_amount", "") or "").strip().lower()
+    _amount_mpm = {"low": 42, "medium": 65, "high": 95}.get(_amount)
+    _amount_cap = {"low": 52, "medium": 80, "high": 110}.get(_amount, 52)
+    _default_mpm = _amount_mpm if _amount_mpm is not None else 42
+    mpm = max(8, int(config.get("editor_sfx_max_per_minute", _default_mpm) or _default_mpm))
+    cap = max(12, int(config.get("editor_sfx_budget_cap", _amount_cap) or _amount_cap))
+    budget = max(12, min(cap, int(round(duration / 60.0 * mpm))))
 
     def prio(i, sc):
         if i == 0:
@@ -8603,13 +8610,25 @@ def run_project(form, status_cb=None):
                         or str(form.get("scrape_cookies", "") or "").strip())
             already = existing_seedance_clips(project_dir)
 
+            # Scraping engine selection (default V2). V1 = legacy bucket scrape; V2 = relevance-first,
+            # segment-based (scrape_v2.py). `config` does not exist yet here (built later), so read the
+            # engine from the run form only, safe-default to v2.
+            _scrape_engine = str((form.get("scraping_engine") if isinstance(form, dict) else None)
+                                 or "v2").strip().lower()
+            if _scrape_engine not in ("v1", "v2"):
+                _scrape_engine = "v2"
+            _v2 = (_scrape_engine == "v2")
+            if _v2:
+                import scrape_v2
+
             # Build a structured SOCIAL SEARCH PLAN: reusable visual buckets + a dedicated hook
             # influencer bucket, each with TikTok-native tiered queries (exact->semantic->broad->
             # hashtag). Scrape tier by tier, widening only when a bucket finds too few clips.
             log(status_cb, "Building social search buckets from script...")
-            social_plan = build_social_search_plan(
+            # V2 has its own visual-intent planner; skip the V1 bucket-plan LLM call for V2.
+            social_plan = ({} if _v2 else build_social_search_plan(
                 title, script, scenes_override, understanding=script_understanding,
-                reasoning_model=reasoning_model, collaborate=collaborate_reasoning, status_cb=status_cb)
+                reasoning_model=reasoning_model, collaborate=collaborate_reasoning, status_cb=status_cb))
             custom_queries = [q.strip() for q in re.split(r"[,\n]", scrape_terms or "") if q.strip()]
             if social_plan.get("buckets") and custom_queries:
                 social_plan["buckets"].insert(0, {
@@ -8651,7 +8670,35 @@ def run_project(form, status_cb=None):
             # longer than 45 minutes; user cancellation and provider-level deadlines still work,
             # but the app must never discard a healthy scrape merely because elapsed time passed.
             with step_watchdog(form, "Clip scrape", limit_s=0, status_cb=status_cb):
-                if social_plan.get("buckets"):
+                if _v2:
+                    # SCRAPE V2: relevance-first, segment-based engine. It plans concrete visual
+                    # intents, discovers usable SEGMENTS across whole videos, two-stage vision-matches
+                    # them and assigns globally - then exposes scene_clips/decisions so the SAME V1
+                    # finalize machinery below writes the scenes (scraped_NN copy + enforcement report).
+                    log(status_cb, "Scrape V2 (relevance-first, segment-based) engine selected.")
+                    # `config` is not built yet here; give V2 a minimal config to read the title from
+                    # and stash its result on. The scene fields it writes go onto scenes_override
+                    # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
+                    _v2cfg = {"title": title, "voice_speed": 1.20}
+                    (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
+                     filter_summary) = scrape_v2.scrape_social_plan_v2(
+                        _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
+                        script_relevancy, _cookies, _cancel, understanding=script_understanding,
+                        reasoning_model=reasoning_model, status_cb=status_cb, script_text=script)
+                    if isinstance(form, dict):
+                        form["_scrape_v2_used"] = True
+                    _v2res = _v2cfg.get("_scrape_v2") or {}
+                    scene_clips = list(_v2res.get("scene_clips") or [None] * scene_total)
+                    while len(scene_clips) < scene_total:
+                        scene_clips.append(None)
+                    clip_decision_log = list(_v2res.get("clip_decision_log") or [None] * scene_total)
+                    while len(clip_decision_log) < scene_total:
+                        clip_decision_log.append(None)
+                    best_hook = _v2res.get("best_hook")
+                    hook_results = ([{"clip": best_hook, "passed": True, "vision_passed": True,
+                                      "hook_presenter_score": 8.0, "scores": {}, "likes": 0}]
+                                    if best_hook else [])
+                elif social_plan.get("buckets"):
                     existing_body, existing_hooks, existing_meta = [], [], {}
                     project_reuse_report = {"searched_projects": 0, "selected_projects": []}
                     # HARD RULE: previously-scraped clips are reused ONLY when this is the SAME script
@@ -8779,7 +8826,7 @@ def run_project(form, status_cb=None):
                 # ---- Dedicated HOOK finder: score 20K+ cute/dance creator clips, reserve scene 0 ----
                 # Hook-bucket clips are kept out of the body pool because their job is scroll-stop
                 # energy, not literal narration coverage.
-                if hook_pool:
+                if hook_pool and not _v2:
                     hook_results = score_hook_candidates(
                         hook_pool, project_dir, reasoning_model=reasoning_model,
                         status_cb=status_cb, collaborate=collaborate_reasoning)
@@ -8875,10 +8922,11 @@ def run_project(form, status_cb=None):
                         shifted.append(None)
                     return ([None] + list(clips or []), shifted)
 
-                if body_pool:
+                if body_pool and not _v2:
                     scene_clips, clip_decision_log = _match_body_candidates(
                         body_pool, current_match_threshold)
-                _apply_hook(scene_clips)
+                if not _v2:
+                    _apply_hook(scene_clips)
 
                 # Keep searching TikTok for any BODY scene still unmatched (targeted retry rounds).
                 # Scene 0 is the hook and is never re-searched here.
@@ -9003,7 +9051,7 @@ def run_project(form, status_cb=None):
                 # Preserve the hard 20K-like gate even if vision scoring is unavailable/overly
                 # strict. Hook queries themselves target cute/dance creators, so choose the most-
                 # liked metadata-qualified hook rather than aborting the entire project.
-                if best_hook is None and hook_pool:
+                if best_hook is None and hook_pool and not _v2:
                     best_hook = max(
                         hook_pool,
                         key=lambda p: int((clip_meta.get(str(p)) or {}).get("likes") or 0))
@@ -9498,6 +9546,10 @@ def run_project(form, status_cb=None):
     config["sfx_enabled"] = bool(out_sfx or out_tr_sfx)
     config["sfx_content_enabled"] = bool(out_sfx)
     config["transition_sfx_enabled"] = bool(out_tr_sfx)
+    # user-selected SFX density (low/medium/high) -> place_editor_sfx budget + AI instructions
+    _sfx_amount = str(form.get("sfx_amount", "") or "").strip().lower()
+    if _sfx_amount in ("low", "medium", "high"):
+        config["sfx_amount"] = _sfx_amount
     # Real video footage (scraped clips) is cut hard — a whoosh on every boundary looks
     # cheap on found-footage. Force transition SFX off for video; keep content/ambient SFX.
     # Also never use the TikTok clips' own audio (only narration + ambient SFX + music).
@@ -9827,7 +9879,11 @@ def run_project(form, status_cb=None):
     # HARD pre-render gate for scrape mode: refuse to render a broken timeline (no hook, junk
     # clips, fake-vertical, D_REJECTED, wrong speech speed, emphasis on, semantic matching skipped).
     if clip_source == "scrape":
-        validate_scrape_render(config, status_cb=status_cb)
+        if isinstance(form, dict) and form.get("_scrape_v2_used"):
+            import scrape_v2
+            scrape_v2.validate_scrape_render_v2(config, status_cb=status_cb)
+        else:
+            validate_scrape_render(config, status_cb=status_cb)
 
     check_cancel(form)
     log(status_cb, "Rendering final 9:16 MP4...")

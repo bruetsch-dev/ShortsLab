@@ -191,22 +191,60 @@ def library_catalog(config):
     return catalog
 
 
-def plan_sfx_with_llm(duration, cuts, phrases, catalog, reasoning_model=None, status_cb=None):
+# User-selectable SFX density. "low" matches the app's historical behaviour; medium/high raise the
+# per-minute budget AND tell the reasoning model to place more, denser effects.
+SFX_AMOUNT_PROFILES = {
+    "low": {
+        "max_per_minute": 42, "budget_cap": 52,
+        "plan": "Keep it sparse and intentional: roughly 1 effect every 2-4 seconds, "
+                "never stack two within 0.4s. When unsure, leave the moment silent.",
+        "review": "Be strict: when a pick does not clearly fit the moment, DROP it - "
+                  "silence beats a wrong sound.",
+    },
+    "medium": {
+        "max_per_minute": 65, "budget_cap": 80,
+        "plan": "Aim for a lively, professionally edited feel: roughly 1 effect every 1.5-2.5 "
+                "seconds. Cover EVERY real scene change and every emphasised word/number/reveal; "
+                "never stack two within 0.3s.",
+        "review": "Balance quality and coverage: replace a wrong pick with a better file instead "
+                  "of dropping it; only drop when nothing in the library fits.",
+    },
+    "high": {
+        "max_per_minute": 95, "budget_cap": 110,
+        "plan": "Make it a DENSE hyper-edited TikTok mix: roughly 1 effect every 0.8-1.5 seconds. "
+                "Every cut gets a transition sound, every emphasised word/number/name gets a hit, "
+                "add risers into payoffs and foley wherever an on-screen action supports it; "
+                "never stack two within 0.25s.",
+        "review": "Preserve density: NEVER drop an event just because it feels busy - replace a "
+                  "wrong file with a better-fitting one. Only drop if the sound would actively "
+                  "clash with speech.",
+    },
+}
+
+
+def sfx_amount_profile(amount):
+    return SFX_AMOUNT_PROFILES.get(str(amount or "medium").strip().lower(),
+                                   SFX_AMOUNT_PROFILES["medium"])
+
+
+def plan_sfx_with_llm(duration, cuts, phrases, catalog, reasoning_model=None, status_cb=None,
+                      sfx_amount="medium"):
     if not os.environ.get("WAVESPEED_API_KEY") or not catalog:
         return None
+    profile = sfx_amount_profile(sfx_amount)
     category_lines = "\n".join(f"- {name}: {meta['desc']}" for name, meta in catalog.items())
     prompt = (
         "You are a meticulous sound designer for short vertical videos.\n"
         "You are given a finished video's duration, its hard visual cut timestamps, and the timed "
-        "speech transcript. Place tasteful sound effects that make the video feel professionally "
-        "edited WITHOUT being cheesy or constant.\n\n"
+        "speech transcript. Place sound effects that make the video feel professionally "
+        "edited WITHOUT being cheesy.\n\n"
         "Use ONLY these categories:\n" + category_lines + "\n\n"
         "Guidelines:\n"
         "- Put a 'transition' or 'whoosh' on most real image/scene changes (use the cut timestamps).\n"
         "- Use 'impact', 'boom', or 'stinger' to emphasise a specific powerful word, number, reveal, "
         "or punchline - align the time to when that word is spoken in the transcript.\n"
-        "- Use 'riser' sparingly before a big payoff; 'foley' only when it matches an on-screen action.\n"
-        "- Keep it sparse and intentional: roughly 1 effect every 2-4 seconds, never stack two within 0.4s.\n"
+        "- Use 'riser' before a big payoff; 'foley' only when it matches an on-screen action.\n"
+        f"- DENSITY ({str(sfx_amount).upper()}): {profile['plan']}\n"
         "- intensity is one of: subtle, medium, strong. Most should be subtle/medium.\n"
         "- time is in seconds (float), must be within the video duration.\n\n"
         "Return STRICT JSON only: {\"events\":[{\"time\":number,\"category\":string,"
@@ -363,7 +401,8 @@ def mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, st
     return out_path
 
 
-def refine_segments_with_llm(segments, phrases, reasoning_model=None, status_cb=None):
+def refine_segments_with_llm(segments, phrases, reasoning_model=None, status_cb=None,
+                             sfx_amount="medium"):
     """FILE-LEVEL intelligence pass: show the reasoning model每 placed event (time, current
     file, why) plus the actual library files (name + seconds + category) and let it veto or
     swap picks that do not FIT - e.g. a church bell as a transition or a melodic hit on a
@@ -395,7 +434,7 @@ def refine_segments_with_llm(segments, phrases, reasoning_model=None, status_cb=
         "NEVER bells, gongs, church/choir, musical jingles or melodic hits on a plain cut.\n"
         "- Dramatic hits only where the transcript actually has a reveal/shock/punchline.\n"
         "- Never use scary/horror/scream files. Prefer variety over repeating one file.\n"
-        "- When nothing in the library fits an event, drop it (silence beats a wrong sound).\n\n"
+        f"- AMOUNT POLICY ({str(sfx_amount).upper()}): {sfx_amount_profile(sfx_amount)['review']}\n\n"
         "Return STRICT JSON only: {\"events\":[{\"i\":number,\"action\":\"keep|drop|replace\","
         "\"file\":\"name-when-replacing\"}]}\n\n"
         f"Planned events: {json.dumps(events, ensure_ascii=False)}\n"
@@ -527,7 +566,7 @@ def _scenes_from_cuts_and_phrases(cuts, phrases, duration):
 
 
 def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out_dir=None,
-                           generate_missing=True):
+                           generate_missing=True, sfx_amount="medium"):
     video_path = Path(video_path)
     if not video_path.exists():
         raise RuntimeError("Uploaded video not found.")
@@ -570,15 +609,18 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     # volumes/CAT_DB, short-punchy duration caps, density/spacing gates, big-moment impacts + topic
     # accents). We synthesize the `scenes` it needs from this uploaded video's cuts + transcript.
     plan_source = "editor_pack"
+    profile = sfx_amount_profile(sfx_amount)
     scenes = _scenes_from_cuts_and_phrases(cuts, phrases, duration)
     sfx_config = {
         "sfx_enabled": True,
         "scenes": scenes,
         "duration": duration,
-        "editor_sfx_max_per_minute": int(config.get("editor_sfx_max_per_minute", 42)),
+        "sfx_amount": str(sfx_amount or "medium"),
+        "editor_sfx_max_per_minute": int(profile["max_per_minute"]),
+        "editor_sfx_budget_cap": int(profile["budget_cap"]),
     }
     log(status_cb, f"Placing editor SFX over {len(scenes)} cut point(s) with the local SFX library "
-                   "(same engine as a normal run)...")
+                   f"(amount: {str(sfx_amount)}, same engine as a normal run)...")
     agent_core.place_editor_sfx(sfx_config, reasoning_model=reasoning_model, status_cb=status_cb)
     events = sfx_config.get("ai_content_sfx") or []
     sfx_report = sfx_config.get("sfx_report") or {}
@@ -596,7 +638,7 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     # FILE-LEVEL review: the reasoning model vetoes/swaps picks that don't fit the moment
     # (no bells/melodic hits on plain cuts, no repeats, drop instead of wrong sound).
     segments = refine_segments_with_llm(segments, phrases, reasoning_model=reasoning_model,
-                                        status_cb=status_cb)
+                                        status_cb=status_cb, sfx_amount=sfx_amount)
 
     mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
     log(status_cb, "SFX enhancement complete.")
