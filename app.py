@@ -1380,12 +1380,32 @@ def app_style():
       #job-root[data-minimal="1"] .tl-render-center { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 8px; }
       .tl-render-progress { width: min(640px, 92%); text-align: center; }
       .tl-render-title { font-family: var(--display); font-size: clamp(15px, 2.6vw, 24px); color: var(--ink); margin-bottom: 20px; }
-      .tl-render-bar { position: relative; height: 16px; border: 2px solid var(--ink); border-radius: 999px; overflow: hidden; background: var(--bg-input); box-shadow: var(--sh-1); }
-      .tl-render-bar span { position: absolute; top: 0; bottom: 0; width: 38%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); animation: tlrenderbar 1.15s cubic-bezier(.5,.05,.5,.95) infinite; }
+      .tl-render-title .tl-render-pct { color: var(--accent); font-family: var(--mono); font-variant-numeric: tabular-nums; margin-left: 8px; }
+      .tl-render-bar { position: relative; height: 16px; border-radius: 999px; overflow: hidden; background: var(--bg-input); box-shadow: var(--sh-1); }
+      /* DETERMINATE: the fill width = the real render %, animated smoothly, with a moving
+         stripe sheen + a soft leading glow (the "effects"). */
+      .tl-render-bar.det span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px;
+        background:
+          repeating-linear-gradient(115deg, rgba(255,255,255,.22) 0 12px, rgba(255,255,255,0) 12px 26px),
+          linear-gradient(90deg, var(--accent), var(--accent-2));
+        background-size: 44px 100%, 100% 100%;
+        box-shadow: 0 0 14px 1px color-mix(in srgb, var(--accent) 60%, transparent);
+        transition: width .5s cubic-bezier(.3,.7,.4,1);
+        animation: tlbarstripes 1s linear infinite; }
+      .tl-render-bar.det::after { content: ""; position: absolute; top: 0; bottom: 0; width: 40%;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,.28), transparent);
+        animation: tlbarsheen 1.7s ease-in-out infinite; pointer-events: none; }
+      @keyframes tlbarstripes { to { background-position: 44px 0, 0 0; } }
+      @keyframes tlbarsheen { 0% { left: -40%; } 100% { left: 100%; } }
+      /* INDETERMINATE (before any % is known): the old sliding block */
+      .tl-render-bar.indet span { position: absolute; top: 0; bottom: 0; width: 38%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); animation: tlrenderbar 1.15s cubic-bezier(.5,.05,.5,.95) infinite; }
       @keyframes tlrenderbar { 0% { left: -40%; } 100% { left: 102%; } }
       .tl-render-sub { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-top: 12px; color: var(--muted); font-size: 13px; }
       .tl-render-sub strong { color: var(--ink); font-family: var(--mono); }
-      @media (prefers-reduced-motion: reduce) { .tl-render-bar span { animation-duration: 2.4s; } }
+      @media (prefers-reduced-motion: reduce) {
+        .tl-render-bar.indet span { animation-duration: 2.4s; }
+        .tl-render-bar.det span { animation: none; } .tl-render-bar.det::after { animation: none; display: none; }
+      }
       .preview-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
       .preview img { display: block; width: 100%; max-height: 420px; object-fit: contain; background: var(--bg-base); border: 1px solid var(--line); border-radius: var(--r-md); transition: transform .18s ease, filter .18s ease; }
       .preview:hover img { transform: scale(1.012); filter: contrast(1.04) saturate(1.02); }
@@ -4513,6 +4533,20 @@ def compute_step_view(status, logs, log_times=None, job_kind=None):
     return view
 
 
+def _render_bar_percent(logs):
+    """Real progress % for a render/longform bar, or None if not started yet.
+    Uses the latest 'Rendering frames: N%' (ffmpeg), or 'image K/N' for longform."""
+    for line in reversed(logs or []):
+        m = re.search(r"Rendering frames:\s*(\d+)\s*%", str(line))
+        if m:
+            return max(0, min(99, int(m.group(1))))
+    for line in reversed(logs or []):
+        m = re.search(r"(?:image|clip|scene)\s+(\d+)\s*/\s*(\d+)", str(line), re.I)
+        if m and int(m.group(2)) > 0:
+            return max(0, min(99, round(int(m.group(1)) / int(m.group(2)) * 100)))
+    return None
+
+
 def render_progress(status, logs, created_at=None, log_times=None, job_kind=None):
     _percent, activity = progress_state(status, logs)
     elapsed = format_duration(time.time() - float(created_at or time.time()))
@@ -4523,10 +4557,18 @@ def render_progress(status, logs, created_at=None, log_times=None, job_kind=None
             label = "Cancelling&hellip;" if status == "cancelling" else "Generating images&hellip;"
         else:
             label = "Cancelling render&hellip;" if status == "cancelling" else "Rendering your Short&hellip;"
+        # DETERMINATE bar driven by the real render percentage (ffmpeg frame % for a render,
+        # "image K/N" for longform). Before any percentage is known it stays indeterminate.
+        pct = _render_bar_percent(logs)
+        determinate = pct is not None
+        fill = pct if determinate else 42
+        pct_html = f'<strong class="tl-render-pct">{pct}%</strong>' if determinate else ""
+        bar_cls = "det" if determinate else "indet"
         return f"""
     <div id="job-progress-wrap" class="progress-wrap tl-render-progress">
-      <div class="tl-render-title">{label}</div>
-      <div class="tl-render-bar"><span></span></div>
+      <div class="tl-render-title">{label} {pct_html}</div>
+      <div class="tl-render-bar {bar_cls}" role="progressbar" aria-valuenow="{fill}" aria-valuemin="0" aria-valuemax="100">
+        <span style="width:{fill}%"></span></div>
       <div class="tl-render-sub"><span>{esc(activity)}</span><strong>{esc(elapsed)}</strong></div>
     </div>
     """

@@ -352,11 +352,36 @@ h1,h2,h3 { letter-spacing: -0.02em; margin: 0; }
 .prog-embed .step-name { position: relative; }
 .prog-embed .step-elapsed { position: relative; margin-left: 6px; font-family: var(--mono); font-size: 10px; color: var(--text-muted); }
 .prog-embed .progress-current { font-size: 13px; color: var(--text-secondary); }
-.prog-embed .tl-render-title { font-weight: 650; margin-bottom: 8px; }
-.prog-embed .tl-render-bar { height: 8px; border-radius: 99px; background: var(--surface-raised); overflow: hidden; border: 1px solid var(--border); }
-.prog-embed .tl-render-bar span { display: block; height: 100%; width: 40%; background: var(--accent); animation: bar-slide 1.6s ease-in-out infinite; }
-@keyframes bar-slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
-.prog-embed .tl-render-sub { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.prog-embed .tl-render-title { font-weight: 650; margin-bottom: 9px; font-size: 15px; }
+.prog-embed .tl-render-title .tl-render-pct { color: var(--accent); font-family: var(--mono); font-variant-numeric: tabular-nums; margin-left: 6px; font-size: 16px; }
+.prog-embed .tl-render-bar { position: relative; height: 12px; border-radius: 99px; background: var(--surface-raised); overflow: hidden; border: 1px solid var(--border); }
+/* determinate: fill = real render %, with moving stripes + leading glow + a sheen sweep */
+.prog-embed .tl-render-bar.det span {
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 99px;
+  background:
+    repeating-linear-gradient(115deg, rgba(255,255,255,.20) 0 12px, rgba(255,255,255,0) 12px 26px),
+    linear-gradient(90deg, var(--accent), #7dff5a);
+  background-size: 44px 100%, 100% 100%;
+  box-shadow: 0 0 16px 1px var(--accent-medium);
+  transition: width .5s cubic-bezier(.3,.7,.4,1);
+  animation: bar-stripes 1s linear infinite;
+}
+.prog-embed .tl-render-bar.det::after {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 42%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.30), transparent);
+  animation: bar-sheen 1.7s ease-in-out infinite; pointer-events: none;
+}
+@keyframes bar-stripes { to { background-position: 44px 0, 0 0; } }
+@keyframes bar-sheen { 0% { left: -42%; } 100% { left: 100%; } }
+/* indeterminate: before any % is known */
+.prog-embed .tl-render-bar.indet span { position: absolute; top: 0; bottom: 0; width: 40%; background: var(--accent); border-radius: 99px; animation: bar-slide 1.6s ease-in-out infinite; }
+@keyframes bar-slide { 0% { left: -40%; } 100% { left: 100%; } }
+.prog-embed .tl-render-sub { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-top: 7px; }
+@media (prefers-reduced-motion: reduce) {
+  .prog-embed .tl-render-bar.det span { animation: none; }
+  .prog-embed .tl-render-bar.det::after { display: none; }
+  .prog-embed .tl-render-bar.indet span { animation-duration: 3s; }
+}
 
 /* typing indicator caret on assistant bubbles */
 .bubble .typing::after, .bubble.typing::after {
