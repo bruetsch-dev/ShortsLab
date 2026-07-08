@@ -4445,6 +4445,18 @@ CAPTION_STEPS = [
 ]
 
 
+# When the run scrapes real TikTok/X footage there is no web-image search, no AI image
+# generation and no post-render review pass, so those step chips just sit dead. Drop them.
+SCRAPE_RUN_STEPS = [s for s in RUN_STEPS if s[0] not in ("Web search", "Images", "Review")]
+_SCRAPE_LOG_MARKERS = ("scrape v2", "scrape v1", "social search", "searching tiktok",
+                       "tiktok search", "building social search", "relevance-first")
+
+
+def _is_scrape_run(logs):
+    blob = " ".join(str(x) for x in (logs or [])[:120]).lower()
+    return any(m in blob for m in _SCRAPE_LOG_MARKERS)
+
+
 def _match_step_index(text, steps):
     for index, (_name, markers) in enumerate(steps):
         if any(marker in text for marker in markers):
@@ -4459,7 +4471,8 @@ def compute_step_view(status, logs, log_times=None, job_kind=None):
     real per-step duration (from log timestamps) for started steps.
     """
     steps = (SFX_STEPS if job_kind == "sfx"
-             else CAPTION_STEPS if job_kind == "caption" else RUN_STEPS)
+             else CAPTION_STEPS if job_kind == "caption"
+             else SCRAPE_RUN_STEPS if _is_scrape_run(logs) else RUN_STEPS)
     log_times = log_times or []
     start_times = [None] * len(steps)
     active = -1
