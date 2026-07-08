@@ -2809,7 +2809,17 @@ def app_script():
           function ensureIO() {
             if (io || !("IntersectionObserver" in window)) return io;
             io = new IntersectionObserver(function (entries) {
-              entries.forEach(function (en) { en.isIntersecting ? load(en.target) : unload(en.target); });
+              entries.forEach(function (en) {
+                if (en.isIntersecting) {
+                  load(en.target);
+                  // Timeline library thumbnails are small + few: once loaded, KEEP them (stop
+                  // observing) so scrolling the library never blanks a tile. Larger run-page
+                  // media grids still unload off-screen to cap live decoders.
+                  if (en.target.closest(".tl-library")) { try { io.unobserve(en.target); } catch (e) {} }
+                } else if (!en.target.closest(".tl-library")) {
+                  unload(en.target);
+                }
+              });
             }, { root: null, rootMargin: "800px 0px", threshold: 0.01 });
             return io;
           }
@@ -7090,6 +7100,38 @@ TIMELINE_ASSETS = """
     font-size:10px; border-width:1px; flex:0 0 auto;
   }
   .tl-lib-sound .tl-lib-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+
+  /* ============ ONE-WINDOW LAYOUT: no page scroll; library beside the player ============ */
+  body:has(#timeline-root) main { height:100vh; max-height:100vh; overflow:hidden;
+    display:flex; flex-direction:column; padding-top:8px; }
+  /* back arrow floats onto the toolbar row (top-left) to save vertical space */
+  body.page-timeline .top { position:absolute; top:12px; left:14px; z-index:40; margin:0; padding:0; }
+  #timeline-root {
+    flex:1 1 auto; min-height:0; display:grid; gap:12px; align-content:stretch;
+    grid-template-columns: minmax(340px, 1.5fr) minmax(230px, 300px);
+    grid-template-rows: auto minmax(0, 1fr) minmax(140px, 1.15fr);
+    grid-template-areas: "toolbar toolbar" "stagearea library" "tracks tracks";
+  }
+  #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding-left:54px; }
+  #timeline-root .tl-grid.tl-top { grid-area:stagearea; margin:0; min-height:0;
+    grid-template-columns: minmax(220px,1fr) minmax(200px,1fr); align-content:start; }
+  #timeline-root .tl-library { grid-area:library; margin:0; min-height:0;
+    display:flex; flex-direction:column; }
+  #timeline-root .tl-library .tl-lib-body { flex:1 1 auto; min-height:0; overflow-y:auto; }
+  #timeline-root .tl-stage { grid-area:tracks; margin:0; min-height:0; overflow:auto; }
+  /* scale the preview player down so the timeline gets room */
+  body.page-timeline .tl-stage-view { height:clamp(200px, 26vh, 300px); }
+  body.page-timeline .tl-player h2, body.page-timeline .tl-inspector h2,
+  body.page-timeline .tl-library h2 { font-size:13px; margin-bottom:8px; }
+  #timeline-root .tl-inspector { max-height:100%; overflow-y:auto; }
+  /* change-script modal: centered fixed overlay (was opening at a weird offset) */
+  body.page-timeline .tl-script-overlay:not([hidden]) { position:fixed; inset:0; z-index:950;
+    display:flex; align-items:center; justify-content:center; }
+  @media (max-width: 1000px) {
+    #timeline-root { grid-template-columns:1fr; grid-template-rows:auto auto auto minmax(160px,1fr);
+      grid-template-areas:"toolbar" "stagearea" "library" "tracks"; }
+    body:has(#timeline-root) main { height:auto; max-height:none; overflow:visible; }
+  }
 </style>
 <script>
 (function(){
