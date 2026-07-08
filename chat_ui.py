@@ -28,6 +28,17 @@ CHAT_STATE_PATH = ROOT / "chat_session.json"
 CHAT_UI_VERSION = "chat-1.0"
 
 
+def _asset_ver():
+    """mtime-based cache-buster so a rebuilt chat-shell.css/js is never served stale from the
+    WebView2 cache (the symptom was a working new JS with the OLD CSS -> broken layouts)."""
+    try:
+        css = (ROOT / "static" / "chat-shell.css").stat().st_mtime
+        js = (ROOT / "static" / "chat-shell.js").stat().st_mtime
+        return str(int(max(css, js)))
+    except Exception:
+        return str(int(time.time()))
+
+
 # ------------------------------------------------------------------ English string layer
 
 UI_STRINGS = {
@@ -462,7 +473,7 @@ def chat_shell_page(initial=None):
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="icon" href="/static/app_icon.png" type="image/png">
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="stylesheet" href="/static/chat-shell.css">
+<link rel="stylesheet" href="/static/chat-shell.css?v={_asset_ver()}">
 </head>
 <body>
 <div id="app" class="app">
@@ -514,7 +525,7 @@ def chat_shell_page(initial=None):
   </main>
 </div>
 <script id="chat-boot" type="application/json">{boot_json}</script>
-<script src="/static/chat-shell.js"></script>
+<script src="/static/chat-shell.js?v={_asset_ver()}"></script>
 </body>
 </html>"""
     return html.encode("utf-8")

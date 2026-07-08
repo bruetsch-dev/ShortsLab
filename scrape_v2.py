@@ -1569,21 +1569,40 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     assignments = assign_segments_globally_v2(body_intents, scene_candidates, cfg, status_cb=status_cb)
 
     used_seg_ids = {a.segment_id for a in assignments.values() if a.segment_id}
-    spare = sorted([s for s in all_segments if s.segment_id not in used_seg_ids],
-                   key=lambda s: s.quality_score, reverse=True)
+    # For filling unmatched scenes, rank spares by RELEVANCE to THIS scene, not by raw quality:
+    # a topically-closest Japanese clip beats a shiny but off-topic filler. Relevance is computed
+    # per-intent below; keep a quality-sorted copy only as the final tiebreaker source.
+    spare = [s for s in all_segments if s.segment_id not in used_seg_ids]
+
+    def _spare_relevance(seg, intent):
+        # best available signal that this specific segment relates to this specific scene
+        base = max(getattr(seg, "semantic_score", 0.0), getattr(seg, "metadata_relevance", 0.0))
+        vd = getattr(seg, "visual_description", None) or {}
+        want = " ".join([intent.subject or "", intent.action or "", intent.location or "",
+                         intent.jp_subject or "", intent.jp_action or "", intent.jp_location or ""])
+        have = " ".join([str(vd.get("subjects") or ""), str(vd.get("action") or ""),
+                         str(vd.get("location") or ""), str(seg.query or "")])
+        wt, ht = _tokens(want), _tokens(have)
+        overlap = (len(wt & ht) / float(len(wt))) * 10.0 if wt else 0.0
+        return base * 0.6 + overlap * 0.4
+
     for it in body_intents:
         a = assignments.get(it.scene_id)
         if a and a.segment_id:
             continue
         chosen = None
         atype, flevel = "context_fallback", 4
-        for s in spare:
+        # rank the remaining pool by relevance to THIS scene
+        ranked_spare = sorted(spare, key=lambda s: _spare_relevance(s, it), reverse=True)
+        for s in ranked_spare:
             rel = max(s.semantic_score, s.metadata_relevance)
             if rel >= CONTEXT_FALLBACK_MIN_RELEVANCE and s.quality_score >= CONTEXT_FALLBACK_MIN_QUALITY:
                 chosen = s
                 break
-        if chosen is None and spare:
-            chosen = spare[0]
+        if chosen is None and ranked_spare:
+            # last resort: the MOST RELEVANT remaining clip for this scene (never the shiniest
+            # random one). Still marked emergency_fallback so the report/validator can flag it.
+            chosen = ranked_spare[0]
             atype, flevel = "emergency_fallback", 5
         if chosen is not None:
             spare.remove(chosen)

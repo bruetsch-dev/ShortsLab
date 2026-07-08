@@ -79,11 +79,12 @@ def test_ranking_relevance_over_likes():
         query=q.query, query_tier="exact_action")
     ranked = v.rank_metadata_candidates_v2([irrelevant_high_likes, relevant_low_likes], q)
     check("relevant 500-like beats irrelevant 500k-like", ranked and ranked[0].source_id == "A")
+    # V2 now gates on RELEVANCE, not likes: every tier's like floor is 0 (a like-gate skewed
+    # results toward big Western viral clips even for Japanese queries).
     check("exact_action tier keeps 0-like clips (no like floor)",
           v._dynamic_like_floor_v2("exact_action", "tiktok") == 0)
-    check("broad tier has a like floor", v._dynamic_like_floor_v2("broad_context", "tiktok") > 0)
-    check("X like floor is quartered",
-          v._dynamic_like_floor_v2("creator_style", "twitter") == v.LIKE_FLOORS_V2["creator_style"] // 4)
+    check("no tier has a like floor anymore",
+          all(v._dynamic_like_floor_v2(t, "tiktok") == 0 for t in v.LIKE_FLOORS_V2))
 
 
 # ---- segment discovery windows --------------------------------------------

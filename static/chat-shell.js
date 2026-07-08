@@ -1052,8 +1052,10 @@ function renderAssignedMedia(items) {
     if (it.type === "video") {
       const v = el("video"); v.muted = true; v.preload = "none"; v.setAttribute("playsinline", "");
       v.dataset.src = it.url;
+      // show a real first frame once loaded (not a black box)
+      v.addEventListener("loadeddata", () => { try { if (v.currentTime < 0.03) v.currentTime = 0.08; } catch (e) {} }, { once: true });
       t.appendChild(v);
-      t.addEventListener("mouseenter", () => { if (!v.src) v.src = v.dataset.src; v.play().catch(() => {}); });
+      t.addEventListener("mouseenter", () => { if (!v.src) { v.preload = "auto"; v.src = v.dataset.src; } v.play().catch(() => {}); });
       t.addEventListener("mouseleave", () => { try { v.pause(); } catch (e) {} });
     } else {
       const im = el("img"); im.loading = "lazy"; im.src = it.url; t.appendChild(im);
@@ -1076,16 +1078,19 @@ function renderAssignedMedia(items) {
   loadVisibleAssigned(grid);
 }
 function loadVisibleAssigned(grid) {
-  // load first-frame posters lazily: give each on-screen tile a src (paused at 0)
-  if (!("IntersectionObserver" in window)) return;
+  // load first-frame posters lazily: give each on-screen tile a src (metadata only)
+  if (!("IntersectionObserver" in window)) {
+    grid.querySelectorAll("video[data-src]").forEach(v => { v.preload = "metadata"; v.src = v.dataset.src; });
+    return;
+  }
   const io = new IntersectionObserver(es => {
     es.forEach(en => {
       if (!en.isIntersecting) return;
       const v = en.target.querySelector("video[data-src]");
-      if (v && !v.src) { v.src = v.dataset.src; v.currentTime = 0.05; }
+      if (v && !v.src) { v.preload = "metadata"; v.src = v.dataset.src; }
       io.unobserve(en.target);
     });
-  }, { rootMargin: "300px 0px" });
+  }, { rootMargin: "400px 0px" });
   grid.querySelectorAll(".am-tile").forEach(t => io.observe(t));
 }
 
@@ -1189,14 +1194,10 @@ function renderResultCard(container, d) {
   }
   const side = el("div", "result-side"); wrap.appendChild(side);
   if (vid) {
-    const raw = decodeURIComponent((vid.getAttribute("src") || "").split("path=")[1] || "");
-    side.appendChild(btn("⬇ " + T.download, async (ev) => {
-      const b = ev.currentTarget; b.disabled = true;
-      try {
-        const r = await jget("/save-render?path=" + encodeURIComponent(raw));
-        b.textContent = r.ok ? "✓ " + T.downloaded_to : T.err_generic;
-      } catch (e) { b.textContent = T.err_generic; }
-    }, "primary"));
+    const fileUrl = vid.getAttribute("src") || "";
+    const raw = decodeURIComponent(fileUrl.split("path=")[1] || "");
+    const name = (raw.split(/[\\/]/).pop()) || "short.mp4";
+    side.appendChild(btn("⬇ " + T.download, (ev) => downloadVideo(fileUrl, raw, name, ev.currentTarget), "primary"));
   }
   jget("/jobs-list").then(dd => {
     const j = (dd.jobs || []).find(x => x.id === S.jobId);
@@ -1620,13 +1621,48 @@ function hideLoading() {
   if (_loadEl) { _loadEl.remove(); _loadEl = null; }
 }
 
-/* legacy fragment shims: embedded server HTML may call these */
-window.saveRender = async function (encPath, btnEl) {
+/* Download the finished video where the USER chooses. Uses the File System Access API
+   (showSaveFilePicker) so a real "Save as" dialog appears; falls back to a normal browser
+   download (<a download>), and finally to the server-side copy into Downloads. */
+async function downloadVideo(fileUrl, rawPath, name, btnEl) {
+  const setLabel = (t) => { if (btnEl) btnEl.textContent = t; };
+  if (btnEl) btnEl.disabled = true;
+  setLabel(T.download + "...");
   try {
-    if (btnEl) btnEl.disabled = true;
-    const r = await jget("/save-render?path=" + encPath);
-    if (btnEl) btnEl.textContent = r.ok ? "✓ " + T.downloaded_to : T.err_generic;
-  } catch (e) { if (btnEl) btnEl.textContent = T.err_generic; }
+    if (window.showSaveFilePicker) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }],
+      });
+      const resp = await fetch(fileUrl);
+      const writable = await handle.createWritable();
+      await resp.body.pipeTo(writable);
+      setLabel("✓ Saved"); if (btnEl) btnEl.disabled = false;
+      return;
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") { setLabel("⬇ " + T.download); if (btnEl) btnEl.disabled = false; return; }
+    // fall through to the fallbacks
+  }
+  try {
+    const a = document.createElement("a");
+    a.href = fileUrl; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setLabel("✓ " + T.download); if (btnEl) btnEl.disabled = false;
+    return;
+  } catch (e) {}
+  try {
+    const r = await jget("/save-render?path=" + encodeURIComponent(rawPath));
+    setLabel(r.ok ? "✓ " + T.downloaded_to : T.err_generic);
+  } catch (e) { setLabel(T.err_generic); }
+  if (btnEl) btnEl.disabled = false;
+}
+
+/* legacy fragment shims: embedded server HTML may call these */
+window.saveRender = function (encPath, btnEl) {
+  const raw = decodeURIComponent(encPath || "");
+  const name = (raw.split(/[\\/]/).pop()) || "short.mp4";
+  downloadVideo("/file?path=" + encPath, raw, name, btnEl);
 };
 window.playClick = function () {};
 

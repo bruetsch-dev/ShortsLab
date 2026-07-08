@@ -5953,8 +5953,9 @@ TIMELINE_ASSETS = """
         node.className='tl-ovitem'+(sel&&sel.type==='overlay'&&String(sel.id)===String(ov.id)?' selected':'');
         node.style.left=((sceneStart+st*s.dur)*SCALE)+'px';
         node.style.width=Math.max(42,(en-st)*s.dur*SCALE)+'px';
-        node.textContent='\u279C '+overlayLabel(ov); node.title='Move, scale or delete '+overlayLabel(ov).toLowerCase();
+        node.textContent='\u279C '+overlayLabel(ov); node.title='Select; right-click to open the inspector or delete';
         node.addEventListener('pointerdown',function(ev){ev.stopPropagation();selectOverlay(ov.id,s.id);});
+        (function(o){ node.addEventListener('contextmenu',function(ev){ev.preventDefault();ev.stopPropagation();openOverlayMenu(ev.clientX,ev.clientY,o,s.id);}); })(ov);
         ovEl.appendChild(node);
       });
     });
@@ -6163,17 +6164,28 @@ TIMELINE_ASSETS = """
   }
 
   function showPane(which){
+    // Only syncs WHICH pane's content is prepared. The inspector is a floating popup that is
+    // only shown via an explicit right-click -> "Open inspector" (openInspectorAt). Selecting
+    // (left-click) never pops it open. Deselecting (which=null) closes it.
     document.getElementById('tl-insp-empty').hidden = !!which;
     document.getElementById('tl-insp-clip').hidden = which!=='clip';
     document.getElementById('tl-insp-fx').hidden = which!=='fx';
     document.getElementById('tl-insp-overlay').hidden = which!=='overlay';
-    // The inspector is a floating popup now (no fixed slot). Sounds/visuals open it on
-    // selection (it is their only editor); clips open it via right-click "Open inspector".
     var insp=document.getElementById('tl-inspector');
-    if(insp){
-      if(!which) insp.classList.remove('open');
-      else if(which!=='clip') insp.classList.add('open');
-    }
+    if(insp && !which) insp.classList.remove('open');
+  }
+  var _lastPointer={x:null,y:null};
+  document.addEventListener('pointerdown', function(ev){ _lastPointer={x:ev.clientX,y:ev.clientY}; }, true);
+  function openInspectorAt(x,y){
+    var insp=document.getElementById('tl-inspector'); if(!insp) return;
+    if(x==null) x=_lastPointer.x; if(y==null) y=_lastPointer.y;
+    insp.classList.add('open');
+    var w=insp.offsetWidth||320, h=insp.offsetHeight||320;
+    var left=(x!=null)? x+14 : (window.innerWidth-w-16);
+    var top =(y!=null)? y-10 : 72;
+    insp.style.left=Math.max(8, Math.min(left, window.innerWidth-w-8))+'px';
+    insp.style.top =Math.max(8, Math.min(top,  window.innerHeight-h-8))+'px';
+    insp.style.right='auto';
   }
   function selectClip(id,rangeSelect){
     var vis=visible();
@@ -6871,11 +6883,17 @@ TIMELINE_ASSETS = """
     clipMenuEl.style.top=Math.max(8,Math.min(y,window.innerHeight-h-8))+'px';
   }
   function openClipMenu(x, y, scn){
-    var items=[['Open inspector', function(){ selectClip(scn.id); document.getElementById('tl-inspector').classList.add('open'); }],
+    var items=[['Open inspector', function(){ selectClip(scn.id); openInspectorAt(x,y); }],
                ['Replace media\\u2026', function(){ if(playing) stop(); startReplacePick(scn); }],
                ['Remove clip', function(){ scn.removed=true; if(sel&&sel.id===scn.id){ sel=null; showPane(null);} layout(); markDirty(); }]];
     if(replacedMap[scn.id]) items.push(['Undo replace', function(){ delete replacedMap[scn.id]; layout(); markDirty(); }]);
     showContextMenu(x,y,items);
+  }
+  function openOverlayMenu(x,y,ov,sceneId){
+    showContextMenu(x,y,[
+      ['Open inspector', function(){ selectOverlay(ov.id, sceneId); openInspectorAt(x,y); }],
+      ['Delete visual', function(){ var rec=overlayRecord(ov.id); if(rec){ rec.scene.overlays=(rec.scene.overlays||[]).filter(function(o){return String(o.id)!==String(ov.id);}); if(sel&&String(sel.id)===String(ov.id)){sel=null;showPane(null);} layout(); markDirty(); } }]
+    ]);
   }
   function removeEffect(fx,type){
     if(type==='fx'&&fx.added)sfx=sfx.filter(function(item){return item.id!==fx.id;});
@@ -6884,6 +6902,7 @@ TIMELINE_ASSETS = """
   }
   function openFxMenu(x,y,fx,type){
     showContextMenu(x,y,[
+      ['Open inspector',function(){ selectFx(fx.id); openInspectorAt(x,y); }],
       ['Replace sound\\u2026',function(){
         if(playing)stop();
         var at=type==='trans'?trAbsStart(fx):fxAbsStart(fx);
@@ -7210,7 +7229,7 @@ TIMELINE_ASSETS = """
   if(sb) sb.addEventListener('click', function(){
     document.querySelectorAll('.tl-pop').forEach(function(p){ p.setAttribute('hidden',''); });
   }, true);
-  /* floating inspector: close button + Escape */
+  /* floating inspector: close button + Escape + close when the mouse leaves it */
   var insp=document.getElementById('tl-inspector');
   if(insp){
     var x=document.createElement('button'); x.type='button'; x.className='tl-insp-close';
@@ -7220,6 +7239,13 @@ TIMELINE_ASSETS = """
     document.addEventListener('keydown', function(e){
       if(e.key==='Escape') insp.classList.remove('open');
     });
+    // Close on mouse-leave with a short grace period (re-entering cancels), so it does not
+    // snap shut the instant the cursor clips a corner while reaching for a control.
+    var leaveTimer=null;
+    insp.addEventListener('mouseleave', function(){
+      leaveTimer=setTimeout(function(){ insp.classList.remove('open'); }, 450);
+    });
+    insp.addEventListener('mouseenter', function(){ if(leaveTimer){ clearTimeout(leaveTimer); leaveTimer=null; } });
   }
 })();
 </script>
