@@ -70,6 +70,66 @@ def media_duration(path, ffprobe):
         return 0.0
 
 
+def detect_existing_sfx_onsets(video_path, ffmpeg, status_cb=None):
+    """Detect sharp audio transients already in the uploaded video (existing SFX/whooshes/impacts).
+    Returns their timestamps (s). Pure stdlib WAV RMS (no audioop - removed in Py 3.13): a hop whose
+    loudness spikes well above the local baseline is an onset. Used so the SFX Master does NOT stack
+    a NEW transition sound on a cut that already has one."""
+    import wave, array, math, tempfile
+    if not ffmpeg:
+        return []
+    tmp = Path(tempfile.gettempdir()) / f"_sfxonset_{os.getpid()}_{int(time.time()*1000)}.wav"
+    try:
+        # HIGH-PASS at 4.5 kHz first: speech is band-limited, so this removes almost all of it and
+        # leaves broadband transients (whooshes/clicks/impacts). Detection is deliberately
+        # CONSERVATIVE - only clearly LOUD existing SFX are flagged - because quiet ducked SFX look
+        # just like sibilant speech in this band, and over-skipping would make the Master add
+        # nothing on a voice-only clip. So: it won't stack a new whoosh on an obvious existing one,
+        # but very subtle existing SFX may go undetected (adding a soft whoosh there is harmless).
+        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
+                        "-vn", "-ac", "1", "-ar", "16000", "-af", "highpass=f=4500",
+                        "-f", "wav", str(tmp)], capture_output=True, timeout=180)
+        if not tmp.exists() or tmp.stat().st_size < 1024:
+            return []
+        with wave.open(str(tmp), "rb") as wf:
+            if wf.getsampwidth() != 2:
+                return []
+            sr = wf.getframerate()
+            samples = array.array("h"); samples.frombytes(wf.readframes(wf.getnframes()))
+        hop = max(1, int(sr * 0.02))          # 20 ms windows
+        rmses = []
+        for i in range(0, len(samples) - hop, hop):
+            chunk = samples[i:i + hop]
+            rmses.append(math.sqrt(sum(s * s for s in chunk) / len(chunk)))
+        if not rmses:
+            return []
+        # CONSERVATIVE floor: only a strong HF burst well above the clip's 90th-percentile HF level
+        # counts (a real loud whoosh/impact). Tuned so a voice-only clip yields ~0 detections.
+        ref = sorted(rmses)[int(len(rmses) * 0.90)]
+        floor = max(1800.0, ref * 4.5)
+        onsets, base = [], []
+        for k, rms in enumerate(rmses):
+            t = k * hop / float(sr)
+            if base:
+                med = sorted(base)[len(base) // 2] or 1.0
+                if rms > floor and rms > med * 3.0 and (not onsets or t - onsets[-1] > 0.12):
+                    onsets.append(round(t, 3))
+            base.append(rms)
+            if len(base) > 8:
+                base.pop(0)
+        log(status_cb, f"Existing-audio scan: {len(onsets)} SFX-like transient(s) already present "
+                       f"(voice removed via high-pass).")
+        return onsets
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Existing-audio scan skipped ({exc}).")
+        return []
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def detect_scene_cuts(video_path, ffmpeg, threshold=0.30, min_gap=0.45):
     """Return sorted timestamps (s) where the picture changes hard enough."""
     if not ffmpeg:
@@ -604,6 +664,11 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     if phrases:
         log(status_cb, f"Transcript: {len(phrases)} timed phrase(s).")
 
+    # Detect SFX the video ALREADY has (transients in the existing audio). At any cut that already
+    # has one, the SFX Master skips adding a NEW transition/cut sound - it only fills the gaps and
+    # still adds non-transition SFX (impacts, topic accents) elsewhere.
+    existing_onsets = detect_existing_sfx_onsets(video_path, ffmpeg, status_cb=status_cb)
+
     # Use the EXACT same SFX engine as the normal agent run: agent_core.place_editor_sfx over the
     # user's local, classified sfx_library (variety rotation across cut sounds, per-category dB
     # volumes/CAT_DB, short-punchy duration caps, density/spacing gates, big-moment impacts + topic
@@ -618,6 +683,7 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
         "sfx_amount": str(sfx_amount or "medium"),
         "editor_sfx_max_per_minute": int(profile["max_per_minute"]),
         "editor_sfx_budget_cap": int(profile["budget_cap"]),
+        "existing_sfx_onsets": existing_onsets,   # skip NEW cut sounds where one already exists
     }
     log(status_cb, f"Placing editor SFX over {len(scenes)} cut point(s) with the local SFX library "
                    f"(amount: {str(sfx_amount)}, same engine as a normal run)...")

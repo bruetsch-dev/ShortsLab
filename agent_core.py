@@ -4884,6 +4884,8 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     scenes = config.get("scenes", [])
     if not scenes:
         return 0
+    # SFX-Master gap-fill: cut times that already have a transition sound in the source audio.
+    existing_onsets = [float(o) for o in (config.get("existing_sfx_onsets") or [])]
     import sfx_library
     meme_enabled = bool(config.get("meme_sfx_enabled")
                         or str(config.get("video_style", "")).lower() in ("meme", "comedy"))
@@ -5090,6 +5092,11 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         if loud and (t - last_loud) < 1.5:                        # avoid stacked loud impacts
             cat = "swipe_whoosh" if lib.get("swipe_whoosh") else "bright_whoosh"
             reason, loud = "clip_cut", False
+        # SFX Master: if this cut ALREADY has a transition sound in the source audio (a transient
+        # onset near t), don't stack a NEW cut/transition sound on it. Non-transition SFX (impacts,
+        # topic accents, hook opening) are still placed - only clip-cut/transition hits are skipped.
+        if reason == "clip_cut" and any(abs(t - o) <= 0.14 for o in existing_onsets):
+            continue
         if not (cat and density_ok(t, loud=loud)):
             continue
         path, picked_cat = pick_with_alts(cat)
