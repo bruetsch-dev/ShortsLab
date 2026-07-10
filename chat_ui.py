@@ -399,6 +399,7 @@ def projects_list_payload(show_hidden=False, limit=200):
                                  "clips": s.get("seedance", 0)},
                     "thumb_url": (app.link_for(thumb) if thumb and Path(str(thumb)).exists()
                                   and app.is_image_path(thumb) else ""),
+                    "preview_kind": s.get("preview_kind") or "",
                     "video_url": (app.link_for(video) if has_video else ""),
                     "results_url": (app.view_for(video, "assets") if has_video
                                     else app.view_for(s.get("project_dir"), "assets")),

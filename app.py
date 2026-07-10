@@ -5143,6 +5143,38 @@ def project_edited_mtime(project_dir):
     return max(times) if times else 0.0
 
 
+def project_preview_kind(project_dir, report):
+    """Badge to overlay on the preview: 'sfx' / 'vfx' for master-tool projects, else ''."""
+    slug = project_dir.name.lower()
+    kind = str(report.get("job_kind") or report.get("mode") or "").lower()
+    if slug.startswith("sfxmaster") or "sfx" in kind:
+        return "sfx"
+    if slug.startswith("visualmaster") or slug.endswith("_visual_enhanced") or "visual" in kind or "vfx" in kind:
+        return "vfx"
+    return ""
+
+
+def project_preview_image(project_dir, video):
+    """A SINGLE representative frame (the opening = hook), cached once, instead of a busy
+    contact-sheet grid. Falls back to one generated image, never a sheet."""
+    cache = project_dir / "review" / "_preview.jpg"
+    try:
+        if cache.exists() and cache.stat().st_size > 1024:
+            # refresh if the render is newer than the cached poster
+            if not (video and Path(video).exists() and Path(video).stat().st_mtime > cache.stat().st_mtime):
+                return cache
+        if video and Path(video).exists():
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            if pipeline.extract_poster_frame(video, cache, at=1.0) and cache.exists():
+                return cache
+    except Exception:
+        pass
+    # no video yet: a single generated image (NOT a contact sheet)
+    return (latest_media(project_dir / "gpt images", {".jpg", ".jpeg", ".png", ".webp"})
+            or latest_media(project_dir / "web images", {".jpg", ".jpeg", ".png", ".webp"})
+            or latest_media(project_dir / "speaker images", {".jpg", ".jpeg", ".png", ".webp"}))
+
+
 def project_summary(project_dir):
     report = read_project_report(project_dir)
     video = existing_report_path(report, "video") or latest_media(project_dir / "renders", {".mp4", ".webm"})
@@ -5150,9 +5182,9 @@ def project_summary(project_dir):
     shot_review = existing_report_path(report, "shot_review")
     web_sheet = existing_report_path(report, "web_contact_sheet")
     gpt_sheet = existing_report_path(report, "gpt_contact_sheet")
-    thumb = scene_review or shot_review or web_sheet or gpt_sheet or latest_media(project_dir / "review", {".jpg", ".jpeg", ".png", ".webp"})
-    if not thumb:
-        thumb = latest_media(project_dir / "gpt images", {".jpg", ".jpeg", ".png", ".webp"}) or latest_media(project_dir / "web images", {".jpg", ".jpeg", ".png", ".webp"})
+    # single-frame preview (hook/opening) instead of a contact-sheet grid
+    thumb = project_preview_image(project_dir, video)
+    preview_kind = project_preview_kind(project_dir, report)
     created_at = report.get("created_at")
     if not created_at:
         created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(project_dir.stat().st_mtime))
@@ -5170,6 +5202,7 @@ def project_summary(project_dir):
         "web_sheet": web_sheet,
         "gpt_sheet": gpt_sheet,
         "thumb": thumb,
+        "preview_kind": preview_kind,
         "renders": project_dir / "renders",
         "review": project_dir / "review",
         "gpt_images": count_media(project_dir / "gpt images", {".jpg", ".jpeg", ".png", ".webp"}),
@@ -5511,19 +5544,18 @@ TIMELINE_SKELETON = """
   </div>
   <div class="tl-grid tl-top">
     <div class="panel tl-player">
-      <h2>Preview</h2>
       <div class="tl-stage-view" id="tl-stage-view">
         <img id="tl-pimg" alt="">
         <video id="tl-pvid" muted playsinline></video>
         <div class="tl-preview-caption" id="tl-preview-caption" aria-live="off"></div>
         <div class="tl-overlay-layer" id="tl-overlay-layer"></div>
         <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview</div>
-      </div>
-      <div class="tl-player-bar">
-        <button type="button" class="tl-ctrl" id="tl-back" title="Back 5s" aria-label="Back 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 6h2.2v12H6zM20 6v12L9.5 12z"/></svg></button>
-        <button type="button" class="tl-ctrl tl-ctrl-main" id="tl-play" title="Play / Pause" aria-label="Play"><span id="tl-play-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></button>
-        <button type="button" class="tl-ctrl" id="tl-fwd" title="Forward 5s" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M15.8 6H18v12h-2.2zM4 6v12l10.5-6z"/></svg></button>
-        <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
+        <div class="tl-player-bar">
+          <button type="button" class="tl-ctrl" id="tl-back" title="Back 5s" aria-label="Back 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 6h2.2v12H6zM20 6v12L9.5 12z"/></svg></button>
+          <button type="button" class="tl-ctrl tl-ctrl-main" id="tl-play" title="Play / Pause" aria-label="Play"><span id="tl-play-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></button>
+          <button type="button" class="tl-ctrl" id="tl-fwd" title="Forward 5s" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M15.8 6H18v12h-2.2zM4 6v12l10.5-6z"/></svg></button>
+          <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
+        </div>
       </div>
     </div>
     <div class="panel tl-inspector" id="tl-inspector">
@@ -5549,6 +5581,8 @@ TIMELINE_SKELETON = """
         <input type="range" id="tl-fx-vol" min="0" max="0.6" step="0.01">
         <label>Start (seconds)</label>
         <input type="number" id="tl-fx-time" min="0" step="0.05">
+        <label>Trim start of sound (seconds) <span id="tl-fx-trim-val"></span></label>
+        <input type="number" id="tl-fx-trim" min="0" step="0.05" title="Skip the first N seconds of the sound file - e.g. cut the slow start off a riser so it hits sooner.">
         <label>Sound</label>
         <select id="tl-fx-sound"><option value="">(keep current)</option></select>
         <div class="tl-insp-actions">
@@ -5688,9 +5722,9 @@ TIMELINE_ASSETS = """
   .tl-render-cap-choice { padding:8px 10px; border:1px solid var(--line-strong); border-radius:var(--r-md); background:var(--bg-input); font-size:12px; }
   .tl-grid { display:grid; grid-template-columns:minmax(300px,420px) minmax(340px,500px); gap:16px; align-items:start; justify-content:start; }
   .tl-top { margin-bottom:16px; }
-  .tl-player { display:flex; flex-direction:column; align-items:center; }
-  .tl-player h2 { align-self:flex-start; }
-  .tl-stage-view { position:relative; aspect-ratio:9/16; height:clamp(260px,38vh,390px); width:auto; max-width:100%; background:#000; border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+  /* player fills its panel; the 9:16 stage uses all available height, controls FLOAT over it */
+  .tl-player { display:flex; align-items:center; justify-content:center; padding:6px; overflow:hidden; }
+  .tl-stage-view { position:relative; aspect-ratio:9/16; height:100%; max-height:100%; width:auto; max-width:100%; background:#000; border:1px solid var(--line); border-radius:12px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
   .tl-stage-view img, .tl-stage-view video { width:100%; height:100%; object-fit:cover; display:none; background:#000; }
   .tl-preview-caption { position:absolute; left:7%; right:7%; top:72%; z-index:6; display:none; text-align:center; color:#fff; font-size:clamp(18px,3.1vh,31px); line-height:1.04; font-weight:950; letter-spacing:.02em; text-transform:uppercase; text-shadow:-2px -2px 0 #111,2px -2px 0 #111,-2px 2px 0 #111,2px 2px 0 #111,0 4px 8px rgba(0,0,0,.8); pointer-events:none; }
   .tl-overlay-layer { position:absolute; inset:0; z-index:4; pointer-events:none; }
@@ -5706,7 +5740,13 @@ TIMELINE_ASSETS = """
   .tl-ov-scale-handle { position:absolute; right:-12px; bottom:-12px; width:18px; height:18px; border-radius:50%; background:var(--accent); border:2px solid #fff; cursor:nwse-resize; display:none; }
   .tl-preview-overlay.selected .tl-ov-scale-handle { display:block; }
   .tl-stage-empty { position:absolute; color:var(--faint); font-weight:600; }
-  .tl-player-bar { display:flex; align-items:center; justify-content:center; gap:14px; margin-top:14px; }
+  /* floating transport bar overlaying the bottom of the video */
+  .tl-player-bar { position:absolute; left:0; right:0; bottom:0; z-index:6; display:flex; align-items:center; justify-content:center; gap:14px; padding:12px 10px 10px;
+    background:linear-gradient(to top, rgba(0,0,0,.62), rgba(0,0,0,.28) 55%, transparent);
+    opacity:0; transition:opacity .18s ease; }
+  .tl-stage-view:hover .tl-player-bar, .tl-stage-view:focus-within .tl-player-bar { opacity:1; }
+  .tl-player-bar .tl-playtime { position:absolute; right:12px; bottom:16px; color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.7); font-variant-numeric:tabular-nums; }
+  @media (prefers-reduced-motion: reduce) { .tl-player-bar { transition:none; } }
   .tl-player-bar .tl-ctrl { width:42px; height:42px; min-width:0; padding:0; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; color:var(--text); background:var(--bg-overlay); border:1px solid var(--line-strong); box-shadow:none; }
   .tl-ctrl::after { display:none; }
   .tl-player-bar .tl-ctrl:hover { background:var(--bg-raised); border-color:var(--accent); transform:translateY(-1px); box-shadow:none; }
@@ -6318,6 +6358,9 @@ TIMELINE_ASSETS = """
     document.getElementById('tl-fx-vol-val').textContent=Math.round(v*100)+'%';
     var abs = (sel.type==='trans') ? trAbsStart(fx) : fxAbsStart(fx);
     document.getElementById('tl-fx-time').value = abs===null ? '' : abs.toFixed(2);
+    var trim=Math.max(0,+(fx.source_trim||0));
+    document.getElementById('tl-fx-trim').value = trim ? trim.toFixed(2) : '';
+    document.getElementById('tl-fx-trim-val').textContent = trim>0 ? ('-'+trim.toFixed(2)+'s') : '';
     var sndSel=document.getElementById('tl-fx-sound');
     sndSel.innerHTML='<option value="">(keep current)</option>'+libSounds.map(function(s,i){
       return '<option value="'+i+'">'+esc(s.name)+'</option>'; }).join('');
@@ -6352,6 +6395,13 @@ TIMELINE_ASSETS = """
   });
   document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); markDirty(); } });
   document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); markDirty(); } });
+  document.getElementById('tl-fx-trim').addEventListener('change', function(){
+    var fx=currentFx(); if(!fx) return;
+    var trim=Math.max(0, parseFloat(this.value)||0);
+    fx.source_trim=+trim.toFixed(3);
+    document.getElementById('tl-fx-trim-val').textContent = trim>0 ? ('-'+trim.toFixed(2)+'s') : '';
+    markDirty();
+  });
   document.getElementById('tl-fx-time').addEventListener('change', function(){
     var fx=currentFx(); if(!fx) return;
     var t=Math.max(0, parseFloat(this.value)||0);
@@ -6795,8 +6845,8 @@ TIMELINE_ASSETS = """
       volumes: volumes,
       captions: captionsOn,
       sfx_on: sfxOn,
-      transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:(t.deleted?false:t.enabled), start_abs:(t.start_abs!=null?t.start_abs:null), path_override:t.path_override||null};}),
-      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null};})
+      transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:(t.deleted?false:t.enabled), start_abs:(t.start_abs!=null?t.start_abs:null), path_override:t.path_override||null, source_trim:+(+(t.source_trim||0)).toFixed(3)};}),
+      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null, source_trim:+(+(f.source_trim||0)).toFixed(3)};})
     };
   }
 
@@ -7190,11 +7240,14 @@ TIMELINE_ASSETS = """
   body.page-timeline .top { position:absolute; top:12px; left:14px; z-index:40; margin:0; padding:0; }
   #timeline-root {
     flex:1 1 auto; min-height:0; display:grid; gap:12px; align-content:stretch;
-    grid-template-columns: minmax(280px, 400px) 1fr;
+    grid-template-columns: minmax(280px, 380px) 1fr;
     grid-template-rows: auto minmax(0, 1fr) minmax(140px, 1.15fr);
-    grid-template-areas: "toolbar toolbar" "stagearea library" "tracks tracks";
+    /* toolbar box ends at the player's right edge; the library spans BOTH top rows so it
+       reaches up to the top and is as large as possible */
+    grid-template-areas: "toolbar library" "stagearea library" "tracks tracks";
   }
-  #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding-left:54px; }
+  #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding-left:54px; align-content:center; }
+  #timeline-root .tl-toolbar .tl-actions { flex-wrap:wrap; }
   /* player alone on the left; the LIBRARY takes the whole former inspector column */
   #timeline-root .tl-grid.tl-top { grid-area:stagearea; margin:0; min-height:0;
     grid-template-columns: 1fr; align-content:start; }

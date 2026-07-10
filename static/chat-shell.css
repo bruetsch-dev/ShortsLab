@@ -124,10 +124,19 @@ h1,h2,h3 { letter-spacing: -0.02em; margin: 0; }
   border: 1px solid transparent; background: transparent; cursor: pointer; width: 100%; text-align: left;
 }
 .sb-proj:hover { background: var(--sidebar-raised); border-color: var(--border); }
-.sb-proj .th {
+.sb-proj .th, .sb-proj .pv-wrap.th {
   width: 34px; height: 44px; border-radius: 6px; background: var(--surface-raised);
-  object-fit: cover; flex: 0 0 auto; border: 1px solid var(--border);
+  flex: 0 0 auto; border: 1px solid var(--border); overflow: hidden; position: relative; display: block;
 }
+/* single-frame thumbnail wrapper + master-tool badge overlay (sfx/vfx) */
+.pv-wrap { position: relative; display: inline-block; overflow: hidden; }
+.pv-wrap > img, .pv-wrap > video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pv-badge { position: absolute; right: 3px; bottom: 3px; width: 18px; height: 18px; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center; font-size: 11px; line-height: 1;
+  background: rgba(0,0,0,.66); color: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+.asset-card2 .afig { position: relative; }
+.asset-card2 .pv-wrap.ath { width: 100%; aspect-ratio: 9/12; display: block; }
+.asset-card2 .pv-wrap.ath .pv-badge { width: 26px; height: 26px; font-size: 15px; right: 6px; bottom: 6px; border-radius: 7px; }
 .sb-proj .meta { flex: 1; min-width: 0; }
 .sb-proj .meta b { display: block; font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sb-proj .meta span { font-size: 11px; color: var(--text-muted); }

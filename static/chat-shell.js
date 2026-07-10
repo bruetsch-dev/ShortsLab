@@ -28,6 +28,16 @@ const esc = (s) => String(s == null ? "" : s)
 const fmtDate = (s) => s || "";
 
 async function jget(url) { const r = await fetch(url); return r.json(); }
+
+/* single-frame project thumbnail (hook/opening) + a master-tool badge overlay */
+function projThumb(p, cls) {
+  const badge = p.preview_kind === "sfx" ? '<span class="pv-badge">🔊</span>'
+    : p.preview_kind === "vfx" ? '<span class="pv-badge">➜</span>' : '';
+  const inner = p.thumb_url
+    ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">`
+    : (p.video_url ? `<video muted preload="none" src="${esc(p.video_url)}"></video>` : "");
+  return `<span class="pv-wrap ${cls || ""}">${inner}${badge}</span>`;
+}
 async function jpost(url, data) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data || {}) });
@@ -1104,9 +1114,15 @@ async function pollJob() {
     errorCard(T.err_no_job, ""); persist(); return;
   }
   if (d.status !== S.jobStatus) {
+    const prev = S.jobStatus;
     S.jobStatus = d.status; renderTopbar(); persist();
     const badge = $("job-badge");
     if (badge) { badge.textContent = d.status; badge.className = "tb-badge" + (d.status === "running" ? " run" : ""); }
+    // notification chime: render finished, or voiceover ready for approval (halt-after-speech)
+    if (prev && prev !== "missing") {
+      if (d.status === "done") playNotification("done");
+      else if (d.status === "awaiting_approval") playNotification("speech");
+    }
   }
   const prog = $("job-progress");
   if (prog && d.progress_html !== lastProgressHTML) { prog.innerHTML = d.progress_html || ""; lastProgressHTML = d.progress_html; }
@@ -1275,7 +1291,7 @@ async function openProjectPicker() {
   const list = el("div", "list"); m.appendChild(list);
   (d.projects || []).forEach(p => {
     const b = el("button", "sb-proj");
-    b.innerHTML = `${p.thumb_url ? `<img class="th" loading="lazy" src="${esc(p.thumb_url)}" alt="">` : `<span class="th"></span>`}
+    b.innerHTML = `${projThumb(p, "th")}
       <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
       <span class="st ${p.failed ? "fail" : "ok"}">${p.failed ? "failed" : "ok"}</span>`;
     b.addEventListener("click", () => { close(); loadProject(p.slug); });
@@ -1314,9 +1330,7 @@ function assetCard(p) {
     c.remove(); refreshSidebar();
   });
   c.appendChild(hideB);
-  if (p.thumb_url) { const i = el("img", "ath"); i.loading = "lazy"; i.src = p.thumb_url; c.appendChild(i); }
-  else if (p.video_url) { const v = el("video", "ath"); v.muted = true; v.preload = "none"; v.src = p.video_url; c.appendChild(v); }
-  else c.appendChild(el("div", "ath"));
+  const fig = el("div", "afig"); fig.innerHTML = projThumb(p, "ath"); c.appendChild(fig);
   const body = el("div", "abody");
   const tt = el("b", "", esc(p.title));
   const ren = el("button", "", "✎"); ren.title = T.rename; ren.setAttribute("aria-label", T.rename);
@@ -1390,7 +1404,7 @@ async function openTimelineNav() {
   const list = el("div", "list"); m.appendChild(list);
   withTl.forEach(p => {
     const b = el("button", "sb-proj");
-    b.innerHTML = `<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
+    b.innerHTML = `${projThumb(p, "th")}<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
     b.addEventListener("click", () => {
       showLoading(T.open_timeline + "...");
       location.href = "/timeline?slug=" + encodeURIComponent(p.slug);
@@ -1430,7 +1444,7 @@ function paintSidebarProjects() {
     .forEach(p => {
       const row = el("div", "sb-proj-row");
       const b = el("button", "sb-proj");
-      b.innerHTML = `${p.thumb_url ? `<img class="th" loading="lazy" src="${esc(p.thumb_url)}" alt="">` : `<span class="th"></span>`}
+      b.innerHTML = `${projThumb(p, "th")}
         <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
         ${p.failed ? '<span class="st fail">!</span>' : ""}`;
       b.title = p.title;
@@ -1606,6 +1620,29 @@ function errorCard(title, detail) {
 }
 let _audio = null;
 function ensureAudio() { if (!_audio) { _audio = new Audio(); } return _audio; }
+
+/* short pleasant two-note chime (WebAudio, no asset) for render-finish + speech-ready */
+let _actx = null;
+function playNotification(kind) {
+  try {
+    _actx = _actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (_actx.state === "suspended") _actx.resume();
+    const now = _actx.currentTime;
+    const notes = kind === "speech" ? [[660, 0], [880, 0.14]] : [[784, 0], [1047, 0.13], [1319, 0.26]];
+    const gain = _actx.createGain();
+    gain.gain.value = 0.0001; gain.connect(_actx.destination);
+    notes.forEach(([freq, t]) => {
+      const o = _actx.createOscillator(); o.type = "sine"; o.frequency.value = freq;
+      const g = _actx.createGain();
+      const s = now + t;
+      g.gain.setValueAtTime(0.0001, s);
+      g.gain.exponentialRampToValueAtTime(0.16, s + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, s + 0.26);
+      o.connect(g); g.connect(_actx.destination);
+      o.start(s); o.stop(s + 0.3);
+    });
+  } catch (e) {}
+}
 
 /* ---- loading overlay (opening Assets, the Timeline Editor, a project ...) ---- */
 let _loadEl = null, _loadTimer = null;

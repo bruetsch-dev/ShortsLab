@@ -7261,6 +7261,7 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 "id": eid, "scene_id": str(item.get("scene_id") or ""),
                 "path": item.get("path") or "", "offset": float(item.get("offset") or 0.0),
                 "volume": max(0.0, min(0.6, float(item.get("volume") or 0.25))),
+                "source_trim": max(0.0, float(item.get("source_trim") or 0.0)),
                 "enabled": item.get("enabled") is not False,
                 "label": item.get("label") or "Sound",
             })
@@ -7281,6 +7282,11 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 pass
         if item.get("path_override"):
             entry["path"] = str(item["path_override"])
+        if item.get("source_trim") is not None:
+            try:
+                entry["source_trim"] = max(0.0, float(item["source_trim"]))
+            except (TypeError, ValueError):
+                pass
         if entry:
             overrides[eid] = entry
     if overrides:

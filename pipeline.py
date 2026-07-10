@@ -2497,6 +2497,7 @@ def custom_sfx_segments(config):
         out.append({"path": path, "start": round(max(0.0, st), 3),
                     "duration": float(cs.get("duration") or 1.0),
                     "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.25))),
+                    "source_trim": max(0.0, float(cs.get("source_trim") or 0.0)),
                     "category": "custom", "id": str(cs.get("id") or "custom")})
     return out
 
@@ -2614,7 +2615,8 @@ def build_sfx_segments(config, has_speech=False):
             except (TypeError, ValueError):
                 pass
         events.append({"path": path, "start": start_at, "duration": ev["duration"],
-                       "volume": round(volume, 3), "category": ev["category"], "id": ev["id"]})
+                       "volume": round(volume, 3), "category": ev["category"], "id": ev["id"],
+                       "source_trim": max(0.0, float(ov.get("source_trim") or 0.0))})
     max_events = max(3, int(float(config.get("duration", 60)) / 60.0 * int(config.get("sfx_max_per_minute", 24))))
     transition_events = [e for e in events if e.get("category") == "analog_transitions"]
     other_events = [e for e in events if e.get("category") != "analog_transitions"]
@@ -3178,9 +3180,13 @@ def render_video(config, basename=None):
                 input_index = sfx_offset + index
                 label = f"sfx{index}"
                 delay_ms = int(round(segment["start"] * 1000))
-                fade_out_start = max(0.0, float(segment["duration"]) - 0.08)
+                # source_trim = how much of the sound FILE's start to skip (editor "Trim start"),
+                # e.g. cut the first 0.5s off a riser so it hits sooner.
+                src_trim = max(0.0, float(segment.get("source_trim", 0.0) or 0.0))
+                dur = float(segment["duration"])
+                fade_out_start = max(0.0, dur - 0.08)
                 filters.append(
-                    f"[{input_index}:a:0]atrim=0:{segment['duration']:.3f},"
+                    f"[{input_index}:a:0]atrim={src_trim:.3f}:{src_trim + dur:.3f},"
                     f"asetpts=PTS-STARTPTS,afade=t=out:st={fade_out_start:.3f}:d=0.080,"
                     f"adelay={delay_ms}:all=1,volume={segment['volume']:.3f}[{label}]"
                 )
