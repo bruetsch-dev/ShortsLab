@@ -20,6 +20,7 @@ SFX Master) but for visuals.
 import json
 import math
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -550,5 +551,108 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
                        for c in char_events],
     }, indent=2), encoding="utf-8")
 
+    # Editable project: split the CLEAN original into scene clips and store every arrow/neko as an
+    # editable overlay so the timeline editor can move/restyle/delete each one and re-render.
+    project_dir = None
+    try:
+        project_dir = _write_visual_timeline_project(
+            video_path, effects, char_events, cuts, phrases, duration, ffmpeg, out_path,
+            status_cb=status_cb)
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Timeline project not written ({exc}); the enhanced video is still saved.")
+
     return {"video": str(out_path), "original_video": str(video_path), "visual_plan": str(plan_path),
-            "arrow_count": n_arrow, "character_count": len(char_events), "plan_source": "opus_vision"}
+            "arrow_count": n_arrow, "character_count": len(char_events), "plan_source": "opus_vision",
+            "project_dir": (str(agent_core.PROJECTS_DIR / project_dir) if project_dir else None)}
+
+
+def _write_visual_timeline_project(video_path, effects, char_events, cuts, phrases, duration,
+                                   ffmpeg, enhanced_out, status_cb=None):
+    """Create a REAL project for the VFX-master output: the CLEAN original video is split at the
+    detected cuts into per-scene clips (original audio -> voice track), and every arrow/neko lands
+    in that scene's `overlays` list - fully editable (move / scale / restyle / delete / re-render)
+    exactly like an agent-produced project's visuals. Mirrors sfx_agent._write_timeline_project."""
+    import shutil
+    video_path = Path(video_path)
+    base = re.sub(r"[^a-z0-9_]+", "_", video_path.stem.lower()).strip("_")[:36] or "upload"
+    slug = f"visualmaster_{base}_{time.strftime('%H%M%S')}"
+    pdir = agent_core.PROJECTS_DIR / slug
+    clip_dir = pdir / "seedance 2.0"
+    for d in (clip_dir, pdir / "input", pdir / "config", pdir / "renders"):
+        d.mkdir(parents=True, exist_ok=True)
+
+    def _run(cmd, timeout=600):
+        subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+    # original audio -> the voice track laid back over the (muted) clean segments
+    _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path), "-vn",
+          "-ar", "48000", "-ac", "2", str(pdir / "input" / "voiceover.wav")], timeout=300)
+
+    scenes = sfx_agent._scenes_from_cuts_and_phrases(cuts, phrases, duration)
+    log(status_cb, f"Timeline project: splitting the video into {len(scenes)} clean segment(s)...")
+    cfg_scenes = []
+    for k, sc in enumerate(scenes):
+        start, end = float(sc["start"]), float(sc["end"])
+        seg_dur = max(0.15, end - start)
+        name = f"seg_{k:02d}.mp4"
+        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.3f}",
+              "-i", str(video_path), "-t", f"{seg_dur:.3f}", "-an",
+              "-c:v", "libx264", "-crf", "19", "-preset", "veryfast", str(clip_dir / name)])
+        cfg_scenes.append({
+            "id": f"{k + 1:02d}", "name": f"Segment {k + 1:02d}",
+            "script": sc.get("script", ""), "exact_voice_text": sc.get("exact_voice_text", ""),
+            "start": round(start, 3), "end": round(end, 3), "clip": name, "asset": name,
+            "seedance": True, "seedance_start_trim": 0.0, "render_caption": False, "overlays": [],
+        })
+
+    ffprobe = pipeline.find_ffprobe(ffmpeg)
+    try:
+        _snd_segs = _overlay_sfx_segments(effects + char_events, ffprobe, status_cb=None)
+    except Exception:
+        _snd_segs = []
+    sfx_by_time = {round(float(s.get("start", 0.0)), 2): s for s in _snd_segs}
+
+    def _scene_for(at):
+        return next((s for s in cfg_scenes if s["start"] <= at < s["end"]), cfg_scenes[-1])
+
+    def _rel(at, scene):
+        span = max(0.05, scene["end"] - scene["start"])
+        return max(0.0, min(0.96, (at - scene["start"]) / span))
+
+    # Arrows -> fully editable "arrows" overlays (the timeline inspector's arrow-style / scale /
+    # rotation / animation controls drive exactly this type, and it re-renders cleanly). Nekos stay
+    # baked into the initial render (the render pipeline has no character-overlay draw path), so we
+    # do not add them as overlays to avoid a re-render silently dropping them.
+    for i, e in enumerate(effects):
+        at = float(e["time"]); scene = _scene_for(at); st = _rel(at, scene)
+        snd = sfx_by_time.get(round(at, 2)) or {}
+        scene["overlays"].append({
+            "id": f"vm-arrow-{i:03d}", "type": "arrows", "shape": "arrow",
+            "from": e.get("from") or "left",
+            "start": round(st, 4), "end": round(min(1.0, st + 0.42), 4),
+            "cx": round(float(e.get("cx", 0.5)), 4), "cy": round(float(e.get("cy", 0.4)), 4),
+            "editor_x": round(float(e.get("cx", 0.5)), 4), "editor_y": round(float(e.get("cy", 0.4)), 4),
+            "editor_scale": 1.0, "editor_rotation": 0,
+            "arrow_style": e.get("arrow_style") or "default_thick_red_arrow",
+            "animation": "slide", "animation_duration": 0.3,
+            "appear_sfx_path": str(snd["path"]) if snd.get("path") else "",
+            "appear_sfx_volume": float(snd.get("volume", 0.22)) if snd.get("path") else 0.0,
+        })
+
+    config = {
+        "project_slug": slug, "title": f"Visual Master - {video_path.stem}"[:70],
+        "duration": round(float(duration), 3), "scenes": cfg_scenes,
+        "sfx_enabled": False, "render_captions": False, "animated_captions": False,
+        "use_seedance_clips": True, "seedance_clip_start_trim": 0.0,
+        "background_music_choice": "none", "audio_master_gain": 1.0,
+        "visual_master_source": str(video_path),
+    }
+    (pdir / "config" / "project.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        shutil.copy2(enhanced_out, pdir / "renders" / Path(enhanced_out).name)
+    except Exception:
+        pass
+    log(status_cb, f"Timeline project ready: {slug} (open it in the timeline editor to move / "
+                   "restyle / delete the arrows and nekos).")
+    return slug
