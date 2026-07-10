@@ -1024,13 +1024,17 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     hook_text = form.get("hook_text", "") if is_form else ""
     hook, body = split_hook_from_script(script, hook_text)
     ffmpeg = pipeline.find_ffmpeg()
-    # Punch up the delivery: speed the narration 1.20x (pitch-preserving) and denoise
-    # the TTS hiss. Applied to EACH segment (hook AND body) BEFORE concat + alignment, so the
-    # saved hook.wav (InfiniteTalk) and the word timing both match the final 1.20x pace.
+    # Punch up the delivery: speed the narration (pitch-preserving) and denoise the TTS hiss.
+    # Script->visual (AI Generate) narration runs at 1.15x; the scrape/found-footage pace stays
+    # 1.20x (a deliberate viral pacing that the scrape pre-render gate enforces). Applied to EACH
+    # segment (hook AND body) BEFORE concat + alignment, so the saved hook.wav (InfiniteTalk) and
+    # the word timing both match the final pace.
+    _clip_src = str(form.get("clip_source") or "generate").lower() if is_form else "generate"
+    _default_speed = 1.20 if _clip_src == "scrape" else 1.15
     try:
-        voice_speed = float(form.get("voice_speed", 1.20) or 1.20) if is_form else 1.20
+        voice_speed = float(form.get("voice_speed", _default_speed) or _default_speed) if is_form else _default_speed
     except (TypeError, ValueError):
-        voice_speed = 1.20
+        voice_speed = _default_speed
 
     try:
         if hook and body and ffmpeg:
@@ -7576,7 +7580,8 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
     config["timing_audio_path"] = str(Path(audio_path).resolve())
     config["speech_audio_in_final"] = True
     config["timeline_editor_render"] = True
-    config["voice_speed"] = float(form.get("voice_speed", config.get("voice_speed", 1.2)) or 1.2)
+    _vs_default = 1.20 if str(form.get("clip_source") or "generate").lower() == "scrape" else 1.15
+    config["voice_speed"] = float(form.get("voice_speed", config.get("voice_speed", _vs_default)) or _vs_default)
     caption_track = []
     for row in analysis.get("sentence_timestamps") or []:
         if not isinstance(row, dict) or not str(row.get("text") or "").strip():
