@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -117,9 +118,10 @@ MATCH_THRESHOLDS_V2 = {
 
 # segment quality: only genuinely unusable material is a HARD reject; everything else scores soft.
 SEGMENT_HARD_REJECT_BLACKBAR = 6.0        # black_bar_score above this = massive letterbox
-SEGMENT_MIN_QUALITY = 5.5                 # combined soft quality below this = drop the segment
+SEGMENT_MIN_QUALITY = 6.3                 # combined soft quality below this = drop the segment
+                                          # (raised 5.5 -> 6.3 2026-07-11: "clips qualitativ schlecht")
 CONTEXT_FALLBACK_MIN_RELEVANCE = 6.0
-CONTEXT_FALLBACK_MIN_QUALITY = 6.5
+CONTEXT_FALLBACK_MIN_QUALITY = 7.0
 
 
 # ---------------------------------------------------------------- data models
@@ -254,13 +256,68 @@ def _log(status_cb, message):
     _ac().log(status_cb, message)
 
 
-def _llm_json(messages, max_tokens=4000, temperature=0.3, reasoning_model=None):
-    """Text-only LLM call returning a parsed JSON dict (or {})."""
+def _slog(project_dir, entry):
+    """Append one entry to the USER-FACING scrape log (review/scrape_log.json). Written live
+    during the run so the Log view can be opened mid-scrape. Best-effort, never raises."""
+    try:
+        path = Path(project_dir) / "review" / "scrape_log.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        if path.exists():
+            try:
+                rows = json.loads(path.read_text(encoding="utf-8")) or []
+            except Exception:
+                rows = []
+        entry = dict(entry)
+        entry["at"] = time.strftime("%H:%M:%S")
+        rows.append(entry)
+        path.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _slog_thumbs(seg, project_dir, ffmpeg, n=3):
+    """Extract up to n small thumbnails from a segment for the scrape log. Returns rel paths."""
+    out = []
+    try:
+        src = seg.final_path or seg.source_path
+        if not src or not Path(src).exists():
+            return out
+        tdir = Path(project_dir) / "review" / "_scrape_log"
+        tdir.mkdir(parents=True, exist_ok=True)
+        dur = max(0.4, float(seg.duration or 2.0))
+        base = hashlib.sha1(str(seg.segment_id).encode("utf-8", "ignore")).hexdigest()[:10]
+        offs = ([dur * 0.15, dur * 0.5, dur * 0.85][:n]
+                if not seg.final_path else [dur * (i + 1) / (n + 1) for i in range(n)])
+        start = 0.0 if seg.final_path else float(seg.start_time or 0.0)
+        for i, off in enumerate(offs):
+            dst = tdir / f"{base}_{i}.jpg"
+            if not dst.exists():
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{start + off:.2f}",
+                                "-i", str(src), "-frames:v", "1",
+                                "-vf", "scale=180:-2,format=yuvj420p", "-q:v", "6", str(dst)],
+                               capture_output=True, timeout=30)
+            if dst.exists():
+                out.append(str(dst))
+    except Exception:
+        pass
+    return out
+
+
+def _llm_json(messages, max_tokens=4000, temperature=0.3, reasoning_model=None,
+              status_cb=None, label="LLM"):
+    """Text-only LLM call returning a parsed JSON dict (or {}).
+
+    NEVER fail silently: a swallowed matcher error used to collapse a whole run into
+    emergency fallbacks with no trace (every scene filled with random off-topic clips).
+    """
     ac = _ac()
     try:
         return ac._post_llm_json(reasoning_model or ac.GPT55_MODEL, messages,
                                  max_tokens, temperature) or {}
-    except Exception:
+    except Exception as exc:
+        _log(status_cb, "Scrape V2: %s call FAILED (%s: %s) - continuing without its result."
+             % (label, exc.__class__.__name__, str(exc)[:160]))
         return {}
 
 
@@ -709,9 +766,6 @@ def build_viral_search_plan_v2(title, script, scenes, understanding=None, reason
     ac = _ac()
     if not (script or "").strip():
         return []
-    numbered = "\n".join(
-        f"scene {i}: {(ac.scene_text_for_planning(s) or s.get('script', ''))[:180]}"
-        for i, s in enumerate(scenes))
     system = (
         "You are the Architect Agent for fast viral B-roll in the 'Wildest School Rules' style. "
         "Your JSON is executed autonomously by a TikTok/X Scraper Agent. Never make a boring "
@@ -737,7 +791,7 @@ digits or #. No Romaji, English, translation, parentheses, colons, slashes, labe
 Never translate the full narration sentence. Arrays contain strings only.
 
 Scenes:
-{numbered}
+{{numbered}}
 
 Return exactly:
 {{"intents":[{{"scene_id":0,"visual_type":"concrete|context|abstract",
@@ -748,14 +802,34 @@ Return exactly:
 "alternatives":[{{"subject":"...","action":"...","location":"...","camera_style":"...",
 "mood":"...","english_queries":["raw phrase"],"japanese_queries":["日本語検索"]}}]}}]}}
 """
-    data = _llm_json([{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                     max_tokens=10000, temperature=0.35, reasoning_model=reasoning_model)
-    rows = data.get("intents") if isinstance(data.get("intents"), list) else []
-    if not rows:
-        _log(status_cb, "Scrape V2 Architect returned no executable plan; retrying once with lower variance...")
-        data = _llm_json([{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                         max_tokens=8000, temperature=0.1, reasoning_model=reasoning_model)
-        rows = data.get("intents") if isinstance(data.get("intents"), list) else []
+
+    # BATCHED (2026-07-11): one call for ALL scenes truncated on longer scripts - ~400 output
+    # tokens per scene x 20+ scenes plus the model's reasoning tokens exceeds any max_tokens,
+    # the JSON gets cut mid-array and extract_json_object returns None ("Architect returned no
+    # executable plan" although the API worked). 8 scenes per call always fit comfortably.
+    ARCH_BATCH = 8
+
+    def _architect_call(idx_list, temperature):
+        numbered = "\n".join(
+            f"scene {i}: {(ac.scene_text_for_planning(scenes[i]) or scenes[i].get('script', ''))[:180]}"
+            for i in idx_list)
+        data = _llm_json([{"role": "system", "content": system},
+                          {"role": "user", "content": prompt.replace("{numbered}", numbered)}],
+                         max_tokens=10000, temperature=temperature,
+                         reasoning_model=reasoning_model,
+                         status_cb=status_cb, label="architect")
+        return data.get("intents") if isinstance(data.get("intents"), list) else []
+
+    rows = []
+    all_ids = list(range(len(scenes)))
+    for b0 in range(0, len(all_ids), ARCH_BATCH):
+        batch_ids = all_ids[b0:b0 + ARCH_BATCH]
+        got = _architect_call(batch_ids, 0.35)
+        if not got:
+            _log(status_cb, "Scrape V2 Architect: batch %d-%d returned no plan; retrying once "
+                            "with lower variance..." % (batch_ids[0], batch_ids[-1]))
+            got = _architect_call(batch_ids, 0.1)
+        rows.extend(got or [])
     intents, seen = [], set()
     for row in rows:
         if not isinstance(row, dict):
@@ -1273,7 +1347,26 @@ def _segment_strip(seg: SegmentCandidate, frames_dir, idx, ffmpeg):
 def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_cb=None):
     """Vision stage B (TEXT): compare structured segment descriptions to the visual intents. Returns
     a dict scene_id -> sorted list of {segment, subject_match, action_match, location_match,
-    mood_match, script_match, semantic_match, overall_match, match_class} candidates that pass floors."""
+    mood_match, script_match, semantic_match, overall_match, match_class} candidates that pass floors.
+
+    BATCHED over scenes (2026-07-11): the response size scales with scenes x 4 candidates; one
+    call for 16+ scenes exceeded max_tokens once the model spends reasoning tokens too - the JSON
+    was cut mid-array and EVERY scene scored 0 (the all-emergency-fallback failure). 6 scenes per
+    call keeps the answer far inside any budget; the full segment list rides along in each call.
+    """
+    MATCH_SCENE_BATCH = 6
+    intents = list(intents or [])
+    if len(intents) > MATCH_SCENE_BATCH:
+        merged = {}
+        matched_total = 0
+        for b0 in range(0, len(intents), MATCH_SCENE_BATCH):
+            part = match_segments_to_scenes_v2(intents[b0:b0 + MATCH_SCENE_BATCH], segments,
+                                               reasoning_model=reasoning_model, status_cb=status_cb)
+            merged.update(part or {})
+        matched_total = sum(1 for v in merged.values() if v)
+        _log(status_cb, f"Scrape V2: matcher total {matched_total}/{len(intents)} scene(s) "
+                        f"across {(len(intents) + MATCH_SCENE_BATCH - 1) // MATCH_SCENE_BATCH} batches.")
+        return merged
     ac = _ac()
     described = [s for s in segments if s.visual_description]
     if not described or not intents:
@@ -1296,20 +1389,29 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         "You match short video SEGMENTS to narration SCENES for a found-footage short. For EACH scene, "
         "pick the best-fitting segments and score the fit. A segment fits when its subject/action/"
         "location genuinely support the scene's visible intent. Fragments/abstract scenes accept a "
-        "topically coherent segment. Never invent a match for off-topic footage.\n\n"
+        "topically coherent segment; for those, a topically related Japanese slice-of-life segment is "
+        "a VALID candidate (score it honestly rather than returning nothing). Only genuinely off-topic "
+        "footage gets no candidate.\n\n"
         "SEGMENTS:\n" + "\n".join(seg_lines) + "\n\nSCENES:\n" + "\n".join(intent_lines) + "\n\n"
-        'Return STRICT JSON: {"scenes": {"<scene_id>": [{"seg": <seg index>, "subject_match":0-10,'
+        'Return STRICT JSON: {"scenes": {"1": [{"seg": <seg index>, "subject_match":0-10,'
         '"action_match":0-10,"location_match":0-10,"mood_match":0-10,"script_match":0-10,'
-        '"style_match":0-10,"reason":"short"}], ...}} - list up to 4 candidates per scene, best first.')
+        '"style_match":0-10,"reason":"short"}], "2": [...]}} - keys are the BARE scene numbers '
+        'shown above (digits only, never "scene 1"); list up to 4 candidates per scene, best first.')
     data = _llm_json([{"role": "system", "content": "You are a precise footage-to-script matcher. JSON only."},
                       {"role": "user", "content": prompt}],
-                     max_tokens=6000, temperature=0.1, reasoning_model=reasoning_model)
+                     max_tokens=6000, temperature=0.1, reasoning_model=reasoning_model,
+                     status_cb=status_cb, label="scene matcher")
     smap = data.get("scenes") if isinstance(data.get("scenes"), dict) else {}
+    if not smap:
+        _log(status_cb, "Scrape V2: WARNING - scene matcher returned NO usable data for "
+                        f"{len(described)} segment(s); these segments scored 0 for every scene.")
     intent_by_id = {it.scene_id: it for it in intents}
     out = {}
     for sid_str, cands in smap.items():
         try:
-            sid = int(sid_str)
+            # models routinely answer with "scene 3" / "Scene_3" instead of "3" - a strict
+            # int() threw ValueError and silently DISCARDED every candidate of that scene
+            sid = int(re.sub(r"[^0-9-]", "", str(sid_str)) or "x")
         except (TypeError, ValueError):
             continue
         it = intent_by_id.get(sid)
@@ -1384,7 +1486,10 @@ def assign_segments_globally_v2(intents, scene_candidates, cfg=None, status_cb=N
         return False
 
     def _caps_ok(seg, cand_class):
-        if seg_use.get(seg.segment_id, 0) >= 2:
+        # ONE scene per segment (was 2): the same segment appearing twice reads as "the video
+        # repeats itself" (user complaint on run #5 - 4 segments were each used for 2 scenes).
+        # Different WINDOWS of the same source stay allowed via max_segments_per_source_final.
+        if seg_use.get(seg.segment_id, 0) >= 1:
             return False
         if source_use.get(seg.source_id, 0) >= cfg["max_segments_per_source_final"]:
             return False
@@ -1440,11 +1545,13 @@ def validate_scrape_render_v2(config, status_cb=None):
                 raise RuntimeError(f"Scrape V2: circle/stamp overlay on scene {sc.get('id')}")
     if (scenes[0].get("visual_role") or "") != "hook_influencer":
         raise RuntimeError("Scrape V2: hook is not the first scene")
+    emergency_scenes = 0
     for i, sc in enumerate(scenes):
         if not sc.get("clip"):
             raise RuntimeError(f"Scrape V2: scene {i} has no segment clip")
         atype = str(sc.get("assignment_type") or "exact")
         if atype == "emergency_fallback":
+            emergency_scenes += 1
             _log(status_cb, f"Scrape V2 WARNING: scene {i} uses an emergency fallback clip.")
         if str(sc.get("match_class") or "") == "D_REJECTED" and atype not in ("context_fallback", "emergency_fallback"):
             raise RuntimeError(f"Scrape V2: scene {i} is D_REJECTED without a controlled fallback")
@@ -1454,6 +1561,13 @@ def validate_scrape_render_v2(config, status_cb=None):
             bbs = 0.0
         if sc.get("is_fake_vertical") or bbs > SEGMENT_HARD_REJECT_BLACKBAR:
             raise RuntimeError(f"Scrape V2: scene {i} massive black bars (score={bbs})")
+    # A couple of emergency scenes are tolerable; a MAJORITY means the matcher collapsed and
+    # the video would be mostly random off-topic footage - refuse to render that.
+    if emergency_scenes * 2 > len(scenes):
+        raise RuntimeError(
+            f"Scrape V2 pre-render validation failed: {emergency_scenes}/{len(scenes)} scenes are "
+            "emergency-fallback (unmatched) clips - the semantic matcher failed; not rendering "
+            "a mostly off-topic video.")
     config["pre_render_validation_passed"] = True
     _log(status_cb, "Scrape V2 pre-render validation passed.")
     return True
@@ -1467,6 +1581,7 @@ def build_debug_report(state: dict) -> dict:
         "engine": "scrape_v2",
         "analysis_version": V2_ANALYSIS_VERSION,
         "queries_executed": state.get("queries_executed", 0),
+        "query_texts": list(state.get("query_texts") or []),
         "sort_pass_counts": dict(state.get("sort_pass_counts") or {}),
         "raw_results": state.get("raw_results", 0),
         "metadata_candidates": state.get("metadata_candidates", 0),
@@ -1509,10 +1624,20 @@ def _hook_presenter_queries_v2():
     Reuses the same query pool as the V1 hook finder (agent_core.HOOK_PRESENTER_QUERIES)."""
     pools = getattr(_ac(), "HOOK_PRESENTER_QUERIES", {}) or {}
     out = []
-    # Six strong terms are enough. Each is searched under relevance/likes/views, so the old
-    # 18-term pool caused ~54 serial browser searches and could spend 15 minutes on the hook alone.
-    limits = {"exact": 2, "social": 1, "english": 2, "hashtag": 1}
-    for group, lang in (("exact", "ja"), ("social", "ja"), ("english", "en"), ("hashtag", "ja")):
+    # A handful of strong terms is enough. Each is searched under relevance/likes/views, so the
+    # old 18-term pool caused ~54 serial browser searches and could spend 15 minutes on the hook
+    # alone. Birth-year tags ("#0X #女の子", user-provided) go FIRST: they surface exactly the
+    # young-Japanese-creator demographic on TikTok AND Instagram, and their surplus segments
+    # double as generic Japanese-style fill for the body/context-fallback pool. Rotate through
+    # the years so consecutive runs don't hammer the same two tags.
+    limits = {"birthyear": 2, "exact": 2, "social": 1, "english": 1, "hashtag": 1}
+    by = list(pools.get("birthyear") or [])
+    if by:
+        rot = int(time.time() // 3600) % len(by)      # hourly rotation start
+        pools = dict(pools)
+        pools["birthyear"] = by[rot:] + by[:rot]
+    for group, lang in (("birthyear", "ja"), ("exact", "ja"), ("social", "ja"),
+                        ("english", "en"), ("hashtag", "ja")):
         for q in (pools.get(group) or [])[:limits[group]]:
             out.append(SearchQueryV2(
                 query=q, language=lang, tier="exact_action", visual_intent_id="hook_influencer",
@@ -1547,6 +1672,9 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
             items = clip_scraper.backend_search(q.query, 8, status_cb=status_cb, sort=sort_mode,
                                                 platforms=platforms, deadline=deadline) or []
             state["queries_executed"] = state.get("queries_executed", 0) + 1
+            qt = state.setdefault("query_texts", [])
+            if q.query not in qt:
+                qt.append(q.query)
             state.setdefault("sort_pass_counts", {})[sort_mode] = (
                 state.setdefault("sort_pass_counts", {}).get(sort_mode, 0) + 1)
             state["raw_results"] = state.get("raw_results", 0) + len(items)
@@ -1613,14 +1741,26 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
     return passed
 
 
-def _finalize_segment_clip(seg, project_dir, ffmpeg):
-    """Normalize the chosen segment window into a clean 9:16 1080x1920 clip. Returns the path."""
+def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
+    """Normalize the chosen segment window into a clean 9:16 1080x1920 clip. Returns the path.
+
+    `min_seconds`: cut AT LEAST this much source (scene length + headroom). The segment window
+    is only the DISCOVERY window (~2.3s); the source proxy is the whole video, so a scene that
+    needs 3.3s can simply take more material from the same start point. Cutting only the window
+    made the renderer FREEZE the last frame for the difference (user: "zahlreiche freezeframes").
+    """
+    want = max(float(seg.duration or 0), float(min_seconds or 0))
+    prev = getattr(seg, "_final_secs", 0.0)
+    if seg.final_path and prev >= want - 0.01:
+        return seg.final_path
     out_dir = Path(project_dir) / "seedance 2.0"
     key = hashlib.sha1(seg.segment_id.encode("utf-8", "ignore")).hexdigest()[:10]
     dest = out_dir / ("v2seg_" + key + ".mp4")
-    final = clip_scraper.normalize_clip(seg.source_path, dest, ffmpeg, seconds=seg.duration,
+    final = clip_scraper.normalize_clip(seg.source_path, dest, ffmpeg, seconds=want,
                                         start=seg.start_time)
     seg.final_path = str(final) if final else ""
+    if final:
+        seg._final_secs = want
     return seg.final_path
 
 
@@ -1805,12 +1945,68 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         _log(status_cb, "Scrape V2: matching clips to scenes...")
         new_matches = match_segments_to_scenes_v2(body_intents, segs, reasoning_model=reasoning_model,
                                                   status_cb=status_cb)
+        # USER-FACING SCRAPE LOG: one entry per evaluated clip - thumbnails, search term,
+        # what the vision AI saw, per-scene scores + accept/reject verdict with reason.
+        intent_text = {it.scene_id: (it.scene_text or "")[:160] for it in body_intents}
+        for seg in segs:
+            vd = seg.visual_description or {}
+            best = None
+            scored_scenes = []
+            for sid, cands in (new_matches or {}).items():
+                for c in cands:
+                    if c["segment"].segment_id == seg.segment_id:
+                        row = {"scene": sid, "scene_text": intent_text.get(sid, ""),
+                               "overall": c["overall_match"], "script_match": c["script_match"],
+                               "match_class": c["match_class"], "reason": c.get("reason", "")}
+                        scored_scenes.append(row)
+                        if best is None or row["overall"] > best["overall"]:
+                            best = row
+            if scored_scenes:
+                verdict = "candidate"
+                why = (f"passed match floors for scene(s) "
+                       f"{', '.join(str(r['scene']) for r in scored_scenes)}"
+                       + (f" - best: {best['reason']}" if best and best.get("reason") else ""))
+            else:
+                verdict = "rejected"
+                why = ("below the semantic match floors for every scene "
+                       "(subject/action/location did not support any narration line strongly enough)")
+            _slog(project_dir, {
+                "type": "clip", "segment_id": seg.segment_id, "platform": seg.platform,
+                "clip_id": seg.source_id, "query": seg.query or "",
+                "thumbs": _slog_thumbs(seg, project_dir, ffmpeg),
+                "vision": {k: vd.get(k) for k in ("subjects", "action", "location",
+                                                  "camera_style", "visible_text",
+                                                  "burned_captions", "raw_footage_score",
+                                                  "visual_quality") if k in vd},
+                "quality_score": round(float(seg.quality_score or 0), 1),
+                "verdict": verdict, "why": why, "scenes": scored_scenes[:4],
+            })
         for sid, cands in new_matches.items():
             scene_candidates.setdefault(sid, [])
             scene_candidates[sid].extend(cands)
             scene_candidates[sid].sort(key=lambda r: r["overall_match"], reverse=True)
             scene_candidates[sid] = scene_candidates[sid][:6]
         state["segments_semantic_passed"] = sum(len(v) for v in scene_candidates.values())
+
+    # RESCUE RE-MATCH: if the semantic matcher produced ZERO candidates across ALL scenes
+    # (single silent LLM failure, truncated JSON, timeout...), one more attempt over the best
+    # described segments - this is cheap next to the scrape and prevents the whole run from
+    # degrading into random emergency-fallback clips.
+    if not any(scene_candidates.get(it.scene_id) for it in body_intents):
+        described_all = [s for s in all_segments if s.visual_description]
+        if described_all:
+            _log(status_cb, "Scrape V2: matcher yielded 0 candidates for every scene - "
+                            "running a rescue re-match over %d described segment(s)..."
+                 % len(described_all))
+            best = sorted(described_all, key=lambda s: s.quality_score, reverse=True)[:40]
+            rescue = match_segments_to_scenes_v2(body_intents, best,
+                                                 reasoning_model=reasoning_model, status_cb=status_cb)
+            for sid, cands in rescue.items():
+                scene_candidates.setdefault(sid, [])
+                scene_candidates[sid].extend(cands)
+                scene_candidates[sid].sort(key=lambda r: r["overall_match"], reverse=True)
+                scene_candidates[sid] = scene_candidates[sid][:6]
+            state["segments_semantic_passed"] = sum(len(v) for v in scene_candidates.values())
 
     weak = [it for it in body_intents if not scene_candidates.get(it.scene_id)]
     if weak and time.monotonic() < deadline:
@@ -1820,6 +2016,18 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         for sid, cands in retry_matches.items():
             scene_candidates.setdefault(sid, []).extend(cands)
             scene_candidates[sid].sort(key=lambda r: r["overall_match"], reverse=True)
+
+    # TOTAL-COLLAPSE GUARD: still zero semantic candidates for every scene although segments
+    # were described -> DO NOT render a video out of random clips. Fail loudly instead; the
+    # emergency fallback exists for a FEW unmatched scenes, not for all of them.
+    if (not any(scene_candidates.get(it.scene_id) for it in body_intents)
+            and any(s.visual_description for s in all_segments)):
+        raise RuntimeError(
+            "Scrape V2: the clip-to-scene matcher failed for EVERY scene (0 semantic matches "
+            "across %d described segments). The result would be a video of random off-topic "
+            "clips, so the run was stopped. Likely cause: the matcher LLM call failed or "
+            "returned unusable JSON - check the log lines above and the reasoning model."
+            % sum(1 for s in all_segments if s.visual_description))
 
     _log(status_cb, "Scrape V2: final assignment...")
     assignments = assign_segments_globally_v2(body_intents, scene_candidates, cfg, status_cb=status_cb)
@@ -1842,6 +2050,16 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         overlap = (len(wt & ht) / float(len(wt))) * 10.0 if wt else 0.0
         return base * 0.6 + overlap * 0.4
 
+    # Same-source cap for the fallback filler too: the global assigner already enforces
+    # max_segments_per_source_final, but this filler used to ignore it - one source video
+    # could fill 3+ scenes (the "same clip 5x" complaint). Count existing uses first.
+    _src_use = {}
+    for a in assignments.values():
+        seg0 = getattr(a, "_seg", None)
+        if a.segment_id and seg0 is not None:
+            _src_use[seg0.source_id] = _src_use.get(seg0.source_id, 0) + 1
+    _src_cap = int(cfg.get("max_segments_per_source_final", 2) or 2)
+
     for it in body_intents:
         a = assignments.get(it.scene_id)
         if a and a.segment_id:
@@ -1850,17 +2068,21 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         atype, flevel = "context_fallback", 4
         # rank the remaining pool by relevance to THIS scene
         ranked_spare = sorted(spare, key=lambda s: _spare_relevance(s, it), reverse=True)
-        for s in ranked_spare:
+        fresh = [s for s in ranked_spare if _src_use.get(s.source_id, 0) < _src_cap]
+        for s in fresh:
             rel = max(s.semantic_score, s.metadata_relevance)
             if rel >= CONTEXT_FALLBACK_MIN_RELEVANCE and s.quality_score >= CONTEXT_FALLBACK_MIN_QUALITY:
                 chosen = s
                 break
-        if chosen is None and ranked_spare:
+        if chosen is None and (fresh or ranked_spare):
             # last resort: the MOST RELEVANT remaining clip for this scene (never the shiniest
-            # random one). Still marked emergency_fallback so the report/validator can flag it.
-            chosen = ranked_spare[0]
+            # random one). Prefer a source not yet over the cap; only break the cap when every
+            # remaining spare is from an already-used source. Still marked emergency_fallback
+            # so the report/validator can flag it.
+            chosen = (fresh or ranked_spare)[0]
             atype, flevel = "emergency_fallback", 5
         if chosen is not None:
+            _src_use[chosen.source_id] = _src_use.get(chosen.source_id, 0) + 1
             spare.remove(chosen)
             na = SceneAssignment(scene_id=it.scene_id, segment_id=chosen.segment_id,
                                  assignment_type=atype, fallback_level=flevel,
@@ -1888,7 +2110,14 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     clip_decision_log = [None] * len(scenes)
 
     def _write_scene(scene_idx, seg, atype, flevel, sem, mclass, visual_role=None):
-        final = _finalize_segment_clip(seg, project_dir, ffmpeg) if not seg.final_path else seg.final_path
+        sc0 = scenes[scene_idx]
+        try:
+            scene_need = max(0.0, float(sc0.get("end", 0) or 0) - float(sc0.get("start", 0) or 0))
+        except (TypeError, ValueError):
+            scene_need = 0.0
+        # cut enough source for the scene (+headroom) so the renderer never freeze-frames
+        final = _finalize_segment_clip(seg, project_dir, ffmpeg,
+                                       min_seconds=(scene_need + 0.3) if scene_need else None)
         if not final:
             return False
         sc = scenes[scene_idx]
@@ -1909,6 +2138,19 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         if visual_role:
             sc["visual_role"] = visual_role
         scene_clips_out[scene_idx] = final
+        _slog(project_dir, {
+            "type": "assignment", "segment_id": seg.segment_id, "platform": seg.platform,
+            "clip_id": seg.source_id, "query": seg.query or "",
+            "scene": scene_idx,
+            "scene_text": str(sc.get("exact_voice_text") or sc.get("voice_line")
+                             or sc.get("script") or "")[:160],
+            "assignment_type": atype, "match_class": mclass,
+            "script_match_score": round(sem, 1),
+            "why": ("exact semantic match" if atype == "exact" else
+                    "relevance-ranked fallback (no exact match passed the floors for this scene)"
+                    if atype in ("context_fallback",) else atype),
+            "thumbs": _slog_thumbs(seg, project_dir, ffmpeg, n=1),
+        })
         clip_decision_log[scene_idx] = {
             "scene": scene_idx, "chosen_clip": name, "match_class": mclass,
             "script_match_score": round(sem, 1), "assignment_type": atype,

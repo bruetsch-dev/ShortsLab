@@ -119,8 +119,16 @@ def concat_audio_parts(part_paths, out_path, ffmpeg):
     return out_path
 
 
-def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None):
-    """Script -> voiceover.wav (parts stitched). Returns (path, parts_count)."""
+def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
+                       speech_gate=None):
+    """Script -> voiceover.wav (parts stitched). Returns (path, parts_count).
+
+    `speech_gate(parts_info, regen_part)` (optional, "Halt after speech"): called AFTER all
+    TTS parts exist and BEFORE they are stitched. `parts_info` is a list of
+    {"index", "text", "path"}; `regen_part(i)` re-generates part i with a fresh TTS take and
+    returns the new path. The gate blocks until the user has approved every part (declines
+    trigger regen through the callback); it raises to cancel the run.
+    """
     parts = split_script_for_tts(script)
     if not parts:
         raise LongformError("The script is empty.")
@@ -139,6 +147,36 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
                                             model=tts_model, cancel_event=cancel_event,
                                             status_cb=status_cb)
         part_files.append(p)
+
+    if speech_gate is not None:
+        parts_info = [{"index": i, "text": parts[i], "path": str(part_files[i])}
+                      for i in range(len(parts))]
+        take_counter = {}
+
+        def regen_part(i):
+            if cancel_event is not None and cancel_event.is_set():
+                raise pipeline.PipelineCancelled("Cancelled.")
+            take = take_counter.get(i, 0) + 1
+            take_counter[i] = take
+            _log(status_cb, f"Re-generating voiceover part {i + 1}/{len(parts)} (take {take + 1})...")
+            # a NEW filename per take: browsers cache the old audio URL otherwise
+            new_path = pipeline.generate_speech_gemini(
+                parts[i], out_dir / f"vo_part{i:02d}_take{take}.wav",
+                model=tts_model, cancel_event=cancel_event, status_cb=status_cb)
+            old = part_files[i]
+            part_files[i] = Path(new_path)
+            try:
+                if str(old) != str(new_path):
+                    Path(old).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return str(new_path)
+
+        _log(status_cb, f"Halt after speech: waiting for your approval of {len(parts)} "
+                        "voiceover part(s)...")
+        speech_gate(parts_info, regen_part)
+        _log(status_cb, "All voiceover parts approved - stitching and continuing.")
+
     out = concat_audio_parts(part_files, out_dir / "voiceover.wav", ffmpeg)
     for p in part_files:
         try:
@@ -530,7 +568,7 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
 # ------------------------------------------------------------------ ORCHESTRATOR
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
-                       status_cb=None, cancel_event=None):
+                       status_cb=None, cancel_event=None, speech_gate=None):
     """The whole pipeline. Returns a result dict for the job UI."""
     script = str(script or "").strip()
     if len(script) < 40:
@@ -541,7 +579,8 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     (out_dir / "script.txt").write_text(script, encoding="utf-8")
 
     voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
-                                               status_cb=status_cb, cancel_event=cancel_event)
+                                               status_cb=status_cb, cancel_event=cancel_event,
+                                               speech_gate=speech_gate)
     ffprobe = pipeline.find_ffprobe(pipeline.find_ffmpeg())
     audio_duration = 0.0
     try:

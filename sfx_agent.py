@@ -715,7 +715,8 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
                             + (lib.get("whoosh_hit_combo") or []))
     impact_pool = lib.get("impact_hit") or (data.get("reactions", {}).get("shock_reveal") or [])
     ui_pool = lib.get("ui_click") or lib.get("caption_pop") or []
-    hook_pool = data.get("hook_risers") or data.get("risers") or []
+    # the OPENING sound must be a dedicated hook_riser file - never a generic body riser
+    hook_pool = data.get("hook_risers") or []
     reactions = data.get("reactions") or {}
     existing_onsets = [float(o) for o in (existing_onsets or [])]
     profile = sfx_amount_profile(sfx_amount)
@@ -754,6 +755,27 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
     # -- hook riser first (exactly one; extra risers dropped) --
     riser_events = [e for e in events if e["sfx_type"] == "hook_riser"]
     rest = [e for e in events if e["sfx_type"] != "hook_riser"]
+    if not hook_pool:
+        # the passed catalog may carry no riser entries (e.g. label-only catalogs) - the riser
+        # FILES exist in the scanned sound library, so fall back to it; without this the final
+        # mix opened with a bare reaction sound instead of the mandatory hook riser.
+        try:
+            _full = sfx_library.build_library()
+            # hook_risers ONLY - a generic body riser at 0.0s is not an opening hook riser
+            hook_pool = list(_full.get("hook_risers") or [])
+            if hook_pool:
+                log(status_cb, f"Hook riser pool loaded from the sound library "
+                               f"({len(hook_pool)} file(s)) - the catalog had none.")
+        except Exception:
+            hook_pool = []
+    if hook_pool and not riser_events:
+        # The director is REQUIRED to open with a hook_riser at 0.00 but LLMs sometimes omit
+        # it - then the video used to open with whatever reaction landed first (e.g. an "aww"
+        # at 0.0s). Synthesize the riser instead of trusting the plan blindly.
+        log(status_cb, "Hook riser missing from the director plan - synthesizing the mandatory opening riser.")
+        riser_events = [{"sfx_type": "hook_riser", "timestamp": 0.0, "end_timestamp": 0.0,
+                         "trigger_source": "backend",
+                         "trigger_detail": "synthesized (director omitted the mandatory opening riser)"}]
     if riser_events and hook_pool:
         ev = riser_events[0]
         end = float(ev.get("end_timestamp") or 0.0)
@@ -783,6 +805,13 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
                          "trigger_source": "backend", "trigger_detail": "riser climax (auto)",
                          "reasoning": "guaranteed impact at hook_riser end"})
             rest.sort(key=lambda e: e["timestamp"])
+
+    if hook_done:
+        # the riser owns the opening: no other sound may sit in the first 0.3s on top of it
+        early = [e for e in rest if float(e.get("timestamp", 0) or 0) < 0.30]
+        if early:
+            rest = [e for e in rest if float(e.get("timestamp", 0) or 0) >= 0.30]
+            log(status_cb, f"Dropped {len(early)} SFX event(s) inside 0.0-0.3s - the hook riser owns the opening.")
 
     # TWO-PASS ORDER (user rule): place ALL structural/cut SFX first (transitions, impacts, ui),
     # THEN the reaction SFX. This way cut sounds always claim their slot on the boundary and the

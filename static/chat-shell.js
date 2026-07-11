@@ -910,6 +910,16 @@ function renderLongformFlow() {
       c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
       appendReasoningField(c, S.longform.reasoning_model || firstVal(OPT.longform_reasoning), S.longform);
     }
+    // "Halt after speech": pause after TTS so every voiceover part can be approved/declined
+    {
+      const row = el("label", "toggle-row");
+      const cb = document.createElement("input"); cb.type = "checkbox";
+      cb.checked = S.longform.halt_after_speech !== false;   // default ON
+      cb.addEventListener("change", () => { S.longform.halt_after_speech = cb.checked; persist(); });
+      row.appendChild(cb);
+      row.appendChild(el("span", "", esc(T.longform_halt_speech)));
+      c.appendChild(row);
+    }
     c.appendChild(el("div", "card-cap", esc(T.connections)));
     c.appendChild(connectionRow("higgsfield", T.connect_higgsfield, "/higgsfield-status", "/higgsfield-login"));
     const foot = el("div", "card-foot");
@@ -926,6 +936,7 @@ async function submitLongform() {
   fd.append("tts_model", S.longform.tts_model || firstVal(OPT.longform_tts) || "pro");
   fd.append("reasoning_model", S.longform.reasoning_model || firstVal(OPT.longform_reasoning) || "anthropic/claude-opus-4.8");
   fd.append("reasoning_mode", S.longform.reasoning_mode || "");
+  if (S.longform.halt_after_speech !== false) fd.append("halt_after_speech", "on");
   const c = card(); c.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
   try {
     const r = await fetch("/longform-run", { method: "POST", body: fd });
@@ -1208,6 +1219,42 @@ async function pollJob() {
   const lg = $("job-log");
   if (lg && d.log_text != null && lg.textContent !== d.log_text) { lg.textContent = d.log_text; lg.scrollTop = lg.scrollHeight; }
   // (phase-message chat bubbles removed - the user follows progress in the run box / tech log)
+  // longform per-part speech approval ("Halt after speech" in the longform creator)
+  const lfp = $("job-speech");
+  if (lfp && d.status === "awaiting_approval" && (d.lf_parts || []).length) {
+    const sig = JSON.stringify((d.lf_parts || []).map(p => [p.index, p.state, p.url]));
+    if (lfp.dataset.lfSig !== sig) {
+      lfp.dataset.lfSig = sig; lfp.innerHTML = "";
+      const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", esc(T.lf_parts_ready))); lfp.appendChild(m);
+      const c = el("div", "chat-card"); lfp.appendChild(c);
+      (d.lf_parts || []).forEach(p => {
+        const row = el("div", "lf-part");
+        row.appendChild(el("div", "card-cap", esc(T.lf_part) + " " + (p.index + 1) +
+          (p.state === "approved" ? " · ✓ " + esc(T.lf_approved) :
+           p.state === "regenerating" ? " · ↻ " + esc(T.lf_regenerating) : "")));
+        row.appendChild(el("div", "lf-part-text", esc((p.text || "").slice(0, 220))));
+        if (p.url && p.state !== "regenerating") {
+          const au = el("audio", "inline-audio"); au.controls = true; au.src = p.url; row.appendChild(au);
+        }
+        if (p.state === "pending") {
+          const foot = el("div", "card-foot");
+          const decide = async (action, btnEl) => {
+            btnEl.disabled = true;
+            await fetch("/longform-speech-decide?id=" + encodeURIComponent(S.jobId) +
+              "&part=" + encodeURIComponent(p.index) + "&action=" + action, { method: "POST" });
+            setTimeout(pollJob, 700);
+          };
+          foot.appendChild(btn("✓ " + T.lf_approve, ev => decide("approve", ev.currentTarget), "primary"));
+          foot.appendChild(btn("↻ " + T.lf_decline, ev => decide("decline", ev.currentTarget), "danger"));
+          row.appendChild(foot);
+        }
+        c.appendChild(row);
+      });
+      scrollDown();
+    }
+  } else if (lfp && lfp.dataset.lfSig && d.status !== "awaiting_approval") {
+    lfp.innerHTML = ""; delete lfp.dataset.lfSig;
+  }
   // speech approval
   const sp = $("job-speech");
   if (sp) {
@@ -1579,6 +1626,7 @@ function paintSidebarProjects() {
 const CONNS = [
   ["tiktok", "TikTok", "/tiktok-status", "/tiktok-login"],
   ["x", "X", "/twitter-status", "/twitter-login"],
+  ["instagram", "Instagram", "/instagram-status", "/instagram-login"],
   ["higgsfield", "Higgsfield", "/higgsfield-status", "/higgsfield-login"],
 ];
 async function paintConnections() {

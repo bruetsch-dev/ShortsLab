@@ -61,6 +61,11 @@ try:
 except Exception:  # pragma: no cover - Playwright not installed
     twitter_login = None
 
+try:
+    import instagram_login           # logged-in Instagram Reels backend (searched IN PARALLEL)
+except Exception:  # pragma: no cover - Playwright not installed
+    instagram_login = None
+
 
 TARGET_W, TARGET_H = 1080, 1920
 DEFAULT_CLIP_SECONDS = 4.0
@@ -216,8 +221,12 @@ def twitter_backend_ready():
     return bool(twitter_login is not None and twitter_login.is_ready())
 
 
+def instagram_backend_ready():
+    return bool(instagram_login is not None and instagram_login.is_ready())
+
+
 def normalize_platforms(platforms=None):
-    """Return the requested scrape backends using the two canonical names."""
+    """Return the requested scrape backends using the canonical names."""
     if isinstance(platforms, str):
         platforms = re.split(r"[,\s]+", platforms)
     requested = {str(p or "").strip().lower() for p in (platforms or ("tiktok", "twitter"))}
@@ -226,6 +235,8 @@ def normalize_platforms(platforms=None):
         out.add("tiktok")
     if requested & {"x", "twitter", "x.com"}:
         out.add("twitter")
+    if requested & {"instagram", "ig", "insta", "reels"}:
+        out.add("instagram")
     return out or {"tiktok", "twitter"}
 
 
@@ -235,14 +246,22 @@ def platform_like_floor(min_likes, platform):
         floor = max(0, int(min_likes or 0))
     except (TypeError, ValueError):
         floor = 0
-    return max(1, int(math.ceil(floor / 4.0))) if floor and str(platform).lower() == "twitter" else floor
+    if not floor:
+        return floor
+    p = str(platform).lower()
+    if p == "twitter":
+        return max(1, int(math.ceil(floor / 4.0)))
+    if p == "instagram":            # Reels likes trail TikTok's for the same reach
+        return max(1, int(math.ceil(floor / 2.0)))
+    return floor
 
 
 def backend_active(platforms=None):
     """True when at least one requested backend has a saved login."""
     selected = normalize_platforms(platforms)
     return (("tiktok" in selected and tiktok_backend_ready())
-            or ("twitter" in selected and twitter_backend_ready()))
+            or ("twitter" in selected and twitter_backend_ready())
+            or ("instagram" in selected and instagram_backend_ready()))
 
 
 def backend_name(platforms=None):
@@ -252,6 +271,8 @@ def backend_name(platforms=None):
         names.append("tiktok_login")
     if "twitter" in selected and twitter_backend_ready():
         names.append("twitter_login")
+    if "instagram" in selected and instagram_backend_ready():
+        names.append("instagram_login")
     return "+".join(names) if names else "none"
 
 
@@ -365,7 +386,8 @@ def backend_search_health(platforms=None):
     total = {"searches": 0, "items": 0, "login_wall": 0}
     selected = normalize_platforms(platforms)
     for platform, mod, ready in (("tiktok", tiktok_login, tiktok_backend_ready()),
-                                 ("twitter", twitter_login, twitter_backend_ready())):
+                                 ("twitter", twitter_login, twitter_backend_ready()),
+                                 ("instagram", instagram_login, instagram_backend_ready())):
         if platform not in selected:
             continue
         if not ready or mod is None:
@@ -384,7 +406,7 @@ def reset_backend_search_health():
     _SEEN_QUERIES.clear()               # fresh run -> allow every query once again
     _X_ZERO_STREAK = 0
     _X_UNAVAILABLE = False
-    for mod in (tiktok_login, twitter_login):
+    for mod in (tiktok_login, twitter_login, instagram_login):
         if mod is not None:
             try:
                 mod.reset_search_stats()
@@ -407,6 +429,13 @@ def _merge_backend_cookies(platforms=None):
     if "twitter" in selected and twitter_backend_ready():
         try:
             ck = twitter_login.export_cookies_txt()
+            if ck and Path(ck).exists():
+                parts.append(Path(ck).read_text("utf-8"))
+        except Exception:
+            pass
+    if "instagram" in selected and instagram_backend_ready():
+        try:
+            ck = instagram_login.export_cookies_txt()
             if ck and Path(ck).exists():
                 parts.append(Path(ck).read_text("utf-8"))
         except Exception:
@@ -483,6 +512,12 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
                 sort=sort)
         else:
             _status(status_cb, f"X: skipped malformed query {query!r} (not a valid search phrase).")
+    ig_future = None
+    if "instagram" in selected and instagram_backend_ready():
+        # Instagram runs on its own worker thread, concurrently with TikTok + X.
+        ig_future = instagram_login.search_async(
+            query, want=int(want), status_cb=lambda _message: None, timeout_s=remaining,
+            sort=sort)
     items = []
     if tt_ready:
         items = tiktok_login.search_sync(query, want=int(want), status_cb=lambda _message: None,
@@ -503,6 +538,22 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             if ck:
                 set_cookies(ck)    # make sure yt-dlp has x.com cookies for these downloads
             items.extend(x_items)
+    if ig_future is not None:
+        try:
+            wait_s = 90.0 if deadline is None else max(0.1, deadline - time.monotonic())
+            ig_items = ig_future.result(timeout=min(90.0, wait_s)) or []
+        except concurrent.futures.TimeoutError:
+            ig_future.cancel()
+            _status(status_cb, f"Instagram search timed out for {query!r}; moving to the next query.")
+            ig_items = []
+        except Exception as exc:  # noqa: BLE001
+            _status(status_cb, f"Instagram search failed ({exc.__class__.__name__}: {exc}).")
+            ig_items = []
+        if ig_items:
+            ck = _merge_backend_cookies(selected)
+            if ck:
+                set_cookies(ck)    # instagram.com cookies for the yt-dlp reel downloads
+            items.extend(ig_items)
     sort_mode = str(sort or "MOST_LIKED").upper()
     metric = {"MOST_VIEWED": "views", "MOST_RECENT": "created_at"}.get(sort_mode, "likes")
     if sort_mode in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"}:
@@ -557,8 +608,8 @@ def backend_download(item, dest, status_cb=None):
 
 
 def close_backend():
-    """Tear down the shared TikTok + X sessions at the end of a run."""
-    for mod in (tiktok_login, twitter_login):
+    """Tear down the shared TikTok + X + Instagram sessions at the end of a run."""
+    for mod in (tiktok_login, twitter_login, instagram_login):
         if mod is not None:
             try:
                 mod.close_session()
@@ -1533,13 +1584,18 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             query_perf.extend({"query": q, "bucket_id": bucket_id, "tier": tier,
                                "platform": "twitter", "status": "invalid_query",
                                "raw_results": 0} for q in invalid_x)
+    # Instagram keyword search is tolerant like TikTok's -> it gets the raw phrases.
+    instagram_queries = list(queries) if "instagram" in selected_platforms else []
     prefer_x = str(search_intent or "").lower() in X_QUERY_INTENTS
     search_jobs = []
-    max_queries = max(len(tiktok_queries), len(x_queries))
-    platform_order = ("twitter", "tiktok") if prefer_x else ("tiktok", "twitter")
+    max_queries = max(len(tiktok_queries), len(x_queries), len(instagram_queries))
+    platform_order = (("twitter", "tiktok", "instagram") if prefer_x
+                      else ("tiktok", "instagram", "twitter"))
+    q_by_platform = {"tiktok": tiktok_queries, "twitter": x_queries,
+                     "instagram": instagram_queries}
     for index in range(max_queries):
         for platform in platform_order:
-            source = x_queries if platform == "twitter" else tiktok_queries
+            source = q_by_platform[platform]
             if index < len(source):
                 search_jobs.append((platform, source[index]))
     # dedupe NAMESPACE: retry rounds may re-run a main-phase query once (the pool state has
@@ -1714,7 +1770,8 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
     # proceeds while earlier clips are still being scored and normalized.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     search_summary = {"tiktok": {"queries": 0, "items": 0},
-                      "twitter": {"queries": 0, "items": 0}}
+                      "twitter": {"queries": 0, "items": 0},
+                      "instagram": {"queries": 0, "items": 0}}
     try:
       for qidx, (search_platform, q) in enumerate(search_jobs):
         if ((cancel_check and cancel_check()) or len(accepted) >= want
@@ -1831,7 +1888,7 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         executor.shutdown(wait=True, cancel_futures=True)
     for platform, summary in search_summary.items():
         if summary["queries"]:
-            label = "X" if platform == "twitter" else "TikTok"
+            label = {"twitter": "X", "instagram": "Instagram"}.get(platform, "TikTok")
             _status(status_cb, f"{label}: searched {summary['queries']} quer"
                                f"{'y' if summary['queries'] == 1 else 'ies'} | "
                                f"found {summary['items']} raw video{'s' if summary['items'] != 1 else ''}.")

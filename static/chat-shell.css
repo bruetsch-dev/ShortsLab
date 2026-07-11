@@ -617,3 +617,9 @@ audio.inline-audio { width: 100%; margin-top: 8px; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* longform per-part speech approval + settings toggle */
+.toggle-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; cursor: pointer; font-size: 13px; }
+.toggle-row input { accent-color: var(--accent, #23d160); }
+.lf-part { border: 1px solid var(--line, #2a2f2c); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+.lf-part-text { font-size: 12.5px; color: var(--muted, #9aa39e); margin: 4px 0 2px; line-height: 1.45; }

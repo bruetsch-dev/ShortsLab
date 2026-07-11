@@ -215,8 +215,15 @@ def test_render_validation_v2():
         check("valid v2 timeline passes", True)
     except Exception as e:
         check("valid v2 timeline passes (%s)" % e, False)
-    bad_speed = dict(good); bad_speed["voice_speed"] = 1.0
+    # 1.0x is now a legitimate user choice at the speech gate; only out-of-range speeds fail
+    bad_speed = dict(good); bad_speed["voice_speed"] = 0.5
     check("wrong speed rejected", _raises(lambda: v.validate_scrape_render_v2(bad_speed)))
+    mostly_emergency = {"voice_speed": 1.20, "scenes": [
+        dict(good["scenes"][0]),
+        {"id": 1, "clip": "b1.mp4", "visual_role": "body", "assignment_type": "emergency_fallback"},
+        {"id": 2, "clip": "b2.mp4", "visual_role": "body", "assignment_type": "emergency_fallback"}]}
+    check("mostly-emergency timeline rejected",
+          _raises(lambda: v.validate_scrape_render_v2(mostly_emergency)))
     missing_clip = {"voice_speed": 1.20, "scenes": [dict(good["scenes"][0]),
                     {"id": 1, "visual_role": "body"}]}
     check("scene without clip rejected", _raises(lambda: v.validate_scrape_render_v2(missing_clip)))

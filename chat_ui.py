@@ -99,8 +99,8 @@ UI_STRINGS = {
     "visual_source_q": "Where should the visuals come from?",
     "src_generate": "AI Generate",
     "src_generate_d": "Seedance / image models create every clip.",
-    "src_scrape": "Scrape TikTok + X",
-    "src_scrape_d": "Real clips are found, downloaded and matched to your script.",
+    "src_scrape": "Scrape TikTok + X + Instagram",
+    "src_scrape_d": "Real clips are found, downloaded and matched to your script (connected platforms only).",
     "video_model": "Video model",
     "image_model": "Image model",
     "scrape_engine": "Scraping engine",
@@ -209,6 +209,13 @@ UI_STRINGS = {
     "longform_script_ph": "Paste your full script here...",
     "longform_tts": "Voiceover TTS",
     "longform_reasoning": "Reasoning model",
+    "longform_halt_speech": "Halt after speech (approve each part)",
+    "lf_parts_ready": "Your voiceover parts are ready. Approve each part - declining re-generates that part.",
+    "lf_part": "Part",
+    "lf_approve": "Approve",
+    "lf_decline": "Decline & regenerate",
+    "lf_regenerating": "Regenerating...",
+    "lf_approved": "Approved",
     "create_longform": "Create longform video",
     "upload_txt_btn": "Upload prompt list (.txt)",
     "prompts_found": "prompts found",
@@ -240,7 +247,7 @@ RUN_MANIFEST = {
     # constant hidden fields the legacy form always posts
     "always": {
         "ui_form": "1",
-        "scrape_platforms": "tiktok,x",
+        "scrape_platforms": "tiktok,x,instagram",
         "influencer_hook": "on",
         "mix_voice_in_final": "on",
         "use_visual_direction": "on",
@@ -278,7 +285,8 @@ MASTER_MANIFESTS = {
     "captions": {"action": "/captions-run", "file": "video_file",
                  "fields": ["caption_max_words", "caption_center_y"]},
     "longform": {"action": "/longform-run", "text": ["script"],
-                 "fields": ["tts_model", "reasoning_model"]},
+                 "fields": ["tts_model", "reasoning_model"],
+                 "check": ["halt_after_speech"]},
 }
 
 
@@ -472,6 +480,7 @@ def chat_shell_page(initial=None):
         connections = {
             "tiktok": json.loads(app.tiktok_status_payload().decode("utf-8")),
             "x": json.loads(app.twitter_status_payload().decode("utf-8")),
+            "instagram": json.loads(app.instagram_status_payload().decode("utf-8")),
             "higgsfield": json.loads(app.higgsfield_status_payload().decode("utf-8")),
         }
     except Exception:
@@ -518,7 +527,7 @@ def chat_shell_page(initial=None):
       <div class="sb-projects" id="sb-projects" aria-live="polite"></div>
     </div>
     <div class="sb-section sb-conns-wrap" id="sb-conns-wrap" tabindex="0">
-      <div class="sb-cap sb-conns-cap">{UI_STRINGS["connections"]} <span class="sb-conns-count" id="sb-conns-count">0/3</span></div>
+      <div class="sb-cap sb-conns-cap">{UI_STRINGS["connections"]} <span class="sb-conns-count" id="sb-conns-count">0/4</span></div>
       <div class="sb-conns" id="sb-conns"></div>
     </div>
     <div class="sb-foot">

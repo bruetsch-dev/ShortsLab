@@ -2404,6 +2404,47 @@ def assert_paid_api_allowed(what="paid API"):
             f"NO_PAID_API_TEST_MODE: blocked call to {what} (SHORTSLAB_NO_PAID_API=1)")
 
 
+def _parse_sse_chat_stream(body):
+    """Reassemble a chat/completions SSE stream into one normal response object.
+
+    Since ~2026-07-11 llm.wavespeed.ai streams `text/event-stream` chunks even when
+    `stream` is false/absent. json.loads() on that body raised JSONDecodeError in EVERY
+    LLM call (title gen, balance preflight, V2 architect, scene matcher, audio director...)
+    and silently collapsed whole runs. Concatenate the delta/message content of all
+    `data:` chunks and return a dict shaped like the old non-streaming response.
+    """
+    content, finish, last = [], None, {}
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            d = json.loads(chunk)
+        except Exception:
+            continue
+        if isinstance(d, dict):
+            last = d
+            for ch in d.get("choices") or []:
+                if not isinstance(ch, dict):
+                    continue
+                delta = ch.get("delta") or {}
+                if isinstance(delta, dict) and delta.get("content"):
+                    content.append(str(delta["content"]))
+                msg = ch.get("message") or {}
+                if isinstance(msg, dict) and msg.get("content"):
+                    content.append(str(msg["content"]))
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+    result = dict(last)
+    result["object"] = "chat.completion"
+    result["choices"] = [{"index": 0, "finish_reason": finish,
+                          "message": {"role": "assistant", "content": "".join(content)}}]
+    return result
+
+
 def post_json_url(url, payload, timeout=75):
     payload = dict(payload or {})
     model_id = str(payload.get("model") or "")
@@ -2414,13 +2455,17 @@ def post_json_url(url, payload, timeout=75):
     endpoint = reasoning_modes.get_wavespeed_endpoint(model_id, selected_mode)
     if url == WAVESPEED_LLM_API:
         payload.update(reasoning_payload)
+        # WaveSpeed behavior change ~2026-07-11: sending response_format json_object makes
+        # chat/completions return an EMPTY SSE stream (0 completion tokens) - the model
+        # generates nothing. Prompts already demand strict JSON and extract_json_object
+        # parses fenced/raw text, so drop the parameter entirely.
+        payload.pop("response_format", None)
         if endpoint == "responses":
             url = WAVESPEED_RESPONSES_API
             messages = payload.pop("messages", [])
             payload["input"] = reasoning_modes.responses_input(messages)
             if "max_tokens" in payload:
                 payload["max_output_tokens"] = payload.pop("max_tokens")
-            payload.pop("response_format", None)
     print(f"WaveSpeed request: model={model_id} reasoning={selected_mode or 'unsupported'} "
           f"endpoint={endpoint} payload={reasoning_payload}")
     assert_paid_api_allowed(url)
@@ -2450,7 +2495,13 @@ def post_json_url(url, payload, timeout=75):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+            ctype = str(response.headers.get("Content-Type") or "")
+            if "text/event-stream" in ctype or raw.lstrip().startswith("data:"):
+                # WaveSpeed streams SSE even without stream=true (behavior change 2026-07)
+                result = _parse_sse_chat_stream(raw)
+            else:
+                result = json.loads(raw)
             if endpoint == "responses" and "choices" not in result:
                 text = str(result.get("output_text") or "")
                 if not text:
@@ -2788,6 +2839,11 @@ HOOK_PRESENTER_QUERIES = {
                "TikToker 女子 ダンス"],
     "hashtag": ["#踊ってみた", "#ダンス女子", "#あざと可愛い", "#可愛い", "#おすすめ",
                 "#日本人女性", "#ダンス好きな人と繋がりたい", "#女の子"],
+    # Birth-year tags (user-provided 2026-07-11): young Japanese women tag their birth year
+    # #01..#05 (born 2001-2005); "#0X #女の子" reliably surfaces exactly the hook-presenter
+    # demographic on BOTH TikTok and Instagram, and doubles as generic Japanese-style fill
+    # footage (the hook pool feeds the body/context-fallback pool too).
+    "birthyear": ["#01 #女の子", "#02 #女の子", "#03 #女の子", "#04 #女の子", "#05 #女の子"],
     "english": ["cute Japanese creator dancing", "Japanese idol playful TikTok dance",
                 "kawaii Japanese girl dance TikTok", "Japanese TikToker dance to camera",
                 "Miyu Kishi TikTok dance"],
@@ -5382,7 +5438,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                        f"{start:.2f}->{beat:.2f} ({rlen:.2f}s source at {playback_rate:.3f}x)")
         return True
 
-    hook_pool = data.get("hook_risers") or data.get("risers") or []   # fall back to plain risers
+    hook_pool = data.get("hook_risers") or []   # hook opening = dedicated hook_riser files ONLY
     if hook_pool and len(scenes) > 1 and not semantic_vision:
         _place_riser(float(scenes[1].get("start", 0.0) or 0.0), hook_pool, "hook_riser", -12)
     body_pool = data.get("risers") or []
@@ -8858,6 +8914,12 @@ def run_project(form, status_cb=None):
         if len(scenes_override) != before_stabilize:
             log(status_cb, f"Pacing: merged isolated sub-1.45s beats ({before_stabilize} -> "
                            f"{len(scenes_override)}) to prevent rapid double-cuts in TikTok footage.")
+            # the merge moved boundaries AFTER the voice sync - re-snap every cut onto the
+            # nearest spoken word onset, or the cuts drift off the narration (user complaint)
+            if canonical_words:
+                scenes_override = sync_scenes_to_voice_timeline(
+                    scenes_override, canonical_words, target_duration=target_duration)
+                log(status_cb, "Pacing: cuts re-snapped to spoken word onsets after the merge.")
     log(status_cb, f"Using {len(scenes_override)} micro-beat(s) as the edit map.")
     if visual_script:
         log(status_cb, "Visual Ablauf prompt applied to scene planning, image prompts, Seedance prompts, and review.")
@@ -9854,7 +9916,11 @@ def run_project(form, status_cb=None):
                     continue
                 _key = str(Path(_clip).resolve())
                 _is_dup = _key in _used_keys and _key != _prev_key
-                _is_capt = _cap_score(_clip) > _CAP_MAX
+                # V2 segments already passed the segment-level caption gates
+                # (_segment_caption_signals + burned-caption rejects); re-OCRing them here at
+                # the strict 1.5 bar dropped 13/17 good Japanese clips (signs/stickers score
+                # 2-5) and the continuity fill then rendered ONE clip for the whole video.
+                _is_capt = (not _v2) and _cap_score(_clip) > _CAP_MAX
                 if _is_dup or _is_capt:
                     _cand = [p for p in fallback_pool if str(Path(p).resolve()) not in _used_keys]
                     _clean = [p for p in _cand if _cap_score(p) <= _CAP_MAX]

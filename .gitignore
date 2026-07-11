@@ -88,3 +88,4 @@ static/*.bak
 # per-session chat UI state
 chat_session.json
 soundeffects_backup_original/
+instagram-profile/

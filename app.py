@@ -14,6 +14,21 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# --------------------------------------------------------------------------- env bootstrap
+# WAVESPEED_API_KEY is env-only by design. `setx` writes it to the USER registry scope, but a
+# parent process started BEFORE the setx (launcher, dev harness) hands children its stale
+# environment - the app then sees no key although the machine has one. Fall back to reading
+# the User env var straight from the registry when the process env lacks it.
+if os.name == "nt" and not os.environ.get("WAVESPEED_API_KEY", "").strip():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as _k:
+            _v, _ = winreg.QueryValueEx(_k, "WAVESPEED_API_KEY")
+            if str(_v or "").strip():
+                os.environ["WAVESPEED_API_KEY"] = str(_v).strip()
+    except Exception:
+        pass
+
 # --------------------------------------------------------------------------- crash logging
 # The launcher runs the app with a hidden window and no stderr redirection, so a crash used to
 # vanish with no trace. Persist everything: faulthandler dumps native faults (onnxruntime/opencv
@@ -143,6 +158,7 @@ DEV_TRAINER_SERVERS = {}
 # time per platform. busy = a login window is open and we're waiting for the user to sign in.
 TIKTOK_LOGIN = {"busy": False, "thread": None}
 TWITTER_LOGIN = {"busy": False, "thread": None}
+INSTAGRAM_LOGIN = {"busy": False, "thread": None, "error": ""}
 HIGGSFIELD_LOGIN = {"busy": False, "thread": None, "error": ""}
 TIKTOK_LOCK = threading.Lock()
 HIGGSFIELD_LOCK = threading.Lock()
@@ -168,10 +184,11 @@ UI_TEXT_DEFAULTS = {
     "image_model": "openai/gpt-image-2/text-to-image",
     "hook_text": "",
     "impact_word": "",
+    "reasoning_mode": "",
     "hook_pause_s": "0.45",
     "speaker_image_path": "",
     "clip_source": "generate",
-    "scrape_platforms": "tiktok,x",
+    "scrape_platforms": "tiktok,x,instagram",
     "scrape_terms": "",
     "background_music_choice": "none",
     "script_relevancy": "70",
@@ -305,7 +322,7 @@ BUILTIN_PRESETS = {
         "out_web_images": False, "out_wikimedia": False, "out_gpt_images": False,
         "out_video_clips": True, "out_sfx": True, "out_transition_sfx": True,
         "out_background_music": True, "out_captions": True, "halt_after_speech": False,
-        "clip_source": "scrape", "scrape_platforms": "tiktok,x",
+        "clip_source": "scrape", "scrape_platforms": "tiktok,x,instagram",
         "scrape_terms": "japan, japanese women, tokyo street style, salaryman commute, japan daily life, kimono",
         "script_relevancy": "30",
     },
@@ -3392,7 +3409,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             </div>
           </div>
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
-            <input type="hidden" name="scrape_platforms" value="tiktok,x">
+            <input type="hidden" name="scrape_platforms" value="tiktok,x,instagram">
             <input type="hidden" name="influencer_hook" value="on">
             <label class="scrape-lbl">Scraping engine {help_tip("V2 (Relevance-first) plans concrete visible situations, finds usable SEGMENTS anywhere inside a video, ranks by relevance (not likes) and matches per scene - fewer hard rejects, more on-topic footage. V1 (Legacy) is the original bucket + like-gated scrape. V2 is the default.")}</label>
             <div class="seg-switch" id="engine-seg" data-eng="{esc((state.get('scraping_engine') or 'v2'))}" style="margin-bottom:10px;">
@@ -3474,6 +3491,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
           <input type="hidden" name="impact_word" id="impact-word" value="{esc(state.get('impact_word'))}">
+          <input type="hidden" name="reasoning_mode" value="{esc(state.get('reasoning_mode'))}">
           <div class="hook-controls">
             <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
             <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
@@ -4544,6 +4562,7 @@ def start_longform_video_job(fields):
         tts_model = "pro"
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
     reasoning_mode = fields.get("reasoning_mode")
+    halt_after_speech = agent_core.form_flag(fields, "halt_after_speech", False)
     cancel_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -4578,12 +4597,71 @@ def start_longform_video_job(fields):
             job["logs"].append(message)
             job.setdefault("log_times", []).append(time.time())
 
+    def lf_speech_gate(parts_info, regen_part):
+        """'Halt after speech' for longform: publish every TTS part to the job (text + audio
+        URL), block until each one is APPROVED; a DECLINE re-generates that part via
+        `regen_part` and puts it back to pending. Runs on the worker thread."""
+        states = {p["index"]: "pending" for p in parts_info}
+
+        def publish():
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    raise RunCancelled("Run cancelled by user.")
+                job["lf_parts"] = [
+                    {"index": p["index"], "text": str(p["text"])[:500],
+                     "url": link_for(Path(p["path"])), "state": states[p["index"]]}
+                    for p in sorted(parts_info, key=lambda x: x["index"])]
+
+        with JOB_LOCK:
+            JOBS[job_id]["lf_decisions"] = []
+            JOBS[job_id]["status"] = "awaiting_approval"
+        publish()
+        while True:
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    raise RunCancelled("Run cancelled by user.")
+                decisions = list(job.get("lf_decisions") or [])
+                job["lf_decisions"] = []
+            for dec in decisions:
+                try:
+                    idx = int(dec.get("part"))
+                except (TypeError, ValueError):
+                    continue
+                action = str(dec.get("action") or "").lower()
+                if idx not in states:
+                    continue
+                if action == "approve" and states[idx] in ("pending",):
+                    states[idx] = "approved"
+                    publish()
+                elif action == "decline" and states[idx] in ("pending", "approved"):
+                    states[idx] = "regenerating"
+                    publish()
+                    new_path = regen_part(idx)
+                    for p in parts_info:
+                        if p["index"] == idx:
+                            p["path"] = new_path
+                    states[idx] = "pending"
+                    publish()
+            if states and all(v == "approved" for v in states.values()):
+                with JOB_LOCK:
+                    job = JOBS.get(job_id)
+                    if job:
+                        job["status"] = "running"
+                        job.pop("lf_parts", None)
+                return True
+            time.sleep(0.5)
+
     def worker():
         try:
             reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = longform_video.run_longform_video(
                 script, tts_model=tts_model, reasoning_model=reasoning_model,
-                status_cb=status_cb, cancel_event=cancel_event)
+                status_cb=status_cb, cancel_event=cancel_event,
+                speech_gate=lf_speech_gate if halt_after_speech else None)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -8468,6 +8546,80 @@ def global_sfx_library():
     return out
 
 
+def scrape_log_payload(slug):
+    """JSON for the scrape Log view: every evaluated clip with thumbs/query/vision/verdict."""
+    rows = []
+    project_dir = safe_project_dir(slug)
+    if project_dir:
+        path = project_dir / "review" / "scrape_log.json"
+        if path.exists():
+            try:
+                rows = json.loads(path.read_text(encoding="utf-8")) or []
+            except Exception:
+                rows = []
+        for r in rows:
+            r["thumb_urls"] = [link_for(Path(t)) for t in (r.get("thumbs") or [])
+                               if t and Path(t).exists()]
+    return json.dumps({"slug": slug, "rows": rows}).encode("utf-8")
+
+
+def scrape_log_page(slug):
+    """Standalone dark log view (opened from the run panel / after the run). Polls while the
+    scrape is running so entries stream in live."""
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>Scrape log - {esc(slug)}</title>
+<style>
+body{{background:#0a0c0b;color:#e6e9e7;font:14px/1.5 Inter,system-ui,sans-serif;margin:0;padding:24px}}
+h1{{font-size:17px;margin:0 0 14px}}
+.card{{border:1px solid #262b28;border-radius:12px;padding:12px 14px;margin:0 0 10px;background:#101312}}
+.card.rejected{{border-color:#5a2b2b}} .card.assignment{{border-color:#2b5a38}}
+.thumbs{{display:flex;gap:6px;margin:6px 0}} .thumbs img{{width:84px;border-radius:6px}}
+.k{{color:#8fa096;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;margin-right:6px}}
+.v{{color:#dfe5e1}} .why{{margin-top:6px;color:#c9d2cc}}
+.badge{{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;margin-left:8px}}
+.badge.candidate{{background:#173d24;color:#57e389}} .badge.rejected{{background:#3d1717;color:#ff8f8f}}
+.badge.assignment{{background:#14324a;color:#7cc4ff}}
+.scene{{font-size:12.5px;color:#aab6af;margin-top:3px}}
+</style></head><body>
+<h1>Scrape log &middot; {esc(slug)} <span id="n" class="k"></span></h1>
+<div id="rows">Loading...</div>
+<script>
+async function load() {{
+  const r = await fetch('/scrape-log?slug=' + encodeURIComponent({json.dumps(slug)}));
+  const d = await r.json();
+  const rows = d.rows || [];
+  document.getElementById('n').textContent = rows.length + ' entries';
+  const box = document.getElementById('rows'); box.innerHTML = '';
+  for (const e of rows.slice().reverse()) {{
+    const c = document.createElement('div');
+    c.className = 'card ' + (e.type === 'assignment' ? 'assignment' : (e.verdict === 'rejected' ? 'rejected' : ''));
+    let h = '<b>' + (e.platform || '') + ' ' + (e.clip_id || '') + '</b>'
+      + '<span class="badge ' + (e.type === 'assignment' ? 'assignment' : e.verdict) + '">'
+      + (e.type === 'assignment' ? ('scene ' + (e.scene + 1) + ' &middot; ' + e.assignment_type) : e.verdict)
+      + '</span> <span class="k">' + (e.at || '') + '</span>';
+    if ((e.thumb_urls || []).length)
+      h += '<div class="thumbs">' + e.thumb_urls.map(u => '<img loading="lazy" src="' + u + '">').join('') + '</div>';
+    h += '<div><span class="k">search term</span><span class="v">' + (e.query || '-') + '</span></div>';
+    if (e.scene_text) h += '<div><span class="k">script part</span><span class="v">' + e.scene_text + '</span></div>';
+    if (e.vision) {{
+      const v = e.vision;
+      h += '<div><span class="k">AI saw</span><span class="v">'
+        + [ (v.subjects||[]).join(', '), v.action, v.location ].filter(Boolean).join(' &middot; ')
+        + (v.visible_text && v.visible_text !== 'none' ? ' &middot; text: ' + v.visible_text : '')
+        + '</span></div>';
+    }}
+    for (const s of (e.scenes || []))
+      h += '<div class="scene">scene ' + (s.scene + 1) + ' &middot; score ' + s.overall
+        + ' (' + s.match_class + ') &mdash; "' + (s.scene_text || '') + '"'
+        + (s.reason ? ' &mdash; ' + s.reason : '') + '</div>';
+    if (e.why) h += '<div class="why">' + e.why + '</div>';
+    c.innerHTML = h; box.appendChild(c);
+  }}
+}}
+load(); setInterval(load, 8000);
+</script></body></html>""".encode("utf-8")
+
+
 def timeline_library_payload(slug):
     project_dir = safe_project_dir(slug)
     media = []
@@ -8509,9 +8661,44 @@ def timeline_library_payload(slug):
         if item["path"] not in seen:
             seen.add(item["path"])
             media.append(item)
-    return {"media": media, "sfx": global_sfx_library(),
+    # SOURCE-level dedup: the same TikTok often exists as several files (continuity copies,
+    # candidate + accepted copy, hook pool of another project). Show each source ONCE - the
+    # first occurrence wins (assigned/scraped entries are appended before candidates/hooks).
+    # A file may or may not carry a sidecar (platform+clip_id), so check BOTH the sidecar key
+    # AND the raw content key - a sidecar'd copy and a bare copy of the same clip must collide.
+    def _keys_for(path_str):
+        # content key = 128KB head WITHOUT the file size: re-cuts of the same source (longer
+        # scene windows) share the head but differ in size, and they ARE the same TikTok.
+        import hashlib
+        keys = []
+        try:
+            p = Path(path_str)
+            sk = _clip_dedup_key(p)
+            if sk[0] != "sha":
+                keys.append(sk)
+            h = hashlib.sha1()
+            with open(p, "rb") as fh:
+                h.update(fh.read(131072))
+            keys.append(("head", h.hexdigest()))
+        except Exception:
+            keys.append(("path", str(path_str)))
+        return keys
+
+    content_keys = set()
+
+    def _is_new(path_str):
+        ks = _keys_for(path_str)
+        if any(k in content_keys for k in ks):
+            return False
+        content_keys.update(ks)
+        return True
+
+    unique_media = [item for item in media if _is_new(item["path"])]
+    global_media = [item for item in all_projects_scraped_media(current_slug=slug)
+                    if _is_new(item["path"])]
+    return {"media": unique_media, "sfx": global_sfx_library(),
             "sfx_taxonomy": sfx_taxonomy(),
-            "global_media": all_projects_scraped_media(current_slug=slug)}
+            "global_media": global_media}
 
 
 def save_sfx_label(payload):
@@ -9721,7 +9908,12 @@ def job_status_payload(job_id):
         "exists": status != "missing",
         "status": status,
         "klass": klass,
-        "progress_html": render_progress(status, logs, job.get("created_at"), log_times=job.get("log_times"), job_kind=job.get("job_kind")),
+        "progress_html": (render_progress(status, logs, job.get("created_at"), log_times=job.get("log_times"), job_kind=job.get("job_kind"))
+                          + (f'<div style="margin-top:8px"><a class="button secondary" target="_blank" '
+                             f'href="/scrape-log-view?slug={urllib.parse.quote(Path(job["project_dir"]).name)}">'
+                             f'&#128203; Scrape log</a></div>'
+                             if job.get("project_dir") and Path(job["project_dir"]).exists()
+                             and (Path(job["project_dir"]) / "review" / "scrape_log.json").exists() else "")),
         "log_text": visible_log_text(logs),
         "outputs_html": render_outputs(job.get("result"), job_id),
         "error_html": f'<section class="panel"><h2>Error</h2><pre>{esc(job.get("error"))}</pre></section>' if job.get("error") else "",
@@ -9733,6 +9925,8 @@ def job_status_payload(job_id):
         "speech_audio_url": (link_for(Path(job["speech_audio"]))
                              if status == "awaiting_approval" and job.get("speech_audio") else ""),
         "speech_speed": (_speech_current_speed(job) if status == "awaiting_approval" else 0),
+        # longform per-part speech approval ("Halt after speech" in the longform creator)
+        "lf_parts": (job.get("lf_parts") or []) if status == "awaiting_approval" else [],
         "assigned_media": _assigned_media_payload(job),
         "created_at": job.get("created_at") or 0,
     }
@@ -9921,6 +10115,59 @@ def start_twitter_login():
     th = threading.Thread(target=_run, daemon=True)
     with TIKTOK_LOCK:
         TWITTER_LOGIN["thread"] = th
+    th.start()
+
+
+def instagram_status_payload():
+    """JSON status for the Connect-Instagram control: available / ready / busy."""
+    try:
+        import instagram_login
+        avail = instagram_login.available()
+        ready = instagram_login.is_ready()
+    except Exception:
+        avail = ready = False
+    with TIKTOK_LOCK:
+        busy = bool(INSTAGRAM_LOGIN.get("busy"))
+        err = INSTAGRAM_LOGIN.get("error") or ""
+    return json.dumps({"available": avail, "ready": ready, "busy": busy, "error": err}).encode("utf-8")
+
+
+def start_instagram_login():
+    """Open the headed Instagram login window in a background thread (one at a time)."""
+    try:
+        import instagram_login
+    except Exception:
+        return
+    if not instagram_login.available():
+        return
+    with TIKTOK_LOCK:
+        if INSTAGRAM_LOGIN.get("busy"):
+            return
+        INSTAGRAM_LOGIN["busy"] = True
+        INSTAGRAM_LOGIN["error"] = ""
+
+    def _run():
+        err = ""
+        try:
+            ok = instagram_login.login(status_cb=lambda m: print("[instagram-login]", m), timeout_s=300)
+            if not ok:
+                err = "Login window closed or timed out before sign-in completed."
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            err = f"{exc.__class__.__name__}: {exc}"
+            print("[instagram-login] error:", err)
+        finally:
+            with TIKTOK_LOCK:
+                INSTAGRAM_LOGIN["busy"] = False
+                INSTAGRAM_LOGIN["thread"] = None
+                INSTAGRAM_LOGIN["error"] = err
+
+    print("[instagram-login] launching login browser window...")
+
+    th = threading.Thread(target=_run, daemon=True)
+    with TIKTOK_LOCK:
+        INSTAGRAM_LOGIN["thread"] = th
     th.start()
 
 
@@ -10298,6 +10545,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(reddit_page() if legacy else chat_ui.chat_shell_page({"flow": "reddit"}))
         elif parsed.path == "/twitter-status":
             self.send_bytes(twitter_status_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/instagram-status":
+            self.send_bytes(instagram_status_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/scrape-log":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            self.send_bytes(scrape_log_payload(slug), "application/json; charset=utf-8")
+        elif parsed.path == "/scrape-log-view":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            self.send_bytes(scrape_log_page(slug))
         elif parsed.path == "/tiktok-status":
             self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/higgsfield-status":
@@ -10440,6 +10695,38 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             start_twitter_login()
             self.send_bytes(twitter_status_payload(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/instagram-login":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            start_instagram_login()
+            self.send_bytes(instagram_status_payload(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-speech-decide":
+            # per-part approve/decline for the longform "Halt after speech" gate
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            q = urllib.parse.parse_qs(parsed.query)
+            job_id = (q.get("id") or [""])[0]
+            part = (q.get("part") or [""])[0]
+            action = (q.get("action") or [""])[0].lower()
+            ok = False
+            if action in ("approve", "decline"):
+                with JOB_LOCK:
+                    job = JOBS.get(job_id)
+                    if job and job.get("status") == "awaiting_approval" and "lf_decisions" in job:
+                        job["lf_decisions"].append({"part": part, "action": action})
+                        ok = True
+            self.send_bytes(json.dumps({"ok": ok}).encode("utf-8"),
+                            "application/json; charset=utf-8")
             return
         if parsed.path == "/higgsfield-login":
             try:
