@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import copy
 import json
 import math
 import base64
@@ -982,6 +983,59 @@ def split_hook_from_script(script, hook_text):
     return matched.strip(), body
 
 
+# Narration pace, baked into the voiceover at generation. Scrape was 1.20x for a long time;
+# raised to 1.30x (user call, 2026-07-10). The user can pick a different speed at the
+# speech-approval gate ("Halt after generating speech") before the audio flows on.
+SCRAPE_VOICE_SPEED = 1.30
+GENERATE_VOICE_SPEED = 1.15
+VOICE_SPEED_MIN, VOICE_SPEED_MAX = 1.0, 1.6
+
+
+def resolve_voice_speed(form, clip_source=None):
+    """The run's effective voice speed: explicit form value, else the per-mode default."""
+    src = str((clip_source if clip_source is not None
+               else (form.get("clip_source") if isinstance(form, dict) else "")) or "generate").lower()
+    default = SCRAPE_VOICE_SPEED if src == "scrape" else GENERATE_VOICE_SPEED
+    try:
+        v = float(form.get("voice_speed", default) or default) if isinstance(form, dict) else default
+    except (TypeError, ValueError):
+        v = default
+    return max(VOICE_SPEED_MIN, min(VOICE_SPEED_MAX, v))
+
+
+def apply_approved_voice_speed(audio_path, chosen, form, status_cb=None):
+    """The user picked a different speed at the speech-approval gate: re-tempo the (already
+    sped) voiceover by the RATIO chosen/current and record the new speed on the form so the
+    config, the pre-render gate and the report all follow. Returns the path or None (no-op)."""
+    try:
+        chosen = float(chosen or 0)
+    except (TypeError, ValueError):
+        return None
+    if not chosen:
+        return None
+    chosen = max(VOICE_SPEED_MIN, min(VOICE_SPEED_MAX, chosen))
+    current = resolve_voice_speed(form)
+    if abs(chosen - current) < 0.01:
+        return None
+    ffmpeg = pipeline.find_ffmpeg()
+    if not ffmpeg:
+        return None
+    src = Path(audio_path)
+    tmp = src.with_name(src.stem + "_respeed" + src.suffix)
+    factor = chosen / current
+    r = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+                        "-af", f"atempo={factor:.5f}", str(tmp)],
+                       capture_output=True, text=True, timeout=300)
+    if not tmp.exists() or tmp.stat().st_size < 1000:
+        log(status_cb, f"Speed change failed ({(r.stderr or '')[-120:]}); keeping {current:.2f}x.")
+        return None
+    os.replace(tmp, src)
+    if isinstance(form, dict):
+        form["voice_speed"] = chosen
+    log(status_cb, f"Voiceover re-tempoed to {chosen:.2f}x per your choice (was {current:.2f}x).")
+    return src
+
+
 def generate_project_voiceover(script, project_dir, form, status_cb=None):
     """Generate the spoken voiceover from the script with Gemini TTS.
 
@@ -1025,12 +1079,12 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     hook, body = split_hook_from_script(script, hook_text)
     ffmpeg = pipeline.find_ffmpeg()
     # Punch up the delivery: speed the narration (pitch-preserving) and denoise the TTS hiss.
-    # Script->visual (AI Generate) narration runs at 1.15x; the scrape/found-footage pace stays
-    # 1.20x (a deliberate viral pacing that the scrape pre-render gate enforces). Applied to EACH
+    # Script->visual (AI Generate) narration runs at 1.15x; the scrape/found-footage pace runs
+    # SCRAPE_VOICE_SPEED (user-tunable at the speech-approval gate). Applied to EACH
     # segment (hook AND body) BEFORE concat + alignment, so the saved hook.wav (InfiniteTalk) and
     # the word timing both match the final pace.
     _clip_src = str(form.get("clip_source") or "generate").lower() if is_form else "generate"
-    _default_speed = 1.20 if _clip_src == "scrape" else 1.15
+    _default_speed = SCRAPE_VOICE_SPEED if _clip_src == "scrape" else GENERATE_VOICE_SPEED
     try:
         voice_speed = float(form.get("voice_speed", _default_speed) or _default_speed) if is_form else _default_speed
     except (TypeError, ValueError):
@@ -4872,6 +4926,50 @@ EDITOR_SFX_TYPES = {
 }
 
 
+# Reaction placement: when a spoken line's MEANING matches, drop a labeled reaction sound a beat
+# into the scene (never on the cut - cuts stay transition-only). Trigger words are tunable; the
+# reaction slugs come from the SFX trainer (tools/sfx_trainer.py). Extra/renamed reactions the user
+# adds fall back to matching on their own slug words.
+REACTION_TRIGGERS = {
+    "money_cash": ("money", "cost", "expensive", "cheap", "pay", "yen", "dollar", "price", "rent",
+                   "salary", "wage", "afford", "rich", "poor", "broke", "spend", "buy", "cash",
+                   "wealth", "income", "profit", "fee", "budget", "billion", "million"),
+    "shock_reveal": ("shock", "unbelievable", "insane", "no way", "cannot believe", "actually",
+                     "suddenly", "turns out", "plot twist", "reveal", "shocking", "mind-blow",
+                     "nobody knows", "you won't believe", "believe it or not", "secret", "hidden"),
+    "error_wrong": ("wrong", "mistake", "fail", "error", "illegal", "banned", "forbidden",
+                    "not allowed", "incorrect", "false", "bad idea"),
+    "sad_downer": ("sad", "alone", "lonely", "cry", "depress", "lost", "empty", "tragic",
+                   "heartbreak", "miserable", "suffer", "hopeless"),
+    "comedy_fail": ("funny", "awkward", "embarrass", "weird", "silly", "oops", "ridiculous",
+                    "clumsy", "goofy", "hilarious"),
+    "idea_reveal": ("idea", "discover", "invent", "genius", "clever", "solution", "breakthrough",
+                    "realize", "figured out", "secret to", "trick"),
+    "cute_aww": ("cute", "adorable", "sweet", "wholesome", "kawaii", "baby", "kitten", "puppy", "lovely"),
+    "camera_photo": ("photo", "picture", "camera", "snapshot", "selfie", "caught on"),
+    "celebrate": ("win", "won", "success", "achieve", "best", "amazing", "record", "first place",
+                  "champion", "congrat", "victory", "finally"),
+    "notification": ("message", "text ", "notification", "phone", "app", "dm", "chat", "ping",
+                     "email", "alert", "social media", "instagram", "tiktok"),
+    "question": ("why", "how", "what if", "question", "wonder", "confus", "huh", "unclear"),
+    "suspicious": ("suspicious", "sus ", "sneaky", "shady", "fishy", "creep", "lurk",
+                   "hidden agenda", "up to something", "sketchy"),
+    "correct": ("correct", "right", "exactly", "confirmed", "accurate", "indeed", "precisely", "true"),
+    "death": ("die", "death", "dead", "kill", "deadly", "fatal", "grave", "funeral", "passed away"),
+    "suspense": ("tension", "suspense", "cliffhanger", "about to", "moment of truth", "wait for it"),
+    "tasty": ("eat", "food", "delicious", "tasty", "meal", "hungry", "restaurant", "cook", "dish",
+              "flavor", "yummy", "snack", "ramen", "sushi"),
+}
+# rarer/more-specific reactions win over broad ones when a line matches several (one per scene)
+REACTION_PRIORITY = ("death", "money_cash", "camera_photo", "tasty", "error_wrong", "celebrate",
+                     "cute_aww", "idea_reveal", "comedy_fail", "notification", "suspicious",
+                     "sad_downer", "suspense", "shock_reveal", "question", "correct")
+# per-reaction mix level (dB under the voice); punchier ones a touch louder
+REACTION_DB = {"money_cash": -8, "celebrate": -8, "shock_reveal": -8, "death": -9, "error_wrong": -9,
+               "camera_photo": -9, "comedy_fail": -9}
+_REACTION_DB_DEFAULT = -11
+
+
 def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     """Place the user's LOCAL, classified SFX (sfx_library) on real edit events, synced to the
     visual-FX plan (scene['fx']): the hook, clip cuts, major reveals/shocking beats, visual
@@ -4959,13 +5057,12 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                 return p, alt
         return None, None
 
-    # VARIETY: normal cuts must NOT all be the same whoosh. Build a rotation across every cut-worthy
-    # category the user's library actually has (whooshes weighted higher, but pops/dings/flashes/
-    # clicks interleaved) so consecutive cuts sound different even when a category has one file.
-    # ding + mouse-click weighted UP (user likes those crisp accents), whooshes eased down a touch.
-    _CUT_WEIGHTS = [("swipe_whoosh", 2), ("bright_whoosh", 2), ("whoosh_hit_combo", 1),
-                    ("caption_pop", 2), ("notification_ding", 3), ("camera_flash", 1),
-                    ("idea_reveal", 1), ("flash_blink", 1), ("ui_click", 3)]
+    # CUTS = TRANSITION SOUNDS ONLY (user rule). A scene change never gets a pop/click/ding/flash;
+    # only the whoosh/swish/transition family fires on a cut. Variety still comes from rotating the
+    # WHOLE transition family (so consecutive cuts differ), but never a non-transition category.
+    # Pops/dings/flashes/impacts still fire elsewhere - freeze->camera_flash, big moment->impact,
+    # topic accents on the named word - just never AS the cut sound.
+    _CUT_WEIGHTS = [("swipe_whoosh", 2), ("bright_whoosh", 2), ("whoosh_hit_combo", 1)]
     cut_rotation = []
     for _cat, _w in _CUT_WEIGHTS:
         if lib.get(_cat):
@@ -5039,6 +5136,12 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     selected.sort(key=lambda c: c[1])
 
     events, sfx_events_report = [], []
+    hit_scenes = set()   # scenes that already got an impact hit -> reaction pass skips them
+    # Script-to-Visuals semantic-vision mode: the multimodal Audio Director adds hook riser,
+    # impacts, reactions and callout sounds AFTER the render (it watches the finished video).
+    # Here we then place ONLY the frame-accurate cut transitions - everything else is skipped
+    # so the director's picks don't double up.
+    semantic_vision = bool(config.get("sfx_semantic_vision"))
     last_loud, last_low = -99.0, -99.0
     topic_count = {"school_bell": 0, "payment_ding": 0, "message_sent": 0}
     DARK = ("die", "death", "alone", "lonely", "fear", "dark", "sad", "empty", "cry", "depress", "burnout")
@@ -5062,10 +5165,12 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         cat, reason, t, loud = None, "clip_cut", max(0.0, start - 0.08), False
         link_visual = fx.get("transition")
         if i == 0:
+            if semantic_vision:
+                continue                       # the vision pass owns the hook (riser + climax impact)
             cat, reason, t, loud, link_visual = "impact_hit", "hook_opening", start, True, "hook_start"
-        elif fx.get("freeze_frame"):
+        elif fx.get("freeze_frame") and not semantic_vision:
             cat, reason, t, link_visual = "camera_flash", "freeze_frame", start, "freeze"
-        elif fx.get("impact_shake") or _scene_is_big_moment(sc):
+        elif (not semantic_vision) and (fx.get("impact_shake") or _scene_is_big_moment(sc)):
             if any(w in txt for w in DARK) and (start - last_low) >= 5.0 and lib.get("low_impact"):
                 cat, reason, loud = "low_impact", "major_reveal", True
             else:
@@ -5078,7 +5183,7 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             cat = next_cut_cat(preferred=pref)
 
         # topic accent (only when the line actually names the topic; capped 3 each)
-        if reason in ("visual_callout", "clip_cut"):
+        if reason in ("visual_callout", "clip_cut") and not semantic_vision:
             if topic_money and topic_count["payment_ding"] < 3 and lib.get("payment_ding") \
                     and any(w in txt for w in ("pay", "cost", "money", "price", "cheap", "expensiv", "yen", "bill")):
                 cat, reason = "payment_ding", "topic_accent"; topic_count["payment_ding"] += 1
@@ -5118,6 +5223,8 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         events.append({"path": str(path), "start": round(t, 3),
                        "duration": round(dur + 0.02, 3), "volume": vol,
                        "category": cat, "id": f"sfx-{len(events):02d}", "sfx_type": cat})
+        if cat in ("impact_hit", "low_impact"):
+            hit_scenes.add(i)          # don't also drop a reaction sound on this scene
         if loud:
             last_loud = t
         if cat == "low_impact":
@@ -5132,24 +5239,131 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                        + (f" (link {link_visual})" if link_visual else ""))
 
         # layer a quick click on the visual callout pop (in addition to the cut whoosh)
-        if has_callout and reason in ("clip_cut", "topic_accent") and lib.get("ui_click"):
+        _click_cat = "ui_click" if lib.get("ui_click") else ("caption_pop" if lib.get("caption_pop") else None)
+        if has_callout and reason in ("clip_cut", "topic_accent") and _click_cat and not semantic_vision:
             ct = start + 0.28
             if density_ok(ct):
-                cp = pick("ui_click")
+                cp = pick(_click_cat)
                 if cp:
                     crec = rec_by_path.get(cp, {})
-                    cdb = sfx_library.CAT_DB.get("ui_click", -21)
+                    cdb = sfx_library.CAT_DB.get(_click_cat, -15)
                     events.append({"path": str(cp), "start": round(ct, 3),
                                    "duration": round(min(2.0, float(crec.get("trim_len") or 0.4)) + 0.04, 3),
                                    "volume": round(min(0.85, sfx_library.db_to_gain(cdb)), 3),
-                                   "category": "ui_click", "id": f"sfx-{len(events):02d}", "sfx_type": "ui_click"})
+                                   "category": _click_cat, "id": f"sfx-{len(events):02d}", "sfx_type": _click_cat})
                     sfx_events_report.append({
-                        "time": round(ct, 2), "scene_id": i, "type": "ui_click",
+                        "time": round(ct, 2), "scene_id": i, "type": _click_cat,
                         "asset_file": Path(crec.get("file") or cp).name,
                         "used_trimmed_version": bool(crec.get("requires_trim")), "volume_db": cdb,
                         "reason": "visual_callout", "linked_cut_time": round(start, 2),
                         "linked_word": None, "linked_visual_event": fx.get("callout"), "allowed_by_policy": True})
-                    log(status_cb, f"SFX: ui_click at {ct:.2f} for visual_callout (link {fx.get('callout')})")
+                    log(status_cb, f"SFX: {_click_cat} at {ct:.2f} for visual_callout (link {fx.get('callout')})")
+
+    # ---- REACTION PASS: place a labeled reaction sound when a line's meaning matches a trigger.
+    # Lands a beat INTO the scene (never on the cut - cuts stay transition-only). One reaction per
+    # scene (rarer wins), capped per slug, subject to the same density limits. Pools already respect
+    # policy (meme_only excluded unless meme mode). No-op unless the human labels are active. ----
+    reactions_pool = data.get("reactions", {}) or {}
+    if reactions_pool and not semantic_vision:
+        react_count, react_rot, react_placed = {}, {}, 0
+        _REACT_CAP = 3
+        for i, sc in enumerate(scenes):
+            if i == 0 or i in hit_scenes:
+                continue                # hook + big-moment scenes already got a (reaction-sourced) hit
+            txt = str(sc.get("exact_voice_text") or sc.get("voice_line") or sc.get("script") or "").lower()
+            if not txt:
+                continue
+            try:
+                s0 = float(sc.get("start", 0.0) or 0.0)
+                e0 = float(sc.get("end", s0) or s0)
+            except (TypeError, ValueError):
+                continue
+            for slug in REACTION_PRIORITY:
+                pool = reactions_pool.get(slug)
+                if not pool or react_count.get(slug, 0) >= _REACT_CAP:
+                    continue
+                trigs = REACTION_TRIGGERS.get(slug) or (slug.replace("_", " "),)
+                if not any(w in txt for w in trigs):
+                    continue
+                t = min(e0 - 0.15, s0 + 0.35)             # a beat after the cut, on the line
+                if t <= 0.1 or not density_ok(t):
+                    continue
+                k = react_rot.get(slug, 0); path = pool[k % len(pool)]; react_rot[slug] = k + 1
+                rec = rec_by_path.get(path, {})
+                db = REACTION_DB.get(slug, _REACTION_DB_DEFAULT)
+                dur = min(float(rec.get("trim_len") or 0.9), 1.1)
+                events.append({"path": str(path), "start": round(t, 3),
+                               "duration": round(dur + 0.02, 3),
+                               "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
+                               "category": f"reaction_{slug}", "id": f"sfx-{len(events):02d}",
+                               "sfx_type": f"reaction_{slug}"})
+                react_count[slug] = react_count.get(slug, 0) + 1
+                react_placed += 1
+                sfx_events_report.append({
+                    "time": round(t, 2), "scene_id": i, "type": f"reaction_{slug}",
+                    "asset_file": Path(rec.get("file") or path).name,
+                    "used_trimmed_version": bool(rec.get("requires_trim")), "volume_db": db,
+                    "reason": "reaction_match", "linked_cut_time": round(s0, 2),
+                    "linked_word": None, "linked_visual_event": None, "allowed_by_policy": True})
+                log(status_cb, f"SFX: reaction_{slug} at {t:.2f} (line matched)")
+                break                                     # one reaction per scene
+        if react_placed:
+            events.sort(key=lambda e: e["start"])
+            log(status_cb, f"SFX: placed {react_placed} content-matched reaction sound(s).")
+
+    # ---- RISER PASSES: build-ups that swell INTO a beat and drop on it. Hook risers always
+    # occupy 0.0..hook-end using the closest-duration labeled file + atempo; body risers retain
+    # tail trimming. Long by design -> guard allows riser/hook_riser.
+    #   hook_riser: builds through the HOOK, drops on the first cut into the body.
+    #   riser:      swells into the biggest body moments (max 2, spaced >=4s from any other riser).
+    riser_peaks = []
+
+    def _place_riser(beat, pool, category, db):
+        if beat <= 0.9 or not pool or any(abs(beat - p) < 4.0 for p in riser_peaks):
+            return False
+        if category == "hook_riser":
+            item, rlen, playback_rate = sfx_library.choose_riser_for_target(pool, beat)
+            if not item:
+                return False
+            dur = beat
+            start = 0.0
+            source_trim = 0.0
+        else:
+            item = pool[len(riser_peaks) % len(pool)]
+            rlen = float(item.get("dur") or 2.6)
+            playback_rate = 1.0
+            dur = min(2.6, rlen, beat - 0.05, 4.0)
+            start = max(0.0, beat - dur)
+            source_trim = max(0.0, rlen - dur)
+        if dur < 0.8:
+            return False
+        events.append({"path": str(item["path"]), "start": round(start, 3),
+                       "duration": round(dur, 3), "source_trim": round(source_trim, 3),
+                       "source_duration": round(rlen, 3),
+                       "playback_rate": round(playback_rate, 6),
+                       "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
+                       "category": category, "id": f"sfx-{len(events):02d}", "sfx_type": category})
+        sfx_events_report.append({
+            "time": round(start, 2), "scene_id": None, "type": category,
+            "asset_file": Path(item["path"]).name, "used_trimmed_version": False, "volume_db": db,
+            "reason": category, "linked_cut_time": round(beat, 2), "linked_word": None,
+            "linked_visual_event": None, "allowed_by_policy": True})
+        riser_peaks.append(beat)
+        log(status_cb, f"SFX: {category} {Path(item['path']).name} swelling "
+                       f"{start:.2f}->{beat:.2f} ({rlen:.2f}s source at {playback_rate:.3f}x)")
+        return True
+
+    hook_pool = data.get("hook_risers") or data.get("risers") or []   # fall back to plain risers
+    if hook_pool and len(scenes) > 1 and not semantic_vision:
+        _place_riser(float(scenes[1].get("start", 0.0) or 0.0), hook_pool, "hook_riser", -12)
+    body_pool = data.get("risers") or []
+    if body_pool and not semantic_vision:
+        placed = 0
+        for i in sorted(hit_scenes):
+            if i > 0 and placed < 2 and _place_riser(float(scenes[i].get("start", 0.0) or 0.0), body_pool, "riser", -13):
+                placed += 1
+    if riser_peaks:
+        events.sort(key=lambda e: e["start"])
 
     config["ai_content_sfx"] = events
     summ = {"total_sfx": len(events), "whoosh_or_swipe": 0, "impact_hit": 0, "low_impact": 0,
@@ -5238,7 +5452,7 @@ def measure_voice_noise(path, ffmpeg=None):
 
 def validate_scrape_render(config, status_cb=None):
     """HARD pre-render gate for scrape/social mode. Refuses to render a broken timeline by raising
-    RuntimeError with a clear reason. Enforces: speech 1.20x, arrows/circles/stamps off, semantic
+    RuntimeError with a clear reason. Enforces: speech speed in range, arrows/circles/stamps off, semantic
     matching not skipped, hook influencer first, and every scene = an accepted real social clip
     that is not D_REJECTED and not fake-vertical/black-barred. Returns True on pass."""
     scenes = config.get("scenes", []) or []
@@ -5249,8 +5463,9 @@ def validate_scrape_render(config, status_cb=None):
         vs = float(config.get("voice_speed", 0))
     except (TypeError, ValueError):
         vs = 0.0
-    if abs(vs - 1.20) > 0.001:
-        raise RuntimeError(f"Pre-render validation failed: voice_speed is {config.get('voice_speed')} (must be 1.20x)")
+    if not (VOICE_SPEED_MIN - 0.001 <= vs <= VOICE_SPEED_MAX + 0.001):
+        raise RuntimeError(f"Pre-render validation failed: voice_speed is {config.get('voice_speed')} "
+                           f"(must be {VOICE_SPEED_MIN:.1f}x-{VOICE_SPEED_MAX:.1f}x)")
     # ARROWS ONLY: block circles, stamps, labels and any legacy/untargeted overlay; the only
     # overlay allowed through is a target-based arrow callout.
     for sc in scenes:
@@ -5266,9 +5481,18 @@ def validate_scrape_render(config, status_cb=None):
             evd = float(ev.get("duration") or 0)
         except (TypeError, ValueError):
             evd = 0.0
-        if evd > 2.0 and ev.get("category") != "background_music":
-            raise RuntimeError(f"Render blocked: long/ambient SFX detected ({ev.get('category')} "
-                               f"{evd:.2f}s > 2.0s)")
+        _cat = str(ev.get("category") or "")
+        # risers are intentional build-ups (swell into a reveal), not an ambient bed -> allowed longer
+        if _cat == "hook_riser":
+            max_hook_riser = max(0.1, float(config.get("duration") or 60.0))
+            if evd > max_hook_riser + 0.05:
+                raise RuntimeError(f"Render blocked: hook riser exceeds the video "
+                                   f"({evd:.2f}s > {max_hook_riser:.2f}s)")
+        elif _cat == "riser":
+            if evd > 4.0:
+                raise RuntimeError(f"Render blocked: riser too long ({evd:.2f}s > 4.0s)")
+        elif evd > 2.0 and _cat != "background_music":
+            raise RuntimeError(f"Render blocked: long/ambient SFX detected ({_cat} {evd:.2f}s > 2.0s)")
     if enf.get("semantic_matching_skipped"):
         raise RuntimeError("Semantic matching skipped; refusing to render random clips")
     if (scenes[0].get("visual_role") or "") != "hook_influencer":
@@ -7272,7 +7496,10 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 "id": eid, "scene_id": str(item.get("scene_id") or ""),
                 "path": item.get("path") or "", "offset": float(item.get("offset") or 0.0),
                 "volume": max(0.0, min(0.6, float(item.get("volume") or 0.25))),
+                "duration": max(0.05, float(item.get("duration") or 1.0)),
                 "source_trim": max(0.0, float(item.get("source_trim") or 0.0)),
+                "source_duration": max(0.0, float(item.get("source_duration") or 0.0)),
+                "playback_rate": max(0.01, float(item.get("playback_rate") or 1.0)),
                 "enabled": item.get("enabled") is not False,
                 "label": item.get("label") or "Sound",
             })
@@ -7367,6 +7594,7 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     project_dir = PROJECTS_DIR / slug
     if cancel_event is not None:
         config["_cancel_event"] = cancel_event
+    config["_status_cb"] = status_cb          # real "Rendering frames: N%" for the progress bar
     apply_timeline_edits_to_config(config, edits, slug)
     config["timeline_editor_render"] = True
     ensure_timeline_voice(config, project_dir, status_cb=status_cb)
@@ -7381,6 +7609,121 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     output = pipeline.render_video(config)
     log(status_cb, f"Timeline render complete: {Path(output).name}")
     return {"title": config.get("title", slug), "project_dir": str(project_dir), "video": str(output)}
+
+
+def rework_project_sfx(slug, mode="add", reasoning_model=None, sfx_amount="medium",
+                       status_cb=None, cancel_event=None):
+    """Redo all SFX or add only into gaps of an existing timeline, then render in-place."""
+    import sfx_agent
+    config = load_project_config(slug)
+    project_dir = PROJECTS_DIR / slug
+    mode = str(mode or "add").lower()
+    if mode not in ("add", "redo"):
+        raise RuntimeError("Unknown SFX rework mode.")
+    # Fail fast BEFORE the expensive clean-base render if the multimodal Audio Director can't run.
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        raise RuntimeError("Redo SFX needs WAVESPEED_API_KEY (the multimodal Audio Director). "
+                           "Set it and try again.")
+    probe_config = copy.deepcopy(config)
+    probe_config["render_sfx_enabled"] = True
+    existing = pipeline.build_sfx_segments(
+        probe_config, has_speech=bool(probe_config.get("audio_path")))
+    existing_times = sorted(float(row.get("start") or 0.0) for row in existing)
+    if mode == "add" and not existing_times:
+        raise RuntimeError("Add more SFX is only available when the timeline already contains SFX.")
+    if cancel_event is not None:
+        config["_cancel_event"] = cancel_event
+    config["_status_cb"] = status_cb
+    ensure_timeline_voice(config, project_dir, status_cb=status_cb)
+
+    if mode == "redo":
+        # The analysis source must be clean: old SFX are removed before the new director pass.
+        clean = copy.deepcopy(config)
+        clean["render_sfx_enabled"] = False
+        clean["sfx_enabled"] = False
+        clean["custom_sfx"] = []
+        clean["ai_content_sfx"] = []
+        clean["sfx_overrides"] = {}
+        clean["output_basename"] = f"{slug}_sfx_clean_{time.strftime('%Y%m%d_%H%M%S')}"
+        log(status_cb, f"Redo SFX: rendering a clean base with {len(existing_times)} old SFX removed...")
+        source_render = Path(pipeline.render_video(clean))
+        blocked_times = []
+    else:
+        source_render = latest_render = max(
+            (p for p in (project_dir / "renders").glob("*.mp4")),
+            key=lambda p: p.stat().st_mtime, default=None)
+        if not latest_render:
+            raise RuntimeError("This project has no render yet.")
+        blocked_times = existing_times
+        log(status_cb, f"Add more SFX: preserving {len(blocked_times)} existing event(s); "
+                       "each blocks -0.30s..+0.30s.")
+
+    ffmpeg = pipeline.find_ffmpeg(); ffprobe = pipeline.find_ffprobe(ffmpeg)
+    duration = sfx_agent.media_duration(source_render, ffprobe)
+    cuts = sfx_agent.detect_scene_cuts(source_render, ffmpeg)
+    phrases = sfx_agent.transcribe_with_timing(
+        source_render, ffmpeg, ffprobe, duration, status_cb=status_cb)
+    data = sfx_agent.labeled_sfx_data(status_cb=status_cb)
+    tags = sfx_agent.vision_tag_catalog(data, transitions_present=False)
+    events = sfx_agent.plan_sfx_with_vision(
+        source_render, duration, cuts, phrases, reasoning_model=reasoning_model,
+        status_cb=status_cb, transitions_present=False, tags=tags, sfx_amount=sfx_amount,
+        impact_word=str(config.get("impact_word") or "").strip() or None)
+    if not events:
+        # plan returns None/[] when the SFX library has no usable labels OR the vision model /
+        # WAVESPEED_API_KEY is unavailable. Fail with a clear reason instead of crashing on a
+        # NoneType (this was the "Redo SFX crashed on start" bug).
+        raise RuntimeError("The SFX Audio Director returned no events. Check that WAVESPEED_API_KEY "
+                           "is set and your SFX library has labeled sounds, then try again.")
+    planned = sfx_agent.resolve_vision_segments(
+        events, data, duration, existing_onsets=blocked_times, sfx_amount=sfx_amount,
+        transitions_present=False, ffprobe=ffprobe, status_cb=status_cb)
+    added = [row for row in planned
+             if all(abs(float(row.get("start") or 0.0) - old) > 0.3001 for old in blocked_times)]
+    log(status_cb, f"SFX gap guard: kept {len(added)}/{len(planned)} new event(s); "
+                   "blocked {len(planned)-len(added)} within an existing +/-0.30s zone.")
+    if not added:
+        raise RuntimeError("No free timeline positions remained for additional SFX.")
+
+    if mode == "redo":
+        config["custom_sfx"] = []
+        config["ai_content_sfx"] = []
+        config["sfx_overrides"] = {}
+    custom = list(config.get("custom_sfx") or [])
+    scenes = list(config.get("scenes") or [])
+    for index, row in enumerate(added):
+        at = float(row.get("start") or 0.0)
+        scene = next((scene for scene in scenes
+                      if float(scene.get("start", 0)) <= at < float(scene.get("end", 0))),
+                     scenes[-1] if scenes else {"id": ""})
+        custom.append({
+            "id": f"sfx-rework-{int(time.time())}-{index:03d}",
+            "scene_id": str(scene.get("id") or ""),
+            "offset": round(max(0.0, at - float(scene.get("start", 0) or 0)), 3),
+            "path": str(row["path"]), "duration": float(row.get("duration") or 0.5),
+            "volume": float(row.get("volume") or 0.25), "enabled": True,
+            "source_trim": float(row.get("source_trim") or 0.0),
+            "source_duration": float(row.get("source_duration") or 0.0),
+            "playback_rate": float(row.get("playback_rate") or 1.0),
+            "label": Path(row["path"]).stem.replace("_", " "),
+        })
+    config["custom_sfx"] = custom
+    if mode == "redo":
+        config["sfx_enabled"] = False  # only the newly planned editable custom events
+    config["render_sfx_enabled"] = True
+    config["output_basename"] = f"{slug}_{'redo' if mode == 'redo' else 'more'}_sfx_{time.strftime('%Y%m%d_%H%M%S')}"
+    config_path = project_dir / "config" / "project.json"
+    config_path.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False), encoding="utf-8")
+    edits_path = project_dir / "config" / "timeline_edits.json"
+    try:
+        edits = json.loads(edits_path.read_text(encoding="utf-8")) if edits_path.exists() else {}
+        edits.pop("sfx", None); edits.pop("transitions", None)
+        edits_path.write_text(json.dumps(edits, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    output = pipeline.render_video(config)
+    return {"title": config.get("title", slug), "project_dir": str(project_dir),
+            "video": str(output), "added_sfx": len(added), "mode": mode}
 
 
 def _timeline_words_from_sentences(sentence_rows, fallback_text, duration):
@@ -7587,7 +7930,7 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
     config["timing_audio_path"] = str(Path(audio_path).resolve())
     config["speech_audio_in_final"] = True
     config["timeline_editor_render"] = True
-    _vs_default = 1.20 if str(form.get("clip_source") or "generate").lower() == "scrape" else 1.15
+    _vs_default = SCRAPE_VOICE_SPEED if str(form.get("clip_source") or "generate").lower() == "scrape" else GENERATE_VOICE_SPEED
     config["voice_speed"] = float(form.get("voice_speed", config.get("voice_speed", _vs_default)) or _vs_default)
     caption_track = []
     for row in analysis.get("sentence_timestamps") or []:
@@ -7632,7 +7975,7 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
 
 def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None,
                                    include_project_pool=False, output_tag="timeline_social_replace",
-                                   reasoning_model_override=None):
+                                   reasoning_model_override=None, media_source="scrape"):
     """Search fresh TikTok/X footage for only the marked timeline scenes, then render.
 
     This is deliberately separate from a full same-script rerun: unmarked media remains intact,
@@ -7657,6 +8000,11 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
         raise RuntimeError("TikTok/X scraper is unavailable.") from exc
     platforms = clip_scraper.normalize_platforms(config.get("scrape_platforms") or "tiktok,x")
     backend_up = is_scrape and clip_scraper.backend_active(platforms)
+    # #114 "library": match against the OVERALL clip library (every project) and never scrape.
+    library_only = str(media_source or "").lower() == "library"
+    if library_only:
+        backend_up = False
+        include_project_pool = True
     if not backend_up and not include_project_pool:
         raise RuntimeError("TikTok/X is not connected. Connect at least one selected source first.")
     if not backend_up and include_project_pool:
@@ -7772,6 +8120,46 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
         if added_pool:
             log(status_cb, f"Candidate pool: +{added_pool} existing project clip(s) offered "
                            "for reuse before new downloads.")
+    if library_only:
+        # pull clips from EVERY project so the agent can pick the best-matching footage that
+        # already exists anywhere in the library (bounded so the vision matcher stays affordable)
+        seen_pool = {str(Path(p).resolve()) for p in pool}
+        added_global = 0
+        try:
+            for proj in sorted(PROJECTS_DIR.iterdir()):
+                if not proj.is_dir() or proj.name == slug:
+                    continue
+                pdir = proj / "seedance 2.0"
+                if not pdir.exists():
+                    continue
+                for pattern in ("scraped_*.mp4", "manual_*.mp4", "rescript_*.mp4",
+                                "timeline_replaced_*.mp4", "replaced_*.mp4"):
+                    for p in pdir.glob(pattern):
+                        if p.name.startswith(("speed_", "capblur_")):
+                            continue
+                        key = str(p.resolve())
+                        if key in seen_pool:
+                            continue
+                        seen_pool.add(key)
+                        pool.append(p)
+                        clip_meta[str(p)] = {
+                            "bucket_id": "global_library", "tier": "library",
+                            "source_query": "", "platform": "library", "clip_id": p.stem,
+                            "caption": "", "likes": 0, "black_bar_score": 0.0,
+                            "text_heaviness": 0.0, "rapid_internal_cut_count": 0,
+                        }
+                        added_global += 1
+                        if added_global >= 80:
+                            break
+                    if added_global >= 80:
+                        break
+                if added_global >= 80:
+                    break
+        except Exception:
+            pass
+        if added_global:
+            log(status_cb, f"Overall library: +{added_global} clip(s) from other projects offered "
+                           "as match candidates.")
     if not pool:
         raise RuntimeError("TikTok/X returned no clean candidates for the marked scenes."
                            if backend_up else
@@ -7917,7 +8305,7 @@ def _split_script_lines(script, density="medium"):
 
 
 def rescript_and_recut(slug, new_script, hook_text=None, voice_settings=None,
-                       clip_density="medium", status_cb=None, cancel_event=None):
+                       clip_density="medium", media_source="scrape", status_cb=None, cancel_event=None):
     """Timeline editor 'Change script', made ATOMIC: rebuilding the scene list overwrites the
     project's config with clip-less scenes BEFORE the media search/render - so a run that dies
     or is interrupted mid-way used to leave the project permanently broken (empty scenes in the
@@ -7958,7 +8346,8 @@ def rescript_and_recut(slug, new_script, hook_text=None, voice_settings=None,
     try:
         result = _rescript_and_recut_impl(
             slug, new_script, hook_text=hook_text, voice_settings=voice_settings,
-            clip_density=clip_density, status_cb=status_cb, cancel_event=cancel_event)
+            clip_density=clip_density, media_source=media_source,
+            status_cb=status_cb, cancel_event=cancel_event)
         try:
             survive_backup.unlink(missing_ok=True)   # success -> the backup is no longer needed
         except Exception:
@@ -7979,7 +8368,8 @@ def rescript_and_recut(slug, new_script, hook_text=None, voice_settings=None,
 
 
 def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=None,
-                             clip_density="medium", status_cb=None, cancel_event=None):
+                             clip_density="medium", media_source="scrape",
+                             status_cb=None, cancel_event=None):
     """The actual rebuild (see rescript_and_recut for the atomic snapshot/restore wrapper).
     ``hook_text`` marks the opening line(s) so the fresh voiceover keeps the hook + pause
     delivery (empty string clears the hook); ``voice_settings`` may override
@@ -8026,11 +8416,26 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
         taken.add(best_index)
         return old_norms[best_index][1]
 
+    # #114 media source: "keep_visible" reuses the clips ALREADY on the timeline positionally
+    # (no search), so changed/new lines borrow the currently-visible footage in order.
+    visible_clips = [dict(scene) for scene in old_pool if scene.get("clip")]
     new_scenes, used_ids, kept, added = [], set(), 0, 0
     for index, line in enumerate(lines):
         matched_scene = _claim_scene_for(_norm(line))
         if matched_scene is not None and matched_scene.get("clip"):
             scene = dict(matched_scene)           # unchanged line -> keeps its media + tuning
+            kept += 1
+        elif media_source == "keep_visible" and visible_clips:
+            # positional reuse of the currently-visible media (cycles if there are fewer clips)
+            est = max(1.2, min(8.0, 0.34 * len(line.split())))
+            base = visible_clips[index % len(visible_clips)]
+            scene = {"id": None, "name": f"Scene {index + 1:02d}",
+                     "seedance": base.get("seedance", True),
+                     "clip": base.get("clip"), "asset": base.get("asset"),
+                     "render_caption": True, "start": 0.0, "end": round(est, 2)}
+            for _k in ("scrape_clip_id", "source_trim", "timeline_speed_src", "speaker_hook"):
+                if base.get(_k) is not None:
+                    scene[_k] = base[_k]
             kept += 1
         else:
             # rough spoken-duration estimate so the retimer weights the new line sensibly
@@ -8146,11 +8551,15 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
                for index, scene in enumerate(config.get("scenes") or [])
                if not scene.get("clip")]
     if missing:
-        log(status_cb, f"Finding media for {len(missing)} changed/new line(s) - existing "
-                       "project clips first, then TikTok/X for the rest...")
+        if media_source == "library":
+            log(status_cb, f"Finding media for {len(missing)} changed/new line(s) from the OVERALL "
+                           "library (all projects' clips) - no new scraping...")
+        else:
+            log(status_cb, f"Finding media for {len(missing)} changed/new line(s) - existing "
+                           "project clips first, then TikTok/X for the rest...")
         return replace_timeline_scrape_scenes(
             slug, missing, status_cb=status_cb, cancel_event=cancel_event,
-            include_project_pool=True, output_tag="rescript")
+            include_project_pool=True, output_tag="rescript", media_source=media_source)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     config["timeline_editor_render"] = True
@@ -8292,7 +8701,10 @@ def run_project(form, status_cb=None):
         if audio_path and form_flag(form, "halt_after_speech", False):
             gate = form.get("_speech_gate")
             if callable(gate):
-                gate(audio_path)
+                _chosen_speed = gate(audio_path)
+                # the user may pick a different narration speed at the approval gate -
+                # re-tempo the voiceover BEFORE alignment/captions so all timing follows
+                apply_approved_voice_speed(audio_path, _chosen_speed, form, status_cb=status_cb)
     audio_analysis = None
     word_timeline_cache = None
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
@@ -8779,7 +9191,7 @@ def run_project(form, status_cb=None):
                     # `config` is not built yet here; give V2 a minimal config to read the title from
                     # and stash its result on. The scene fields it writes go onto scenes_override
                     # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
-                    _v2cfg = {"title": title, "voice_speed": 1.20,
+                    _v2cfg = {"title": title, "voice_speed": resolve_voice_speed(form, "scrape"),
                               "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE")}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
@@ -9572,7 +9984,7 @@ def run_project(form, status_cb=None):
                 "search_mode": "bucket_based_social_search",
                 "old_style_query_path_used": False,
                 "project_media_panel_policy": "accepted_media_only",
-                "voice_speed": 1.20,
+                "voice_speed": resolve_voice_speed(form, "scrape"),
                 "visual_emphasis_enabled": False,
                 "hook_first": hook_first,
                 "semantic_matching_skipped": bool(semantic_matching_skipped),
@@ -9719,7 +10131,7 @@ def run_project(form, status_cb=None):
                            f"HF hiss {_noise['high_frequency_hiss_score']}/10"
                            + (" - constant hiss detected" if _noise.get("constant_hiss_detected") else " - clean."))
         # ---- enforcement flags carried into the pre-render validation gate ----
-        config["voice_speed"] = 1.20
+        config["voice_speed"] = resolve_voice_speed(form, "scrape")
         config["visual_emphasis_enabled"] = False
         config["smart_overlays"] = False
         config["search_mode"] = "bucket_based_social_search"
@@ -9972,6 +10384,14 @@ def run_project(form, status_cb=None):
     # Reference-style short EDITED SFX placed ON THE CUTS (a punchy impact + a whoosh on the
     # emphasis beats, pulled from the SFX library). NOT a continuous ambient drone. Runs after
     # emphasis so it can land a whoosh on the arrow beats.
+    # Script-to-Visuals: with an API key, only the frame-accurate CUT transitions are baked into
+    # the render here - hook riser, impacts, reactions and callout sounds come from the multimodal
+    # Audio Director AFTER the render (it watches+hears the finished video; sfx_agent).
+    config["sfx_semantic_vision"] = bool(
+        clip_source != "scrape"
+        and config.get("sfx_content_enabled", True)
+        and os.environ.get("WAVESPEED_API_KEY")
+        and not os.environ.get("SHORTSLAB_NO_PAID_API"))
     if config.get("sfx_content_enabled", True):
         try:
             place_editor_sfx(config, status_cb=status_cb)
@@ -9997,10 +10417,45 @@ def run_project(form, status_cb=None):
         else:
             validate_scrape_render(config, status_cb=status_cb)
 
+    # #impact-word: the user can mark ONE word in the hook step as the "impact word". The SFX
+    # Master aims its hook impact/riser climax at that word (expected in the first 0-5s) instead
+    # of guessing. Persist it on config so a later "Redo SFX" honours it too.
+    impact_word = clean_text(form.get("impact_word", "") or "").strip()
+    if impact_word:
+        config["impact_word"] = impact_word
+        log(status_cb, f"Impact word marked for the SFX Master: {impact_word!r}")
+
     check_cancel(form)
     log(status_cb, "Rendering final 9:16 MP4...")
     output = pipeline.render_video(config)
     check_cancel(form)
+
+    # SEMANTIC SFX PASS (Script-to-Visuals): the multimodal Audio Director watches + hears the
+    # finished render (voice + baked-in cut whooshes) and layers hook riser, impacts and
+    # content-matched reaction SFX on top. Mixes in place. If the video/audio-URL call FAILS the
+    # whole run ABORTS (user rule: no silent fallback to the old engine).
+    if config.get("sfx_semantic_vision"):
+        import sfx_agent
+        _sem_phrases = [{"start": float(s.get("start", 0) or 0), "end": float(s.get("end", 0) or 0),
+                         "text": str(s.get("exact_voice_text") or s.get("voice_line")
+                                     or s.get("script") or "")}
+                        for s in config.get("scenes", [])]
+        _sem_cuts = [float(s.get("start", 0) or 0) for s in config.get("scenes", [])[1:]]
+        log(status_cb, "Audio Director: watching the finished render for semantic SFX...")
+        try:
+            _sem_n = sfx_agent.apply_semantic_sfx_to_render(
+                output, reasoning_model=config.get("sfx_vision_model") or reasoning_model,
+                status_cb=status_cb, sfx_amount=str(config.get("sfx_amount") or "medium"),
+                phrases=_sem_phrases, cuts=_sem_cuts,
+                impact_word=str(config.get("impact_word") or "").strip() or None)
+        except pipeline.PipelineCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Audio Director FAILED ({exc.__class__.__name__}: {exc}) - aborting run.")
+            raise RuntimeError(f"Semantic SFX (Audio Director) failed: {exc}") from exc
+        log(status_cb, f"Audio Director added {_sem_n} semantic SFX." if _sem_n
+            else "Audio Director added no extra SFX (render unchanged).")
+
     log(status_cb, "Creating review sheets...")
     scene_sheet, checklist = pipeline.create_review(config, output)
     log_preview(status_cb, "Scene review sheet", scene_sheet)
@@ -10023,9 +10478,11 @@ def run_project(form, status_cb=None):
     # The single render above is final. The pre-render edit audit still runs BEFORE the render, and
     # for scrape the pre-render validation gate (validate_scrape_render) still applies.
 
-    check_cancel(form)
-    log(status_cb, "Saving audio render variants...")
-    render_variants = create_render_variants(config, output, status_cb=status_cb)
+    # ONE render only (user rule 2026-07-11): the initial run renders the Short a SINGLE time with
+    # everything baked in. The old alternate-audio variants (no_sfx / voice_only / seedance_audio_only)
+    # each triggered a FULL extra render pass - pointless because the user re-renders exactly what they
+    # want from the timeline editor afterwards. Keep the dict shape so the report stays valid.
+    render_variants = {"all_sounds": str(output)}
 
     check_cancel(form)
     log(status_cb, "Cleaning standard MP4 metadata for privacy...")
@@ -10100,7 +10557,7 @@ def run_project(form, status_cb=None):
         report["social_search"] = social_search_report
         # Top-level enforcement proof (mirrors the keys the spec requires at report root).
         if clip_source == "scrape":
-            report["voice_speed"] = 1.20
+            report["voice_speed"] = config.get("voice_speed", SCRAPE_VOICE_SPEED)
             _fxr = config.get("visual_fx_report") or {}
             _fxs = _fxr.get("visual_fx_summary") or {}
             report["visual_emphasis_enabled"] = bool(config.get("visual_emphasis_enabled"))
@@ -10122,7 +10579,7 @@ def run_project(form, status_cb=None):
             report["scene_visual_fx"] = _fxr.get("scene_visual_fx")
             _an = config.get("audio_noise_report") or {}
             report["voice_processing"] = {
-                "speed": 1.20, "highpass_hz": 100, "low_mid_cut_applied": True,
+                "speed": config.get("voice_speed", SCRAPE_VOICE_SPEED), "highpass_hz": 100, "low_mid_cut_applied": True,
                 "presence_boost_applied": True, "air_boost_applied": True, "deesser_applied": True,
                 "voice_clarity_score": _an.get("voice_clarity_score"),
                 "voice_muffled": bool(_an.get("voice_muffled")),

@@ -432,12 +432,36 @@ def _ensure_tiktok_cookies(status_cb=None, platforms=None):
     return ready
 
 
+SORT_ALL_ORDER = ("MOST_LIKED", "RELEVANCE", "MOST_VIEWED", "MOST_RECENT")
+
+
 def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=None, deadline=None):
     """Search the selected logged-in backends and return one popularity-ranked result set.
 
     ``deadline`` is an absolute ``time.monotonic()`` value shared with the bucket caller, so
     one weak query cannot silently run beyond the bucket budget.
+
+    ``sort="ALL"`` runs EVERY backend sort order in the viral-priority sequence and merges the
+    unique results (MOST_LIKED first, then RELEVANCE, then MOST_VIEWED, then MOST_RECENT) so a
+    single query harvests the top clips the platform surfaces under each ordering.
     """
+    if str(sort or "").upper() == "ALL":
+        seen, merged = set(), []
+        for _mode in SORT_ALL_ORDER:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            batch = backend_search(query, want, status_cb=status_cb, sort=_mode,
+                                   platforms=platforms, deadline=deadline) or []
+            added = 0
+            for _it in batch:
+                _m = _item_meta(_it) or {}
+                _key = str(_m.get("id") or _m.get("url") or "")
+                if not _key or _key in seen:
+                    continue
+                seen.add(_key); merged.append(_it); added += 1
+            if status_cb:
+                _status(status_cb, f"Sort {_mode}: +{added} new clip(s) ({len(merged)} total) for {query!r}.")
+        return merged
     selected = normalize_platforms(platforms)
     remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
     if remaining is not None and remaining <= 0:
@@ -1743,8 +1767,9 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
                 m["rank_score"] = math.log10(int(m.get("views") or 0) + 1) - float(m.get("penalty") or 0)
             elif sort_mode == "MOST_RECENT":
                 m["rank_score"] = float(m.get("created_at") or 0)
-            elif sort_mode == "RELEVANCE":
-                # Preserve the backend's relevance order through the metadata gate.
+            elif sort_mode in ("RELEVANCE", "ALL"):
+                # Preserve the backend's merged order (RELEVANCE = topical; ALL = the four sort
+                # orders concatenated liked->relevance->viewed->recent) through the metadata gate.
                 m["rank_score"] = -float(item_index)
             scored.append((float(m.get("rank_score", 0.0)), it, m, cid))
         scored.sort(key=lambda r: r[0], reverse=True)

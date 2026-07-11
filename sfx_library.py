@@ -12,6 +12,7 @@ The classification is cached to that folder so the scan only re-runs when files 
 """
 
 import json
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -36,6 +37,152 @@ DEFAULT_ALLOWED = {"bright_whoosh", "swipe_whoosh", "whoosh_hit_combo", "impact_
                    "caption_pop", "ui_click", "notification_ding", "idea_reveal", "camera_flash",
                    "flash_blink", "school_bell", "payment_ding", "message_sent"}
 TOPIC_SPECIFIC = {"school_bell", "payment_ding", "message_sent"}
+
+# ---------------------------------------------------------------------------
+# HUMAN GROUND TRUTH (tools/sfx_trainer.py). When soundeffects/sfx_labels.json is ACTIVE it
+# OVERRIDES the filename/feature classifier below: each sound is routed into the placement
+# buckets its human ROLE dictates, plus a per-reaction pool keyed by reaction slug. Cuts then
+# only ever see transition sounds, accents only accent sounds, etc.
+# ---------------------------------------------------------------------------
+LABELS_PATH = ROOT / "soundeffects" / "sfx_labels.json"
+# role -> the placement categories place_editor_sfx already knows how to fire
+ROLE_TO_CATEGORIES = {
+    "transition": ["bright_whoosh", "swipe_whoosh", "whoosh_hit_combo"],  # CUTS (clicks live here too)
+    "impact":     ["impact_hit"],                                         # hook + big reveals (hard hit)
+    "accent":     ["caption_pop"],                                        # small word/number pop
+    "ui":         ["ui_click"],                                           # click / tap texture
+    # "riser"/"hook_riser" -> own pools (data['risers'] / ['hook_risers']); swell INTO a beat.
+    # skip is never auto-placed (available only in the timeline library for manual drag).
+}
+# a few reactions ALSO backfill a legacy slot the placement code uses directly
+REACTION_TO_CATEGORIES = {
+    "camera_photo": ["camera_flash"],      # freeze-frame flash
+    "idea_reveal":  ["idea_reveal"],       # lightbulb/reveal
+    "notification": ["notification_ding"], # ding
+}
+# The hook-opening + big-moment slots (impact_hit / low_impact). Impact-ROLE sounds fill them first;
+# these heavy reactions only BACKFILL an otherwise-empty bucket (so it still works with 0 impacts).
+IMPACT_FROM_REACTIONS = {"impact_hit": ["shock_reveal"], "low_impact": ["death", "sad_downer"]}
+
+
+def choose_riser_for_target(pool, target_duration, duration_getter=None):
+    """Choose the riser needing the least speed change to fill ``0..target_duration``.
+
+    Returns ``(item, source_duration, playback_rate)``. ``playback_rate`` follows ffmpeg/
+    HTML audio semantics: source duration divided by rate equals the requested output duration.
+    """
+    try:
+        target = float(target_duration)
+    except (TypeError, ValueError):
+        return None, 0.0, 1.0
+    if target <= 0:
+        return None, 0.0, 1.0
+    candidates = []
+    for index, item in enumerate(pool or []):
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        try:
+            source_duration = float(item.get("dur") or 0.0)
+        except (TypeError, ValueError):
+            source_duration = 0.0
+        if source_duration <= 0 and duration_getter:
+            try:
+                source_duration = float(duration_getter(item.get("path")) or 0.0)
+            except Exception:
+                source_duration = 0.0
+        if source_duration <= 0:
+            continue
+        rate = source_duration / target
+        # Ratio distance treats 0.5x and 2x as equally disruptive. Stable index is the tie-break.
+        candidates.append((abs(math.log(max(rate, 1e-6))), index, item,
+                           source_duration, rate))
+    if not candidates:
+        return None, 0.0, 1.0
+    _score, _index, item, source_duration, rate = min(candidates, key=lambda row: (row[0], row[1]))
+    return item, source_duration, rate
+
+
+def load_active_labels():
+    """Return (labels_dict, reactions_meta) if sfx_labels.json exists AND is active, else (None, None)."""
+    try:
+        data = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    if not data.get("active"):
+        return None, None
+    return data.get("labels", {}), data.get("reactions", [])
+
+
+def _label_roles(rec):
+    roles = rec.get("roles")
+    if roles is None:
+        one = rec.get("role")
+        roles = [one] if one else []
+    return [r for r in roles if r]
+
+
+def _label_reactions(rec):
+    rx = rec.get("reactions")
+    if rx is None:
+        one = rec.get("reaction")
+        rx = [one] if one else []
+    return [r for r in rx if r]
+
+
+def route_by_labels(data, meme_enabled=False):
+    """If the human labels are active, rebuild data['library'] from them (role->buckets) and add
+    data['reactions'] = {slug: [paths]}. Cheap (no ffmpeg) - runs on cached records every call, so
+    editing labels takes effect immediately without a re-scan. No-op when labels are inactive."""
+    labels, _ = load_active_labels()
+    if labels is None:
+        return data
+    rec_by_file = {r["file"]: r for r in data.get("records", [])}
+    library = {c: [] for c in SFX_CATEGORIES}
+    reactions = {}
+    risers = []
+    hook_risers = []
+    used = 0
+    for fn, rec in labels.items():
+        r = rec_by_file.get(fn)
+        if not r:
+            continue
+        policy = rec.get("policy", "core")
+        usable = policy in ("core", "topic_specific") or (policy == "meme_only" and meme_enabled)
+        if not usable:
+            continue
+        roles = _label_roles(rec)
+        rxs = _label_reactions(rec)
+        if not roles or "skip" in roles:
+            continue
+        used += 1
+        path = r["use_path"]
+        # risers use the ORIGINAL (untrimmed) file so the full swell/peak is available
+        _riser_item = {"path": r.get("path") or path, "dur": float(r.get("duration") or 0.0)}
+        if "riser" in roles:
+            risers.append(_riser_item)
+        if "hook_riser" in roles:
+            hook_risers.append(_riser_item)
+        for role in roles:
+            for cat in ROLE_TO_CATEGORIES.get(role, []):
+                library[cat].append(path)
+        for slug in rxs:
+            reactions.setdefault(slug, []).append(path)
+            for cat in REACTION_TO_CATEGORIES.get(slug, []):
+                library[cat].append(path)
+    # impact-role sounds already filled impact_hit; backfill from heavy reactions ONLY if empty
+    for cat, slugs in IMPACT_FROM_REACTIONS.items():
+        if not library[cat]:
+            for slug in slugs:
+                library[cat].extend(reactions.get(slug, []))
+    dedup = lambda xs: list(dict.fromkeys(xs))
+    data = dict(data)
+    data["library"] = {c: dedup(v) for c, v in library.items()}
+    data["reactions"] = {s: dedup(v) for s, v in reactions.items()}
+    data["risers"] = risers
+    data["hook_risers"] = hook_risers
+    data["label_driven"] = True
+    data["labeled_sounds_used"] = used
+    return data
 
 # Manual filename hints from the user (stem without extension) -> (category, policy).
 SFX_HINTS = {
@@ -215,7 +362,7 @@ def build_library(status_cb=None, meme_enabled=False, force=False):
             cached = json.loads(cache.read_text(encoding="utf-8"))
             if cached.get("sig") == sig:
                 _log(status_cb, f"SFX Scanner: using cached scan of {len(files)} audio file(s).")
-                return cached["data"]
+                return route_by_labels(cached["data"], meme_enabled=meme_enabled)
         except Exception:
             pass
 
@@ -283,4 +430,5 @@ def build_library(status_cb=None, meme_enabled=False, force=False):
         cache.write_text(json.dumps({"sig": sig, "data": data}, indent=0), encoding="utf-8")
     except Exception:
         pass
-    return data
+    # cache stores the auto classification; the human labels re-route on top (cheap, no re-scan)
+    return route_by_labels(data, meme_enabled=meme_enabled)

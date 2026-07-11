@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["app.py", "--host", "127.0.0.1", "--port", "7866"],
       "port": 7866
+    },
+    {
+      "name": "sfx-trainer",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "tools.sfx_trainer", "serve", "--port", "7871"],
+      "port": 7871
     }
   ]
 }

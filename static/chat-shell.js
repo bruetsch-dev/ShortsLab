@@ -31,12 +31,15 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 
 /* single-frame project thumbnail (hook/opening) + a master-tool badge overlay */
 function projThumb(p, cls) {
-  const badge = p.preview_kind === "sfx" ? '<span class="pv-badge">🔊</span>'
-    : p.preview_kind === "vfx" ? '<span class="pv-badge">➜</span>' : '';
+  // Overlay label + colored border: failed (red) wins, else an SFX/VFX-Master upload gets its
+  // own colored tag; an ordinary generated/scraped project gets no overlay.
+  const kind = p.failed ? "failed" : (p.kind || p.preview_kind || "");
+  const txt = kind === "failed" ? "failed" : kind === "sfx" ? "SFX" : kind === "vfx" ? "VFX" : "";
+  const tag = txt ? `<span class="pv-tag pv-tag-${kind}">${txt}</span>` : "";
   const inner = p.thumb_url
     ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">`
     : (p.video_url ? `<video muted preload="none" src="${esc(p.video_url)}"></video>` : "");
-  return `<span class="pv-wrap ${cls || ""}">${inner}${badge}</span>`;
+  return `<span class="pv-wrap ${cls || ""}${kind ? " pv-" + kind : ""}">${inner}${tag}</span>`;
 }
 async function jpost(url, data) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -56,7 +59,7 @@ const DEFAULT_VALUES = () => {
   if (!v.clip_source) v.clip_source = "generate";
   if (!v.scraping_engine) v.scraping_engine = "v2";
   if (!v.script_relevancy) v.script_relevancy = "70";
-  if (!v.scrape_sort) v.scrape_sort = "MOST_LIKED";
+  if (!v.scrape_sort) v.scrape_sort = "ALL";
   if (!v.sfx_amount) v.sfx_amount = "medium";
   if (!v.speaker_name) v.speaker_name = "Narrator";
   v.loaded_project_mode = v.loaded_project_mode || "normal";
@@ -98,7 +101,7 @@ const FLOW_STEPS = {
   script: ["script", "hook", "source", "reasoning", "voice", "outputs", "review"],
   viraltrans: ["topic", "review"],
   reddit: ["discover", "pick"],
-  longform: ["upload", "settings", "review"],
+  longform: ["script", "settings"],
   sfx: ["upload", "settings"],
   visual: ["upload", "settings"],
   captions: ["upload", "settings"],
@@ -288,6 +291,9 @@ function renderScriptFlow() {
       c.appendChild(choiceButtons(OPT.reasoning_model, S.values.reasoning_model, v => {
         S.values.reasoning_model = v; completeStep("reasoning", "voice");
       }));
+      const foot = el("div", "card-foot");
+      foot.appendChild(btn(T.back, () => editStep("source"), "ghost"));
+      c.appendChild(foot);
       setComposer("off"); return;
     }
   }
@@ -328,23 +334,32 @@ function renderHookCard() {
   const view = el("div", "hook-view"); view.id = "hook-view";
   paintHook(view);
   c.appendChild(view);
-  // Capture the selection WHILE it exists (inside the script view). Clicking the "Mark hook"
-  // button moves focus and clears window.getSelection(), so we remember the last valid range.
-  let pendingHook = "";
+  // Capture the selection WHILE it exists (inside the script view). Clicking a "Mark" button
+  // moves focus and clears window.getSelection(), so we remember the last valid selection.
+  let lastSel = "";
   const grab = () => {
     const sel = window.getSelection();
     const txt = sel ? String(sel.toString() || "").trim() : "";
-    if (txt && view.contains(sel.anchorNode) && (S.values.script || "").includes(txt)) pendingHook = txt;
+    if (txt && view.contains(sel.anchorNode) && (S.values.script || "").includes(txt)) lastSel = txt;
   };
   view.addEventListener("mouseup", grab);
   view.addEventListener("keyup", grab);
   const st = el("div", "hook-status " + (S.values.hook_text ? "on" : "off"),
     S.values.hook_text ? esc(T.hook_marked) : esc(T.no_hook));
   st.style.marginTop = "8px"; c.appendChild(st);
+  // #impact-word: mark ONE word the SFX Master must hit with the big impact/riser in the first 0-5s
+  const ist = el("div", "hook-status impact " + (S.values.impact_word ? "on" : "off"),
+    S.values.impact_word ? (T.impact_marked + ": " + esc(S.values.impact_word)) : esc(T.no_impact));
+  ist.style.marginTop = "6px"; c.appendChild(ist);
+  const paintImpactStatus = () => {
+    ist.className = "hook-status impact " + (S.values.impact_word ? "on" : "off");
+    ist.innerHTML = S.values.impact_word ? (esc(T.impact_marked) + ": <b>" + esc(S.values.impact_word) + "</b>") : esc(T.no_impact);
+  };
   const foot = el("div", "card-foot");
+  foot.appendChild(btn(T.back, () => editStep("script"), "ghost"));
   foot.appendChild(btn("★ " + T.mark_hook, () => {
     grab();
-    if (pendingHook && (S.values.script || "").includes(pendingHook)) S.values.hook_text = pendingHook;
+    if (lastSel && (S.values.script || "").includes(lastSel)) S.values.hook_text = lastSel;
     paintHook(view); st.className = "hook-status " + (S.values.hook_text ? "on" : "off");
     st.textContent = S.values.hook_text ? T.hook_marked : T.no_hook;
   }));
@@ -353,9 +368,15 @@ function renderHookCard() {
     S.values.hook_text = first.trim();
     paintHook(view); st.className = "hook-status on"; st.textContent = T.hook_marked;
   }, "ghost"));
+  foot.appendChild(btn("⚡ " + T.mark_impact, () => {
+    grab();
+    // the impact word is ONE word - take the first token of the selection
+    const w = (lastSel || "").split(/\s+/)[0].replace(/[^\p{L}\p{N}'-]/gu, "");
+    if (w && (S.values.script || "").toLowerCase().includes(w.toLowerCase())) { S.values.impact_word = w; paintHook(view); paintImpactStatus(); }
+  }, "ghost"));
   foot.appendChild(btn(T.clear_hook, () => {
-    S.values.hook_text = ""; paintHook(view);
-    st.className = "hook-status off"; st.textContent = T.no_hook;
+    S.values.hook_text = ""; S.values.impact_word = ""; paintHook(view);
+    st.className = "hook-status off"; st.textContent = T.no_hook; paintImpactStatus();
   }, "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => completeStep("hook", "source"), "primary"));
@@ -363,10 +384,21 @@ function renderHookCard() {
 }
 function paintHook(view) {
   const sc = S.values.script || ""; const hk = S.values.hook_text || "";
+  const iw = (S.values.impact_word || "").trim();
+  let html;
   if (hk && sc.includes(hk)) {
     const i = sc.indexOf(hk);
-    view.innerHTML = esc(sc.slice(0, i)) + "<mark>" + esc(hk) + "</mark>" + esc(sc.slice(i + hk.length));
-  } else view.innerHTML = esc(sc);
+    html = esc(sc.slice(0, i)) + "<mark>" + esc(hk) + "</mark>" + esc(sc.slice(i + hk.length));
+  } else html = esc(sc);
+  if (iw) {
+    // wrap the first standalone occurrence of the impact word (⚡ = the SFX Master's impact anchor)
+    try {
+      const re = new RegExp("([^\\p{L}\\p{N}>]|^)(" + iw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+        ")(?![\\p{L}\\p{N}])", "iu");
+      html = html.replace(re, (m, pre, w) => pre + '<mark class="impact">' + w + "</mark>");
+    } catch (e) {}
+  }
+  view.innerHTML = html;
 }
 
 function renderSourceCard() {
@@ -588,6 +620,7 @@ function renderReviewCard() {
   rows.push(["Voice", S.values.tts_voice + " · " + labelFor(OPT.tts_model, S.values.tts_model), "voice"]);
   rows.push(["Speaker video", S.values.enable_speaker_hook ? "On" : "Off", "voice"]);
   rows.push(["Hook", S.values.hook_text ? T.hook_marked : T.no_hook, "hook"]);
+  if (S.values.impact_word) rows.push(["Impact word", S.values.impact_word, "hook"]);
   rows.push([T.background_music, (S.values.background_music_choice && S.values.background_music_choice !== "none")
       ? S.values.background_music_choice : "Off", "source"]);
   rows.push([T.sfx_amount, S.values.sfx_amount || "medium", "outputs"]);
@@ -608,6 +641,7 @@ function renderReviewCard() {
       + " · " + esc(labelForRunMode(S.values.loaded_project_mode))));
   }
   const foot = el("div", "card-foot");
+  foot.appendChild(btn(T.back, () => editStep("outputs"), "ghost"));
   foot.appendChild(btn(T.presets, openPresets, "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn("⚡ " + T.create_short, submitRun, "primary"));
@@ -723,6 +757,8 @@ async function submitMaster(kind) {
     const r = await fetch(man.action, { method: "POST", body: fd });
     const jid = new URL(r.url, location.href).searchParams.get("id");
     if (!jid) throw new Error("no job id");
+    // All Master runs (SFX / VFX / captions) show their progress INSIDE the chat shell, so the
+    // sidebar stays visible - same as every other tab, just the progress interface instead of chat.
     startJob(jid);
   } catch (e) { c.remove(); errorCard(T.upload_failed, String(e)); }
 }
@@ -759,7 +795,7 @@ function renderViralFlow() {
         chips.appendChild(b);
       }
     }).catch(() => {});
-    setComposer("text", (v) => { S.topic = v; completeStep("topic", "review"); }, T.topic_placeholder);
+    textInputCard(T.topic_placeholder, (v) => { S.topic = v; completeStep("topic", "review"); });
   }
 }
 async function submitViral() {
@@ -813,67 +849,59 @@ function renderRedditFlow() {
   setComposer("off");
 }
 
-/* ------------------------------------------------------------------ FLOW: longform image set */
+/* ------------------------------------------------------------------ FLOW: longform video
+   Paste the SCRIPT + pick the TTS + reasoning model - nothing else. The backend then runs
+   voiceover -> exact-timestamp transcript -> one doodle prompt per timestamp -> FLUX.2 Pro
+   16:9 images on Higgsfield (4 in flight) -> assembled MP4. */
 function renderLongformFlow() {
   msgU(esc(T.mode_longform_t));
-  msgA(esc(T.longform_upload_q));
-  const f = FILES.prompt_file;
-  if (S.completed.includes("upload") && (f || S._uploadName)) {
-    msgU("📄 " + esc(f ? f.name : S._uploadName) + (S._promptCount ? ` · ${S._promptCount} ${esc(T.prompts_found)}` : ""), "upload");
-  } else if (S.step === "upload") {
+  msgA(esc(T.longform_script_q));
+  const script = (S.longform.script || "").trim();
+  if (S.completed.includes("script") && script) {
+    msgU(esc(script.length > 220 ? script.slice(0, 220) + "…" : script), "script");
+  } else if (S.step === "script" || !S.completed.includes("script")) {
     const c = card();
-    const drop = el("div", "upl-drop", "📄 " + esc(T.upload_txt_btn));
-    drop.tabIndex = 0; drop.setAttribute("role", "button");
-    const onFile = (file) => {
-      if (!file) return;
-      FILES.prompt_file = file; S._uploadName = file.name;
-      file.text().then(t => { S._promptCount = t.split(/\r?\n/).filter(l => l.trim()).length; persist(); renderAll(); });
-      completeStep("upload", "settings");
-    };
-    drop.addEventListener("click", () => pickFile(".txt,text/plain", onFile));
-    dragDrop(drop, onFile);
-    c.appendChild(drop);
-    setComposer("upload", onFile, ".txt,text/plain");
+    const ta = el("textarea", "script-box");
+    ta.placeholder = T.longform_script_ph; ta.rows = 12; ta.value = S.longform.script || "";
+    ta.addEventListener("input", () => { S.longform.script = ta.value; persist(); });
+    c.appendChild(ta);
+    const foot = el("div", "card-foot");
+    foot.appendChild(el("span", "spacer"));
+    const go = btn(T.continue_btn || "Continue", () => {
+      if ((S.longform.script || "").trim().length < 40) { ta.focus(); return; }
+      completeStep("script", "settings");
+    }, "primary");
+    foot.appendChild(go);
+    c.appendChild(foot);
+    setComposer("off");
     return;
   }
-  if (S.completed.includes("upload") && !S.jobId && (S.step === "settings" || S.step === "review")) {
+  if (S.completed.includes("script") && !S.jobId && (S.step === "settings" || S.step === "review")) {
     const c = card();
-    if (!f) {
-      c.appendChild(el("div", "card-note", "⚠ " + esc(S._uploadName || "") +
-        " - the file selection was lost on reload. Please attach it again."));
-      c.appendChild(btn("📄 " + T.upload_txt_btn, () => editStep("upload"), "ghost small"));
-    }
-    if (OPT.longform_model.length) c.appendChild(selectField("Model", OPT.longform_model, S.longform.model, v => S.longform.model = v));
-    if (OPT.longform_aspect.length) c.appendChild(selectField("Aspect", OPT.longform_aspect, S.longform.aspect, v => S.longform.aspect = v));
-    if (OPT.longform_concurrency.length) c.appendChild(selectField("Concurrency", OPT.longform_concurrency, S.longform.concurrency, v => S.longform.concurrency = v));
+    if (OPT.longform_tts.length) c.appendChild(selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model, v => S.longform.tts_model = v));
+    if (OPT.longform_reasoning.length) c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => S.longform.reasoning_model = v));
     c.appendChild(el("div", "card-cap", esc(T.connections)));
     c.appendChild(connectionRow("higgsfield", T.connect_higgsfield, "/higgsfield-status", "/higgsfield-login"));
     const foot = el("div", "card-foot");
-    foot.appendChild(btn(T.back, () => editStep("upload"), "ghost"));
+    foot.appendChild(btn(T.back, () => editStep("script"), "ghost"));
     foot.appendChild(el("span", "spacer"));
-    const go = btn("🎨 " + T.generate, submitLongform, "primary");
-    if (!f) go.disabled = true;
-    foot.appendChild(go);
+    foot.appendChild(btn("🎬 " + T.create_longform, submitLongform, "primary"));
     c.appendChild(foot);
   }
   setComposer("off");
 }
 async function submitLongform() {
   const fd = new FormData();
-  fd.append("prompt_file", FILES.prompt_file);
-  if (S.longform.model) fd.append("model", S.longform.model);
-  else if (firstVal(OPT.longform_model)) fd.append("model", firstVal(OPT.longform_model));
-  if (S.longform.aspect) fd.append("aspect", S.longform.aspect);
-  else if (firstVal(OPT.longform_aspect)) fd.append("aspect", firstVal(OPT.longform_aspect));
-  if (S.longform.concurrency) fd.append("concurrency", S.longform.concurrency);
-  else if (firstVal(OPT.longform_concurrency)) fd.append("concurrency", firstVal(OPT.longform_concurrency));
+  fd.append("script", S.longform.script || "");
+  fd.append("tts_model", S.longform.tts_model || firstVal(OPT.longform_tts) || "pro");
+  fd.append("reasoning_model", S.longform.reasoning_model || firstVal(OPT.longform_reasoning) || "anthropic/claude-opus-4.8");
   const c = card(); c.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
   try {
     const r = await fetch("/longform-run", { method: "POST", body: fd });
     const jid = new URL(r.url, location.href).searchParams.get("id");
     if (!jid) throw new Error("no job id");
     startJob(jid);
-  } catch (e) { c.remove(); errorCard(T.upload_failed, String(e)); }
+  } catch (e) { c.remove(); errorCard(T.err_generic, String(e)); }
 }
 
 /* ------------------------------------------------------------------ FLOW: loaded project */
@@ -981,24 +1009,7 @@ function typedMsg(container, text) {
 
 function renderJobSection() {
   typedMsg(chat, T.project_started);
-  // ---- hero progress card: pulsing status, prominent activity + elapsed, step chips
-  const c = card("prog-card"); c.id = "job-card";
-  const head = el("div", "prog-head");
-  const dot = el("span", "status-pulse"); dot.id = "job-dot";
-  head.appendChild(dot);
-  head.appendChild(el("b", "", "Creating your Short"));
-  head.appendChild(el("span", "spacer"));
-  const badge = el("span", "tb-badge run", esc(S.jobStatus || "running")); badge.id = "job-badge";
-  head.appendChild(badge);
-  const cancelB = btn(T.cancel_process, cancelJob, "danger small"); cancelB.id = "job-cancel";
-  head.appendChild(cancelB);
-  c.appendChild(head);
-  const prog = el("div", "prog-embed"); prog.id = "job-progress"; c.appendChild(prog);
-  // deterministic phase messages land here (typed, chatbot-style)
-  const events = el("div"); events.id = "job-events"; chat.appendChild(events);
-  // speech approval placeholder
-  const speech = el("div"); speech.id = "job-speech"; chat.appendChild(speech);
-  // assigned footage grid (ONLY the clips chosen for scenes)
+  // #111 - assigned footage grid (ONLY the clips chosen for scenes) sits at the TOP
   const mwrap = el("div"); mwrap.id = "job-media"; chat.appendChild(mwrap);
   // technical console (terminal-styled, collapsible)
   const tcard = card("term-card"); tcard.id = "job-tech-card";
@@ -1016,7 +1027,26 @@ function renderJobSection() {
   thead.appendChild(tbtn); tcard.appendChild(thead);
   const lg = el("pre", "tech-log"); lg.id = "job-log"; lg.setAttribute("hidden", "");
   tcard.appendChild(lg);
-  // outputs / result container
+  // #111 - deterministic phase stats stack in this container, which sits directly ABOVE the run
+  // box. Each new stat is appended to the bottom (right above the box), so the newest is always
+  // closest to the box and older stats move up.
+  const events = el("div", "job-events-stack"); events.id = "job-events"; chat.appendChild(events);
+  // speech approval placeholder (interactive gate, right above the run box)
+  const speech = el("div"); speech.id = "job-speech"; chat.appendChild(speech);
+  // ---- hero progress card: FURTHEST DOWN, big prominent bar, pulsing status + elapsed
+  const c = card("prog-card"); c.id = "job-card";
+  const head = el("div", "prog-head");
+  const dot = el("span", "status-pulse"); dot.id = "job-dot";
+  head.appendChild(dot);
+  head.appendChild(el("b", "", "Creating your Short"));
+  head.appendChild(el("span", "spacer"));
+  const badge = el("span", "tb-badge run", esc(S.jobStatus || "running")); badge.id = "job-badge";
+  head.appendChild(badge);
+  const cancelB = btn(T.cancel_process, cancelJob, "danger small"); cancelB.id = "job-cancel";
+  head.appendChild(cancelB);
+  c.appendChild(head);
+  const prog = el("div", "prog-embed"); prog.id = "job-progress"; c.appendChild(prog);
+  // outputs / result container (appears below the box when the run completes)
   const owrap = el("div"); owrap.id = "job-out"; chat.appendChild(owrap);
   pollJob(); pollTimer = setInterval(pollJob, 2500);
   setComposer("off");
@@ -1128,7 +1158,7 @@ async function pollJob() {
   if (prog && d.progress_html !== lastProgressHTML) { prog.innerHTML = d.progress_html || ""; lastProgressHTML = d.progress_html; }
   const lg = $("job-log");
   if (lg && d.log_text != null && lg.textContent !== d.log_text) { lg.textContent = d.log_text; lg.scrollTop = lg.scrollHeight; }
-  announcePhases(d.log_text);
+  // (phase-message chat bubbles removed - the user follows progress in the run box / tech log)
   // speech approval
   const sp = $("job-speech");
   if (sp) {
@@ -1138,20 +1168,45 @@ async function pollJob() {
       const c = el("div", "chat-card"); sp.appendChild(c);
       const au = el("audio", "inline-audio"); au.controls = true; au.src = d.speech_audio_url; c.appendChild(au);
       const foot = el("div", "card-foot");
+      // narration speed: the preview is already baked at `curSpeed`; picking a different one
+      // previews it live (audio playbackRate = chosen/current) and re-tempos the voice on approve.
+      const curSpeed = +(d.speech_speed || 0) || 1.15;
+      const ssel = el("select"); ssel.title = "Narration speed before the run continues";
+      [["", "Keep current speed (" + curSpeed.toFixed(2) + "x)"],
+       ["1.0", "1.00x"], ["1.15", "1.15x"], ["1.2", "1.20x"],
+       ["1.3", "1.30x"], ["1.4", "1.40x"], ["1.5", "1.50x"], ["1.6", "1.60x"]]
+        .forEach(([v, l]) => ssel.appendChild(new Option(l, v)));
+      // live preview of the selected speed relative to the baked one
+      ssel.addEventListener("change", () => {
+        const sel = +ssel.value || curSpeed;
+        au.playbackRate = Math.max(0.5, Math.min(2.5, sel / curSpeed));
+        try { au.currentTime = 0; au.play().catch(() => {}); } catch (e) {}
+      });
+      foot.appendChild(ssel);
       foot.appendChild(btn("✓ " + T.approve_continue, async () => {
-        await fetch("/approve-speech?id=" + encodeURIComponent(S.jobId), { method: "POST" });
+        const q = ssel.value ? "&speed=" + encodeURIComponent(ssel.value) : "";
+        await fetch("/approve-speech?id=" + encodeURIComponent(S.jobId) + q, { method: "POST" });
         sp.innerHTML = ""; delete sp.dataset.done;
       }, "primary"));
       const vsel = el("select"); OPT.tts_voice.forEach(o => vsel.appendChild(new Option(o.label, o.value)));
       vsel.value = S.values.tts_voice || vsel.value;
       const msel = el("select"); OPT.tts_model.forEach(o => msel.appendChild(new Option(o.label, o.value)));
       foot.appendChild(vsel); foot.appendChild(msel);
-      foot.appendChild(btn("↻ " + T.new_take, async () => {
+      foot.appendChild(btn("↻ " + T.new_take, async (ev) => {
+        const b = ev.currentTarget; b.disabled = true;
         const body = new URLSearchParams({ speaker_name: S.values.speaker_name || "Narrator",
           tts_voice: vsel.value, tts_model: msel.value });
-        await fetch("/replace-speech?id=" + encodeURIComponent(S.jobId), { method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+        // #127 - /replace-speech regenerates the voiceover as a follow-on run in the SAME project.
+        // Follow that new job in-place (same chat) instead of leaving the poller on the old job,
+        // which used to surface a spurious "run cancelled" + "new chat".
+        try {
+          const r = await fetch("/replace-speech?id=" + encodeURIComponent(S.jobId), { method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+          const jid = new URL(r.url, location.href).searchParams.get("id");
+          if (jid) { S.jobId = jid; S.jobStatus = "running"; persist(); }
+        } catch (e) {}
         sp.innerHTML = ""; delete sp.dataset.done;
+        renderTopbar();
       }, "danger"));
       c.appendChild(foot);
       scrollDown();
@@ -1161,15 +1216,10 @@ async function pollJob() {
   }
   // assigned footage only (clean grid; the full grouped media wall stays on ?legacy_ui=1)
   renderAssignedMedia(d.assigned_media || []);
-  // outputs / done / error
-  const ow = $("job-out");
-  if (ow && (d.outputs_html || "") !== lastOutputsHTML) {
-    lastOutputsHTML = d.outputs_html || "";
-    ow.innerHTML = "";
-    if (lastOutputsHTML.trim()) {
-      const c = el("div", "chat-card embed", lastOutputsHTML); ow.appendChild(c);
-    }
-  }
+  // The raw grouped "outputs" fragment is NOT shown in the chat any more - on done we render a
+  // single clean result card (video + download). Keep the latest outputs_html only as the source
+  // renderResultCard parses the final video out of.
+  lastOutputsHTML = d.outputs_html || lastOutputsHTML || "";
   if (["done", "error", "cancelled"].includes(d.status)) {
     stopPolling();
     const cancelB = $("job-cancel"); if (cancelB) cancelB.remove();
@@ -1304,21 +1354,37 @@ function showAssets(showHidden) {
   showLoading(T.nav_assets + "...");
   S.view = "assets"; S.showHidden = !!showHidden; renderAll(); persist();
 }
+let assetsProjects = [];
 async function renderAssetsView() {
   const head = el("div", "assets-head");
   head.appendChild(el("h2", "", esc(T.nav_assets)));
+  // Search lives here now (moved out of the sidebar): filters this project & asset library.
+  const search = el("input", "assets-search");
+  search.type = "search"; search.placeholder = T.search_projects;
+  search.setAttribute("aria-label", T.search_projects);
+  head.appendChild(search);
   const back = btn("← " + T.new_chat, () => { S.view = "chat"; renderAll(); persist(); }, "ghost small");
   head.appendChild(back);
   chat.appendChild(head);
   const grid = el("div", "assets-grid"); chat.appendChild(grid);
+  const empty = el("div", "card-note", esc(T.no_projects)); empty.hidden = true; chat.appendChild(empty);
+  const footer = el("div", "card-foot"); chat.appendChild(footer);
   const d = await jget("/projects-list" + (S.showHidden ? "?hidden=1" : ""));
   hideLoading();
-  (d.projects || []).forEach(p => grid.appendChild(assetCard(p)));
-  if (!(d.projects || []).length) chat.appendChild(el("div", "card-note", esc(T.no_projects)));
-  const footer = el("div", "card-foot");
+  assetsProjects = d.projects || [];
+  const paint = () => {
+    const q = (search.value || "").trim().toLowerCase();
+    grid.innerHTML = "";
+    const rows = assetsProjects.filter(p => !q ||
+      (p.title || "").toLowerCase().includes(q) || (p.slug || "").toLowerCase().includes(q));
+    rows.forEach(p => grid.appendChild(assetCard(p)));
+    empty.hidden = rows.length > 0;
+  };
+  search.addEventListener("input", paint);
+  paint();
   if (S.showHidden) footer.appendChild(btn("← " + T.hide_hidden, () => showAssets(false), "ghost"));
   else if (d.hidden_count) footer.appendChild(btn(`👁 ${T.show_hidden} (${d.hidden_count})`, () => showAssets(true), "ghost"));
-  chat.appendChild(footer);
+  setTimeout(() => { try { search.focus(); } catch (e) {} }, 30);
 }
 function assetCard(p) {
   const c = el("div", "asset-card2");
@@ -1436,10 +1502,9 @@ async function refreshSidebar() {
 }
 function paintSidebarProjects() {
   const box = $("sb-projects");
-  const q = ($("sb-search").value || "").toLowerCase();
+  // Search moved to the Projects & Assets tab; the sidebar just lists the recent projects.
   box.innerHTML = "";
   sidebarProjects
-    .filter(p => !q || (p.title || "").toLowerCase().includes(q) || (p.slug || "").toLowerCase().includes(q))
     .slice(0, 24)
     .forEach(p => {
       const row = el("div", "sb-proj-row");
@@ -1467,9 +1532,11 @@ const CONNS = [
 ];
 async function paintConnections() {
   const box = $("sb-conns"); box.innerHTML = "";
+  let ready = 0;
   for (const [key, label, statusUrl, loginUrl] of CONNS) {
     let st = (BOOT.connections || {})[key] || {};
     try { st = await jget(statusUrl); } catch (e) {}
+    if (st.ready) ready++;
     const row = el("div", "sb-conn");
     const dot = el("span", "dot" + (st.busy ? " busy" : st.ready ? " on" : ""));
     row.appendChild(dot);
@@ -1480,6 +1547,8 @@ async function paintConnections() {
     row.appendChild(b);
     box.appendChild(row);
   }
+  // Collapsed header shows just the count (e.g. "1/3"); the rows expand on hover/focus.
+  const cnt = $("sb-conns-count"); if (cnt) cnt.textContent = ready + "/" + CONNS.length;
 }
 function connectionRow(key, label, statusUrl, loginUrl) {
   const row = el("div", "sb-conn");
@@ -1499,50 +1568,34 @@ function connectionRow(key, label, statusUrl, loginUrl) {
   return row;
 }
 
-/* ------------------------------------------------------------------ composer */
-let composerMode = "off", composerCb = null;
-function setComposer(mode, cb, acceptOrPh) {
-  composerMode = mode; composerCb = cb || null;
-  const inp = $("cmp-input"), send = $("cmp-send"), clip = $("cmp-clip"), footer = $("composer");
-  // The composer is only shown when it does something: a text step or a file-upload step.
-  // For pure button/choice steps it is hidden entirely (no dead disabled input bar).
-  if (mode === "text") {
-    footer.hidden = false;
-    inp.disabled = false; send.disabled = false; clip.style.display = "none";
-    inp.placeholder = acceptOrPh || T.type_message;
-  } else if (mode === "upload") {
-    footer.hidden = false;
-    inp.disabled = true; send.disabled = true; clip.style.display = "";
-    inp.placeholder = T.attach_video;
-    $("cmp-file").accept = acceptOrPh || "";
-  } else {
-    footer.hidden = true;   // "off" -> hide the whole composer
-  }
-}
-function wireComposer() {
-  const inp = $("cmp-input"), send = $("cmp-send"), clip = $("cmp-clip"), file = $("cmp-file");
-  const submit = () => {
-    if (composerMode !== "text" || !composerCb) return;
-    const v = inp.value.trim(); if (!v) return;
-    inp.value = ""; autoGrow();
-    composerCb(v);
-  };
-  send.addEventListener("click", submit);
-  inp.addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+/* ------------------------------------------------------------------ composer (removed)
+   The bottom chatbox was dropped everywhere - it had no utility. Free-text steps (e.g. the
+   viral topic) now render an inline text-input card in the chat; file-upload steps already
+   use their own inline drop-zone. setComposer/wireComposer are kept as no-ops so the many
+   setComposer("off") call sites stay harmless. */
+function setComposer() {}
+function wireComposer() {}
+// Inline text-input card: a textarea + submit button rendered directly in the chat flow.
+// Replaces the old composer "text" mode. Enter submits (Shift+Enter = newline).
+function textInputCard(placeholder, onSubmit, initial) {
+  const c = card("input-card");
+  const ta = el("textarea", "input-card-ta");
+  ta.rows = 2; ta.placeholder = placeholder || T.type_message;
+  if (initial) ta.value = initial;
+  const grow = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 200) + "px"; };
+  ta.addEventListener("input", grow);
+  const foot = el("div", "card-foot");
+  const send = btn(T.send || "Send", () => {
+    const v = ta.value.trim(); if (!v) return;
+    onSubmit(v);
+  }, "primary");
+  ta.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send.click(); }
   });
-  const autoGrow = () => { inp.style.height = "auto"; inp.style.height = Math.min(inp.scrollHeight, 200) + "px"; };
-  inp.addEventListener("input", autoGrow);
-  clip.addEventListener("click", () => file.click());
-  file.addEventListener("change", () => {
-    if (file.files && file.files[0] && composerMode === "upload" && composerCb) composerCb(file.files[0]);
-    file.value = "";
-  });
-  document.addEventListener("paste", e => {
-    if (composerMode !== "upload" || !composerCb) return;
-    const f = e.clipboardData && e.clipboardData.files && e.clipboardData.files[0];
-    if (f) composerCb(f);
-  });
+  foot.appendChild(el("span", "spacer")); foot.appendChild(send);
+  c.appendChild(ta); c.appendChild(foot);
+  setTimeout(() => { try { ta.focus(); grow(); } catch (e) {} }, 30);
+  return c;
 }
 
 /* ------------------------------------------------------------------ small helpers */
@@ -1663,8 +1716,22 @@ function hideLoading() {
    download (<a download>), and finally to the server-side copy into Downloads. */
 async function downloadVideo(fileUrl, rawPath, name, btnEl) {
   const setLabel = (t) => { if (btnEl) btnEl.textContent = t; };
+  const done = () => { if (btnEl) btnEl.disabled = false; };
   if (btnEl) btnEl.disabled = true;
   setLabel(T.download + "...");
+  // 1) DESKTOP app (pywebview / WebView2): native "Save As" dialog. WebView2 ignores <a download>
+  //    AND has no showSaveFilePicker, so this is the ONLY reliable path there - it must be tried
+  //    FIRST (previously the <a download> fallback silently did nothing yet claimed success).
+  try {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
+      const r = await window.pywebview.api.save_file(rawPath);
+      if (r && r.ok) { setLabel("✓ " + T.download); done(); return; }
+      if (r && r.cancelled) { setLabel("⬇ " + T.download); done(); return; }
+      const sr = await jget("/save-render?path=" + encodeURIComponent(rawPath));
+      setLabel(sr && sr.ok ? "✓ " + T.downloaded_to : T.err_generic); done(); return;
+    }
+  } catch (e) {}
+  // 2) BROWSER: File System Access API "Save As"
   try {
     if (window.showSaveFilePicker) {
       const handle = await window.showSaveFilePicker({
@@ -1674,25 +1741,25 @@ async function downloadVideo(fileUrl, rawPath, name, btnEl) {
       const resp = await fetch(fileUrl);
       const writable = await handle.createWritable();
       await resp.body.pipeTo(writable);
-      setLabel("✓ Saved"); if (btnEl) btnEl.disabled = false;
-      return;
+      setLabel("✓ Saved"); done(); return;
     }
   } catch (e) {
-    if (e && e.name === "AbortError") { setLabel("⬇ " + T.download); if (btnEl) btnEl.disabled = false; return; }
+    if (e && e.name === "AbortError") { setLabel("⬇ " + T.download); done(); return; }
     // fall through to the fallbacks
   }
+  // 3) plain browser download
   try {
     const a = document.createElement("a");
     a.href = fileUrl; a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
-    setLabel("✓ " + T.download); if (btnEl) btnEl.disabled = false;
-    return;
+    setLabel("✓ " + T.download); done(); return;
   } catch (e) {}
+  // 4) server-side copy into Downloads
   try {
     const r = await jget("/save-render?path=" + encodeURIComponent(rawPath));
-    setLabel(r.ok ? "✓ " + T.downloaded_to : T.err_generic);
+    setLabel(r && r.ok ? "✓ " + T.downloaded_to : T.err_generic);
   } catch (e) { setLabel(T.err_generic); }
-  if (btnEl) btnEl.disabled = false;
+  done();
 }
 
 /* legacy fragment shims: embedded server HTML may call these */
@@ -1718,11 +1785,45 @@ function wireChrome() {
   $("tb-menu").addEventListener("click", () => {
     const app = $("app");
     app.classList.remove("sb-collapsed");
-    app.classList.add("sb-open"); $("sb-scrim").hidden = false;
+    if (window.matchMedia("(max-width: 900px)").matches) {
+      // narrow screens: the sidebar is a drawer over the content -> scrim behind it
+      app.classList.add("sb-open"); $("sb-scrim").hidden = false;
+    } else {
+      // desktop: just show the sidebar again - NO scrim (it used to dim the whole
+      // window until the next click)
+      app.classList.remove("sb-open"); $("sb-scrim").hidden = true;
+    }
   });
   $("sb-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
-  $("sb-search").addEventListener("input", paintSidebarProjects);
+  wireSidebarResize();
+}
+// #125 - drag the sidebar's right edge to resize; width persists in localStorage.
+function wireSidebarResize() {
+  const grip = $("sb-resize"); if (!grip) return;
+  const MIN = 210, MAX = 460;
+  const apply = (w) => { document.documentElement.style.setProperty("--sb-w", w + "px"); };
+  try { const s = parseInt(localStorage.getItem("sl-chat-sbw") || "", 10); if (s >= MIN && s <= MAX) apply(s); } catch (e) {}
+  let startX = 0, startW = 0, dragging = false;
+  const move = (e) => {
+    if (!dragging) return;
+    const w = Math.max(MIN, Math.min(MAX, startW + (e.clientX - startX)));
+    apply(w);
+  };
+  const up = () => {
+    if (!dragging) return;
+    dragging = false; document.body.classList.remove("sb-resizing");
+    document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up);
+    try { localStorage.setItem("sl-chat-sbw", parseInt(getComputedStyle($("sidebar")).width, 10)); } catch (e) {}
+  };
+  grip.addEventListener("pointerdown", (e) => {
+    // resizing only makes sense on desktop where the sidebar is docked, not the mobile drawer
+    if (window.matchMedia("(max-width: 900px)").matches) return;
+    e.preventDefault(); dragging = true; startX = e.clientX;
+    startW = parseInt(getComputedStyle($("sidebar")).width, 10) || 260;
+    document.body.classList.add("sb-resizing");
+    document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
+  });
 }
 function closeDrawer() { $("app").classList.remove("sb-open"); $("sb-scrim").hidden = true; }
 

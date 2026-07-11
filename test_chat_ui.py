@@ -91,7 +91,8 @@ def test_option_extraction():
     check("vfx amount has low/medium/high",
           {o["value"] for o in opts["vfx_amount"]} == {"low", "medium", "high"})
     check("preset fields extracted", len(opts["preset_fields"]) >= 20, str(len(opts["preset_fields"])))
-    check("longform model options extracted", len(opts["longform_model"]) >= 1)
+    check("longform tts options extracted", len(opts["longform_tts"]) >= 2)
+    check("longform reasoning options extracted", len(opts["longform_reasoning"]) >= 3)
     check("caption selects extracted", len(opts["caption_max_words"]) >= 1
           and len(opts["caption_center_y"]) >= 1)
 

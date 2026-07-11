@@ -1237,8 +1237,9 @@ def validate_scrape_render_v2(config, status_cb=None):
         vs = float(config.get("voice_speed", 0))
     except (TypeError, ValueError):
         vs = 0.0
-    if abs(vs - 1.20) > 0.001:
-        raise RuntimeError(f"Scrape V2 pre-render validation failed: voice_speed {config.get('voice_speed')} != 1.20x")
+    if not (0.999 <= vs <= 1.601):
+        raise RuntimeError(f"Scrape V2 pre-render validation failed: voice_speed {config.get('voice_speed')} "
+                           "outside 1.0x-1.6x (default 1.30x, user-tunable at the speech gate)")
     for i, sc in enumerate(scenes):
         for ov in (sc.get("overlays") or []):
             if ov.get("type") in ("arrows", "highlight", "paper", "newspaper", "counter"):
@@ -1307,6 +1308,21 @@ def _item_to_source(item, query: SearchQueryV2):
         likes=int(m.get("likes") or 0), duration=float(m.get("duration") or 0.0),
         width=int(m.get("w") or 0), height=int(m.get("h") or 0),
         query=query.query, query_tier=query.tier, raw_item=item)
+
+
+def _hook_presenter_queries_v2():
+    """Dedicated OPENING-HOOK search queries: a young-adult Japanese female creator dancing /
+    playfully acting cute to camera (idol energy). Topic-agnostic - the universal scroll-stopper.
+    Reuses the same query pool as the V1 hook finder (agent_core.HOOK_PRESENTER_QUERIES)."""
+    pools = getattr(_ac(), "HOOK_PRESENTER_QUERIES", {}) or {}
+    out = []
+    for group, lang in (("exact", "ja"), ("social", "ja"), ("english", "en"), ("hashtag", "ja")):
+        for q in (pools.get(group) or [])[:6]:
+            out.append(SearchQueryV2(
+                query=q, language=lang, tier="exact_action", visual_intent_id="hook_influencer",
+                expected_subject="young adult Japanese female creator",
+                expected_action="dancing or playfully acting cute to camera", expected_location=""))
+    return out
 
 
 def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids, state, status_cb,
@@ -1426,9 +1442,11 @@ def score_hook_candidates_v2(hook_segments, hook_intent, project_dir, ffmpeg, re
     topic = ('subject="' + hook_intent.subject + '", action="' + hook_intent.action
              + '", location="' + hook_intent.location + '"')
     prompt = (
-        "Cast the OPENING HOOK of a vertical Japanese social short. A great hook combines presenter "
-        "energy with TOPIC RELEVANCE and a visible action - NOT a generic dance. The topic hook wants: "
-        + topic + ".\nScore EACH tile 0-10: face_visibility, eye_contact, expression_energy, "
+        "Cast the OPENING HOOK of a vertical Japanese social short. The strongest hooks are a young-"
+        "adult Japanese female creator DANCING or playfully acting cute directly to camera (idol "
+        "energy) - this is a great scroll-stopper on its own, topic relevance is a bonus not a "
+        "requirement. Topic (bonus only): " + topic + ".\nScore EACH tile 0-10: face_visibility, "
+        "eye_contact, expression_energy, "
         "topic_relevance, visible_action, clean_frame, vertical_quality, plus sexualization_penalty "
         "(0 wholesome..10 body-bait) and text_penalty (0 clean..10 text over face). Set passed=false for: "
         "minor/child, sexualized body-bait, anime/VTuber/CGI, slideshow, livestream, heavy text over "
@@ -1448,8 +1466,9 @@ def score_hook_candidates_v2(hook_segments, hook_intent, project_dir, ffmpeg, re
                 return max(0.0, min(10.0, float(d.get(k, 0))))
             except (TypeError, ValueError):
                 return 0.0
-        score = (g("face_visibility") * 0.15 + g("eye_contact") * 0.10 + g("expression_energy") * 0.15
-                 + g("topic_relevance") * 0.25 + g("visible_action") * 0.15 + g("clean_frame") * 0.10
+        # Presenter/dance energy dominates; topic relevance is a small bonus (female-creator hook).
+        score = (g("face_visibility") * 0.15 + g("eye_contact") * 0.15 + g("expression_energy") * 0.20
+                 + g("topic_relevance") * 0.10 + g("visible_action") * 0.20 + g("clean_frame") * 0.10
                  + g("vertical_quality") * 0.10 - g("sexualization_penalty") * 0.6 - g("text_penalty") * 0.4)
         if score > best_score:
             best, best_score = seg, score
@@ -1496,7 +1515,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     # Backend result order chosen by the user (default RELEVANCE = TikTok's topical order, which
     # returns far more on-topic Japanese footage than MOST_LIKED's Western viral bias).
     sort_mode = str(config.get("scrape_sort") or config.get("search_sort") or "RELEVANCE").upper()
-    if sort_mode not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"):
+    if sort_mode not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "ALL"):
         sort_mode = "RELEVANCE"
     t0 = time.monotonic()
     deadline = t0 + cfg["max_total_scrape_time_seconds"]
@@ -1524,6 +1543,29 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     query_queue.sort(key=lambda q: V2_QUERY_TIERS.index(q.tier) if q.tier in V2_QUERY_TIERS else 9)
 
     all_segments = []
+    # --- OPENING HOOK gathering (RE-ADDED 2026-07-11): a dedicated search for a young-adult
+    # Japanese female creator dancing / idol / playfully acting cute to camera. This is the
+    # universal scroll-stopper for scene 0 and is gathered separately from the topical body pool.
+    hook_presenter_segments = []
+    if hook_intent is not None and not (cancel_check and cancel_check()) and time.monotonic() < deadline:
+        hq = _hook_presenter_queries_v2()
+        if hq:
+            _log(status_cb, "Scrape V2: gathering the opening HOOK - Japanese creator dancing / cute to camera...")
+            try:
+                hook_sources = _search_sources(hq, platforms, cancel_check, deadline, seen_source_ids,
+                                               state, status_cb, sort="MOST_LIKED")
+            except Exception:
+                hook_sources = []
+            hi_likes = int(getattr(_ac(), "HOOK_MIN_LIKES", 20000) or 20000)
+            filt = [s for s in hook_sources if int(getattr(s, "likes", 0) or 0) >= hi_likes]
+            hook_sources = (filt or hook_sources)[:10]
+            if hook_sources:
+                hook_presenter_segments = _download_and_segment(
+                    hook_sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
+                    status_cb, cfg["max_downloaded_analysis_videos"]) or []
+                if hook_presenter_segments:
+                    all_segments.extend(hook_presenter_segments)
+                    _log(status_cb, "Scrape V2: gathered %d hook-presenter clip(s)." % len(hook_presenter_segments))
     BATCH = 8
     while query_queue:
         if (cancel_check and cancel_check()) or time.monotonic() >= deadline:
@@ -1615,7 +1657,10 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
 
     hook_seg = None
     if hook_intent is not None:
-        hook_pool_segs = sorted(all_segments, key=lambda s: s.quality_score, reverse=True)[:16]
+        # Prefer the dedicated hook-presenter clips (female Japanese creator dancing / cute to
+        # camera); fall back to the topical body pool only if that search returned nothing.
+        hook_pool_segs = (sorted(hook_presenter_segments, key=lambda s: s.quality_score, reverse=True)[:16]
+                          or sorted(all_segments, key=lambda s: s.quality_score, reverse=True)[:16])
         hook_seg = score_hook_candidates_v2(hook_pool_segs, hook_intent, project_dir, ffmpeg,
                                             reasoning_model=reasoning_model, status_cb=status_cb)
 

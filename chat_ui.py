@@ -70,8 +70,8 @@ UI_STRINGS = {
     "mode_viral_d": "Give one topic - the agents write, film, caption and voice it fully autonomously.",
     "mode_reddit_t": "A Reddit Story Video",
     "mode_reddit_d": "A Reddit-style story over Minecraft parkour with an AI voiceover.",
-    "mode_longform_t": "A Longform Image Set",
-    "mode_longform_d": "Upload a prompt list - Higgsfield renders one 16:9 FLUX.2 Pro image per line.",
+    "mode_longform_t": "A Longform Video",
+    "mode_longform_d": "Paste a script - voiceover, timestamps, doodle images and the finished 16:9 video, fully automatic.",
     "mode_sfx_t": "Sound Effects",
     "mode_sfx_d": "Upload a finished Short and add editor SFX from the local library.",
     "mode_vfx_t": "Visual Effects",
@@ -92,6 +92,9 @@ UI_STRINGS = {
     "skip_hook": "Continue without a hook",
     "hook_marked": "Hook marked",
     "no_hook": "No hook",
+    "mark_impact": "Mark impact word",
+    "impact_marked": "Impact word",
+    "no_impact": "No impact word (SFX Master will guess)",
     "visual_source_q": "Where should the visuals come from?",
     "src_generate": "AI Generate",
     "src_generate_d": "Seedance / image models create every clip.",
@@ -201,6 +204,11 @@ UI_STRINGS = {
     "find_stories": "Find 5 stories",
     "pick_story": "Pick a story to continue.",
     "longform_upload_q": "Upload a .txt prompt list - one image prompt per line.",
+    "longform_script_q": "Paste your longform script - the app does the rest: voiceover, exact timestamps, one doodle image per timestamp (FLUX.2 Pro 16:9 on your Higgsfield account), then the finished video.",
+    "longform_script_ph": "Paste your full script here...",
+    "longform_tts": "Voiceover TTS",
+    "longform_reasoning": "Reasoning model",
+    "create_longform": "Create longform video",
     "upload_txt_btn": "Upload prompt list (.txt)",
     "prompts_found": "prompts found",
 
@@ -247,7 +255,7 @@ RUN_MANIFEST = {
         "loaded_project_source", "loaded_project_mode", "reasoning_model",
         "clip_source", "video_model", "image_model", "scraping_engine",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "script",
-        "hook_text", "script_relevancy", "visual_script", "speaker_name",
+        "hook_text", "impact_word", "script_relevancy", "visual_script", "speaker_name",
         "tts_voice", "tts_model", "speaker_image_path",
     ],
     # checkbox fields: posted as "on" only when checked (HTML checkbox semantics)
@@ -268,8 +276,8 @@ MASTER_MANIFESTS = {
                "check": ["add_characters"]},
     "captions": {"action": "/captions-run", "file": "video_file",
                  "fields": ["caption_max_words", "caption_center_y"]},
-    "longform": {"action": "/longform-run", "file": "prompt_file",
-                 "fields": ["model", "aspect", "concurrency"]},
+    "longform": {"action": "/longform-run", "text": ["script"],
+                 "fields": ["tts_model", "reasoning_model"]},
 }
 
 
@@ -327,9 +335,8 @@ def extract_legacy_options():
         "master_sfx_amount": _parse_select(sfx, "sfx_amount"),
         "vfx_reasoning": _parse_select(vis, "reasoning_model"),
         "vfx_amount": _parse_select(vis, "vfx_amount"),
-        "longform_model": _parse_select(lf, "model"),
-        "longform_aspect": _parse_select(lf, "aspect"),
-        "longform_concurrency": _parse_select(lf, "concurrency"),
+        "longform_tts": _parse_select(lf, "tts_model"),
+        "longform_reasoning": _parse_select(lf, "reasoning_model"),
         "caption_max_words": _parse_select(cap, "caption_max_words"),
         "caption_center_y": _parse_select(cap, "caption_center_y"),
         "preset_fields": preset_fields,
@@ -368,6 +375,19 @@ def save_chat_state(data):
 
 # ------------------------------------------------------------------ sidebar JSON payloads
 
+def _project_kind(slug, title):
+    """Classify a project for the sidebar/asset overlay: a video run through the SFX or Visual
+    (VFX) Master gets a labelled overlay; an ordinary generated/scraped project gets none."""
+    s = (slug or "").lower()
+    t = (title or "").lower()
+    if s.startswith("sfxmaster") or "_sfx_enhanced" in s or t.startswith("sfx master"):
+        return "sfx"
+    if (s.startswith("visualmaster") or "_visual_enhanced" in s
+            or t.startswith("visual master") or t.startswith("vfx master")):
+        return "vfx"
+    return ""
+
+
 def projects_list_payload(show_hidden=False, limit=200):
     """Metadata-only project list for the sidebar + assets grid (no full hydration)."""
     import app
@@ -404,6 +424,8 @@ def projects_list_payload(show_hidden=False, limit=200):
                     "results_url": (app.view_for(video, "assets") if has_video
                                     else app.view_for(s.get("project_dir"), "assets")),
                     "has_timeline": bool(app.project_has_render(s.get("slug"))),
+                    # sidebar/asset overlay: "sfx" / "vfx" for a Master-processed upload, else "".
+                    "kind": _project_kind(s.get("slug"), s.get("title")),
                 }
                 items.append(item)
             except Exception:
@@ -484,7 +506,6 @@ def chat_shell_page(initial=None):
       <div class="sb-title"><b>Shortslab</b><span>{UI_STRINGS["workspace"]}</span></div>
       <button type="button" class="sb-collapse" id="sb-collapse" title="{UI_STRINGS["collapse"]}" aria-label="{UI_STRINGS["collapse"]}">&#171;</button>
     </div>
-    <input type="search" class="sb-search" id="sb-search" placeholder="{UI_STRINGS["search_projects"]}" aria-label="{UI_STRINGS["search_projects"]}">
     <nav class="sb-nav" id="sb-nav" aria-label="Sections"></nav>
     <div class="sb-section" id="sb-jobs-wrap" hidden>
       <div class="sb-cap">{UI_STRINGS["nav_jobs"]}</div>
@@ -494,14 +515,16 @@ def chat_shell_page(initial=None):
       <div class="sb-cap">{UI_STRINGS["recent_projects"]}</div>
       <div class="sb-projects" id="sb-projects" aria-live="polite"></div>
     </div>
-    <div class="sb-section">
-      <div class="sb-cap">{UI_STRINGS["connections"]}</div>
+    <div class="sb-section sb-conns-wrap" id="sb-conns-wrap" tabindex="0">
+      <div class="sb-cap sb-conns-cap">{UI_STRINGS["connections"]} <span class="sb-conns-count" id="sb-conns-count">0/3</span></div>
       <div class="sb-conns" id="sb-conns"></div>
     </div>
     <div class="sb-foot">
+      <a class="sb-foot-btn sb-dev-btn" id="sb-dev" href="/dev-tools" title="Open local developer and trainer tools">dev</a>
       <button type="button" class="sb-foot-btn" id="theme-toggle" aria-label="Toggle theme">&#9788; {UI_STRINGS["theme"]}</button>
       <span class="sb-version">{CHAT_UI_VERSION}</span>
     </div>
+    <div class="sb-resize" id="sb-resize" title="Drag to resize the sidebar" aria-hidden="true"></div>
   </aside>
   <div class="sb-scrim" id="sb-scrim" hidden></div>
 
@@ -514,15 +537,6 @@ def chat_shell_page(initial=None):
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat" aria-live="polite"></div>
     </div>
-    <footer class="composer" id="composer">
-      <div class="cmp-attach-preview" id="cmp-attach" hidden></div>
-      <div class="cmp-row">
-        <button type="button" class="cmp-btn" id="cmp-clip" title="Attach a file" aria-label="Attach a file">&#128206;</button>
-        <textarea id="cmp-input" rows="1" placeholder="{UI_STRINGS["type_message"]}" aria-label="Message"></textarea>
-        <button type="button" class="cmp-send" id="cmp-send" aria-label="{UI_STRINGS["send"]}">&#10148;</button>
-      </div>
-      <input type="file" id="cmp-file" hidden>
-    </footer>
   </main>
 </div>
 <script id="chat-boot" type="application/json">{boot_json}</script>

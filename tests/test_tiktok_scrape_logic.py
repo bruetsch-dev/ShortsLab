@@ -10,9 +10,175 @@ import agent_core
 import app
 import clip_scraper
 import pipeline
+import sfx_agent
+import sfx_library
 
 
 class TikTokScrapeLogicTests(unittest.TestCase):
+    def test_sidebar_has_subtle_dev_entry_and_dev_page_lists_real_trainers(self):
+        shell = app.chat_ui.chat_shell_page({}).decode("utf-8")
+        self.assertIn('id="sb-dev"', shell)
+        self.assertIn('href="/dev-tools"', shell)
+        dev_page = app.dev_tools_page().decode("utf-8")
+        self.assertIn("SFX Trainer", dev_page)
+        self.assertIn("Scrape Trainer", dev_page)
+        self.assertIn("/dev-trainer-open", dev_page)
+
+    def test_transition_add_hitbox_cannot_cover_timeline_sfx(self):
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertIn(".tl-trans-slot { position:absolute; top:50%; width:26px; height:26px", source)
+        self.assertIn("z-index:2", source)
+        self.assertIn("pointer-events:none", source)
+        self.assertIn(".tl-fx { position:absolute; top:6px; bottom:6px; z-index:8", source)
+        self.assertIn("button.addEventListener('click'", source)
+
+    def test_dev_scrape_trainer_rejects_unknown_run_before_starting_server(self):
+        with mock.patch.object(app, "scrape_trainer_runs", return_value=[{"id": "known", "edited": 1}]):
+            with self.assertRaisesRegex(RuntimeError, "Unknown or incomplete"):
+                app.start_dev_trainer("scrape", "missing")
+
+    def test_dev_sfx_trainer_starts_on_free_local_port(self):
+        key = ("sfx", "")
+        app.DEV_TRAINER_SERVERS.pop(key, None)
+        url = app.start_dev_trainer("sfx")
+        server, thread, saved_url = app.DEV_TRAINER_SERVERS[key]
+        try:
+            self.assertEqual(url, saved_url)
+            self.assertRegex(url, r"^http://127\.0\.0\.1:\d+/$")
+            self.assertTrue(thread.is_alive())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.DEV_TRAINER_SERVERS.pop(key, None)
+
+    def test_hook_riser_chooses_nearest_duration_and_fills_zero_to_climax(self):
+        pool = [
+            {"path": "short.wav", "dur": 1.1},
+            {"path": "near.wav", "dur": 2.8},
+            {"path": "long.wav", "dur": 5.4},
+            {"path": "longest.wav", "dur": 8.0},
+        ]
+        item, source_duration, rate = sfx_library.choose_riser_for_target(pool, 3.0)
+        self.assertEqual(item["path"], "near.wav")
+        self.assertAlmostEqual(source_duration, 2.8)
+        self.assertAlmostEqual(source_duration / rate, 3.0)
+
+        segments = sfx_agent.resolve_vision_segments(
+            [{"timestamp": 0.0, "end_timestamp": 3.0, "sfx_type": "hook_riser",
+              "trigger_detail": "hook climax", "reasoning": ""}],
+            {"library": {}, "hook_risers": pool, "reactions": {}},
+            duration=20.0, ffprobe=None)
+        riser = segments[0]
+        self.assertEqual(riser["start"], 0.0)
+        self.assertEqual(riser["duration"], 3.0)
+        self.assertEqual(str(riser["path"]), "near.wav")
+        self.assertAlmostEqual(riser["source_duration"] / riser["playback_rate"], 3.0, places=4)
+
+        late = sfx_agent.resolve_vision_segments(
+            [{"timestamp": 0.0, "end_timestamp": 9.0, "sfx_type": "hook_riser",
+              "trigger_detail": "late hook climax", "reasoning": ""}],
+            {"library": {}, "hook_risers": pool, "reactions": {}},
+            duration=20.0, ffprobe=None)[0]
+        self.assertEqual(late["start"], 0.0)
+        self.assertEqual(late["duration"], 9.0)  # explicit timestamp remains authoritative
+        self.assertEqual(str(late["path"]), "longest.wav")
+
+    def test_atempo_chain_supports_stretching_and_speeding_up(self):
+        self.assertEqual(pipeline.atempo_filter_chain(1.0), "")
+        self.assertEqual(pipeline.atempo_filter_chain(2.8 / 3.0), "atempo=0.933333")
+        fast = pipeline.atempo_filter_chain(5.0)
+        self.assertEqual(fast, "atempo=2.000000,atempo=2.000000,atempo=1.250000")
+
+    def test_visual_repair_replaces_generic_transition_and_rejects_audio_events(self):
+        initial = [
+            {"timestamp": 8.0, "sfx_type": "transition", "trigger_source": "visual",
+             "trigger_detail": "cut", "reasoning": ""},
+            {"timestamp": 16.0, "sfx_type": "reaction: money_cash", "trigger_source": "audio",
+             "trigger_detail": "money spoken", "reasoning": ""},
+        ]
+        repair = [
+            {"timestamp": 8.05, "sfx_type": "reaction: camera_photo", "trigger_source": "visual",
+             "trigger_detail": "camera flash fires", "reasoning": "visible flash"},
+            {"timestamp": 22.0, "sfx_type": "reaction: sad_downer", "trigger_source": "audio",
+             "trigger_detail": "sad word", "reasoning": "audio keyword"},
+        ]
+        tags = ["transition", "reaction: camera_photo", "reaction: sad_downer",
+                "reaction: money_cash"]
+        merged, added = sfx_agent.merge_visual_repair_events(initial, repair, tags)
+        self.assertEqual(added, 1)
+        self.assertFalse(any(sfx_agent._tag_key(row["sfx_type"]) == "transition" for row in merged))
+        self.assertTrue(any(sfx_agent._tag_key(row["sfx_type"]) == "reaction:camera_photo"
+                            for row in merged))
+        self.assertFalse(any(float(row["timestamp"]) == 22.0 for row in merged))
+        self.assertEqual(sfx_agent.visual_semantic_target(53.55, "medium"), 7)
+        prompt = sfx_agent.build_visual_repair_prompt(tags, 3, initial)
+        self.assertIn("IGNORE transcript keywords", prompt)
+        self.assertIn("Do NOT return generic cuts", prompt)
+
+    def test_audio_director_runs_visual_repair_when_first_pass_is_audio_heavy(self):
+        initial_json = {"choices": [{"message": {"content": json.dumps({"sfx_timeline": [
+            {"timestamp": 0.0, "end_timestamp": 2.0, "sfx_type": "hook_riser",
+             "trigger_source": "audio"},
+            {"timestamp": 2.0, "sfx_type": "impact", "trigger_source": "visual"},
+            {"timestamp": 8.0, "sfx_type": "transition", "trigger_source": "visual"},
+            {"timestamp": 12.0, "sfx_type": "reaction: money_cash", "trigger_source": "audio"},
+        ]})}}]}
+        repair_json = {"choices": [{"message": {"content": json.dumps({"sfx_timeline": [
+            {"timestamp": 8.05, "sfx_type": "reaction: camera_photo", "trigger_source": "visual"},
+            {"timestamp": 15.0, "sfx_type": "reaction: cute_aww", "trigger_source": "visual"},
+            {"timestamp": 20.0, "sfx_type": "reaction: question", "trigger_source": "visual"},
+        ]})}}]}
+        tags = ["hook_riser", "impact", "transition", "reaction: money_cash",
+                "reaction: camera_photo", "reaction: cute_aww", "reaction: question"]
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"WAVESPEED_API_KEY": "test-key"}), \
+             mock.patch.object(sfx_agent, "prepare_audio_director_proxy",
+                               return_value=(Path(tmp) / "proxy.mp4", Path(tmp) / "proxy")), \
+             mock.patch.object(sfx_agent, "upload_audio_director_media",
+                               return_value=("https://media.example/proxy.mp4", {})), \
+             mock.patch.object(sfx_agent.agent_core, "post_json_url",
+                               side_effect=[initial_json, repair_json]) as post:
+            events = sfx_agent.plan_sfx_with_vision(
+                Path(tmp) / "source.mp4", 24.0, [], [], tags=tags, sfx_amount="medium")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sum(1 for row in events if sfx_agent.is_visual_semantic_event(row)), 3)
+        self.assertFalse(any(sfx_agent._tag_key(row["sfx_type"]) == "transition"
+                             and abs(float(row["timestamp"]) - 8.0) < 0.3 for row in events))
+
+    def test_audio_director_proxy_is_480p_and_keeps_aac_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.mp4"
+            source.write_bytes(b"source-video")
+
+            def fake_ffmpeg(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"proxy-video")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.object(sfx_agent.pipeline, "find_ffmpeg", return_value="ffmpeg"), \
+                 mock.patch.object(sfx_agent.subprocess, "run", side_effect=fake_ffmpeg) as run:
+                proxy, proxy_dir = sfx_agent.prepare_audio_director_proxy(source)
+            try:
+                command = run.call_args.args[0]
+                self.assertIn("scale=480:-2", command)
+                self.assertIn("0:a:0?", command)
+                self.assertIn("aac", command)
+                self.assertTrue(proxy.exists())
+            finally:
+                import shutil
+                shutil.rmtree(proxy_dir, ignore_errors=True)
+
+    def test_audio_director_upload_retries_connection_failures_three_times(self):
+        failures = [ConnectionResetError(10054, "reset"), TimeoutError("timeout")]
+        with mock.patch.object(sfx_agent.pipeline, "upload_media",
+                               side_effect=failures + [("https://media.example/proxy.mp4", {})]) as upload, \
+             mock.patch.object(sfx_agent.time, "sleep") as sleep:
+            result = sfx_agent.upload_audio_director_media(
+                Path("proxy.mp4"), "test-key", attempts=3)
+        self.assertEqual(result[0], "https://media.example/proxy.mp4")
+        self.assertEqual(upload.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+
     def test_planning_text_does_not_duplicate_narration(self):
         scene = {"script": "This is the spoken line.", "visual_script": "show a train"}
         self.assertEqual(

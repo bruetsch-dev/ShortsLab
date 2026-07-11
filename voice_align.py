@@ -16,7 +16,15 @@ _MODEL = None
 _MODEL_KEY = None
 _MODEL_LOCK = threading.Lock()
 
-DEFAULT_MODEL = "small"  # multilingual; "small.en" is a touch sharper for English-only
+DEFAULT_MODEL = "small"  # multilingual; kept as the compat default / CPU fallback
+# Caption-timing accuracy: word timestamps from "small" are visibly jittery on sped-up
+# narration (1.15-1.3x), which made some caption words flip early/late. Prefer "medium"
+# on the GPU (still ~seconds for a 60s voiceover); fall back to small, then CPU.
+MODEL_PREFERENCE = (
+    ("medium", "cuda", "float16"),
+    ("small", "cuda", "float16"),
+    ("small", "cpu", "int8"),
+)
 
 
 def _norm(token):
@@ -31,31 +39,40 @@ def available():
         return False
 
 
-def _load_model(model_name=DEFAULT_MODEL, status_cb=None):
+def _load_model(model_name=None, status_cb=None):
+    """Load the best available aligner model. model_name=None walks MODEL_PREFERENCE
+    (medium on GPU first); an explicit name keeps the old cuda->cpu behaviour."""
     global _MODEL, _MODEL_KEY
     with _MODEL_LOCK:
-        if _MODEL is not None and _MODEL_KEY == model_name:
+        key = model_name or "auto"
+        if _MODEL is not None and _MODEL_KEY == key:
             return _MODEL
         from faster_whisper import WhisperModel
+        attempts = (MODEL_PREFERENCE if model_name is None
+                    else ((model_name, "cuda", "float16"), (model_name, "cpu", "int8")))
         last_exc = None
-        for device, compute in (("cuda", "float16"), ("cpu", "int8")):
+        for name, device, compute in attempts:
             try:
-                model = WhisperModel(model_name, device=device, compute_type=compute)
+                model = WhisperModel(name, device=device, compute_type=compute)
                 if status_cb:
-                    status_cb(f"Voice aligner: {model_name} on {device}.")
-                _MODEL, _MODEL_KEY = model, model_name
+                    status_cb(f"Voice aligner: {name} on {device}.")
+                _MODEL, _MODEL_KEY = model, key
                 return model
             except Exception as exc:
                 last_exc = exc
         raise RuntimeError(f"Could not load faster-whisper model: {last_exc}")
 
 
-def transcribe_words(audio_path, model_name=DEFAULT_MODEL, language=None, status_cb=None):
+def transcribe_words(audio_path, model_name=None, language=None, status_cb=None):
     """Return [{word, start, end}] with frame-accurate timestamps from ASR."""
     model = _load_model(model_name, status_cb=status_cb)
     segments, _info = model.transcribe(
         str(audio_path), word_timestamps=True, language=language,
         vad_filter=True, beam_size=5,
+        # pad the VAD speech regions: without this, words right after a pause get their
+        # onset CLIPPED (caption appears late); no previous-text conditioning = less drift
+        vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 150},
+        condition_on_previous_text=False,
     )
     words = []
     for segment in segments:
@@ -92,36 +109,72 @@ def align_script_to_words(script_text, asr_words):
                 aw = asr_words[j1 + k]
                 timed[i1 + k] = {"word": script_tokens[i1 + k],
                                  "start": aw["start"], "end": aw["end"]}
-        elif tag in ("replace", "delete", "insert"):
-            # Distribute the ASR time span of this block across the script words it covers.
+        elif tag == "replace":
+            # ASR heard different words here: distribute the ASR span across the script
+            # words WEIGHTED BY WORD LENGTH (uniform steps made long words flash by and
+            # short words linger - a visible caption desync).
             span_start = asr_words[j1]["start"] if j1 < len(asr_words) else (
                 asr_words[-1]["end"] if asr_words else 0.0)
             span_end = asr_words[max(j1, j2 - 1)]["end"] if j2 > j1 and j2 - 1 < len(asr_words) else span_start
-            count = max(1, i2 - i1)
-            step = (span_end - span_start) / count if count else 0.0
-            for k in range(i1, i2):
-                a = span_start + step * (k - i1)
-                b = a + step if step > 0 else a + 0.12
-                timed[k] = {"word": script_tokens[k], "start": round(a, 3), "end": round(b, 3)}
+            _fill_span_weighted(timed, script_tokens, i1, i2, span_start, span_end)
+        # tag == "insert": ASR has extra words the script lacks -> nothing to time here.
+        # tag == "delete": script words the ASR never heard (i2 > i1, j1 == j2) -> they get
+        # timed in the anchor-gap pass below (the old code stacked them all on one instant,
+        # which then cascaded 0.08s offsets over the following words - THE timing bug).
 
-    # Fill any remaining gaps by interpolating between known anchors.
-    last = 0.0
+    # Time the still-missing script words inside the GAP between their neighbouring
+    # anchors, again weighted by word length.
+    idx = 0
+    while idx < len(timed):
+        if timed[idx] is not None:
+            idx += 1
+            continue
+        run_start = idx
+        while idx < len(timed) and timed[idx] is None:
+            idx += 1
+        run_end = idx                                     # [run_start, run_end) untimed
+        prev_end = timed[run_start - 1]["end"] if run_start > 0 else 0.0
+        next_start = (timed[run_end]["start"] if run_end < len(timed)
+                      else prev_end + 0.25 * (run_end - run_start))
+        _fill_span_weighted(timed, script_tokens, run_start, run_end, prev_end, next_start)
+
+    # Enforce monotonic, non-overlapping order + clamp runaway word durations (whisper
+    # sometimes stretches the last word of a sentence across the following pause, which
+    # kept the caption highlight stuck on that word).
     for idx in range(len(timed)):
-        if timed[idx] is None:
-            nxt = next((timed[j]["start"] for j in range(idx + 1, len(timed)) if timed[j]), last + 0.2)
-            timed[idx] = {"word": script_tokens[idx], "start": round(last, 3), "end": round(nxt, 3)}
-        last = timed[idx]["end"]
-
-    # Enforce monotonic, non-overlapping order.
-    for idx in range(1, len(timed)):
-        if timed[idx]["start"] < timed[idx - 1]["end"]:
+        if idx and timed[idx]["start"] < timed[idx - 1]["end"]:
             timed[idx]["start"] = timed[idx - 1]["end"]
         if timed[idx]["end"] < timed[idx]["start"]:
             timed[idx]["end"] = timed[idx]["start"] + 0.08
+        if timed[idx]["end"] - timed[idx]["start"] > 1.2:
+            timed[idx]["end"] = round(timed[idx]["start"] + 1.2, 3)
     return timed
 
 
-def word_timeline(audio_path, script_text=None, model_name=DEFAULT_MODEL,
+def _fill_span_weighted(timed, tokens, i1, i2, span_start, span_end):
+    """Distribute [span_start, span_end] over tokens[i1:i2], weighted by word length
+    (min 0.06s each). Writes into `timed` in place."""
+    count = i2 - i1
+    if count <= 0:
+        return
+    span = max(0.0, float(span_end) - float(span_start))
+    weights = [max(2, len(_norm(tokens[k])) or len(tokens[k])) for k in range(i1, i2)]
+    total = float(sum(weights)) or 1.0
+    if span <= 0.01:                        # no room at all: tight sequential fallback
+        cursor = float(span_start)
+        for k in range(i1, i2):
+            timed[k] = {"word": tokens[k], "start": round(cursor, 3), "end": round(cursor + 0.08, 3)}
+            cursor += 0.08
+        return
+    cursor = float(span_start)
+    for pos, k in enumerate(range(i1, i2)):
+        d = max(0.06, span * weights[pos] / total)
+        timed[k] = {"word": tokens[k], "start": round(cursor, 3),
+                    "end": round(min(span_end, cursor + d) if pos < count - 1 else span_end, 3)}
+        cursor += d
+
+
+def word_timeline(audio_path, script_text=None, model_name=None,
                   language=None, status_cb=None):
     """Frame-accurate word timeline. Aligns the script when given, else raw ASR."""
     asr_words = transcribe_words(audio_path, model_name=model_name,

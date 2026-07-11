@@ -423,6 +423,26 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def atempo_filter_chain(playback_rate):
+    """Return ffmpeg atempo filters for any positive rate using safe 0.5..2.0 stages."""
+    try:
+        rate = max(0.01, float(playback_rate or 1.0))
+    except (TypeError, ValueError):
+        rate = 1.0
+    if abs(rate - 1.0) < 0.0005:
+        return ""
+    stages = []
+    while rate > 2.0:
+        stages.append(2.0)
+        rate /= 2.0
+    while rate < 0.5:
+        stages.append(0.5)
+        rate /= 0.5
+    if abs(rate - 1.0) >= 0.0005:
+        stages.append(rate)
+    return ",".join(f"atempo={stage:.6f}" for stage in stages)
+
+
 def ease_in_out(x):
     x = clamp(x, 0.0, 1.0)
     return x * x * (3 - 2 * x)
@@ -618,15 +638,24 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
         return []
     spans = []
     if word_times:
+        # Perceptual sync: flip each word a touch EARLY. Viewers read a caption as "on the
+        # voice" when it appears ~2 frames before the word is audible; appearing even
+        # slightly late reads as lag (the user's complaint). Monotonicity is preserved.
+        CAPTION_SYNC_LEAD = 0.06
         for wt in word_times:
             word = _caption_display_word(wt.get("word") or "")
             if not word:
                 continue
-            start = max(0.0, float(wt.get("start", 0.0)))
+            start = max(0.0, float(wt.get("start", 0.0)) - CAPTION_SYNC_LEAD)
+            if spans and start < spans[-1]["start"] + 0.03:
+                start = spans[-1]["start"] + 0.03
+            end = max(start + 0.05, float(wt.get("end", start)) - CAPTION_SYNC_LEAD)
+            if spans and spans[-1]["end"] > start:
+                spans[-1]["end"] = start           # keep spans gap-free + non-overlapping
             spans.append({
                 "text": word.upper() if uppercase else word,
                 "start": start,
-                "end": max(start + 0.05, float(wt.get("end", start))),
+                "end": end,
             })
     else:
         text = (text or "").strip()
@@ -1488,6 +1517,10 @@ def request_multipart_upload(url, key, path, timeout=240):
         ".ogg": "audio/ogg",
         ".flac": "audio/flac",
         ".webm": "audio/webm",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".m4v": "video/x-m4v",
+        ".mkv": "video/x-matroska",
     }.get(suffix, "application/octet-stream")
     file_bytes = path.read_bytes()
     header = (
@@ -2498,6 +2531,8 @@ def custom_sfx_segments(config):
                     "duration": float(cs.get("duration") or 1.0),
                     "volume": max(0.0, min(0.6, float(cs.get("volume") or 0.25))),
                     "source_trim": max(0.0, float(cs.get("source_trim") or 0.0)),
+                    "source_duration": max(0.0, float(cs.get("source_duration") or 0.0)),
+                    "playback_rate": max(0.01, float(cs.get("playback_rate") or 1.0)),
                     "category": "custom", "id": str(cs.get("id") or "custom")})
     return out
 
@@ -2547,6 +2582,10 @@ def ai_content_sfx_segments(config):
                "duration": float(cs.get("duration") or 4.0),
                "volume": max(0.0, min(0.9, float(cs.get("volume") or 0.1))),
                "category": str(cs.get("category") or "ambient"),
+               # source_trim lets a riser play its tail (swell peak) instead of the quiet intro
+               "source_trim": max(0.0, float(cs.get("source_trim") or 0.0)),
+               "source_duration": max(0.0, float(cs.get("source_duration") or 0.0)),
+               "playback_rate": max(0.01, float(cs.get("playback_rate") or 1.0)),
                "id": str(cs.get("id") or "ambient")}
         _apply_sfx_override(seg, ov, at_key="start")
         out.append(seg)
@@ -3184,10 +3223,15 @@ def render_video(config, basename=None):
                 # e.g. cut the first 0.5s off a riser so it hits sooner.
                 src_trim = max(0.0, float(segment.get("source_trim", 0.0) or 0.0))
                 dur = float(segment["duration"])
+                playback_rate = max(0.01, float(segment.get("playback_rate") or 1.0))
+                source_duration = float(segment.get("source_duration") or (dur * playback_rate))
+                tempo = atempo_filter_chain(playback_rate)
+                tempo_part = f",{tempo}" if tempo else ""
                 fade_out_start = max(0.0, dur - 0.08)
                 filters.append(
-                    f"[{input_index}:a:0]atrim={src_trim:.3f}:{src_trim + dur:.3f},"
-                    f"asetpts=PTS-STARTPTS,afade=t=out:st={fade_out_start:.3f}:d=0.080,"
+                    f"[{input_index}:a:0]atrim={src_trim:.3f}:{src_trim + source_duration:.3f},"
+                    f"asetpts=PTS-STARTPTS{tempo_part},atrim=0:{dur:.3f},asetpts=PTS-STARTPTS,"
+                    f"afade=t=out:st={fade_out_start:.3f}:d=0.080,"
                     f"adelay={delay_ms}:all=1,volume={segment['volume']:.3f}[{label}]"
                 )
                 labels.append(label)

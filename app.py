@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -71,6 +72,62 @@ except Exception:  # keep the main app working even if the optional mode fails t
     reddit_orchestrator = None
 
 
+def snapshot_timeline_version(slug, reason):
+    """Persist the complete editable timeline state before a destructive rework."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        raise RuntimeError("Unknown project.")
+    config_dir = project_dir / "config"
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    version_dir = config_dir / "timeline_versions" / stamp
+    version_dir.mkdir(parents=True, exist_ok=False)
+    source = config_dir / "project.json"
+    if not source.exists():
+        config = agent_core.load_project_config(slug)
+        source.write_text(json.dumps(agent_core.config_for_json(config), indent=2,
+                                     ensure_ascii=False), encoding="utf-8")
+    shutil.copy2(source, version_dir / "project.json")
+    edits = config_dir / "timeline_edits.json"
+    if edits.exists():
+        shutil.copy2(edits, version_dir / "timeline_edits.json")
+    metadata = {"id": stamp, "reason": str(reason),
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    (version_dir / "version.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return metadata
+
+
+def timeline_versions(slug):
+    project_dir = safe_project_dir(slug)
+    root = project_dir / "config" / "timeline_versions" if project_dir else None
+    rows = []
+    for folder in (sorted(root.iterdir(), reverse=True) if root and root.exists() else []):
+        try:
+            row = json.loads((folder / "version.json").read_text(encoding="utf-8"))
+            if (folder / "project.json").exists():
+                rows.append(row)
+        except Exception:
+            continue
+    return rows
+
+
+def restore_timeline_version(slug, version_id):
+    project_dir = safe_project_dir(slug)
+    if not project_dir or not re.fullmatch(r"[0-9_]+", str(version_id or "")):
+        raise RuntimeError("Unknown timeline version.")
+    config_dir = project_dir / "config"
+    source = config_dir / "timeline_versions" / str(version_id)
+    if not (source / "project.json").exists():
+        raise RuntimeError("Timeline version no longer exists.")
+    snapshot_timeline_version(slug, "Before restoring an older version")
+    shutil.copy2(source / "project.json", config_dir / "project.json")
+    old_edits = source / "timeline_edits.json"
+    current_edits = config_dir / "timeline_edits.json"
+    if old_edits.exists():
+        shutil.copy2(old_edits, current_edits)
+    elif current_edits.exists():
+        current_edits.unlink()
+
+
 ROOT = Path(__file__).resolve().parent
 SPEAKER_GALLERY_DIR = ROOT / "speaker images"
 SPEAKER_UPLOADED_DIR = ROOT / "speaker" / "uploaded"
@@ -78,6 +135,8 @@ SPEAKER_GALLERY_DIR.mkdir(exist_ok=True)
 SPEAKER_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 JOBS = {}
 JOB_LOCK = threading.Lock()
+DEV_TRAINER_LOCK = threading.Lock()
+DEV_TRAINER_SERVERS = {}
 # TikTok + X logins (the clip-scrape backends, no API keys): a single headed login at a
 # time per platform. busy = a login window is open and we're waiting for the user to sign in.
 TIKTOK_LOGIN = {"busy": False, "thread": None}
@@ -105,6 +164,7 @@ UI_TEXT_DEFAULTS = {
     "tts_model": "flash",
     "image_model": "openai/gpt-image-2/text-to-image",
     "hook_text": "",
+    "impact_word": "",
     "hook_pause_s": "0.45",
     "speaker_image_path": "",
     "clip_source": "generate",
@@ -112,7 +172,7 @@ UI_TEXT_DEFAULTS = {
     "scrape_terms": "",
     "background_music_choice": "none",
     "script_relevancy": "70",
-    "scrape_sort": "RELEVANCE",
+    "scrape_sort": "ALL",
     "scraping_engine": "v2",
     "sfx_amount": "medium",
     "scrape_cookies": "",
@@ -1728,6 +1788,23 @@ def app_script():
                 return;
               }
             } catch (e) {}
+            // #121 - browser: let the user CHOOSE the destination (Save As), else copy to Downloads
+            if (window.showSaveFilePicker) {
+              var nm = (decodeURIComponent(pathEnc).split(/[\\\\/]/).pop()) || "video.mp4";
+              (async function () {
+                try {
+                  var h = await window.showSaveFilePicker({ suggestedName: nm,
+                    types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }] });
+                  var resp = await fetch("/file?path=" + pathEnc);
+                  var w = await h.createWritable(); await resp.body.pipeTo(w);
+                  done("Saved", true);
+                } catch (e) {
+                  if (e && e.name === "AbortError") return;   // user cancelled
+                  saveRenderServer(pathEnc, done);
+                }
+              })();
+              return;
+            }
             saveRenderServer(pathEnc, done);
           };
           document.addEventListener("click", function (e) {
@@ -2933,6 +3010,142 @@ def page(title, body, refresh=None, body_class=""):
     <body{f' class="{esc(body_class)}"' if body_class else ""}><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
 
 
+def scrape_trainer_runs():
+    """Existing reviewable Scrape Trainer runs, newest first."""
+    runs_root = ROOT / "scrape_training" / "runs"
+    if not runs_root.exists():
+        return []
+    rows = []
+    for directory in runs_root.iterdir():
+        if directory.is_dir() and (directory / "trainer.db").exists():
+            try:
+                edited = directory.stat().st_mtime
+            except OSError:
+                edited = 0.0
+            rows.append({"id": directory.name, "edited": edited})
+    rows.sort(key=lambda row: row["edited"], reverse=True)
+    return rows
+
+
+def start_dev_trainer(tool, run_id=""):
+    """Start an existing trainer UI on an ephemeral localhost port and return its URL."""
+    tool = str(tool or "").strip().lower()
+    run_id = str(run_id or "").strip()
+    if tool == "sfx":
+        key = ("sfx", "")
+    elif tool == "scrape":
+        allowed = {row["id"] for row in scrape_trainer_runs()}
+        if run_id not in allowed:
+            raise RuntimeError("Unknown or incomplete Scrape Trainer run.")
+        key = ("scrape", run_id)
+    else:
+        raise RuntimeError("Unknown developer tool.")
+    with DEV_TRAINER_LOCK:
+        existing = DEV_TRAINER_SERVERS.get(key)
+        if existing and existing[1].is_alive():
+            return existing[2]
+        if tool == "sfx":
+            from tools import sfx_trainer_serve
+            handler = sfx_trainer_serve._Handler
+        else:
+            from tools import scrape_trainer_serve
+            handler = scrape_trainer_serve._Handler
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        if tool == "scrape":
+            server.run_id = run_id
+        port = int(server.server_address[1])
+        url = (f"http://127.0.0.1:{port}/"
+               if tool == "sfx" else
+               f"http://127.0.0.1:{port}/?run={urllib.parse.quote(run_id)}")
+        thread = threading.Thread(target=server.serve_forever,
+                                  name=f"dev-{tool}-trainer", daemon=True)
+        thread.start()
+        DEV_TRAINER_SERVERS[key] = (server, thread, url)
+        return url
+
+
+def dev_tools_page():
+    """Developer/trainer utilities, styled to match the general chat-shell UI (shares
+    /static/chat-shell.css so it looks like the rest of the normal interface)."""
+    runs = scrape_trainer_runs()
+    scrape_rows = "".join(
+        f'<form method="post" action="/dev-trainer-open" target="_blank" class="dev-run">'
+        f'<input type="hidden" name="tool" value="scrape">'
+        f'<input type="hidden" name="run_id" value="{esc(row["id"])}">'
+        f'<code class="dev-code">{esc(row["id"])}</code>'
+        f'<button class="btn small" type="submit">Open</button></form>'
+        for row in runs
+    ) or '<div class="card-note">No completed Scrape Trainer runs were found.</div>'
+    ver = chat_ui._asset_ver()
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Developer tools &middot; Shortslab</title>
+<link rel="icon" href="/static/app_icon.png" type="image/png">
+<link rel="stylesheet" href="/static/chat-shell.css?v={ver}">
+<style>
+  .dev-wrap {{ max-width: var(--chat-max); margin: 0 auto; padding: 22px 20px 60px; display: flex; flex-direction: column; gap: 16px; }}
+  .dev-top {{ display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }}
+  .dev-top h1 {{ flex: 1; font-size: 20px; }}
+  .dev-brand {{ display: flex; align-items: center; gap: 10px; }}
+  .dev-brand img {{ border-radius: 9px; }}
+  .dev-runs {{ display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }}
+  .dev-run {{ display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-raised); }}
+  .dev-code {{ font-family: var(--mono); font-size: 12.5px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+</style>
+</head>
+<body>
+<div class="dev-wrap">
+  <div class="dev-top">
+    <div class="dev-brand">
+      <img src="/static/app_icon.png" alt="" width="30" height="30">
+      <h1>Developer tools</h1>
+    </div>
+    <a class="btn ghost small" href="/">&#8592; Back to Shortslab</a>
+    <button type="button" class="btn ghost small" id="dev-theme">&#9788; Theme</button>
+  </div>
+  <div class="chat-card">
+    <div class="card-cap">Local utilities</div>
+    <div class="card-note">Review and training tools that edit trainer ground truth on this machine.</div>
+  </div>
+  <div class="chat-card">
+    <h3>SFX Trainer</h3>
+    <div class="card-note">Listen to the local sound library, correct roles / reactions, and activate the labels.</div>
+    <div class="card-foot">
+      <form method="post" action="/dev-trainer-open" target="_blank">
+        <input type="hidden" name="tool" value="sfx">
+        <button class="btn primary" type="submit">Open SFX Trainer</button>
+      </form>
+    </div>
+  </div>
+  <div class="chat-card">
+    <h3>Scrape Trainer</h3>
+    <div class="card-note">Open an existing scrape-training run and rate every collected clip.</div>
+    <div class="dev-runs">{scrape_rows}</div>
+  </div>
+</div>
+<script>
+  (function(){{
+    var saved; try {{ saved = localStorage.getItem("sl-chat-theme"); }} catch(e) {{}}
+    document.documentElement.dataset.theme = saved || "dark";
+    var b = document.getElementById("dev-theme");
+    if (b) b.addEventListener("click", function(){{
+      var t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = t;
+      try {{ localStorage.setItem("sl-chat-theme", t); }} catch(e) {{}}
+    }});
+  }})();
+</script>
+</body>
+</html>"""
+    return html.encode("utf-8")
+
+
 def parse_content_disposition(value):
     result = {}
     for part in value.split(";"):
@@ -3099,6 +3312,9 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="anthropic/claude-sonnet-5"{' selected' if state.get("reasoning_model") == "anthropic/claude-sonnet-5" else ""}>Claude Sonnet 5 (fast, high quality)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best 4.x quality)</option>
               <option value="openai/gpt-5.5"{' selected' if state.get("reasoning_model") == "openai/gpt-5.5" else ""}>GPT-5.5 (fast, standard)</option>
+              <option value="openai/gpt-5.6-sol"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-sol" else ""}>GPT-5.6 Sol</option>
+              <option value="openai/gpt-5.6-terra"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-terra" else ""}>GPT-5.6 Terra</option>
+              <option value="openai/gpt-5.6-luna"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-luna" else ""}>GPT-5.6 Luna</option>
               <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
             </select>
@@ -3216,6 +3432,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <textarea id="script-field" name="script" spellcheck="false" placeholder="Paste your script here. Write it as a punchy spoken narration — the AI generates the voiceover, finds visuals and cuts the Short from this text. Then select your opening line(s) and click &#8220;Mark hook&#8221;.">{esc(state.get("script"))}</textarea>
           </div>
           <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
+          <input type="hidden" name="impact_word" id="impact-word" value="{esc(state.get('impact_word'))}">
           <div class="hook-controls">
             <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
             <button type="button" class="button secondary hook-btn" onclick="clearHook()">Clear</button>
@@ -3226,6 +3443,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
             <label class="scrape-lbl" for="scrape-sort">Search result order</label>
             <select name="scrape_sort" id="scrape-sort">
+              <option value="ALL"{' selected' if state.get('scrape_sort') in (None, '', 'ALL') else ''}>All sortings (liked &rarr; relevance &rarr; viewed &rarr; recent)</option>
               <option value="MOST_LIKED"{' selected' if state.get('scrape_sort') == 'MOST_LIKED' else ''}>Most liked</option>
               <option value="MOST_VIEWED"{' selected' if state.get('scrape_sort') == 'MOST_VIEWED' else ''}>Most viewed</option>
               <option value="MOST_RECENT"{' selected' if state.get('scrape_sort') == 'MOST_RECENT' else ''}>Most recent</option>
@@ -3394,6 +3612,9 @@ def sfx_page():
             <option value="anthropic/claude-sonnet-5">Claude Sonnet 5 (fast, high quality)</option>
             <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
             <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
+            <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
+            <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
+            <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
@@ -3445,6 +3666,9 @@ def visual_page():
             <option value="anthropic/claude-sonnet-5">Claude Sonnet 5 (fast, high quality)</option>
             <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8 (recommended)</option>
             <option value="openai/gpt-5.5">GPT-5.5 (faster)</option>
+            <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
+            <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
+            <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
@@ -3586,10 +3810,34 @@ def longform_page():
     <form method="post" action="/longform-run" enctype="multipart/form-data">
       <section class="stack">
         <div class="panel accent">
-          <label>Prompt list (.txt)</label>
-          <label class="filepick" for="lf-file"><span class="filepick-btn">&#128193; Choose prompt .txt</span><span class="filepick-name" id="lf-file-name">No file chosen</span></label>
-          <input type="file" name="prompt_file" id="lf-file" class="filepick-input" accept=".txt,text/plain" required onchange="var n=document.getElementById('lf-file-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
-          <div class="hint">One prompt per line, each starting with its timestamp, e.g. <code>[0:06] a doodle cartoon of ...</code>. Each finished image is saved as that timestamp (<code>[0-06].png</code>). Blank lines are ignored.</div>
+          <label>Your script</label>
+          <textarea name="script" rows="14" placeholder="Paste your full longform script here..." spellcheck="false"></textarea>
+          <div class="hint">Paste the narration script - that's all. The app generates the voiceover
+            (Gemini TTS, stitched from parts), transcribes it with exact timestamps, writes one doodle
+            image prompt per timestamp (reasoning model), renders every image on your Higgsfield account
+            (FLUX.2 Pro, 16:9, 4 in flight), then cuts images + voiceover into the finished video.</div>
+        </div>
+
+        <div class="panel">
+          <label>Voiceover TTS</label>
+          <select name="tts_model">
+            <option value="pro" selected>Gemini 2.5 Pro TTS (cleaner)</option>
+            <option value="flash">Gemini 2.5 Flash TTS (cheaper)</option>
+          </select>
+        </div>
+        <div class="panel">
+          <label>Reasoning model {help_tip("Writes one doodle image prompt per timestamp (STAGE-3 prompt) and verifies the final image set before assembly.")}</label>
+          <select name="reasoning_model">
+            <option value="anthropic/claude-opus-4.8" selected>Claude Opus 4.8</option>
+            <option value="anthropic/claude-fable-5">Claude Fable 5</option>
+            <option value="anthropic/claude-sonnet-5">Claude Sonnet 5</option>
+            <option value="openai/gpt-5.5">GPT-5.5</option>
+            <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
+            <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
+            <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+            <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
+          </select>
         </div>
 
         <div class="panel">
@@ -3602,45 +3850,20 @@ def longform_page():
           {('' if hf_avail else '<div class="conn-warn">&#9888; Browser engine missing. Run: pip install playwright &amp;&amp; playwright install chromium</div>')}
         </div>
 
-        <div class="panel">
-          <label>Image model</label>
-          <select name="model">
-            <option value="FLUX.2 Pro" selected>FLUX.2 Pro (unlimited)</option>
-            <option value="FLUX.2 Flex">FLUX.2 Flex</option>
-            <option value="Soul">Soul</option>
-          </select>
-          <div class="hint">FLUX.2 Pro is the default per your plan's 365-day unlimited access.</div>
-        </div>
-        <div class="panel">
-          <label>Aspect ratio</label>
-          <select name="aspect">
-            <option value="16:9" selected>16:9 (landscape / longform)</option>
-            <option value="9:16">9:16 (vertical)</option>
-            <option value="1:1">1:1 (square)</option>
-          </select>
-        </div>
-        <div class="panel">
-          <label>Images in flight {help_tip("How many generations to keep running at once on your Higgsfield account. Your plan allows up to 4 concurrent.")}</label>
-          <select name="concurrency">
-            <option value="4" selected>4 at a time</option>
-            <option value="3">3 at a time</option>
-            <option value="2">2 at a time</option>
-            <option value="1">1 at a time</option>
-          </select>
-        </div>
-
-        <button type="submit">Generate images</button>
+        <button type="submit">Create longform video</button>
       </section>
 
       <section class="stack">
         <div class="loaded-media-panel">
           <h2 style="margin-bottom: 12px;">How it works</h2>
           <ol class="hint" style="margin: 0; padding-left: 18px; line-height: 1.9;">
-            <li><strong>Parse</strong> &mdash; every non-blank line becomes one prompt, keyed by its <code>[m:ss]</code> timestamp.</li>
-            <li><strong>Generate</strong> &mdash; each prompt is sent to your logged-in Higgsfield (FLUX.2 Pro, 16:9), a few in flight at once.</li>
-            <li><strong>Auto-download</strong> &mdash; each finished image is saved named by its timestamp (<code>[0-06].png</code>).</li>
+            <li><strong>Voiceover</strong> &mdash; the script is split into sentence-safe parts, spoken with Gemini TTS, then stitched.</li>
+            <li><strong>Timestamps</strong> &mdash; faster-whisper + script alignment produce an exact <code>[m:ss.d]</code> transcript.</li>
+            <li><strong>Prompts</strong> &mdash; the reasoning model writes one doodle image prompt per timestamp (auto-batched).</li>
+            <li><strong>Images</strong> &mdash; FLUX.2 Pro 16:9 on your Higgsfield account, 4 in flight, failed images auto-retried; each file is named with its timestamp + on-screen duration.</li>
+            <li><strong>Assembly</strong> &mdash; every image is cut to its exact duration (black frame if one is missing) and muxed with the voiceover. A chime plays when it's done.</li>
           </ol>
-          <div class="hint" style="margin-top: 16px;">Output lands in <code>projects/_longform/&lt;file&gt;/</code>.</div>
+          <div class="hint" style="margin-top: 16px;">Output lands in <code>projects/_longform/&lt;slug&gt;/</code>.</div>
         </div>
       </section>
     </form>
@@ -3733,6 +3956,7 @@ def _make_speech_gate(job_id, cancel_event, approval_event):
         with JOB_LOCK:
             job = JOBS.get(job_id)
             decision = (job.get("speech_decision") if job else "approve") or "approve"
+            chosen_speed = job.get("speech_speed_choice") if job else None
         if decision == "replace":
             raise RunCancelled("Voice replaced — restarting with a new speaker.")
         with JOB_LOCK:
@@ -3741,6 +3965,7 @@ def _make_speech_gate(job_id, cancel_event, approval_event):
                 job["status"] = "running"
                 job["logs"].append("Voiceover approved — continuing the run.")
                 job.setdefault("log_times", []).append(time.time())
+        return chosen_speed        # the run re-tempos the voice if this differs
     return gate
 
 
@@ -3900,6 +4125,71 @@ def start_sfx_job(fields, files):
                     # the enhanced upload now lives in a real project -> timeline editor works
                     if result.get("project_dir"):
                         JOBS[job_id]["project_dir"] = result["project_dir"]
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_redo_sfx_job(slug, reasoning_model=None, sfx_amount="medium", mode="redo", regen_captions=False):
+    """Timeline "Redo SFX": run a NORMAL SFX-Master pass over the project's LATEST render
+    (no upload). Same engine as /sfx-run - the multimodal Audio Director watches the render.
+    ``regen_captions`` re-aligns captions FIRST (so a combined "redo captions + redo SFX" rework
+    produces ONE render with both)."""
+    job_id = str(int(time.time() * 1000))
+    project_dir = safe_project_dir(slug)
+    render = latest_media(project_dir / "renders", {".mp4", ".webm"}) if project_dir else None
+    mode = "add" if str(mode).lower() == "add" else "redo"
+    reasoning_model = (reasoning_model or "anthropic/claude-opus-4.8").strip()
+    sfx_amount = str(sfx_amount or "medium").strip().lower()
+    if sfx_amount not in ("low", "medium", "high"):
+        sfx_amount = "medium"
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Queued."], "log_times": [time.time()],
+            "result": None, "error": None, "cancel_event": cancel_event,
+            "project_dir": None, "created_at": time.time(), "job_kind": "sfx",
+        }
+    if not render:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "This project has no render yet - render once first."
+            JOBS[job_id]["logs"].append("Error: no render found.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            if regen_captions:
+                _regenerate_project_captions(slug, status_cb=status_cb)
+            status_cb(f"{'Add more' if mode == 'add' else 'Redo'} SFX on {Path(render).name}...")
+            result = agent_core.rework_project_sfx(
+                slug, mode=mode, reasoning_model=reasoning_model, status_cb=status_cb,
+                sfx_amount=sfx_amount, cancel_event=cancel_event)
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+                    JOBS[job_id]["project_dir"] = result.get("project_dir") or str(project_dir)
         except Exception as exc:
             with JOB_LOCK:
                 if cancel_event.is_set() or isinstance(exc, RunCancelled):
@@ -4181,6 +4471,78 @@ def start_longform_job(fields, files):
         except Exception as exc:
             with JOB_LOCK:
                 if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_longform_video_job(fields):
+    """Longform VIDEO: paste a script -> voiceover (Gemini TTS) -> exact-timestamp transcript
+    (faster-whisper + alignment) -> one doodle prompt per timestamp (reasoning model) ->
+    FLUX.2 Pro 16:9 images on Higgsfield (4 in flight, retries) -> images + voiceover cut into
+    the finished MP4 (black frame where an image is missing). See longform_video.py."""
+    import longform_video
+    job_id = str(int(time.time() * 1000))
+    script = str(fields.get("script") or "").strip()
+    tts_model = (fields.get("tts_model") or "pro").strip().lower()
+    if tts_model not in ("pro", "flash"):
+        tts_model = "pro"
+    reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": ["Queued."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "longform",
+        }
+
+    def fail(msg):
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = msg
+            JOBS[job_id]["logs"].append(f"Error: {msg}")
+        return job_id
+
+    if len(script) < 40:
+        return fail("Please paste the full script (at least a few sentences).")
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        return fail("WAVESPEED_API_KEY missing - the voiceover + image prompts need it.")
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            result = longform_video.run_longform_video(
+                script, tts_model=tts_model, reasoning_model=reasoning_model,
+                status_cb=status_cb, cancel_event=cancel_event)
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = result
+                JOBS[job_id]["project_dir"] = result.get("project_dir")
+                JOBS[job_id]["logs"].append(
+                    f"Done. {result.get('images_done')}/{result.get('images_total')} images; "
+                    f"final video: {result.get('video')}")
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, (RunCancelled, pipeline.PipelineCancelled)):
                     JOBS[job_id]["status"] = "cancelled"
                     JOBS[job_id]["logs"].append("Cancelled.")
                 else:
@@ -5466,6 +5828,13 @@ TIMELINE_SKELETON = """
     <div class="tl-actions">
       <button type="button" class="button secondary tl-save-btn" id="tl-save" title="Save timeline changes">&#128190; Save</button>
       <div class="tl-popwrap">
+        <button type="button" class="button secondary tl-save-btn" id="tl-versions-open" title="Load a timeline from before a redo or replacement">&#128337; Versions</button>
+        <div class="tl-pop tl-version-pop" id="tl-versions-pop" hidden>
+          <div class="tl-version-title">Older timelines</div>
+          <div id="tl-version-list" class="tl-version-list"><span class="hint">No older versions yet.</span></div>
+        </div>
+      </div>
+      <div class="tl-popwrap">
         <button type="button" class="button primary tl-render-btn" id="tl-render-open">&#11015; Render</button>
         <div class="tl-pop" id="tl-render-pop" hidden>
           <label class="tl-cap-toggle"><input type="checkbox" id="tl-captions"><span>Render with captions</span></label>
@@ -5474,24 +5843,31 @@ TIMELINE_SKELETON = """
         </div>
       </div>
       <div class="tl-popwrap">
-        <button type="button" class="button tl-rework-btn" id="tl-rework-open">&#129302; Agent rework</button>
+        <button type="button" class="button tl-rework-btn" id="tl-rework-open" title="Agent rework">&#129302; Rework</button>
         <div class="tl-pop" id="tl-rework-pop" hidden>
           <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"><span id="tl-rw-replace-label">replace selected media</span></label>
-          <label class="tl-chk"><input type="checkbox" id="tl-rw-recut" checked> reorder &amp; recut</label>
+          <label class="tl-chk"><input type="checkbox" id="tl-rw-recut"> reorder &amp; recut</label>
           <label class="tl-chk" title="Creates a fresh take with the saved voice, then force-aligns captions and clip cuts to it"><input type="checkbox" id="tl-rw-revoice"> regenerate speech + retime</label>
+          <label class="tl-chk" id="tl-rw-redo-sfx-wrap"><input type="checkbox" id="tl-rw-redo-sfx"> redo SFX</label>
+          <label class="tl-chk" id="tl-rw-add-sfx-wrap"><input type="checkbox" id="tl-rw-add-sfx"> add more SFX</label>
+          <label class="tl-chk" id="tl-rw-redo-cap-wrap"><input type="checkbox" id="tl-rw-redo-captions"> redo captions</label>
           <label class="tl-pop-field" for="tl-rw-model">Rework model</label>
           <select id="tl-rw-model">
             <option value="anthropic/claude-fable-5">Claude Fable 5</option>
             <option value="anthropic/claude-sonnet-5">Claude Sonnet 5</option>
             <option value="anthropic/claude-opus-4.8">Claude Opus 4.8</option>
             <option value="openai/gpt-5.5">GPT-5.5</option>
+            <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
+            <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
+            <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
           </select>
-          <button type="button" class="button secondary tl-rework-btn" id="tl-script-btn" title="Edit the spoken script, then re-voice and recut - unchanged lines keep their media">&#128221; Change script</button>
+          <button type="button" id="tl-script-btn" hidden>Change script</button>
           <button type="button" class="button tl-rework-btn" id="tl-rework">&#129302; Start rework</button>
         </div>
       </div>
+      <button type="button" class="button secondary tl-rework-btn" id="tl-script-open" title="Rewrite the narration - fresh voiceover + recut (its own workflow)">&#128221; Script</button>
     </div>
     <div class="tl-script-overlay" id="tl-script-modal" hidden>
       <div class="tl-script-box panel">
@@ -5523,6 +5899,15 @@ TIMELINE_SKELETON = """
             <button type="button" data-density="many">Many</button>
           </div>
           <span class="tl-density-hint" id="tl-script-density-hint"></span>
+        </div>
+        <div class="tl-script-densitybar">
+          <label>Media</label>
+          <div class="tl-density-seg" id="tl-script-mediasrc" title="Where the media for changed / new lines comes from">
+            <button type="button" data-media="scrape" class="on">Scrape new</button>
+            <button type="button" data-media="keep_visible">Keep current</button>
+            <button type="button" data-media="library">Best from library</button>
+          </div>
+          <span class="tl-density-hint" id="tl-script-mediasrc-hint"></span>
         </div>
         <div class="tl-script-actions">
           <button type="button" class="button secondary" id="tl-script-cancel">Cancel</button>
@@ -5638,20 +6023,17 @@ TIMELINE_SKELETON = """
         <div class="tl-rlabel tl-rl-ruler"></div>
         <div class="tl-rlabel tl-rl-clips">Clips</div>
         <div class="tl-rlabel tl-rl-ov">Visuals</div>
-        <div class="tl-rlabel tl-rl-cap">Captions</div>
         <div class="tl-rlabel tl-rl-voice">Voice</div>
-        <div class="tl-rlabel tl-rl-tr">Cut&nbsp;SFX</div>
         <div class="tl-rlabel tl-rl-sfx">Sound&nbsp;FX</div>
       </div>
       <div class="tl-scroll" id="tl-scroll">
         <div class="tl-playhead" id="tl-playhead"></div>
+        <div class="tl-voice-end" id="tl-voice-end" hidden title="Voiceover length"><span class="tl-voice-end-lbl"></span></div>
         <div class="tl-ruler" id="tl-ruler"></div>
         <div class="tl-track tl-clips-track" id="tl-clips"></div>
         <div class="tl-track tl-ovtrack" id="tl-ovtrack"></div>
-        <div class="tl-track tl-cap" id="tl-captrack"></div>
         <div class="tl-track tl-aud" id="tl-voice"></div>
-        <div class="tl-track tl-trtrack" id="tl-trtrack"></div>
-        <div class="tl-track tl-sfx" id="tl-sfx"></div>
+        <div class="tl-track tl-sfx tl-trtrack" id="tl-sfx"></div>
       </div>
     </div>
   </div>
@@ -5712,8 +6094,17 @@ TIMELINE_ASSETS = """
   .tl-density-seg button.on { background:var(--accent); color:#fff; }
   .tl-density-hint { font-size:12px; color:var(--muted); font-weight:600; }
   .tl-rework-btn { font-size:13px; padding:9px 14px; }
-  .tl-chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:#c9d2cf; margin:0; cursor:pointer; }
-  .tl-chk input { margin:0; }
+  .tl-chk { display:flex; align-items:center; gap:9px; font-size:12px; font-weight:600; color:#c9d2cf; margin:0; cursor:pointer; }
+  .tl-chk input { appearance:none; -webkit-appearance:none; width:30px; height:17px; flex:0 0 30px; margin:0; border:1px solid #4b5753; border-radius:999px; background:#252d2a; position:relative; cursor:pointer; transition:.16s ease; }
+  .tl-chk input::after { content:""; position:absolute; width:11px; height:11px; left:2px; top:2px; border-radius:50%; background:#8b9692; transition:.16s ease; }
+  .tl-chk input:checked { border-color:#42d39a; background:#176d50; }
+  .tl-chk input:checked::after { left:15px; background:#eafff6; }
+  .tl-chk input:disabled { opacity:.38; cursor:not-allowed; }
+  .tl-version-pop { min-width:270px; max-height:330px; overflow:auto; }
+  .tl-version-title { font-size:12px; font-weight:800; margin-bottom:7px; }
+  .tl-version-list { display:flex; flex-direction:column; gap:6px; }
+  .tl-version-item { width:100%; text-align:left; padding:8px 10px; font-size:11.5px; line-height:1.3; }
+  .tl-version-item small { display:block; opacity:.65; margin-top:2px; }
   .tl-meta { display:flex; align-items:center; gap:16px; }
   .tl-total { font-weight:700; color:var(--muted); font-variant-numeric:tabular-nums; }
   .tl-cap-toggle { display:flex; align-items:center; gap:8px; font-weight:700; margin:0; cursor:pointer; }
@@ -5741,11 +6132,12 @@ TIMELINE_ASSETS = """
   .tl-preview-overlay.selected .tl-ov-scale-handle { display:block; }
   .tl-stage-empty { position:absolute; color:var(--faint); font-weight:600; }
   /* floating transport bar overlaying the bottom of the video */
-  .tl-player-bar { position:absolute; left:0; right:0; bottom:0; z-index:6; display:flex; align-items:center; justify-content:center; gap:14px; padding:12px 10px 10px;
+  .tl-player-bar { position:absolute; left:0; right:0; bottom:0; z-index:6; display:flex; align-items:center; justify-content:center; gap:12px; padding:10px 10px 22px;
     background:linear-gradient(to top, rgba(0,0,0,.62), rgba(0,0,0,.28) 55%, transparent);
     opacity:0; transition:opacity .18s ease; }
   .tl-stage-view:hover .tl-player-bar, .tl-stage-view:focus-within .tl-player-bar { opacity:1; }
-  .tl-player-bar .tl-playtime { position:absolute; right:12px; bottom:16px; color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.7); font-variant-numeric:tabular-nums; }
+  /* time on its OWN centered line at the very bottom - never overlaps the transport buttons */
+  .tl-player-bar .tl-playtime { position:absolute; left:0; right:0; bottom:4px; text-align:center; color:#fff; font-size:11px; text-shadow:0 1px 3px rgba(0,0,0,.7); font-variant-numeric:tabular-nums; pointer-events:none; }
   @media (prefers-reduced-motion: reduce) { .tl-player-bar { transition:none; } }
   .tl-player-bar .tl-ctrl { width:42px; height:42px; min-width:0; padding:0; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; color:var(--text); background:var(--bg-overlay); border:1px solid var(--line-strong); box-shadow:none; }
   .tl-ctrl::after { display:none; }
@@ -5766,17 +6158,24 @@ TIMELINE_ASSETS = """
   .tl-rows { display:flex; gap:10px; }
   .tl-row-labels { display:flex; flex-direction:column; gap:6px; flex:0 0 auto; }
   .tl-rlabel { display:flex; align-items:center; font-weight:600; color:var(--faint); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
-  .tl-rl-ruler { height:26px; }
-  .tl-rl-clips { height:96px; }
-  .tl-rl-ov, .tl-rl-cap, .tl-rl-voice, .tl-rl-tr, .tl-rl-sfx { height:40px; }
-  .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:12px; user-select:none; -webkit-user-select:none; }
-  .tl-ruler { position:relative; height:26px; cursor:pointer; }
-  .tl-tick { position:absolute; top:0; height:26px; border-left:1px solid rgba(255,255,255,.2); padding-left:5px; font-size:10px; color:rgba(255,255,255,.6); }
+  .tl-rl-ruler { height:22px; }
+  .tl-rl-clips { height:74px; }
+  .tl-rl-ov, .tl-rl-cap, .tl-rl-voice, .tl-rl-tr, .tl-rl-sfx { height:32px; }
+  .tl-scroll { position:relative; overflow-x:auto; flex:1; min-width:0; padding-bottom:4px; user-select:none; -webkit-user-select:none; scrollbar-width:none; -ms-overflow-style:none; }
+  .tl-scroll::-webkit-scrollbar { display:none; height:0; width:0; }
+  .tl-ruler { position:relative; height:22px; cursor:pointer; }
+  .tl-tick { position:absolute; top:0; height:22px; border-left:1px solid rgba(255,255,255,.2); padding-left:5px; font-size:10px; color:rgba(255,255,255,.6); }
+  .tl-rubber { position:absolute; top:4px; bottom:4px; background:var(--accent-subtle); border:1px solid var(--accent); border-radius:5px; z-index:9; pointer-events:none; }
   .tl-playhead { position:absolute; top:0; bottom:12px; width:2px; background:#ff5d5d; z-index:8; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
   .tl-playhead::before { content:''; position:absolute; top:0; left:-5px; border-left:6px solid transparent; border-right:6px solid transparent; border-top:8px solid #ff5d5d; }
+  /* #119 - voiceover-length marker: a dashed line across all tracks where the voice ends */
+  .tl-voice-end { position:absolute; top:16px; bottom:12px; width:0; border-left:2px dashed #6fd3ff; z-index:7; pointer-events:none; }
+  .tl-voice-end.tl-voice-mismatch { border-left-color:#ffb64f; }
+  .tl-voice-end-lbl { position:absolute; top:-14px; left:3px; font-size:9.5px; font-weight:700; white-space:nowrap; color:#6fd3ff; background:var(--bg-raised); padding:0 3px; border-radius:3px; }
+  .tl-voice-end.tl-voice-mismatch .tl-voice-end-lbl { color:#ffb64f; }
   .tl-track { position:relative; margin-top:6px; background:var(--bg-base); border:1px solid var(--line); border-radius:var(--r-md); }
-  .tl-clips-track { height:96px; }
-  .tl-ovtrack, .tl-cap, .tl-aud, .tl-trtrack, .tl-sfx { height:40px; }
+  .tl-clips-track { height:74px; }
+  .tl-ovtrack, .tl-cap, .tl-aud, .tl-trtrack, .tl-sfx { height:32px; }
   .tl-track.tl-muted { opacity:.32; filter:grayscale(.6); }
   .tl-clip { position:absolute; top:4px; bottom:4px; border:2px solid var(--line-strong); border-radius:var(--r-md); overflow:hidden; cursor:grab; background:var(--bg-overlay); background-size:cover; background-position:center; touch-action:none; box-shadow:var(--sh-1); }
   .tl-clip.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
@@ -5796,8 +6195,10 @@ TIMELINE_ASSETS = """
   .tl-trans.disabled .tl-diamond { background:var(--faint); border-color:var(--line-strong); }
   .tl-trans:hover .tl-diamond { transform:rotate(45deg) scale(1.18); }
   /* hover a clip boundary in the Cut-SFX row to reveal a "+" that adds a transition sound there */
-  .tl-trans-slot { position:absolute; top:0; bottom:0; width:30px; transform:translateX(-50%); z-index:5; display:flex; align-items:center; justify-content:center; cursor:pointer; }
-  .tl-trans-add { width:22px; height:22px; border-radius:50%; border:2px solid var(--accent); background:var(--bg-raised); color:var(--accent); font-size:16px; font-weight:900; line-height:1; display:flex; align-items:center; justify-content:center; opacity:0; transform:scale(.55); transition:opacity .12s var(--ease), transform .12s var(--ease); box-shadow:var(--sh-1); pointer-events:none; }
+  /* Only the visible green circle is interactive. The old slot covered the full track height
+     at z-index 5 and stole pointerdown from SFX blocks underneath it. */
+  .tl-trans-slot { position:absolute; top:50%; width:26px; height:26px; transform:translate(-50%,-50%); z-index:2; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+  .tl-trans-add { width:22px; height:22px; border-radius:50%; border:2px solid var(--accent); background:var(--bg-raised); color:var(--accent); font-size:16px; font-weight:900; line-height:1; display:flex; align-items:center; justify-content:center; opacity:0; transform:scale(.55); transition:opacity .12s var(--ease), transform .12s var(--ease); box-shadow:var(--sh-1); pointer-events:auto; cursor:pointer; }
   .tl-trans-slot:hover .tl-trans-add, .tl-trans-slot.menu-open .tl-trans-add { opacity:1; transform:scale(1); }
   .tl-trans-slot.menu-open .tl-trans-add { background:var(--accent); color:var(--accent-ink); }
   .tl-trans-menu { position:fixed; z-index:60; width:242px; max-height:300px; overflow-y:auto; background:var(--bg-raised); border:2px solid var(--ink); border-radius:var(--r-md); box-shadow:var(--sh-3); padding:6px; }
@@ -5807,13 +6208,44 @@ TIMELINE_ASSETS = """
   .tl-trans-menu .tl-tm-play { flex:0 0 auto; width:22px; height:22px; border-radius:5px; border:1px solid var(--line-strong); background:var(--bg-input); color:var(--text); font-size:9px; display:flex; align-items:center; justify-content:center; cursor:pointer; }
   .tl-trans-menu .tl-tm-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .tl-trans-menu .tl-tm-empty { padding:12px 8px; color:var(--faint); font-size:12px; text-align:center; }
+  /* hierarchical replace-sound picker: category rows drill down to sounds */
+  .tl-trans-menu.tl-sfx-picker .tl-tm-cat { font-weight:600; }
+  .tl-trans-menu .tl-tm-arrow { flex:0 0 auto; color:var(--muted); font-size:14px; }
+  .tl-trans-menu .tl-tm-title .tl-tm-back { width:20px; height:20px; margin-right:6px; padding:0; border:1px solid var(--line-strong);
+    background:var(--bg-input); color:var(--text); border-radius:5px; cursor:pointer; font-size:12px; line-height:1; vertical-align:middle; }
+  .tl-trans-menu .tl-tm-title .tl-tm-back:hover { border-color:var(--accent); }
+  /* SFX library category filter chips - all on ONE horizontal row */
+  .tl-sfx-cats { display:flex; flex-wrap:wrap; gap:5px; margin:0 0 8px; }
+  .tl-sfx-cat { width:auto; min-width:0; margin:0; padding:3px 9px; font-size:11px; font-weight:600; border-radius:99px;
+    border:1px solid var(--line); background:transparent; color:var(--muted); cursor:pointer; box-shadow:none; white-space:nowrap;
+    display:inline-flex; align-items:center; gap:4px; }
+  .tl-sfx-cat:hover { border-color:var(--accent); color:var(--text); }
+  .tl-sfx-cat.on { background:var(--accent-subtle); border-color:var(--accent); color:var(--text); }
+  .tl-sfx-caret { font-size:8px; opacity:.7; }
+  .tl-sfx-subchip { font-size:10.5px; padding:2px 8px; }
+  /* subcategory popup - only opens for a category that actually has subcategories (e.g. Reaction) */
+  .tl-sfx-subpop { position:fixed; z-index:2147483600; max-width:min(320px,92vw); background:var(--bg-raised);
+    border:1px solid var(--line-strong); border-radius:10px; box-shadow:var(--sh-3); padding:8px;
+    display:flex; flex-wrap:wrap; gap:5px; }
+  /* greyed-out (unavailable) rework toggles / render captions toggle */
+  .tl-disabled { opacity:.42; cursor:not-allowed; }
+  .tl-disabled input { cursor:not-allowed; }
+  /* #113 - the low/medium/high SFX-amount popup that appears next to Redo SFX */
+  .tl-amt-pop { position:fixed; z-index:2147483600; background:var(--bg-raised); border:1px solid var(--line-strong);
+    border-radius:10px; box-shadow:var(--sh-3); padding:9px 10px; display:flex; flex-direction:column; gap:7px; }
+  .tl-amt-lbl { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .tl-amt-row { display:flex; gap:6px; }
+  .tl-amt-btn { width:auto; min-width:0; margin:0; padding:5px 12px; font-size:12px; font-weight:600; border-radius:8px;
+    border:1px solid var(--line); background:transparent; color:var(--muted); cursor:pointer; box-shadow:none; }
+  .tl-amt-btn:hover { border-color:var(--accent); color:var(--text); }
+  .tl-amt-btn.on { background:var(--accent-subtle); border-color:var(--accent); color:var(--text); }
   .tl-capbar { position:absolute; top:7px; bottom:7px; border-radius:7px; background:var(--accent-subtle); border:1px solid rgba(124,92,255,.4); display:flex; align-items:center; padding-left:9px; color:var(--text); font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; }
   .tl-capbar.off { opacity:.3; }
   .tl-capitem { position:absolute; top:6px; bottom:6px; min-width:22px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; padding:0 7px; display:flex; align-items:center; border-radius:6px; border:1px solid rgba(124,92,255,.45); background:var(--accent-subtle); color:var(--text); font-size:10.5px; font-weight:650; box-sizing:border-box; }
   .tl-cap.off .tl-capitem { opacity:.32; }
   .tl-audbar { position:absolute; top:7px; bottom:7px; left:0; right:0; border-radius:7px; background:rgba(111,211,255,.12); border:1px solid rgba(111,211,255,.3); }
-  .tl-fx { position:absolute; top:6px; bottom:6px; border-radius:7px; background:var(--bg-overlay); border:1px solid var(--line-strong); cursor:pointer; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; box-sizing:border-box; }
-  .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:4; }
+  .tl-fx { position:absolute; top:6px; bottom:6px; z-index:8; border-radius:7px; background:var(--bg-overlay); border:1px solid var(--line-strong); cursor:pointer; touch-action:none; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; box-sizing:border-box; }
+  .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:9; }
   .tl-fx.disabled { opacity:.4; }
   .tl-mixer-wrap { margin-top:16px; }
   .tl-mixer { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
@@ -5840,7 +6272,10 @@ TIMELINE_ASSETS = """
   .tl-lib-tab.active { border-color:var(--accent); background:var(--accent-subtle); color:var(--text); }
   .tl-lib-hint { color:var(--faint); font-size:12px; }
   .tl-lib-body { display:block; max-height:720px; overflow-y:auto; padding:2px; }
-  .tl-sublib-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; position:sticky; top:0; background:var(--bg-raised); padding-bottom:6px; z-index:2; }
+  /* no enclosing bar: the tabs float as standalone pills. The sticky wrapper is transparent
+     and click-through (pointer-events:none) so clips scrolling underneath stay interactive;
+     only the pills themselves capture clicks (pointer-events:auto below). */
+  .tl-sublib-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; position:sticky; top:0; background:transparent; padding:2px 0; z-index:5; pointer-events:none; }
   .tl-sublib-tab { width:auto; min-width:0; padding:5px 10px; font-family:var(--pixel); font-size:9px; text-transform:uppercase; background:var(--bg-input); border:2px solid var(--ink); color:var(--ink); border-radius:var(--r-sm); box-shadow:none; }
   .tl-sublib-tab::after { display:none; }
   .tl-sublib-tab.active { background:var(--accent); color:#fff; }
@@ -5848,7 +6283,7 @@ TIMELINE_ASSETS = """
   /* sub-tabs + search inside the library body: WITHOUT these rules the buttons/input inherit
      the global full-width pixel button style and wreck the panel layout. */
   .tl-sublib-tabs { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 10px; }
-  .tl-sublib-tabs .tl-sublib-tab { width:auto; min-width:0; flex:0 0 auto; padding:6px 12px; font-size:11.5px; font-weight:600; text-transform:none; letter-spacing:0; background:var(--bg-input); border:1px solid var(--line); color:var(--muted); box-shadow:none; border-radius:var(--r-md); }
+  .tl-sublib-tabs .tl-sublib-tab { width:auto; min-width:0; flex:0 0 auto; padding:6px 12px; font-size:11.5px; font-weight:600; text-transform:none; letter-spacing:0; background:var(--bg-input); border:1px solid var(--line); color:var(--muted); box-shadow:var(--sh-1); border-radius:var(--r-md); pointer-events:auto; }
   .tl-sublib-tabs .tl-sublib-tab::after { display:none; }
   .tl-sublib-tabs .tl-sublib-tab:hover { transform:none; border-color:var(--accent); color:var(--text); }
   .tl-sublib-tab.active { border-color:var(--accent); background:var(--accent-subtle); color:var(--text); }
@@ -5891,6 +6326,67 @@ TIMELINE_ASSETS = """
   var model;
   try { model = JSON.parse(document.getElementById('timeline-model').textContent); } catch(e){ return; }
   var replaceLabel=document.getElementById('tl-rw-replace-label');
+  var addMoreSfx=document.getElementById('tl-rw-add-sfx');
+  if(addMoreSfx && !model.has_sfx){
+    addMoreSfx.disabled=true;
+    document.getElementById('tl-rw-add-sfx-wrap').title='Add more SFX becomes available after this timeline has at least one sound effect.';
+  }
+  var versionsOpen=document.getElementById('tl-versions-open');
+  var versionsPop=document.getElementById('tl-versions-pop');
+  function loadVersions(){
+    fetch('/timeline-versions?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('tl-version-list'), rows=(d&&d.versions)||[];
+      if(!rows.length){box.innerHTML='<span class="hint">No older versions yet.</span>';return;}
+      box.innerHTML=''; rows.forEach(function(v){
+        var b=document.createElement('button'); b.type='button'; b.className='button secondary tl-version-item';
+        b.innerHTML=(v.reason||'Earlier timeline')+'<small>'+(v.created_at||'')+'</small>';
+        b.addEventListener('click',function(){
+          if(!confirm('Load this older timeline? Your current timeline will be saved as another version first.'))return;
+          b.disabled=true; fetch('/timeline-version-restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,version_id:v.id})})
+            .then(function(r){return r.json();}).then(function(x){if(x&&x.ok)location.reload();else{b.disabled=false;alert((x&&x.error)||'Could not restore version.');}})
+            .catch(function(){b.disabled=false;alert('Could not restore version.');});
+        }); box.appendChild(b);
+      });
+    });
+  }
+  versionsOpen.addEventListener('click',function(){versionsPop.hidden=!versionsPop.hidden;if(!versionsPop.hidden)loadVersions();});
+  var redoSfxToggle=document.getElementById('tl-rw-redo-sfx');
+  var redoCapToggle=document.getElementById('tl-rw-redo-captions');
+  var reworkSfxAmount='medium';   // #113 - low/medium/high chosen when redo-SFX is turned on
+  // #108 - gate the redo controls to what is actually editable in this project.
+  var captionsEditableRW=(model.captions_editable!==false)
+      && (model.caption_track||[]).filter(function(r){return r&&String(r.text||'').trim();}).length>0;
+  if(redoCapToggle && !captionsEditableRW){
+    redoCapToggle.checked=false; redoCapToggle.disabled=true;
+    var _rcw=document.getElementById('tl-rw-redo-cap-wrap');
+    if(_rcw){ _rcw.classList.add('tl-disabled'); _rcw.title='Redo captions needs an editable caption track. This project has none (captions are baked into the video).'; }
+  }
+  if(redoSfxToggle && model.sfx_removable===false){
+    redoSfxToggle.checked=false; redoSfxToggle.disabled=true;
+    var _rsw=document.getElementById('tl-rw-redo-sfx-wrap');
+    if(_rsw){ _rsw.classList.add('tl-disabled'); _rsw.title='Redo SFX needs removable sound effects. This project\\u2019s SFX are baked into the video and can\\u2019t be stripped.'; }
+  }
+  // #113 - a small low/medium/high popup appears next to Redo SFX when it is switched on.
+  function showSfxAmountPopup(anchor){
+    document.querySelectorAll('.tl-amt-pop').forEach(function(p){ p.remove(); });
+    var pop=document.createElement('div'); pop.className='tl-amt-pop';
+    pop.innerHTML='<div class="tl-amt-lbl">How many SFX?</div><div class="tl-amt-row">'
+      +['low','medium','high'].map(function(a){ return '<button type="button" class="tl-amt-btn'+(reworkSfxAmount===a?' on':'')+'" data-a="'+a+'">'+a.charAt(0).toUpperCase()+a.slice(1)+'</button>'; }).join('')+'</div>';
+    document.body.appendChild(pop);
+    var r=anchor.getBoundingClientRect();
+    pop.style.top=Math.min(window.innerHeight-pop.offsetHeight-8, r.bottom+6)+'px';
+    pop.style.left=Math.min(window.innerWidth-pop.offsetWidth-8, Math.max(8, r.left))+'px';
+    pop.querySelectorAll('.tl-amt-btn').forEach(function(b){ b.onclick=function(){ reworkSfxAmount=b.getAttribute('data-a');
+      pop.querySelectorAll('.tl-amt-btn').forEach(function(x){x.classList.remove('on');}); b.classList.add('on'); setTimeout(function(){pop.remove();},180); }; });
+    setTimeout(function(){ document.addEventListener('pointerdown', function h(ev){ if(!pop.contains(ev.target)&&ev.target!==anchor){ pop.remove(); document.removeEventListener('pointerdown',h); } }); },0);
+  }
+  if(redoSfxToggle && addMoreSfx){
+    redoSfxToggle.addEventListener('change',function(){ if(this.checked){ addMoreSfx.checked=false; if(redoCapToggle)redoCapToggle.checked=false; showSfxAmountPopup(this); } });
+    addMoreSfx.addEventListener('change',function(){if(this.checked)redoSfxToggle.checked=false;});
+  }
+  if(redoCapToggle){
+    redoCapToggle.addEventListener('change',function(){ if(this.checked){ if(redoSfxToggle)redoSfxToggle.checked=false; if(addMoreSfx)addMoreSfx.checked=false; } });
+  }
   if(replaceLabel&&model.clip_source==='scrape') replaceLabel.textContent='search TikTok/X for selected clips';
   var reworkModelSelect=document.getElementById('tl-rw-model');
   if(reworkModelSelect) reworkModelSelect.value=model.reasoning_model||'openai/gpt-5.5';
@@ -5900,6 +6396,7 @@ TIMELINE_ASSETS = """
   var sfx = (model.sfx||[]).map(function(s){ return Object.assign({}, s); });
   var volumes = Object.assign({voice:1, music:0}, model.volumes||{});
   var captionsOn = !!model.captions;
+  var voiceDuration = Math.max(0, +(model.voice_duration||0));   // #119 - voiceover length (s)
   var sfxOn = model.sfx_on !== false;   // master "render sound FX" switch; off = voice only
   var captionTrack = (model.caption_track||[]).filter(function(row){return row&&String(row.text||'').trim();});
   var captionMaxWords = Math.max(1, Math.min(6, +(model.caption_max_words||3)));
@@ -5957,20 +6454,23 @@ TIMELINE_ASSETS = """
   }
 
   // ---- zoom: SCALE is variable; buttons, +/-, F and Ctrl+wheel re-layout ----
+  // the MIN scale = fit-to-window, so you can never zoom out until the timeline is smaller than
+  // the window (and there is no scrollbar - see .tl-scroll CSS).
+  function fitScale(){
+    var scroll = document.getElementById('tl-scroll');
+    var avail = (scroll && scroll.clientWidth) ? scroll.clientWidth : 900;
+    return Math.max(4, avail / (totalDur() || 1));
+  }
   function setZoom(px){
-    SCALE = Math.max(14, Math.min(300, px));
+    SCALE = Math.max(fitScale(), Math.min(300, px));
     layout();
   }
-  function fitZoom(){
-    var scroll = document.getElementById('tl-scroll');
-    var avail = (scroll ? scroll.clientWidth : 900) - 30;
-    var total = totalDur() || 1;
-    setZoom(avail / total);
-  }
+  function fitZoom(){ setZoom(fitScale()); }
 
   var clipsEl=document.getElementById('tl-clips'), ovEl=document.getElementById('tl-ovtrack'), capEl=document.getElementById('tl-captrack'),
-      voiceEl=document.getElementById('tl-voice'), trEl=document.getElementById('tl-trtrack'),
-      sfxEl=document.getElementById('tl-sfx'), ruler=document.getElementById('tl-ruler'),
+      voiceEl=document.getElementById('tl-voice'),
+      sfxEl=document.getElementById('tl-sfx'), trEl=document.getElementById('tl-sfx'),  // ONE merged SFX track
+      ruler=document.getElementById('tl-ruler'),
       playhead=document.getElementById('tl-playhead'), overlayLayer=document.getElementById('tl-overlay-layer');
 
   function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -5997,8 +6497,10 @@ TIMELINE_ASSETS = """
   }
 
   function layout(){
-    var vis=visible(), total=totalDur(), width=Math.max(720, total*SCALE);
-    [clipsEl,ovEl,capEl,voiceEl,trEl,sfxEl,ruler].forEach(function(el){ if(el) el.style.width=width+'px'; });
+    var vis=visible(), total=totalDur();
+    var _sc=document.getElementById('tl-scroll'); var _cw=(_sc&&_sc.clientWidth)?_sc.clientWidth:720;
+    var width=Math.max(_cw, total*SCALE);   // never narrower than the window (no empty gap)
+    [clipsEl,ovEl,capEl,voiceEl,sfxEl,ruler].forEach(function(el){ if(el) el.style.width=width+'px'; });
     ruler.innerHTML='';
     var step = total>40?10:5;
     for(var t=0;t<=total+0.01;t+=step){ var d=document.createElement('div'); d.className='tl-tick'; d.style.left=(t*SCALE)+'px'; d.textContent=fmt(t); ruler.appendChild(d); }
@@ -6041,7 +6543,7 @@ TIMELINE_ASSETS = """
         ovEl.appendChild(node);
       });
     });
-    trEl.innerHTML='';
+    sfxEl.innerHTML='';                          // ONE track: transitions + sound FX together
     vis.forEach(function(s, i){
       if(i===0) return;                          // no boundary before the first clip
       var atSec=startOf(s.id), bx=atSec*SCALE;
@@ -6050,7 +6552,8 @@ TIMELINE_ASSETS = """
       slot.className='tl-trans-slot'; slot.style.left=bx+'px';
       slot.title='Add a transition sound at this cut';
       slot.innerHTML='<span class="tl-trans-add">+</span>';
-      (function(at, slotEl){ slot.addEventListener('click', function(ev){ ev.stopPropagation(); openTransMenu(ev.clientX, ev.clientY, at, slotEl); }); })(atSec, slot);
+      var addButton=slot.querySelector('.tl-trans-add');
+      (function(at, slotEl, button){ button.addEventListener('click', function(ev){ ev.stopPropagation(); openTransMenu(ev.clientX, ev.clientY, at, slotEl); }); })(atSec, slot, addButton);
       trEl.appendChild(slot);
       // the existing transition diamond, only when a transition record exists for this boundary
       var tr=transitions.filter(function(t){ return t.scene_id===s.id; })[0];
@@ -6064,8 +6567,7 @@ TIMELINE_ASSETS = """
         trEl.appendChild(node);
       }
     });
-    sfxEl.innerHTML='';
-    sfx.forEach(function(fx){
+    sfx.forEach(function(fx){                     // appended onto the SAME merged track (no re-clear)
       if(fx.deleted) return;
       var at=fxAbsStart(fx);
       if(at===null) return;
@@ -6081,17 +6583,36 @@ TIMELINE_ASSETS = """
       (function(effect){ node.addEventListener('contextmenu', function(ev){ ev.preventDefault(); ev.stopPropagation(); openFxMenu(ev.clientX,ev.clientY,effect,'fx'); }); })(fx);
       sfxEl.appendChild(node);
     });
-    capEl.innerHTML=''; capEl.classList.toggle('off',!captionsOn);
-    captionTrack.forEach(function(row){
-      var st=Math.max(0,+(row.start||0)), en=Math.min(total,Math.max(st+.05,+(row.end||st)));
-      if(st>=total||en<=st)return;
-      var item=document.createElement('div');item.className='tl-capitem';
-      item.style.left=(st*SCALE)+'px';item.style.width=Math.max(22,(en-st)*SCALE)+'px';
-      item.textContent=String(row.text||'Caption');
-      item.title=(captionsOn?'Caption':'Caption excluded from render')+' @ '+st.toFixed(2)+'s: '+String(row.text||'');
-      capEl.appendChild(item);
-    });
-    voiceEl.innerHTML='<div class="tl-audbar"></div>';
+    // Captions timeline track removed (useless clutter) - captions still render, they just
+    // aren't drawn as their own lane here. capEl is null now; guard every access.
+    if(capEl){
+      capEl.innerHTML=''; capEl.classList.toggle('off',!captionsOn);
+      captionTrack.forEach(function(row){
+        var st=Math.max(0,+(row.start||0)), en=Math.min(total,Math.max(st+.05,+(row.end||st)));
+        if(st>=total||en<=st)return;
+        var item=document.createElement('div');item.className='tl-capitem';
+        item.style.left=(st*SCALE)+'px';item.style.width=Math.max(22,(en-st)*SCALE)+'px';
+        item.textContent=String(row.text||'Caption');
+        item.title=(captionsOn?'Caption':'Caption excluded from render')+' @ '+st.toFixed(2)+'s: '+String(row.text||'');
+        capEl.appendChild(item);
+      });
+    }
+    // #119 - the voice bar spans the actual voiceover length so clip overrun/underrun is visible
+    voiceEl.innerHTML='';
+    var _vb=document.createElement('div'); _vb.className='tl-audbar';
+    if(voiceDuration>0.01){ _vb.style.right='auto'; _vb.style.width=Math.max(2,voiceDuration*SCALE)+'px'; _vb.title='Voiceover: '+voiceDuration.toFixed(1)+'s'; }
+    voiceEl.appendChild(_vb);
+    var _ve=document.getElementById('tl-voice-end');
+    if(_ve){
+      if(voiceDuration>0.01){
+        _ve.hidden=false; _ve.style.left=(voiceDuration*SCALE)+'px';
+        var _over=total-voiceDuration;
+        var _lbl=_ve.querySelector('.tl-voice-end-lbl');
+        if(_lbl) _lbl.textContent='\\uD83C\\uDFA4 '+voiceDuration.toFixed(1)+'s';
+        _ve.classList.toggle('tl-voice-mismatch', Math.abs(_over)>0.2);
+        _ve.title='Voiceover ends at '+voiceDuration.toFixed(1)+'s'+(Math.abs(_over)>0.2?(' \\u2014 clips '+(_over>0?'overrun by ':'underrun by ')+Math.abs(_over).toFixed(1)+'s'):' (clips match the voice)');
+      } else { _ve.hidden=true; }
+    }
     document.getElementById('tl-total').textContent='Total '+fmt(total)+'  -  '+vis.length+' clips';
     // "Sound FX" off -> dim the SFX + Cut-SFX rows so it's clear they won't be in the render
     if(sfxEl) sfxEl.classList.toggle('tl-muted', !sfxOn);
@@ -6099,10 +6620,19 @@ TIMELINE_ASSETS = """
     updatePlayhead();
   }
 
+  // #117 - a clip can only stretch up to the footage it actually has (from its current in-point),
+  // so dragging it wider never freezes on the last frame. Images / unknown lengths keep the 20s cap.
+  function clipMaxDur(s){
+    if(s && s.clip && +(s.source_full||0) > 0.01){
+      var avail=(+(s.source_full) - +(s.source_trim||0)) / Math.max(0.01, +(s.source_speed||1));
+      return Math.max(0.5, +avail.toFixed(2));
+    }
+    return 20;
+  }
   function startResize(ev, s){
     ev.preventDefault();
-    var startX=ev.clientX, startDur=s.dur;
-    function move(e){ var dd=(e.clientX-startX)/SCALE; s.dur=Math.max(0.5, Math.min(20, +(startDur+dd).toFixed(1))); layout(); if(sel&&sel.type==='clip'&&sel.id===s.id) syncInspector(); }
+    var startX=ev.clientX, startDur=s.dur, maxD=clipMaxDur(s);
+    function move(e){ var dd=(e.clientX-startX)/SCALE; s.dur=Math.max(0.5, Math.min(maxD, +(startDur+dd).toFixed(1))); layout(); if(sel&&sel.type==='clip'&&sel.id===s.id) syncInspector(); }
     function up(){
       document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up);
       if(s.dur!==startDur) markDirty();      // one history entry per resize gesture
@@ -6245,6 +6775,32 @@ TIMELINE_ASSETS = """
     document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
   }
 
+  // #118 - rubberband: drag a box across the empty clips track to multi-select clips. The
+  // existing Delete key / "Remove clip" already act on ALL selectedClipIds (delete together).
+  function startRubberband(ev){
+    if(ev.button!==0) return;
+    var rect=clipsEl.getBoundingClientRect();
+    var x0=ev.clientX, y0=ev.clientY, band=null, moved=false;
+    function mv(e){
+      if(!moved && Math.abs(e.clientX-x0)<5 && Math.abs(e.clientY-y0)<5) return;
+      moved=true;
+      if(!band){ band=document.createElement('div'); band.className='tl-rubber'; clipsEl.appendChild(band); }
+      var left=Math.min(x0,e.clientX)-rect.left+clipsEl.scrollLeft, wid=Math.abs(e.clientX-x0);
+      band.style.left=left+'px'; band.style.width=wid+'px';
+      var lo=left, hi=left+wid, vis=visible(), acc=0, ids=[];
+      for(var i=0;i<vis.length;i++){ var w=vis[i].dur*SCALE; if(acc+w>lo && acc<hi) ids.push(vis[i].id); acc+=w; }
+      selectedClipIds=ids; clipSelectionAnchor=ids.length?ids[0]:null;
+      Array.prototype.forEach.call(clipsEl.querySelectorAll('.tl-clip'),function(b){ b.classList.toggle('selected', ids.indexOf(b.getAttribute('data-id'))!==-1); });
+    }
+    function up(){
+      document.removeEventListener('pointermove',mv); document.removeEventListener('pointerup',up);
+      if(band) band.remove();
+      if(moved && selectedClipIds.length){ sel={type:'clip',id:selectedClipIds[0]}; showPane('clip'); syncInspector(); }
+    }
+    document.addEventListener('pointermove',mv); document.addEventListener('pointerup',up);
+  }
+  clipsEl.addEventListener('pointerdown', function(ev){ if(ev.target===clipsEl) startRubberband(ev); });
+
   function showPane(which){
     // Only syncs WHICH pane's content is prepared. The inspector is a floating popup that is
     // only shown via an explicit right-click -> "Open inspector" (openInspectorAt). Selecting
@@ -6299,6 +6855,11 @@ TIMELINE_ASSETS = """
     showPane('clip');
     document.getElementById('tl-insp-name').textContent=chosen.length>1?(chosen.length+' clips selected'):s.label;
     var durInput=document.getElementById('tl-insp-dur'); durInput.disabled=chosen.length>1; durInput.value=chosen.length>1?'':s.dur;
+    durInput.max=clipMaxDur(s);   // #117 - reflect the per-clip stretch ceiling in the number field
+    var durHint=document.getElementById('tl-insp-note');
+    if(durHint){ var cm=clipMaxDur(s); durHint.textContent=(s.clip&&+(s.source_full||0)>0.01)
+      ? ('This clip has '+(+s.source_full).toFixed(1)+'s of footage - it can stretch to at most '+cm.toFixed(1)+'s (no freeze frames).')
+      : 'Tip: click the red strip on top of a clip to mark its media for the agent to replace.'; }
     var sp=s.speed||1;
     document.getElementById('tl-insp-speed').value=sp;
     var mixed=chosen.some(function(x){return Math.abs((x.speed||1)-sp)>.001;});
@@ -6378,7 +6939,7 @@ TIMELINE_ASSETS = """
     sel=null; showPane(null); layout(); markDirty();
   }
 
-  document.getElementById('tl-insp-dur').addEventListener('input', function(){ if(selectedClipIds.length!==1)return; var s=scenes.filter(function(x){return x.id===selectedClipIds[0];})[0]; if(s){ s.dur=Math.max(0.5,Math.min(20, parseFloat(this.value)||s.dur)); layout(); markDirty(); } });
+  document.getElementById('tl-insp-dur').addEventListener('input', function(){ if(selectedClipIds.length!==1)return; var s=scenes.filter(function(x){return x.id===selectedClipIds[0];})[0]; if(s){ s.dur=Math.max(0.5,Math.min(clipMaxDur(s), parseFloat(this.value)||s.dur)); layout(); markDirty(); } });
   document.getElementById('tl-insp-speed').addEventListener('input', function(){
     var speed=Math.max(0.5,Math.min(2,parseFloat(this.value)||1));
     var chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
@@ -6426,7 +6987,7 @@ TIMELINE_ASSETS = """
   });
   document.getElementById('tl-fx-preview').addEventListener('click', function(){
     var fx=currentFx(); if(!fx||!fx.url) return;
-    try{ var a=new Audio(fx.url); a.volume=Math.max(0,Math.min(1,fx.volume||0.3)); a.play().catch(function(){}); }catch(e){}
+    try{ var a=new Audio(fx.url); a.volume=Math.max(0,Math.min(1,fx.volume||0.3)); a.playbackRate=Math.max(.25,Math.min(4,+(fx.playback_rate||1))); a.currentTime=Math.max(0,+(fx.source_trim||0)); a.play().catch(function(){}); }catch(e){}
   });
   document.getElementById('tl-fx-delete').addEventListener('click', deleteCurrentFx);
   function bindOverlayRange(id,key,out,fmtValue){
@@ -6673,6 +7234,8 @@ TIMELINE_ASSETS = """
         try{
           var a = new Audio(url);
           a.volume = Math.max(0, Math.min(1, f.volume != null ? f.volume : 0.25));
+          a.playbackRate = Math.max(.25, Math.min(4, +(f.playback_rate || 1)));
+          a.currentTime = Math.max(0, +(f.source_trim || 0));
           a.play().catch(function(){});
           liveSfx.push(a);
           if (liveSfx.length > 12) liveSfx.shift();
@@ -6826,8 +7389,17 @@ TIMELINE_ASSETS = """
   bindVol('tl-voice-vol','voice','tl-v-voice');
   bindVol('tl-music-vol','music','tl-v-music');
   var capToggle=document.getElementById('tl-captions');
-  capToggle.checked=captionsOn;
-  capToggle.addEventListener('change', function(){ captionsOn=this.checked; layout(); renderPreviewCaption(clock); markDirty(); });
+  // #109: "render with captions" defaults ON, but is only available when the project has a real
+  // (still-unrendered) caption track. A baked-in-captions upload has none -> grey it out.
+  var captionsEditable=(model.captions_editable!==false) && captionTrack.length>0;
+  if(!captionsEditable){
+    captionsOn=false; capToggle.checked=false; capToggle.disabled=true;
+    var _capLbl=capToggle.closest('.tl-cap-toggle');
+    if(_capLbl){ _capLbl.classList.add('tl-disabled'); _capLbl.title='This project has no separate caption track to render (e.g. captions are already baked into an uploaded video).'; }
+  } else {
+    captionsOn=true; capToggle.checked=true;   // default ON when captions exist
+  }
+  capToggle.addEventListener('change', function(){ if(this.disabled)return; captionsOn=this.checked; layout(); renderPreviewCaption(clock); markDirty(); });
   var sfxToggle=document.getElementById('tl-sfx-toggle');
   if(sfxToggle){ sfxToggle.checked=sfxOn;
     sfxToggle.addEventListener('change', function(){ sfxOn=this.checked; layout(); markDirty(); }); }
@@ -6846,7 +7418,7 @@ TIMELINE_ASSETS = """
       captions: captionsOn,
       sfx_on: sfxOn,
       transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:(t.deleted?false:t.enabled), start_abs:(t.start_abs!=null?t.start_abs:null), path_override:t.path_override||null, source_trim:+(+(t.source_trim||0)).toFixed(3)};}),
-      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null, source_trim:+(+(f.source_trim||0)).toFixed(3)};})
+      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, duration:+(+(f.duration||1)).toFixed(3), source_duration:+(+(f.source_duration||0)).toFixed(3), playback_rate:+(+(f.playback_rate||1)).toFixed(6), start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null, source_trim:+(+(f.source_trim||0)).toFixed(3)};})
     };
   }
 
@@ -6858,12 +7430,32 @@ TIMELINE_ASSETS = """
       .catch(function(){ btn.disabled=false; alert('Could not save.'); });
   });
 
+  // renders go to the FOCUSED progress view (big bar + elapsed/ETA + current action) - no chat UI
+  function gotoProgress(jobUrl){
+    try{ var id=new URL(jobUrl, location.href).searchParams.get('id'); if(id){ window.location.href='/progress?id='+encodeURIComponent(id); return; } }catch(e){}
+    window.location.href=jobUrl;
+  }
   document.getElementById('tl-render').addEventListener('click', function(){
-    var btn=this; btn.disabled=true; var old=btn.innerHTML; btn.textContent='Starting…';
-    fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:collectEdits()})})
+    var btn=this; btn.disabled=true; var old=btn.innerHTML; btn.textContent='Saving…';
+    var edits=collectEdits();
+    // ALWAYS save the project before a render starts (user rule)
+    fetch('/timeline-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
+      .then(function(){ dirty=false; try{ document.getElementById('tl-save').classList.remove('tl-unsaved'); }catch(e){} btn.textContent='Starting…';
+        return fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})}); })
       .then(function(r){return r.json();})
-      .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML=old; alert((d&&d.error)||'Could not start render.'); } })
+      .then(function(d){ if(d&&d.ok&&d.job){ gotoProgress(d.job); } else { btn.disabled=false; btn.innerHTML=old; alert((d&&d.error)||'Could not start render.'); } })
       .catch(function(){ btn.disabled=false; btn.innerHTML=old; alert('Could not start render.'); });
+  });
+
+  // Redo SFX: a normal SFX-Master run over this project's LATEST render -> progress view
+  var redoSfxBtn=document.getElementById('tl-redo-sfx');
+  if(redoSfxBtn) redoSfxBtn.addEventListener('click', function(){
+    var btn=this; btn.disabled=true; var old=btn.innerHTML; btn.textContent='Starting…';
+    var model_=document.getElementById('tl-rw-model'); var rm=model_?model_.value:'';
+    fetch('/timeline-redo-sfx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, reasoning_model:rm})})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.ok&&d.job_id){ window.location.href='/progress?id='+encodeURIComponent(d.job_id); } else { btn.disabled=false; btn.innerHTML=old; alert((d&&d.error)||'Could not start Redo SFX.'); } })
+      .catch(function(){ btn.disabled=false; btn.innerHTML=old; alert('Could not start Redo SFX.'); });
   });
 
   // ---- Change script: edit narration -> fresh voiceover + recut (unchanged lines keep media)
@@ -6897,6 +7489,10 @@ TIMELINE_ASSETS = """
     scriptModal.hidden=false;
     document.getElementById('tl-script-text').focus();
   });
+  // dedicated toolbar "Script" button opens the change-script workflow directly (it is its OWN
+  // flow, no longer a checkbox mixed into the combinable Agent-rework options).
+  var _scriptOpenBtn=document.getElementById('tl-script-open');
+  if(_scriptOpenBtn) _scriptOpenBtn.addEventListener('click', function(){ document.getElementById('tl-script-btn').click(); });
   // clip density: Few / Medium / Many -> how many clips the recut uses
   var scriptDensity = 'medium';
   var DENSITY_HINT = {few:'Fewer, longer clips - slower, cinematic cuts.',
@@ -6912,6 +7508,22 @@ TIMELINE_ASSETS = """
   document.getElementById('tl-script-density').addEventListener('click', function(e){
     var b=e.target.closest('button[data-density]'); if(b) setDensity(b.getAttribute('data-density'));
   });
+  // #114 - media source for changed / new lines
+  var scriptMediaSource = 'scrape';
+  var MEDIA_HINT = {scrape:'Search TikTok/X for fresh footage for changed lines.',
+                    keep_visible:'Reuse the clips already on this timeline (no search).',
+                    library:'Pick the best-matching clips from ALL your projects (no scraping).'};
+  function setMediaSource(m){
+    scriptMediaSource = (['scrape','keep_visible','library'].indexOf(m)!==-1)?m:'scrape';
+    Array.prototype.forEach.call(document.querySelectorAll('#tl-script-mediasrc button'),function(b){
+      b.classList.toggle('on', b.getAttribute('data-media')===scriptMediaSource);
+    });
+    document.getElementById('tl-script-mediasrc-hint').textContent = MEDIA_HINT[scriptMediaSource]||'';
+  }
+  document.getElementById('tl-script-mediasrc').addEventListener('click', function(e){
+    var b=e.target.closest('button[data-media]'); if(b) setMediaSource(b.getAttribute('data-media'));
+  });
+  setMediaSource('scrape');
   document.getElementById('tl-script-markhook').addEventListener('click', function(){
     var ta=document.getElementById('tl-script-text');
     var sel=ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
@@ -6941,7 +7553,7 @@ TIMELINE_ASSETS = """
     fetch('/timeline-rescript',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({slug:slug, script:text, hook_text:scriptHook,
                              speaker_name:speaker, tts_voice:voice, tts_model:ttsModel,
-                             clip_density:scriptDensity})})
+                             clip_density:scriptDensity, media_source:scriptMediaSource})})
       .then(function(r){return r.json();})
       .then(function(d){ if(d&&d.ok&&d.job){ dirty=false; window.location.href=d.job; }
         else { btn.disabled=false; btn.innerHTML='\\uD83C\\uDFA4 Re-voice & recut'; alert((d&&d.error)||'Could not start.'); } })
@@ -6952,11 +7564,18 @@ TIMELINE_ASSETS = """
     var doReplace=document.getElementById('tl-rw-replace').checked;
     var doRecut=document.getElementById('tl-rw-recut').checked;
     var doRevoice=document.getElementById('tl-rw-revoice').checked;
+    var doRedoSfx=document.getElementById('tl-rw-redo-sfx').checked;
+    var doAddSfx=document.getElementById('tl-rw-add-sfx').checked;
+    var doRedoCaptions=(redoCapToggle&&redoCapToggle.checked)||false;
     var reworkModel=document.getElementById('tl-rw-model').value||model.reasoning_model||'openai/gpt-5.5';
-    if(!doReplace && !doRecut && !doRevoice){ alert('Pick at least one rework option.'); return; }
+    if(!doReplace && !doRecut && !doRevoice && !doRedoSfx && !doAddSfx && !doRedoCaptions){ alert('Pick at least one rework option.'); return; }
+    // Multiple options CAN be combined in one run. Only two genuine conflicts remain:
+    if(doRedoSfx&&doAddSfx){ alert('Choose either redo SFX or add more SFX (not both).'); return; }
+    // the heavy media/speech re-plans still can't share a run with an SFX redo
+    if((doReplace||doRecut||doRevoice)&&(doRedoSfx||doAddSfx)){ alert('Run the SFX rework separately from media/speech changes.'); return; }
     if(doReplace && !Object.keys(markedReplace).length){ alert('Mark at least one clip\\'s media to replace (select a clip, then tick \"Mark this clip\\'s media to be replaced\").'); return; }
     var btn=this; btn.disabled=true; btn.textContent='Starting…';
-    fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, reasoning_model:reworkModel, replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
+    fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, redo_sfx:doRedoSfx, add_more_sfx:doAddSfx, redo_captions:doRedoCaptions, sfx_amount:reworkSfxAmount, reasoning_model:reworkModel, replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
       .then(function(r){return r.json();})
       .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert((d&&d.error)||'Could not start rework.'); } })
       .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert('Could not start rework.'); });
@@ -6966,6 +7585,7 @@ TIMELINE_ASSETS = """
   var clipMenuEl=null;
   function closeClipMenu(){ if(clipMenuEl){ clipMenuEl.remove(); clipMenuEl=null; } }
   function showContextMenu(x,y,items){
+    if(playing) stop();   // right-clicking a timeline asset/SFX (to replace/remove) pauses playback
     closeClipMenu();
     clipMenuEl=document.createElement('div');clipMenuEl.className='tl-ctxmenu';
     items.forEach(function(it){var b=document.createElement('button');b.type='button';b.className='tl-ctxitem';b.textContent=it[0];b.addEventListener('click',function(){closeClipMenu();it[1]();});clipMenuEl.appendChild(b);});
@@ -6992,13 +7612,67 @@ TIMELINE_ASSETS = """
     else{fx.enabled=false;fx.deleted=true;}
     if(sel&&sel.id===fx.id){sel=null;showPane(null);}layout();markDirty();
   }
+  // Swap the sound file behind an existing timeline SFX / transition (keeps its timing).
+  function replaceFxWithSound(fx, type, it){
+    fx.label=it.name; fx.path=it.path; fx.path_override=it.path; fx.url=it.url||'';
+    fx.duration=it.duration||fx.duration||1; fx.enabled=true; fx.deleted=false;
+    layout(); markDirty(); if(type==='trans') selectTrans(fx.id); else selectFx(fx.id);
+  }
+  // Hierarchical sound picker: categories -> (reaction subcategories) -> matching sounds.
+  // Reuses the trans-menu shell (transMenuEl + outside-click/ESC handlers).
+  function openSfxPicker(x, y, opts){
+    opts=opts||{}; closeTransMenu();
+    var tax=window.SFX_TAX||{roles:[],reactions:[]};
+    var menu=document.createElement('div'); menu.className='tl-trans-menu tl-sfx-picker'; transMenuEl=menu;
+    function reset(html){ menu.innerHTML=html; }
+    function catsView(){
+      var cats=(tax.roles||[]).filter(function(r){ return r[0]!=='skip'
+        && libSounds.some(function(it){ return soundInCat(it,r[0],'all'); }); });
+      reset('<div class="tl-tm-title">'+esc(opts.title||'Replace sound')+'</div>');
+      if(!cats.length) menu.innerHTML+='<div class="tl-tm-empty">No sounds loaded yet - open the Sound&nbsp;FX library once.</div>';
+      cats.forEach(function(c){ var b=document.createElement('div'); b.className='tl-tm-item tl-tm-cat';
+        b.innerHTML='<span class="tl-tm-name">'+esc(c[1])+'</span><span class="tl-tm-arrow">\\u203A</span>';
+        b.onclick=function(){ if(c[0]==='reaction' && (tax.reactions||[]).length) subsView(); else soundsView(c[0],'all',c[1],false); };
+        menu.appendChild(b); });
+      var all=document.createElement('div'); all.className='tl-tm-item tl-tm-cat';
+      all.innerHTML='<span class="tl-tm-name">All sounds</span><span class="tl-tm-arrow">\\u203A</span>';
+      all.onclick=function(){ soundsView('all','all','All sounds',false); }; menu.appendChild(all);
+    }
+    function subsView(){
+      var subs=(tax.reactions||[]).filter(function(r){ return libSounds.some(function(it){ return soundInCat(it,'reaction',r[0]); }); });
+      reset('<div class="tl-tm-title"><button type="button" class="tl-tm-back">\\u2039</button> Reaction</div>');
+      menu.querySelector('.tl-tm-back').onclick=catsView;
+      var allr=document.createElement('div'); allr.className='tl-tm-item tl-tm-cat';
+      allr.innerHTML='<span class="tl-tm-name">All reactions</span><span class="tl-tm-arrow">\\u203A</span>';
+      allr.onclick=function(){ soundsView('reaction','all','Reaction',true); }; menu.appendChild(allr);
+      subs.forEach(function(s){ var b=document.createElement('div'); b.className='tl-tm-item tl-tm-cat';
+        b.innerHTML='<span class="tl-tm-name">'+esc(s[1])+'</span><span class="tl-tm-arrow">\\u203A</span>';
+        b.onclick=function(){ soundsView('reaction',s[0],s[1],true); }; menu.appendChild(b); });
+    }
+    function soundsView(cat, sub, label, fromReaction){
+      reset('<div class="tl-tm-title"><button type="button" class="tl-tm-back">\\u2039</button> '+esc(label)+'</div>');
+      menu.querySelector('.tl-tm-back').onclick=function(){ fromReaction?subsView():catsView(); };
+      var list=libSounds.filter(function(it){ return soundInCat(it,cat,sub); });
+      if(!list.length){ var e=document.createElement('div'); e.className='tl-tm-empty'; e.textContent='No sounds in this category.'; menu.appendChild(e); }
+      list.forEach(function(it){ var item=document.createElement('div'); item.className='tl-tm-item';
+        item.innerHTML='<span class="tl-tm-play" title="Preview">\\u25B6</span><span class="tl-tm-name">'+esc(it.name)+'</span>';
+        item.querySelector('.tl-tm-play').addEventListener('click', function(ev){ ev.stopPropagation(); if(it.url){ try{ var a=new Audio(it.url); a.volume=.5; a.play().catch(function(){}); }catch(e){} } });
+        item.addEventListener('click', function(){ if(opts.onPick) opts.onPick(it); closeTransMenu(); });
+        menu.appendChild(item); });
+    }
+    catsView();
+    document.body.appendChild(menu);
+    menu.style.left=Math.max(8, Math.min(x, window.innerWidth-menu.offsetWidth-10))+'px';
+    menu.style.top=Math.max(8, Math.min(y, window.innerHeight-menu.offsetHeight-10))+'px';
+    document.addEventListener('pointerdown', transMenuOutside, true);
+    document.addEventListener('keydown', transMenuKey, true);
+  }
   function openFxMenu(x,y,fx,type){
     showContextMenu(x,y,[
       ['Open inspector',function(){ selectFx(fx.id); openInspectorAt(x,y); }],
       ['Replace sound\\u2026',function(){
         if(playing)stop();
-        var at=type==='trans'?trAbsStart(fx):fxAbsStart(fx);
-        openTransMenu(x,y,at==null?clock:at,null,{title:'Replace sound',replaceFx:fx,replaceType:type,category:fx.category||'custom'});
+        openSfxPicker(x,y,{title:'Replace sound', onPick:function(it){ replaceFxWithSound(fx,type,it); }});
       }],
       ['Remove sound',function(){removeEffect(fx,type);}]
     ]);
@@ -7018,6 +7692,14 @@ TIMELINE_ASSETS = """
   document.addEventListener('pointerdown', function(e){ if(clipMenuEl && !clipMenuEl.contains(e.target)) closeClipMenu(); });
   function startReplacePick(scn){
     if(playing)stop();
+    // Flattened SFX/Captions-Master upload: captions are baked into each clip's pixels, so a
+    // replacement can't keep them. Warn once so the lost caption isn't a surprise.
+    if(model.captions_baked && !window._captionsBakedWarned){
+      if(!confirm('Heads up: this project was made by uploading a finished video, so its captions '
+        +'are baked into each clip. Replacing a clip removes that clip\\'s caption and the render '
+        +'can\\'t re-add it to only that segment. Replace anyway?')){ return; }
+      window._captionsBakedWarned=true;
+    }
     replacePickId=scn.id;
     var lib=document.querySelector('.tl-library'); if(lib){ lib.scrollIntoView({behavior:'smooth', block:'nearest'}); lib.classList.add('replace-arming'); }
     // make sure the media tab is showing
@@ -7032,12 +7714,29 @@ TIMELINE_ASSETS = """
   ovEl.addEventListener('contextmenu',function(ev){ev.preventDefault();ev.stopPropagation();openTrackMenu(ev.clientX,ev.clientY,'visual',timelineTimeFromClientX(ev.clientX));});
   sfxEl.addEventListener('contextmenu',function(ev){if(ev.target!==sfxEl)return;ev.preventDefault();ev.stopPropagation();openTrackMenu(ev.clientX,ev.clientY,'sfx',timelineTimeFromClientX(ev.clientX));});
   function cancelReplacePick(){ replacePickId=null; var b=document.getElementById('tl-replace-banner'); if(b) b.style.display='none'; var lib=document.querySelector('.tl-library'); if(lib) lib.classList.remove('replace-arming'); }
+  // Grab a first-frame thumbnail from a video URL (same-origin, so canvas isn't tainted). Used
+  // when a replacement clip has no poster image so the timeline tile doesn't go blank/grey.
+  function captureVideoPoster(url, cb){
+    try{
+      var v=document.createElement('video'); v.muted=true; v.preload='metadata'; v.src=url; var done=false;
+      function fin(x){ if(!done){ done=true; try{ v.removeAttribute('src'); v.load(); }catch(e){} cb(x||''); } }
+      v.addEventListener('loadeddata', function(){ try{ v.currentTime=Math.min(0.15, (v.duration||1)/3); }catch(e){ fin(''); } });
+      v.addEventListener('seeked', function(){ try{ var c=document.createElement('canvas');
+        c.width=v.videoWidth||144; c.height=v.videoHeight||256;
+        c.getContext('2d').drawImage(v,0,0,c.width,c.height); fin(c.toDataURL('image/jpeg',0.72)); }catch(e){ fin(''); } });
+      v.addEventListener('error', function(){ fin(''); });
+      setTimeout(function(){ fin(''); }, 6000);
+    }catch(e){ cb(''); }
+  }
   function applyReplace(it){
     var id=replacePickId; if(id===null) return;
     var s=scenes.filter(function(x){return x.id===id;})[0]; if(!s){ cancelReplacePick(); return; }
     replacedMap[id]={path:it.path, type:it.type, name:it.name};
-    s.poster=(it.type==='video')?(it.poster||it.url):it.url;
     s.clip=(it.type==='video')?it.url:''; s.path=it.path; s.kind=(it.type==='video')?'clip':'image';
+    if(it.type==='video'){
+      if(it.poster){ s.poster=it.poster; }
+      else { s.poster=''; captureVideoPoster(it.url, function(dataUrl){ if(dataUrl && replacedMap[id]){ s.poster=dataUrl; layout(); } }); }
+    } else { s.poster=it.url; }
     cancelReplacePick(); layout(); markDirty(); selectClip(id);
     // show the NEW media in the preview right away (the baked render can't reflect it)
     leaveRenderMode(); previewSceneById(id);
@@ -7056,6 +7755,7 @@ TIMELINE_ASSETS = """
       });
     });
     fetch('/timeline-library?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
+      window.SFX_TAX = (d&&d.sfx_taxonomy) || {roles:[],reactions:[]};
       renderMediaLib(document.getElementById('tl-lib-media'), (d&&d.media)||[], (d&&d.global_media)||[]);
       renderSfxLib(document.getElementById('tl-lib-sfx'), (d&&d.sfx)||[]);
     }).catch(function(){
@@ -7093,10 +7793,14 @@ TIMELINE_ASSETS = """
       }
     } else {
       el.classList.add('tl-lib-sound');
+      var catTxt=sfxCatText(it);
+      var tagBtn=it.labelable?('<button type="button" class="tl-snd-cat" title="Change this sound\\u2019s category">'+esc(catTxt)+' \\u270E</button>'):('<span class="tl-snd-cat readonly">'+esc(catTxt)+'</span>');
       el.innerHTML='<button type="button" class="tl-lib-play tl-snd-play" title="Play sound">\\u25B6</button>'
-        +'<div class="tl-lib-name">'+esc(it.name)+'</div>';
+        +'<div class="tl-snd-info"><div class="tl-lib-name">'+esc(it.name)+'</div>'+tagBtn+'</div>';
       var sb=el.querySelector('.tl-snd-play');
       sb.addEventListener('click', function(ev){ ev.stopPropagation(); playSound(it.url, sb); });
+      var cb=el.querySelector('button.tl-snd-cat');
+      if(cb) cb.addEventListener('click', function(ev){ ev.stopPropagation(); openSfxCatEditor(it, cb); });
     }
     if(kind==='media'){
       el.addEventListener('click', function(ev){ if(replacePickId!==null){ ev.preventDefault(); applyReplace(it); } });
@@ -7109,15 +7813,17 @@ TIMELINE_ASSETS = """
     if(!box) return;
     globalItems = globalItems || [];
     if(!items.length && !globalItems.length){ box.innerHTML='<div class="tl-lib-loading">No project media.</div>'; return; }
-    // Primary tabs by TYPE: Videos (mp4), Images (pictures), Declined (passed-over scraped
+    // Primary tabs by TYPE: Videos (mp4), Images (pictures), Hook (female-influencer clips
+    // from the hook finder, pooled across ALL projects), Declined (passed-over scraped
     // clips), and All projects (scraped footage from EVERY project, newest first).
-    var groups={videos:[], images:[], declined:[], global:globalItems};
+    var groups={videos:[], images:[], hook:[], declined:[], global:globalItems};
     items.forEach(function(it){
-      if(it.kind==='declined'){ groups.declined.push(it); }
+      if(it.kind==='hook'){ groups.hook.push(it); }
+      else if(it.kind==='declined'){ groups.declined.push(it); }
       else if(it.type==='video'){ groups.videos.push(it); }
       else { groups.images.push(it); }
     });
-    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['declined','\\uD83D\\uDEAB Declined'],['global','\\uD83C\\uDF10 All projects']];
+    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['hook','\\uD83D\\uDC83 Hook'],['declined','\\uD83D\\uDEAB Declined'],['global','\\uD83C\\uDF10 All projects']];
     var keys=defs.filter(function(d){ return groups[d[0]].length; });
     box.innerHTML='<div class="tl-sublib-tabs"></div><input type="text" class="tl-sublib-search" placeholder="Filter clips\\u2026" hidden><div class="tl-sublib-grid"></div>';
     var tabsEl=box.querySelector('.tl-sublib-tabs'), gridEl=box.querySelector('.tl-sublib-grid');
@@ -7130,7 +7836,13 @@ TIMELINE_ASSETS = """
         if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.project||'').toLowerCase().indexOf(q)===-1) return;
         gridEl.appendChild(libItemEl(it,'media'));
       });
-      if(window.LazyVideo) window.LazyVideo.observe(gridEl);   // only visible clips get a src
+      // Load the first frame of THIS tab's clips immediately (no hover needed). The huge
+      // "All projects" tab stays lazy so it doesn't spin up hundreds of decoders at once.
+      if(window.LazyVideo){
+        if(k==='global'){ window.LazyVideo.observe(gridEl); }
+        else { Array.prototype.forEach.call(gridEl.querySelectorAll('video[data-lazy-src]'), function(v){
+          v.preload='metadata'; window.LazyVideo.ensure(v); }); }
+      }
     }
     function show(k){
       curKey=k;
@@ -7143,16 +7855,129 @@ TIMELINE_ASSETS = """
     keys.forEach(function(d,i){ var k=d[0]; var t=document.createElement('button'); t.type='button'; t.className='tl-sublib-tab'+(i?'':' active'); t.setAttribute('data-k',k); t.textContent=d[1]+' ('+groups[k].length+')'; t.addEventListener('click',function(){show(k);}); tabsEl.appendChild(t); });
     if(keys.length) show(keys[0][0]);
   }
+  // Map a sound onto category roles. Trainer-labeled sounds carry it.roles/it.reactions;
+  // unlabeled ones are inferred from their category/name so the filter is still useful.
+  var ROLE_KEYWORDS={
+    transition:['whoosh','transition','swish','swoosh','swoop','swipe','whip','woosh','trans'],
+    reaction:['reaction','ding','correct','wrong','error','cash','money','pop','boing','sparkle','laugh','gasp','aww','yay','applause','clap','fail','success','coin','bell'],
+    impact:['impact','boom','hit','slam','bass','thud','punch','drop','smash','stinger'],
+    ui:['ui','click','tap','tick','type','key','notif','bubble','beep','blip','caption'],
+    riser:['riser','rise','build','uplift','sweep'],
+    hook_riser:['hook','hookriser'],
+    accent:['accent','shimmer','chime','glitter','magic','twinkle']
+  };
+  function inferredRoles(it){
+    var r=(it.roles||[]).slice(); if(r.length) return r;
+    var hay=((it.category||'')+' '+(it.name||'')).toLowerCase(), out=[];
+    Object.keys(ROLE_KEYWORDS).forEach(function(role){ if(ROLE_KEYWORDS[role].some(function(k){return hay.indexOf(k)!==-1;})) out.push(role); });
+    return out;
+  }
+  function soundInCat(it, roleKey, reactKey){
+    if(!roleKey||roleKey==='all') return true;
+    if(inferredRoles(it).indexOf(roleKey)===-1) return false;
+    if(roleKey==='reaction' && reactKey && reactKey!=='all'){
+      if((it.reactions||[]).indexOf(reactKey)!==-1) return true;
+      var hay=((it.name||'')+' '+(it.category||'')).toLowerCase();
+      return hay.indexOf(reactKey.replace(/_/g,' '))!==-1 || hay.indexOf(reactKey)!==-1;
+    }
+    return true;
+  }
   function renderSfxLib(box, items){
     if(!box) return;
     libSounds=items.slice();            // feeds the FX inspector's sound dropdown
     if(sel&&sel.type==='fx') syncFx();  // repopulate dropdown if an FX is already selected
     if(sel&&sel.type==='overlay') syncOverlayInspector();
-    box.innerHTML='<input type="text" class="tl-sfx-search" placeholder="Search sounds\\u2026"><div class="tl-sublib-grid" id="tl-sfx-grid"></div>';
+    var tax=window.SFX_TAX||{roles:[],reactions:[]};
+    box.innerHTML='<input type="text" class="tl-sfx-search" placeholder="Search sounds\\u2026">'
+      +'<div class="tl-sfx-cats" id="tl-sfx-cats"></div>'
+      +'<div class="tl-sublib-grid" id="tl-sfx-grid"></div>';
     var grid=box.querySelector('#tl-sfx-grid'), search=box.querySelector('.tl-sfx-search');
-    function draw(q){ grid.innerHTML=''; q=(q||'').toLowerCase().trim(); var n=0; items.forEach(function(it){ if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.category||'').toLowerCase().indexOf(q)===-1) return; grid.appendChild(libItemEl(it,'sfx')); n++; }); if(!n) grid.innerHTML='<div class="tl-lib-loading">No matching sounds.</div>'; }
+    var catsEl=box.querySelector('#tl-sfx-cats');
+    var curCat='all', curSub='all';
+    // only offer category chips that actually match at least one loaded sound
+    var cats=[['all','All']].concat((tax.roles||[]).filter(function(r){
+      return r[0]!=='skip' && items.some(function(it){ return soundInCat(it,r[0],'all'); }); }));
+    function subsFor(cat){
+      // only the Reaction category actually has subcategories (its reaction slugs)
+      if(cat!=='reaction') return [];
+      return (tax.reactions||[]).filter(function(r){ return items.some(function(it){ return soundInCat(it,'reaction',r[0]); }); });
+    }
+    function closeSubPop(){ document.querySelectorAll('.tl-sfx-subpop').forEach(function(p){ p.remove(); }); }
+    // subcategories live in a small popup anchored under the category button - and ONLY exist for
+    // categories that actually have subcategories (currently Reaction).
+    function openSubPop(anchor, cat){
+      closeSubPop();
+      var subs=subsFor(cat); if(!subs.length) return;
+      var pop=document.createElement('div'); pop.className='tl-sfx-subpop';
+      [['all','All']].concat(subs).forEach(function(s){ var b=document.createElement('button'); b.type='button';
+        b.className='tl-sfx-cat tl-sfx-subchip'+(curSub===s[0]?' on':''); b.textContent=s[1];
+        b.onclick=function(){ curSub=s[0]; closeSubPop(); drawCats(); draw(search.value); }; pop.appendChild(b); });
+      document.body.appendChild(pop);
+      var r=anchor.getBoundingClientRect();
+      pop.style.left=Math.max(8, Math.min(r.left, window.innerWidth-pop.offsetWidth-10))+'px';
+      pop.style.top=(r.bottom+5)+'px';
+      setTimeout(function(){ document.addEventListener('pointerdown', function h(ev){
+        if(!pop.contains(ev.target) && ev.target!==anchor){ closeSubPop(); document.removeEventListener('pointerdown',h); } }); }, 0);
+    }
+    function drawCats(){
+      catsEl.innerHTML='';
+      cats.forEach(function(c){ var hasSubs=subsFor(c[0]).length>0;
+        var b=document.createElement('button'); b.type='button';
+        b.className='tl-sfx-cat'+(curCat===c[0]?' on':'')+(hasSubs?' has-subs':'');
+        b.innerHTML=esc(c[1])+(hasSubs?' <span class="tl-sfx-caret">\\u25BE</span>':'');
+        b.onclick=function(){ curCat=c[0]; curSub='all'; drawCats(); draw(search.value);
+          if(hasSubs) openSubPop(b, c[0]); else closeSubPop(); };
+        catsEl.appendChild(b); });
+    }
+    function draw(q){ grid.innerHTML=''; q=(q||'').toLowerCase().trim(); var n=0;
+      items.forEach(function(it){
+        if(!soundInCat(it,curCat,curSub)) return;
+        if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.category||'').toLowerCase().indexOf(q)===-1) return;
+        grid.appendChild(libItemEl(it,'sfx')); n++; });
+      if(!n) grid.innerHTML='<div class="tl-lib-loading">No matching sounds.</div>'; }
     search.addEventListener('input', function(){ draw(this.value); });
-    draw('');
+    drawCats(); draw('');
+  }
+  // ---- subcategorize a library sound into the existing categories (writes sfx_labels.json) ----
+  function sfxCatText(it){
+    var roles=(it.roles||[]), reacts=(it.reactions||[]);
+    if(!roles.length) return it.labelable?'uncategorized':(it.category||'sound');
+    return roles.map(function(r){ return r==='reaction'&&reacts.length?('reaction: '+reacts.join('/')):r; }).join(' + ');
+  }
+  function openSfxCatEditor(it, anchor){
+    document.querySelectorAll('.tl-catpop').forEach(function(p){ p.remove(); });
+    var tax=window.SFX_TAX||{roles:[],reactions:[]};
+    var roles=(it.roles||[]).slice(), reacts=(it.reactions||[]).slice();
+    var pop=document.createElement('div'); pop.className='tl-catpop';
+    function render(){
+      var rHtml=(tax.roles||[]).map(function(r){ return '<button type="button" class="tl-cat-role'+(roles.indexOf(r[0])!==-1?' on':'')+'" data-r="'+r[0]+'">'+esc(r[1])+'</button>'; }).join('');
+      var showReact=roles.indexOf('reaction')!==-1;
+      var xHtml=showReact?('<div class="tl-cat-sub"><div class="tl-cat-lbl">Reaction subcategory</div><div class="tl-cat-chips">'
+        +(tax.reactions||[]).map(function(r){ return '<button type="button" class="tl-cat-rx'+(reacts.indexOf(r[0])!==-1?' on':'')+'" data-x="'+r[0]+'">'+esc(r[1])+'</button>'; }).join('')+'</div></div>'):'';
+      pop.innerHTML='<div class="tl-cat-lbl">Category for &ldquo;'+esc(it.name)+'&rdquo;</div><div class="tl-cat-roles">'+rHtml+'</div>'+xHtml
+        +'<div class="tl-cat-actions"><button type="button" class="button secondary tl-cat-cancel">Cancel</button><button type="button" class="button primary tl-cat-save">Save</button></div>';
+      pop.querySelectorAll('.tl-cat-role').forEach(function(b){ b.onclick=function(){ var r=b.getAttribute('data-r');
+        if(r==='skip'){ roles=(roles.indexOf('skip')!==-1)?[]:['skip']; }
+        else { roles=roles.filter(function(x){return x!=='skip';}); var i=roles.indexOf(r); if(i!==-1) roles.splice(i,1); else roles.push(r); }
+        render(); }; });
+      pop.querySelectorAll('.tl-cat-rx').forEach(function(b){ b.onclick=function(){ var x=b.getAttribute('data-x'); var i=reacts.indexOf(x); if(i!==-1) reacts.splice(i,1); else reacts.push(x); if(roles.indexOf('reaction')===-1) roles.push('reaction'); render(); }; });
+      pop.querySelector('.tl-cat-cancel').onclick=function(){ pop.remove(); };
+      pop.querySelector('.tl-cat-save').onclick=function(){
+        var body={file:it.file, roles:roles, reactions:reacts};
+        fetch('/sfx-label',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+          .then(function(r){return r.json();}).then(function(d){
+            if(d&&d.ok){ it.roles=d.roles||roles; it.reactions=d.reactions||reacts; pop.remove();
+              renderSfxLib(document.getElementById('tl-lib-sfx'), libSounds); }
+            else alert((d&&d.error)||'Could not save the category.');
+          }).catch(function(){ alert('Could not save the category.'); });
+      };
+    }
+    render();
+    document.body.appendChild(pop);
+    var r=anchor.getBoundingClientRect();
+    pop.style.top=Math.min(window.innerHeight-pop.offsetHeight-10, r.bottom+6)+'px';
+    pop.style.left=Math.min(window.innerWidth-pop.offsetWidth-10, Math.max(10, r.left))+'px';
+    setTimeout(function(){ document.addEventListener('pointerdown', function h(ev){ if(!pop.contains(ev.target)){ pop.remove(); document.removeEventListener('pointerdown', h); } }); }, 0);
   }
   function enableDrop(trackEl, accept, handler){
     if(!trackEl) return;
@@ -7208,49 +8033,90 @@ TIMELINE_ASSETS = """
   /* histzoom strip + total + audio mixer: keyboard/mouse cover these - hide the chrome
      (elements stay in the DOM so the editor JS keeps working) */
   .tl-meta, .tl-mixer-wrap { display:none !important; }
-  /* SFX + Cut-SFX chips: tiny icon markers; the name shows on hover (and stays as title) */
+  /* SFX + Cut-SFX chips: SHARP, pointed time markers - the LEFT edge is the exact play time
+     (crisp vertical edge + a downward tip). The name shows ONLY on hover (never on select),
+     and stays available as the title tooltip. */
   #tl-sfx .tl-fx, #tl-trtrack .tl-fx {
-    width:20px !important; min-width:20px; justify-content:center;
-    padding:0 !important; font-size:0 !important; border-radius:6px;
+    width:14px !important; min-width:14px; justify-content:center; overflow:visible;
+    padding:0 !important; font-size:0 !important;
+    border-radius:0 5px 5px 0;                 /* sharp on the left (the exact-time edge) */
+    border-left:2px solid var(--accent);        /* crisp needle exactly at the start time */
   }
   #tl-sfx .tl-fx::before, #tl-trtrack .tl-fx::before {
-    content:"\\266A"; font-size:10.5px; color:var(--accent); line-height:1;
+    content:"\\266A"; font-size:9.5px; color:var(--accent); line-height:1;
   }
-  #tl-sfx .tl-fx:hover, #tl-trtrack .tl-fx:hover,
-  #tl-sfx .tl-fx.selected, #tl-trtrack .tl-fx.selected {
-    width:auto !important; max-width:220px; padding:0 8px !important;
+  /* the pointed tip: a small downward triangle whose point sits on the exact-time edge */
+  #tl-sfx .tl-fx::after, #tl-trtrack .tl-fx::after {
+    content:""; position:absolute; left:-2px; top:-5px; width:0; height:0;
+    border-left:5px solid var(--accent); border-top:5px solid transparent; border-bottom:5px solid transparent;
+    transform:rotate(45deg); transform-origin:left top;
+  }
+  /* name on HOVER only (deliberately NOT on .selected) */
+  #tl-sfx .tl-fx:hover, #tl-trtrack .tl-fx:hover {
+    width:auto !important; max-width:220px; padding:0 8px 0 6px !important;
     font-size:11px !important; z-index:8;
   }
-  #tl-sfx .tl-fx:hover::before, #tl-trtrack .tl-fx:hover::before,
-  #tl-sfx .tl-fx.selected::before, #tl-trtrack .tl-fx.selected::before {
-    margin-right:5px;
-  }
+  #tl-sfx .tl-fx:hover::before, #tl-trtrack .tl-fx:hover::before { margin-right:5px; }
+  #tl-sfx .tl-fx.selected, #tl-trtrack .tl-fx.selected { box-shadow:0 0 0 2px var(--accent); }
   /* sound library rows: inline play button instead of the video-thumb center overlay */
   .tl-lib-sound { display:flex; align-items:center; gap:9px; padding:7px 10px; }
   .tl-lib-sound .tl-lib-play {
     position:static !important; transform:none !important; width:26px; height:26px;
     font-size:10px; border-width:1px; flex:0 0 auto;
   }
-  .tl-lib-sound .tl-lib-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  .tl-lib-sound .tl-lib-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tl-snd-info { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+  .tl-snd-cat { align-self:flex-start; max-width:100%; padding:1px 7px; font-size:10px; font-weight:700; border-radius:99px;
+    border:1px solid var(--line); background:var(--accent-subtle); color:var(--accent); cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-shadow:none; width:auto; min-width:0; }
+  .tl-snd-cat.readonly { background:var(--bg-input); color:var(--faint); cursor:default; border-style:dashed; }
+  button.tl-snd-cat:hover { border-color:var(--accent); color:var(--text); }
+  .tl-catpop { position:fixed; z-index:2147483600; width:min(300px,92vw); background:var(--bg-raised); border:1px solid var(--line-strong); border-radius:12px; box-shadow:var(--sh-3); padding:12px; display:flex; flex-direction:column; gap:9px; }
+  .tl-cat-lbl { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .tl-cat-roles, .tl-cat-chips { display:flex; flex-wrap:wrap; gap:5px; }
+  .tl-cat-role, .tl-cat-rx { width:auto; min-width:0; padding:5px 9px; font-size:11.5px; font-weight:600; border-radius:8px; border:1px solid var(--line); background:transparent; color:var(--muted); cursor:pointer; box-shadow:none; }
+  .tl-cat-rx { font-size:10.5px; padding:4px 8px; }
+  .tl-cat-role:hover, .tl-cat-rx:hover { border-color:var(--accent); color:var(--text); }
+  .tl-cat-role.on, .tl-cat-rx.on { background:var(--accent-subtle); border-color:var(--accent); color:var(--text); }
+  .tl-cat-sub { display:flex; flex-direction:column; gap:5px; border-top:1px solid var(--line); padding-top:8px; }
+  .tl-cat-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:2px; }
+  .tl-cat-actions .button { width:auto; min-width:0; padding:6px 14px; font-size:12px; margin:0; }
 
   /* ============ ONE-WINDOW LAYOUT: no page scroll; library beside the player ============ */
   body:has(#timeline-root) main { height:100vh; max-height:100vh; overflow:hidden;
     display:flex; flex-direction:column; padding-top:8px; }
-  /* back arrow floats onto the toolbar row (top-left) to save vertical space */
-  body.page-timeline .top { position:absolute; top:12px; left:14px; z-index:40; margin:0; padding:0; }
+  /* back arrow floats onto the toolbar row (top-left) to save vertical space.
+     MUST sit above the toolbar panel (z-index:1000) or it gets painted over and the
+     user has no way back. The toolbar reserves a 54px left gap for exactly this button. */
+  body.page-timeline .top { position:fixed; top:11px; left:11px; z-index:1200; margin:0; padding:0; pointer-events:none; }
+  /* clean, flat back button (was a pixel-art shadowed control that looked out of place here) */
+  body.page-timeline .top .back-arrow { pointer-events:auto; width:34px; height:34px; padding:0;
+    border-radius:9px; border:1px solid var(--line-strong); background:var(--bg-raised);
+    box-shadow:none; transform:none; display:flex; align-items:center; justify-content:center; color:var(--text); }
+  body.page-timeline .top .back-arrow:hover { border-color:var(--accent); background:var(--bg-overlay);
+    transform:none; box-shadow:none; }
+  body.page-timeline .top .back-arrow:active { transform:translateY(1px); box-shadow:none; }
+  body.page-timeline .top .back-arrow svg { width:17px; height:17px; }
   #timeline-root {
     flex:1 1 auto; min-height:0; display:grid; gap:12px; align-content:stretch;
     grid-template-columns: minmax(280px, 380px) 1fr;
-    grid-template-rows: auto minmax(0, 1fr) minmax(140px, 1.15fr);
+    /* taller player + library rows, shorter tracks row (the captions lane was removed) */
+    grid-template-rows: auto minmax(0, 1.9fr) minmax(96px, 0.62fr);
     /* toolbar box ends at the player's right edge; the library spans BOTH top rows so it
        reaches up to the top and is as large as possible */
     grid-template-areas: "toolbar library" "stagearea library" "tracks tracks";
   }
-  #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding-left:54px; align-content:center; }
-  #timeline-root .tl-toolbar .tl-actions { flex-wrap:wrap; }
-  /* player alone on the left; the LIBRARY takes the whole former inspector column */
+  /* compact toolbar: smaller box + all three buttons on ONE line (no wrap) */
+  #timeline-root .tl-toolbar { grid-area:toolbar; margin:0; padding:6px 8px 6px 50px; align-content:center; min-height:0; }
+  #timeline-root .tl-toolbar .tl-actions { flex-wrap:nowrap; gap:5px; }
+  #timeline-root .tl-actions .tl-save-btn { font-size:11px; padding:6px 8px; }
+  #timeline-root .tl-actions .tl-render-btn { font-size:11px; padding:6px 10px; }
+  #timeline-root .tl-actions .tl-rework-btn { font-size:11px; padding:6px 8px; }
+  /* player alone on the left; the LIBRARY takes the whole former inspector column.
+     Flex-center so the 9:16 stage fills the full row height (definite height from the grid
+     row) and stays centered - the box then derives its width from that height. */
   #timeline-root .tl-grid.tl-top { grid-area:stagearea; margin:0; min-height:0;
-    grid-template-columns: 1fr; align-content:start; }
+    display:flex; align-items:center; justify-content:center; }
+  #timeline-root .tl-player { height:100%; width:100%; padding:4px; min-height:0; }
   /* inspector: floating popup (no fixed slot). Opens on sound/visual selection or via
      right-click on a clip -> "Open inspector". */
   #timeline-root .tl-inspector { display:none; }
@@ -7270,8 +8136,9 @@ TIMELINE_ASSETS = """
     display:flex; flex-direction:column; }
   #timeline-root .tl-library .tl-lib-body { flex:1 1 auto; min-height:0; overflow-y:auto; }
   #timeline-root .tl-stage { grid-area:tracks; margin:0; min-height:0; overflow:auto; }
-  /* scale the preview player down so the timeline gets room */
-  body.page-timeline .tl-stage-view { height:clamp(200px, 26vh, 300px); }
+  /* the 9:16 stage fills the whole player row; width derives from the height via the
+     base aspect-ratio:9/16 so the visible box matches the video with no letterboxing */
+  body.page-timeline .tl-stage-view { height:100%; max-height:100%; }
   body.page-timeline .tl-player h2, body.page-timeline .tl-inspector h2,
   body.page-timeline .tl-library h2 { font-size:13px; margin-bottom:8px; }
   #timeline-root .tl-inspector { max-height:100%; overflow-y:auto; }
@@ -7391,7 +8258,33 @@ def _timeline_media(project_dir, scene, config, index, manifest_clips=None):
             poster_url = link_for(poster)
     if not poster_url and img:
         poster_url = link_for(img)
-    return poster_url, clip_url, img
+    return poster_url, clip_url, img, clip_path
+
+
+_CLIP_DUR_CACHE = {}
+def _clip_source_seconds(clip_path):
+    """Full playable length (seconds) of a clip file, cached in-process by (path, mtime, size).
+    Used to cap timeline stretching so a clip can never be dragged past its own footage (which
+    would freeze the last frame). Returns 0.0 when unknown (-> the editor applies no extra cap)."""
+    if not clip_path:
+        return 0.0
+    try:
+        p = Path(clip_path)
+        st = p.stat()
+        key = (str(p), int(st.st_mtime), int(st.st_size))
+    except Exception:
+        return 0.0
+    if key in _CLIP_DUR_CACHE:
+        return _CLIP_DUR_CACHE[key]
+    dur = 0.0
+    try:
+        ffmpeg = pipeline.find_ffmpeg()
+        ffprobe = pipeline.find_ffprobe(ffmpeg)
+        dur = float(sfx_agent.media_duration(p, ffprobe) or 0.0)
+    except Exception:
+        dur = 0.0
+    _CLIP_DUR_CACHE[key] = dur
+    return dur
 
 
 def project_has_render(slug):
@@ -7429,9 +8322,44 @@ def resolve_replace_media_paths(slug, scene_ids):
     return [p for p in out if valid_replace_path_values([p])]
 
 
+def _sfx_labels_map():
+    """{filename -> {roles:[], reactions:[]}} from the trainer ground truth (empty if none)."""
+    try:
+        data = json.loads((ROOT / "soundeffects" / "sfx_labels.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for fn, rec in (data.get("labels") or {}).items():
+        roles = rec.get("roles")
+        if roles is None:
+            roles = [rec["role"]] if rec.get("role") else []
+        reactions = rec.get("reactions")
+        if reactions is None:
+            reactions = [rec["reaction"]] if rec.get("reaction") else []
+        out[fn] = {"roles": [r for r in roles if r], "reactions": [r for r in reactions if r]}
+    return out
+
+
+def sfx_taxonomy():
+    """The role + reaction taxonomy the timeline library lets the user pick from."""
+    try:
+        from tools import sfx_trainer
+        roles = [[r[0], r[1]] for r in sfx_trainer.ROLES]
+        data = json.loads((ROOT / "soundeffects" / "sfx_labels.json").read_text(encoding="utf-8"))
+        reactions = data.get("reactions") or [list(r) for r in sfx_trainer.REACTIONS]
+        reactions = [[r[0], r[1]] for r in reactions]
+    except Exception:
+        roles = [["transition", "Transition"], ["reaction", "Reaction"], ["impact", "Impact"],
+                 ["accent", "Accent"], ["ui", "UI / click"], ["riser", "Riser"],
+                 ["hook_riser", "Hook riser"], ["skip", "Skip"]]
+        reactions = []
+    return {"roles": roles, "reactions": reactions}
+
+
 def global_sfx_library():
     """Every reusable sound effect: the builtin soundeffects/ folder plus every clip
-    ever generated via text-to-audio (all projects + the global cache)."""
+    ever generated via text-to-audio (all projects + the global cache). Each sound carries its
+    human trainer label (roles/reactions) so the timeline library can show + edit the category."""
     exts = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
     roots = [ROOT / "soundeffects", ROOT / "wavespeed_media" / "sfx_generated"]
     projects = agent_core.PROJECTS_DIR
@@ -7439,6 +8367,7 @@ def global_sfx_library():
         for proj in projects.iterdir():
             if proj.is_dir():
                 roots.append(proj / "wavespeed_media" / "sfx_generated")
+    labels = _sfx_labels_map()
     seen, out = set(), []
     for root in roots:
         if not root.exists():
@@ -7450,12 +8379,18 @@ def global_sfx_library():
             if key in seen:
                 continue
             seen.add(key)
-            cat = path.parent.name
+            lbl = labels.get(path.name) or {}
+            # library-relative? only files directly in soundeffects/ are trainer-labelable
+            labelable = path.parent.resolve() == (ROOT / "soundeffects").resolve()
             out.append({
                 "name": path.stem.replace("_", " "),
                 "path": str(path.resolve()),
                 "url": link_for(path),
-                "category": cat,
+                "file": path.name,
+                "category": path.parent.name,
+                "roles": lbl.get("roles", []),
+                "reactions": lbl.get("reactions", []),
+                "labelable": labelable,
                 "duration": 1.0,
             })
     return out
@@ -7478,7 +8413,8 @@ def timeline_library_payload(slug):
                 })
         # ALL downloaded scraped footage, including the DECLINED candidates (kept under
         # seedance 2.0/_candidates). These never appear in the accepted panels, but the timeline
-        # library shows them so you can drag a passed-over clip back in.
+        # library shows them so you can drag a passed-over clip back in. The hook finder's
+        # female-influencer pool (_candidates/hook_influencer) gets its own "hook" bucket.
         cand_root = project_dir / "seedance 2.0" / "_candidates"
         if cand_root.exists():
             for path in sorted(cand_root.rglob("*"),
@@ -7491,12 +8427,122 @@ def timeline_library_payload(slug):
                 if key in seen:
                     continue
                 seen.add(key)
+                is_hook = "hook_influencer" in {p.lower() for p in path.parts}
                 media.append({
-                    "kind": "declined", "name": path.name, "path": key,
+                    "kind": "hook" if is_hook else "declined", "name": path.name, "path": key,
                     "url": link_for(path), "type": "video",
                 })
+    # hook/female-influencer clips are generic + reusable -> pool them from EVERY project
+    for item in all_projects_hook_media(current_slug=slug):
+        if item["path"] not in seen:
+            seen.add(item["path"])
+            media.append(item)
     return {"media": media, "sfx": global_sfx_library(),
+            "sfx_taxonomy": sfx_taxonomy(),
             "global_media": all_projects_scraped_media(current_slug=slug)}
+
+
+def save_sfx_label(payload):
+    """Update one sound's trainer label from the timeline library. `payload` = {file, roles[],
+    reactions[]}. Writes soundeffects/sfx_labels.json (invalidates the active flag so a re-run
+    re-reads it). Only sounds directly in soundeffects/ are labelable."""
+    fn = str((payload or {}).get("file") or "").strip()
+    if not fn or "/" in fn or "\\" in fn or ".." in fn:
+        return {"ok": False, "error": "bad filename"}
+    target = (ROOT / "soundeffects" / fn)
+    if not target.exists() or target.parent.resolve() != (ROOT / "soundeffects").resolve():
+        return {"ok": False, "error": "not a labelable library sound"}
+    path = ROOT / "soundeffects" / "sfx_labels.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        data = {}
+    data.setdefault("labels", {})
+    valid_roles = {r[0] for r in sfx_taxonomy()["roles"]}
+    valid_reactions = {r[0] for r in sfx_taxonomy()["reactions"]}
+    roles = [r for r in (payload.get("roles") or []) if r in valid_roles]
+    reactions = [r for r in (payload.get("reactions") or []) if r in valid_reactions]
+    if not roles:
+        roles = ["skip"]
+    rec = dict(data["labels"].get(fn) or {})
+    rec.pop("role", None); rec.pop("reaction", None)
+    rec["roles"] = roles
+    rec["reactions"] = reactions if "reaction" in roles else []
+    rec.setdefault("policy", "core")
+    rec.setdefault("note", "")
+    data["labels"][fn] = rec
+    data["active"] = False           # labels changed -> next render re-reads them
+    data["updated"] = int(time.time())
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "file": fn, "roles": roles,
+            "reactions": rec["reactions"], "active": False}
+
+
+def all_projects_hook_media(current_slug=None, limit=2000):
+    """Every hook-finder candidate clip (female influencer pool) across ALL projects, newest
+    first: projects/*/seedance 2.0/_candidates/hook_influencer/*.mp4. The current project's own
+    clips are skipped (timeline_library_payload already lists them with kind 'hook')."""
+    root = agent_core.PROJECTS_DIR
+    if not root.exists():
+        return []
+    rows = []
+    for proj in root.iterdir():
+        if not proj.is_dir() or proj.name.startswith("_") or proj.name == current_slug:
+            continue
+        hook_dir = proj / "seedance 2.0" / "_candidates" / "hook_influencer"
+        if not hook_dir.exists():
+            continue
+        title = project_title_from_files(proj) or proj.name
+        for path in hook_dir.glob("*.mp4"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            rows.append((mtime, {
+                "kind": "hook", "name": path.name, "path": str(path.resolve()),
+                "url": link_for(path), "type": "video",
+                "project": title, "project_slug": proj.name,
+            }))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [item for _, item in rows[:limit]]
+
+
+_CLIP_DEDUP_CACHE = {}
+def _clip_dedup_key(path):
+    """Identity of a scraped clip for cross-project de-duplication. The SAME source TikTok/X
+    clip downloaded into several projects shares a (platform, clip_id) from its sidecar JSON, so
+    it collapses to ONE library entry. Falls back to a byte fingerprint, then the filename."""
+    try:
+        st = path.stat()
+        cache_key = (str(path), int(st.st_mtime), int(st.st_size))
+    except OSError:
+        return ("name", path.name)
+    if cache_key in _CLIP_DEDUP_CACHE:
+        return _CLIP_DEDUP_CACHE[cache_key]
+    key = None
+    sidecar = path.with_suffix(".json")
+    try:
+        if sidecar.exists():
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            cid = str(meta.get("clip_id") or "").strip()
+            if cid:
+                key = ("id", str(meta.get("platform") or "").lower(), cid)
+    except Exception:
+        key = None
+    if key is None:
+        try:
+            import hashlib
+            h = hashlib.sha1(); h.update(str(st.st_size).encode())
+            with open(path, "rb") as fh:
+                h.update(fh.read(131072))   # first 128 KB is enough to tell copies apart
+            key = ("fp", h.hexdigest())
+        except Exception:
+            key = ("name", path.name)
+    _CLIP_DEDUP_CACHE[cache_key] = key
+    return key
 
 
 def all_projects_scraped_media(current_slug=None, limit=5000):
@@ -7533,7 +8579,18 @@ def all_projects_scraped_media(current_slug=None, limit=5000):
                 "project": title, "project_slug": proj.name, "current": is_current,
             }))
     rows.sort(key=lambda r: r[0], reverse=True)
-    return [item for _, item in rows[:limit]]
+    # De-duplicate across projects: the same source clip shows ONCE (newest copy wins), so the
+    # library isn't flooded with 10 identical previews of one TikTok from different projects.
+    seen, out = set(), []
+    for _, item in rows:
+        key = _clip_dedup_key(Path(item["path"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def timeline_model(slug):
@@ -7545,7 +8602,7 @@ def timeline_model(slug):
         start = float(scene.get("start", 0) or 0)
         end = float(scene.get("end", start) or start)
         dur = max(0.3, end - start)
-        poster, clip_url, img = _timeline_media(project_dir, scene, config, index + 1, manifest_clips)
+        poster, clip_url, img, clip_path = _timeline_media(project_dir, scene, config, index + 1, manifest_clips)
         is_speaker = bool(scene.get("speaker_hook"))
         label = scene.get("name") or scene.get("caption") or scene.get("script") or f"Scene {index + 1}"
         label = re.sub(r"\s+", " ", str(label)).strip()[:54] or f"Scene {index + 1}"
@@ -7589,6 +8646,10 @@ def timeline_model(slug):
             "blur_captions": bool(scene.get("blur_captions")),
             "source_speed": round(source_speed, 3),
             "source_trim": round(source_trim, 3),
+            # #117 - full playable length of the underlying clip (0 = image / unknown). The editor
+            # caps stretching at (source_full - source_trim)/source_speed so a clip can't be
+            # dragged past its own footage into a frozen last frame.
+            "source_full": round(_clip_source_seconds(clip_path), 3) if clip_url else 0.0,
             "media_identity": media_identity,
             "overlays": overlays,
         })
@@ -7672,6 +8733,8 @@ def timeline_model(slug):
             "start_abs": round(at, 3), "offset": 0.0, "duration": duration,
             "volume": volume, "enabled": ov.get("enabled", True) is not False,
             "url": _ev_url({"path": path}), "path": path,
+            "source_duration": max(0.0, float(raw.get("source_duration") or 0.0)),
+            "playback_rate": max(0.01, float(raw.get("playback_rate") or 1.0)),
         })
         content_ids.add(eid)
     # user-added sounds from earlier editing sessions (config['custom_sfx']) - marked added:true
@@ -7682,6 +8745,8 @@ def timeline_model(slug):
                         "label": cs.get("label") or (Path(p).stem.replace("_", " ") if p else "Sound"),
                         "category": "custom", "offset": max(0.0, float(cs.get("offset") or 0.0)),
                         "duration": float(cs.get("duration") or 1.0),
+                        "source_duration": max(0.0, float(cs.get("source_duration") or 0.0)),
+                        "playback_rate": max(0.01, float(cs.get("playback_rate") or 1.0)),
                         "volume": float(cs.get("volume") or 0.25),
                         "enabled": cs.get("enabled") is not False,
                         "url": _ev_url(cs), "path": p, "added": True})
@@ -7723,10 +8788,18 @@ def timeline_model(slug):
         voice_candidates.append(Path(configured_voice))
     voice_candidates.extend(project_dir / "input" / cand
                             for cand in ("voiceover_dehiss.wav", "voiceover.wav"))
+    voice_duration = 0.0
     for vp in voice_candidates:
         if vp.exists():
             voice_url = link_for(vp)
+            voice_duration = _clip_source_seconds(vp)   # #119 - show the voiceover length on the timeline
             break
+    # fall back to the last caption timestamp if the audio can't be probed
+    if voice_duration <= 0.01 and caption_track:
+        try:
+            voice_duration = max(float(r.get("end") or 0.0) for r in caption_track if isinstance(r, dict))
+        except Exception:
+            voice_duration = 0.0
     music_url = ""
     music_choice = str(config.get("background_music_choice") or config.get("background_music_file") or "").strip()
     if music_choice and music_choice.lower() != "none":
@@ -7740,6 +8813,16 @@ def timeline_model(slug):
         "scenes": scenes,
         "transitions": transitions,
         "sfx": content,
+        "has_sfx": bool(transitions or content),
+        # #108/#109 gating: captions are editable/re-renderable only when there is a real caption
+        # track (an uploaded MP4 with baked-in captions has none). SFX are removable/redoable when
+        # the project has editable markers or can plan SFX (baked-in upload audio is neither).
+        "captions_editable": bool([r for r in caption_track if isinstance(r, dict) and str(r.get("text") or "").strip()]),
+        "sfx_removable": bool(content) or bool(transitions) or bool(config.get("sfx_enabled", True)),
+        # SFX/Captions-Master uploads split ONE finished video into seg_NN.mp4 pieces with the
+        # captions BAKED into the pixels - replacing such a clip drops its caption and the render
+        # can't re-add it to just that segment. The editor warns before a replace in this case.
+        "captions_baked": bool(config.get("sfx_master_source") or config.get("captions_master_source")),
         "captions": captions_on,
         "sfx_on": bool(config.get("render_sfx_enabled", True)),
         "caption_track": caption_track,
@@ -7750,6 +8833,7 @@ def timeline_model(slug):
         "volumes": volumes,
         "render_url": render_url,
         "voice_url": voice_url,
+        "voice_duration": round(voice_duration, 3),
         "music_url": music_url,
         "clip_source": str(config.get("clip_source") or "generate"),
         "reasoning_model": str((config.get("wavespeed") or {}).get("reasoning_model")
@@ -7796,7 +8880,51 @@ def _project_script_text(project_dir, config):
                      if str(s.get("exact_voice_text") or s.get("script") or "").strip())
 
 
-def start_timeline_job(slug, edits):
+def _regenerate_project_captions(slug, status_cb=None):
+    """Redo captions: re-align the CURRENT voice to a fresh transcript and refresh the project's
+    caption track so the next render burns updated captions. Used by the rework "redo captions"
+    control (only offered when the project actually has an editable caption track)."""
+    import voice_align
+    project_dir = agent_core.PROJECTS_DIR / slug
+    config = agent_core.load_project_config(slug)
+    voice = None
+    for cand in (config.get("audio_path"),
+                 project_dir / "input" / "voiceover_dehiss.wav",
+                 project_dir / "input" / "voiceover.wav"):
+        try:
+            if cand and Path(cand).exists():
+                voice = Path(cand); break
+        except Exception:
+            pass
+    if not voice:
+        if status_cb: status_cb("Redo captions: no voice audio found - keeping existing captions.")
+        return
+    if status_cb: status_cb("Redo captions: re-aligning captions to the voice (fresh transcript)...")
+    script_text = _project_script_text(project_dir, config)
+    try:
+        analysis, _tl = voice_align.analysis_from_audio(voice, script_text=script_text or None, status_cb=status_cb)
+    except Exception as exc:
+        if status_cb: status_cb(f"Redo captions failed ({exc}); keeping existing captions.")
+        return
+    if not (analysis and analysis.get("sentence_timestamps")):
+        if status_cb: status_cb("Redo captions: alignment produced no lines; keeping existing captions.")
+        return
+    try:
+        (project_dir / "input" / "audio_analysis.json").write_text(
+            json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    config["timeline_caption_track"] = analysis["sentence_timestamps"]
+    config["render_captions"] = True
+    try:
+        cfg_path = Path(config.get("_config_path", project_dir / "config" / "project.json"))
+        cfg_path.write_text(json.dumps(agent_core.config_for_json(config), indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    if status_cb: status_cb(f"Redo captions: {len(analysis['sentence_timestamps'])} caption lines re-aligned.")
+
+
+def start_timeline_job(slug, edits, regen_captions=False):
     job_id = str(int(time.time() * 1000))
     cancel_event = threading.Event()
     with JOB_LOCK:
@@ -7822,6 +8950,8 @@ def start_timeline_job(slug, edits):
 
     def worker():
         try:
+            if regen_captions:
+                _regenerate_project_captions(slug, status_cb=status_cb)
             result = agent_core.render_project_timeline(slug, edits, status_cb=status_cb, cancel_event=cancel_event)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
@@ -7885,7 +9015,7 @@ def start_timeline_social_replace_job(slug, scene_ids, reasoning_model=None):
 
 
 def start_timeline_rescript_job(slug, new_script, hook_text=None, voice_settings=None,
-                                clip_density="medium"):
+                                clip_density="medium", media_source="scrape"):
     """Timeline editor 'Change script': new voiceover + recut, reusing existing media for
     unchanged lines and finding media (project pool first, then TikTok/X) for the rest."""
     job_id = str(int(time.time() * 1000))
@@ -7912,7 +9042,8 @@ def start_timeline_rescript_job(slug, new_script, hook_text=None, voice_settings
         try:
             result = agent_core.rescript_and_recut(
                 slug, new_script, hook_text=hook_text, voice_settings=voice_settings,
-                clip_density=clip_density, status_cb=status_cb, cancel_event=cancel_event)
+                clip_density=clip_density, media_source=media_source,
+                status_cb=status_cb, cancel_event=cancel_event)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -8327,6 +9458,182 @@ def job_page(job_id):
     return page("Job", body)
 
 
+def progress_page(job_id):
+    """Standalone FOCUSED progress view (timeline render / SFX Master / VFX Master): no chat
+    shell, no media previews - one big animated bar with real %, elapsed + ETA, and a small
+    box showing the current action. Chimes + shows the result buttons when done."""
+    jid = esc(str(job_id or ""))
+    body = f"""
+<style>
+  html, body {{ margin:0; padding:0; }}
+  body.page-progress {{ min-height:100vh; display:flex; align-items:center; justify-content:center;
+    font-family:Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+    background: radial-gradient(circle at 65% 25%, rgba(57,255,20,.07), transparent 45%), #090b0a;
+    color:#f1f3f1; }}
+  body.page-progress main {{ max-width:none; width:100%; display:flex; align-items:center; justify-content:center; padding:0; }}
+  .pg-wrap {{ width:min(640px, 92vw); display:flex; flex-direction:column; gap:18px; }}
+  .pg-title {{ font-size:20px; font-weight:800; letter-spacing:-.01em; display:flex; align-items:center; gap:10px; }}
+  .pg-title .pg-ico {{ font-size:24px; }}
+  .pg-sub {{ color:#a0a6a0; font-size:13px; margin-top:-10px; }}
+  .pg-bar {{ position:relative; height:26px; border-radius:99px; background:#151815;
+    border:1px solid rgba(255,255,255,.10); overflow:hidden; }}
+  .pg-fill {{ position:absolute; inset:0; width:0%; border-radius:99px;
+    background:linear-gradient(90deg,#1fb212,#39ff14 60%,#7dff5c);
+    box-shadow:0 0 18px rgba(57,255,20,.45); transition:width .6s ease; }}
+  .pg-fill::before {{ content:""; position:absolute; inset:0;
+    background:repeating-linear-gradient(45deg, rgba(255,255,255,.16) 0 12px, transparent 12px 24px);
+    animation:pgstripes 1s linear infinite; }}
+  .pg-fill::after {{ content:""; position:absolute; top:0; bottom:0; width:60px;
+    background:linear-gradient(90deg, transparent, rgba(255,255,255,.5), transparent);
+    animation:pgsheen 1.8s ease-in-out infinite; }}
+  .pg-bar.indet .pg-fill {{ width:38% !important; animation:pgslide 1.6s ease-in-out infinite; }}
+  @keyframes pgstripes {{ to {{ background-position:34px 0; }} }}
+  @keyframes pgsheen {{ 0% {{ left:-70px; }} 100% {{ left:110%; }} }}
+  @keyframes pgslide {{ 0% {{ transform:translateX(-40%); }} 50% {{ transform:translateX(220%); }} 100% {{ transform:translateX(-40%); }} }}
+  .pg-stats {{ display:flex; justify-content:space-between; font-variant-numeric:tabular-nums;
+    color:#a0a6a0; font-size:13px; }}
+  .pg-stats b {{ color:#f1f3f1; font-weight:700; }}
+  .pg-now {{ border:1px solid rgba(255,255,255,.09); background:rgba(20,23,20,.9); border-radius:12px;
+    padding:11px 14px; font-family:ui-monospace, Consolas, monospace; font-size:12px; color:#9fdd9a;
+    min-height:20px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+  .pg-now::before {{ content:"> "; color:#39ff14; }}
+  .pg-done {{ display:none; flex-direction:column; gap:12px; }}
+  .pg-actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
+  .pg-btn {{ display:inline-flex; align-items:center; gap:8px; padding:11px 18px; border-radius:11px;
+    border:1px solid rgba(255,255,255,.14); background:#181a18; color:#f1f3f1; font-weight:700;
+    font-size:13.5px; text-decoration:none; cursor:pointer; }}
+  .pg-btn:hover {{ border-color:#39ff14; }}
+  .pg-btn.primary {{ background:#39ff14; border-color:#39ff14; color:#062b00; }}
+  .pg-err {{ display:none; border:1px solid rgba(239,102,92,.5); background:rgba(239,102,92,.08);
+    color:#ffb4ad; border-radius:12px; padding:12px 14px; font-size:13px; white-space:pre-wrap; }}
+  .pg-video {{ display:none; width:100%; max-height:46vh; border-radius:14px; background:#000;
+    border:1px solid rgba(255,255,255,.1); }}
+</style>
+<div class="pg-wrap">
+  <div class="pg-title"><span class="pg-ico" id="pg-ico">&#9881;&#65039;</span><span id="pg-title">Working...</span></div>
+  <div class="pg-sub" id="pg-sub"></div>
+  <div class="pg-bar indet" id="pg-bar"><div class="pg-fill" id="pg-fill"></div></div>
+  <div class="pg-stats"><span>Elapsed <b id="pg-elapsed">0:00</b></span><span id="pg-pct"></span><span>Remaining <b id="pg-eta">&mdash;</b></span></div>
+  <div class="pg-now" id="pg-now">Starting...</div>
+  <video class="pg-video" id="pg-video" controls playsinline></video>
+  <div class="pg-done" id="pg-done">
+    <div class="pg-actions">
+      <a class="pg-btn primary" id="pg-download" href="#" download>&#11015; Download video</a>
+      <a class="pg-btn" id="pg-timeline" href="#">&#127902; Open timeline editor</a>
+      <a class="pg-btn" href="/">&#8592; Back to Shortslab</a>
+    </div>
+  </div>
+  <div class="pg-err" id="pg-err"></div>
+</div>
+<script>
+(function() {{
+  var JID = {json.dumps(str(job_id or ""))};
+  var TITLES = {{ timeline: ["\\uD83C\\uDFAC", "Rendering your Short"],
+                 sfx: ["\\uD83D\\uDD0A", "SFX Master"],
+                 visual: ["\\uD83C\\uDFAF", "VFX Master"],
+                 longform: ["\\uD83C\\uDFA8", "Longform video"],
+                 run: ["\\u2699\\uFE0F", "Working"] }};
+  var start = Date.now() / 1000, createdAt = 0, finished = false;
+  function fmt(s) {{ s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60); return m + ":" + String(s % 60).padStart(2, "0"); }}
+  function pctFrom(text) {{
+    var m = null, re = /Rendering frames:\\s*(\\d+(?:\\.\\d+)?)%/g, x;
+    while ((x = re.exec(text))) m = parseFloat(x[1]);
+    if (m == null) {{ var re2 = /image\\s+(\\d+)\\s*\\/\\s*(\\d+)/g; var y, last = null;
+      while ((y = re2.exec(text))) last = y;
+      if (last && +last[2] > 0) m = 100 * (+last[1]) / (+last[2]); }}
+    return m;
+  }}
+  function chime() {{
+    try {{ var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      [523.25, 659.25, 783.99].forEach(function(f, i) {{
+        var o = ctx.createOscillator(), g = ctx.createGain();
+        o.frequency.value = f; o.type = "sine"; o.connect(g); g.connect(ctx.destination);
+        var t = ctx.currentTime + i * 0.12;
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+        o.start(t); o.stop(t + 0.55); }});
+    }} catch (e) {{}}
+  }}
+  setInterval(function() {{
+    if (finished) return;
+    var base = createdAt || start;
+    document.getElementById("pg-elapsed").textContent = fmt(Date.now() / 1000 - base);
+  }}, 1000);
+  function poll() {{
+    fetch("/job-status?id=" + encodeURIComponent(JID)).then(function(r) {{ return r.json(); }}).then(function(j) {{
+      if (!j || !j.exists) {{ document.getElementById("pg-now").textContent = "Job not found."; return; }}
+      if (j.created_at) createdAt = j.created_at;
+      var t = TITLES[j.job_kind] || TITLES.run;
+      document.getElementById("pg-ico").textContent = t[0];
+      document.getElementById("pg-title").textContent = t[1];
+      var lines = (j.log_text || "").split("\\n").filter(function(l) {{ return l.trim(); }});
+      if (lines.length) document.getElementById("pg-now").textContent = lines[lines.length - 1].slice(0, 160);
+      var pct = pctFrom(j.log_text || "");
+      var bar = document.getElementById("pg-bar"), fill = document.getElementById("pg-fill");
+      if (pct != null && j.status === "running") {{
+        bar.classList.remove("indet"); fill.style.width = Math.min(99.5, pct) + "%";
+        document.getElementById("pg-pct").innerHTML = "<b>" + pct.toFixed(0) + "%</b>";
+        var elapsed = Date.now() / 1000 - (createdAt || start);
+        if (pct > 3) document.getElementById("pg-eta").textContent = fmt(elapsed / pct * (100 - pct));
+      }}
+      if (j.status === "done" || j.status === "error" || j.status === "cancelled") {{
+        finished = true;
+        bar.classList.remove("indet"); fill.style.width = "100%";
+        document.getElementById("pg-eta").textContent = "0:00";
+        if (j.status === "done") {{
+          document.getElementById("pg-pct").innerHTML = "<b>100%</b>";
+          document.getElementById("pg-now").textContent = "Done.";
+          document.getElementById("pg-done").style.display = "flex";
+          if (j.result_video_url) {{
+            var v = document.getElementById("pg-video");
+            v.src = j.result_video_url; v.style.display = "block";
+            var dl = document.getElementById("pg-download");
+            var dlName = j.result_video_name || "video.mp4";
+            dl.href = j.result_video_url; dl.setAttribute("download", dlName);
+            // #121 - let the user CHOOSE where to save (native "Save As"), not force Downloads.
+            dl.onclick = function(ev){{
+              if (window.showSaveFilePicker) {{
+                ev.preventDefault();
+                (async function(){{
+                  try {{
+                    var h = await window.showSaveFilePicker({{ suggestedName: dlName,
+                      types: [{{ description: "MP4 video", accept: {{ "video/mp4": [".mp4"] }} }}] }});
+                    var resp = await fetch(j.result_video_url);
+                    var w = await h.createWritable(); await resp.body.pipeTo(w);
+                    dl.textContent = "\\u2713 Saved";
+                  }} catch(e) {{
+                    if (e && e.name === "AbortError") return;      // user cancelled the dialog
+                    var a=document.createElement("a"); a.href=j.result_video_url; a.download=dlName;
+                    document.body.appendChild(a); a.click(); a.remove();   // fallback
+                  }}
+                }})();
+              }}
+            }};
+          }} else {{ document.getElementById("pg-download").style.display = "none"; }}
+          var tl = document.getElementById("pg-timeline");
+          if (j.project_slug) tl.href = "/timeline?slug=" + encodeURIComponent(j.project_slug);
+          else tl.style.display = "none";
+          chime();
+        }} else {{
+          fill.style.background = "#ef665c"; fill.style.boxShadow = "none";
+          var err = document.getElementById("pg-err");
+          err.style.display = "block";
+          err.textContent = (j.status === "cancelled") ? "Cancelled." :
+            ((j.log_text || "").split("\\n").slice(-6).join("\\n") || "The run failed.");
+          document.getElementById("pg-done").style.display = "flex";
+          document.getElementById("pg-download").style.display = "none";
+        }}
+        return;
+      }}
+      setTimeout(poll, 1000);
+    }}).catch(function() {{ setTimeout(poll, 2000); }});
+  }}
+  poll();
+}})();
+</script>"""
+    return page("Working...", body, body_class="page-progress")
+
+
 def job_status_payload(job_id):
     with JOB_LOCK:
         job = dict(JOBS.get(job_id, {"status": "missing", "logs": [], "result": None, "error": "Unknown job"}))
@@ -8348,16 +9655,60 @@ def job_status_payload(job_id):
                          if job.get("project_dir") and Path(job["project_dir"]).exists() else ""),
         "speech_audio_url": (link_for(Path(job["speech_audio"]))
                              if status == "awaiting_approval" and job.get("speech_audio") else ""),
+        "speech_speed": (_speech_current_speed(job) if status == "awaiting_approval" else 0),
         "assigned_media": _assigned_media_payload(job),
+        "created_at": job.get("created_at") or 0,
     }
+    # direct result-video link for the standalone /progress view (additive)
+    _res = job.get("result") if isinstance(job.get("result"), dict) else {}
+    _vid = str(_res.get("video") or "")
+    if _vid and Path(_vid).exists():
+        payload["result_video_url"] = link_for(Path(_vid))
+        payload["result_video_name"] = Path(_vid).name
+    else:
+        payload["result_video_url"] = ""
+        payload["result_video_name"] = ""
     return json.dumps(payload).encode("utf-8")
+
+
+def _speech_current_speed(job):
+    """The narration speed currently baked into the halted voiceover (so the approval UI can show
+    it and preview other speeds relative to it). Falls back to the clip-source default."""
+    try:
+        pd = project_dir_for_job(job)
+        if pd:
+            cfg = agent_core.load_project_config(pd.name)
+            v = float(cfg.get("voice_speed") or 0)
+            if v > 0:
+                return round(v, 2)
+            src = str(cfg.get("clip_source") or "").lower()
+            return 1.30 if src == "scrape" else 1.15
+    except Exception:
+        pass
+    return 1.15
 
 
 def _assigned_media_payload(job, cap=60):
     """ONLY the clips currently assigned to scenes (the run's actual choices) - the chat shell
-    renders these in its own clean grid instead of the full grouped media wall."""
+    renders these in its own clean grid instead of the full grouped media wall.
+
+    Shown ONLY while a live TikTok/X SCRAPE run is processing. Reworks (redo captions/SFX/visual,
+    timeline render, longform, ...) and finished runs return nothing, so the preview never shows
+    stale assigned media from an earlier scrape."""
+    if str(job.get("job_kind") or "").lower() in ("sfx", "visual", "caption", "timeline",
+                                                    "longform", "viraltrans"):
+        return []
+    if str(job.get("status") or "").lower() not in ("running", "cancelling"):
+        return []
     project_dir = project_dir_for_job(job)
     if not project_dir:
+        return []
+    # scrape-only: the grid shows scraped/downloaded clips, which is meaningless for a generate run
+    try:
+        run_form = read_json_file(project_dir / "input" / "run_form.json") or {}
+        if str(run_form.get("clip_source") or "").lower() != "scrape":
+            return []
+    except Exception:
         return []
     items = []
     try:
@@ -8753,7 +10104,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         q_all = urllib.parse.parse_qs(parsed.query)
         legacy = q_all.get("legacy_ui", ["0"])[0] in ("1", "true", "yes")
-        if parsed.path == "/":
+        if parsed.path == "/timeline-versions":
+            slug = str(q_all.get("slug", [""])[0])
+            self.send_bytes(json.dumps({"ok": True, "versions": timeline_versions(slug)}).encode("utf-8"),
+                            "application/json; charset=utf-8")
+        elif parsed.path == "/":
             q = q_all
             if legacy:
                 self.send_bytes(form_page(clear="new" in q, open_load="load" in q, load_slug=q.get("project", [""])[0]))
@@ -8793,6 +10148,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_static_asset("favicon.ico")
         elif parsed.path.startswith("/static/"):
             self.send_static_asset(Path(parsed.path).name)
+        elif parsed.path == "/dev-tools":
+            self.send_bytes(dev_tools_page())
         elif parsed.path == "/assets":
             show_hidden = q_all.get("show_hidden", ["0"])[0] in ("1", "true", "yes")
             if legacy:
@@ -8822,6 +10179,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/timeline":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             self.send_bytes(timeline_page(slug))
+        elif parsed.path == "/progress":
+            jid = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            self.send_bytes(progress_page(jid))
         elif parsed.path == "/ui-state":
             self.send_bytes(json.dumps(load_ui_state()).encode("utf-8"), "application/json; charset=utf-8")
         elif parsed.path == "/presets":
@@ -8922,6 +10282,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/dev-trainer-open":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                fields = urllib.parse.parse_qs(raw.decode("utf-8", errors="replace"))
+                tool = fields.get("tool", [""])[0]
+                run_id = fields.get("run_id", [""])[0]
+                url = start_dev_trainer(tool, run_id=run_id)
+                self.send_response(303)
+                self.send_header("Location", url)
+                self.end_headers()
+            except Exception as exc:  # noqa: BLE001
+                self.send_bytes(page("Developer tool error",
+                                     f'<section class="panel"><h2>Could not open trainer</h2>'
+                                     f'<p>{esc(exc)}</p><a class="button secondary" href="/dev-tools">Back</a></section>'))
+            return
         if parsed.path == "/reddit-discover":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -9067,11 +10443,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
             return
         if parsed.path == "/approve-speech":
-            job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            _q = urllib.parse.parse_qs(parsed.query)
+            job_id = _q.get("id", [""])[0]
+            _spd = _q.get("speed", [""])[0]
             with JOB_LOCK:
                 job = JOBS.get(job_id)
                 if job and job.get("status") == "awaiting_approval":
                     job["speech_decision"] = "approve"
+                    try:
+                        job["speech_speed_choice"] = float(_spd) if _spd else None
+                    except (TypeError, ValueError):
+                        job["speech_speed_choice"] = None
                     ev = job.get("approval_event")
                 if job:
                     ev = job.get("approval_event")
@@ -9259,6 +10641,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
             self.end_headers()
             return
+        if parsed.path == "/sfx-label":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            res = save_sfx_label(data)
+            self.send_bytes(json.dumps(res).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-redo-sfx":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            slug = str(data.get("slug", ""))
+            if not slug or not safe_project_dir(slug):
+                self.send_bytes(json.dumps({"ok": False, "error": "Unknown project."}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            snapshot_timeline_version(slug, "Before redo SFX")
+            jid = start_redo_sfx_job(slug, reasoning_model=data.get("reasoning_model"),
+                                     sfx_amount=data.get("sfx_amount", "medium"))
+            self.send_bytes(json.dumps({"ok": True, "job_id": jid}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-version-restore":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+                restore_timeline_version(str(data.get("slug", "")), str(data.get("version_id", "")))
+                self.send_bytes(json.dumps({"ok": True}).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self.send_bytes(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"), "application/json; charset=utf-8")
+            return
         if parsed.path == "/timeline-render":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -9287,6 +10702,7 @@ class Handler(BaseHTTPRequestHandler):
             if not project_dir or not media_path or not valid_replace_path_values([media_path]):
                 self.send_bytes(json.dumps({"ok": False, "error": "Only web images of this project can be replaced."}).encode("utf-8"), "application/json; charset=utf-8")
                 return
+            snapshot_timeline_version(slug, "Before replacing timeline media")
             fields = project_form_state(project_dir)
             for key, value in list(fields.items()):
                 if isinstance(value, bool):
@@ -9339,9 +10755,12 @@ class Handler(BaseHTTPRequestHandler):
             clip_density = str(data.get("clip_density") or "medium").strip().lower()
             if clip_density not in ("few", "medium", "many"):
                 clip_density = "medium"
+            media_source = str(data.get("media_source") or "scrape").strip().lower()
+            if media_source not in ("scrape", "keep_visible", "library"):
+                media_source = "scrape"
             job_id = start_timeline_rescript_job(slug, new_script, hook_text=hook_text,
                                                  voice_settings=voice_settings,
-                                                 clip_density=clip_density)
+                                                 clip_density=clip_density, media_source=media_source)
             self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={job_id}"}).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/timeline-rework":
@@ -9359,9 +10778,16 @@ class Handler(BaseHTTPRequestHandler):
             do_replace = bool(data.get("replace_media"))
             do_recut = bool(data.get("reorder_recut"))
             do_revoice = bool(data.get("regenerate_speech"))
+            do_redo_sfx = bool(data.get("redo_sfx"))
+            do_add_more_sfx = bool(data.get("add_more_sfx"))
+            do_redo_captions = bool(data.get("redo_captions"))
+            sfx_amount = str(data.get("sfx_amount") or "medium").strip().lower()
+            if sfx_amount not in ("low", "medium", "high"):
+                sfx_amount = "medium"
             reasoning_model = str(data.get("reasoning_model") or "openai/gpt-5.5").strip()
             if reasoning_model not in {"anthropic/claude-fable-5", "anthropic/claude-sonnet-5",
                                        "anthropic/claude-opus-4.8", "openai/gpt-5.5",
+                                       "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
                                        "google/gemini-3.5-flash", "google/gemini-3.1-pro-preview"}:
                 reasoning_model = "openai/gpt-5.5"
             # 1) persist the current timeline (order/durations/etc.) so the rework builds on it
@@ -9369,6 +10795,24 @@ class Handler(BaseHTTPRequestHandler):
                 agent_core.save_timeline_edits(slug, data.get("edits") or {})
             except Exception as exc:
                 self.send_bytes(json.dumps({"ok": False, "error": f"Could not save edits: {exc}"}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            snapshot_timeline_version(slug, "Before " + ("adding more SFX" if do_add_more_sfx else
+                                                         "redo captions" if do_redo_captions else "redo/replacement rework"))
+            # COMBINED reworks: an SFX redo/add can run together with "redo captions" in ONE job
+            # (captions are re-aligned first, then the SFX pass renders the final with both).
+            if do_redo_sfx or do_add_more_sfx:
+                if do_redo_sfx and do_add_more_sfx:
+                    self.send_bytes(json.dumps({"ok": False, "error": "Choose either redo SFX or add more SFX."}).encode("utf-8"), "application/json; charset=utf-8")
+                    return
+                job_id = start_redo_sfx_job(slug, reasoning_model=reasoning_model, sfx_amount=sfx_amount,
+                                            mode="add" if do_add_more_sfx else "redo",
+                                            regen_captions=do_redo_captions)
+                self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            # Redo captions on its own (no SFX / media re-plan): re-align captions, then re-render.
+            if do_redo_captions and not (do_revoice or do_replace or do_recut):
+                job_id = start_timeline_job(slug, data.get("edits") or {}, regen_captions=True)
+                self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
             # A new take changes the authoritative clock. Generate and align it before any
             # optional social replacement so new searches use the newly timed spoken lines.
@@ -9484,7 +10928,12 @@ class Handler(BaseHTTPRequestHandler):
                 fields, files = parse_multipart(content_type, body)
             else:
                 fields, files = {}, {}
-            job_id = start_longform_job(fields, files)
+            # pasted script -> full longform VIDEO pipeline; uploaded prompt .txt -> the
+            # legacy image-set generator (kept as a compatibility path)
+            if str(fields.get("script") or "").strip():
+                job_id = start_longform_video_job(fields)
+            else:
+                job_id = start_longform_job(fields, files)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()

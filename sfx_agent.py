@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -287,6 +288,595 @@ def sfx_amount_profile(amount):
                                    SFX_AMOUNT_PROFILES["medium"])
 
 
+# =====================================================================================
+# VISION AUDIO DIRECTOR - multimodal SFX placement (Gemini watches + hears the video).
+# The WHOLE video (visuals + existing audio) is uploaded and sent to a Gemini model,
+# which returns a timed sfx_timeline JSON using the human-labeled trainer categories
+# (hook_riser / impact / ui / transition / reaction:<slug>). Used by the SFX Master
+# (uploaded videos) and as the post-render semantic pass in Script-to-Visuals mode.
+# =====================================================================================
+
+def _vision_model(reasoning_model):
+    """Video+audio input needs a Gemini model; force one if the dropdown picked e.g. Opus."""
+    m = str(reasoning_model or "").strip()
+    return m if "gemini" in m.lower() else "google/gemini-3.1-pro-preview"
+
+
+def labeled_sfx_data(status_cb=None):
+    """The label-driven library (roles/reactions ground truth from tools/sfx_trainer)."""
+    import sfx_library
+    return sfx_library.build_library(status_cb=status_cb)
+
+
+def vision_tag_catalog(data, transitions_present=False):
+    """Exact tags the director may use, built from pools that actually have sounds."""
+    tags = []
+    if data.get("hook_risers") or data.get("risers"):
+        tags.append("hook_riser")
+    lib = data.get("library", {})
+    if lib.get("impact_hit"):
+        tags.append("impact")
+    if lib.get("ui_click") or lib.get("caption_pop"):
+        tags.append("ui")
+    if not transitions_present and any(lib.get(c) for c in
+                                       ("bright_whoosh", "swipe_whoosh", "whoosh_hit_combo")):
+        tags.append("transition")
+    for slug, files in sorted((data.get("reactions") or {}).items()):
+        if files:
+            tags.append(f"reaction: {slug}")
+    return tags
+
+
+def build_sfx_director_prompt(tags, transitions_present=False):
+    """System prompt for the multimodal Audio Director call."""
+    tag_lines = "\n".join(f'- "{t}"' for t in tags)
+    if transitions_present:
+        redundancy = (
+            "CRITICAL RULE - AVOID REDUNDANCY:\n"
+            "This video's editor has ALREADY placed a transition/whoosh sound on every cut. "
+            "You are STRICTLY FORBIDDEN from adding any structural, transition, or cut sounds. "
+            "Your job is ONLY to add \"Semantic\" and \"Reaction\" SFX based on the content."
+        )
+    else:
+        redundancy = (
+            "CRITICAL RULE - AVOID REDUNDANCY:\n"
+            "First, listen to the provided audio track and the video clip. Identify timestamps "
+            "where the video editor has ALREADY placed structural/transition sounds (e.g., "
+            "whooshes on cuts, impacts on scene changes). You are STRICTLY FORBIDDEN from adding "
+            "new structural, transition, or cut sounds if there is already a transition/cut sound "
+            "where you wanted to place one. Your job is to add \"Semantic\" and \"Reaction\" SFX "
+            "based on the content. If there are no transition/cut sounds present, your job is "
+            "also to add \"transition\" sounds from the according library."
+        )
+    return f"""You are an expert Short-Form Video Audio Director. Your task is to analyze a highly edited, fast-paced video and return a precise JSON payload for Sound Effect (SFX) placement. You must analyze BOTH the visual track and the audio track simultaneously.
+
+{redundancy}
+
+RULES FOR SFX PLACEMENT:
+
+1. EXACT AUDIO LIBRARY:
+You MUST choose ONLY from the following exact tags. Do not invent tags:
+{tag_lines}
+
+2. THE HOOK BUILD-UP (0.00 to about 5 seconds, depending on the script):
+- You MUST include exactly one "hook_riser" at the very beginning of the video.
+- The "hook_riser" ALWAYS starts at timestamp 0.00.
+- The `end_timestamp` of the "hook_riser" MUST perfectly match the `timestamp` of the main impact visual/audio trigger inside the hook.
+- At that `end_timestamp` you MUST also add one single "impact" event (the riser's climax).
+- You are STRICTLY FORBIDDEN from using "hook_riser" (or any other riser) after the hook.
+
+3. VISUAL TRIGGERS (Priority 1):
+Place SFX on clear editorial emphasis moments:
+- An arrow, circle, pointer, or other emphasis overlay appears for the first time.
+- A new visual example is revealed through a strong cut or noticeable change of subject.
+- The main visible action reaches its clearest impact moment.
+- A flash, whip, fast zoom, swipe, or other deliberate transition occurs.
+- A comedic, surprising, awkward, or reaction-based visual punchline appears.
+- A presenter makes a strong gesture or reaction that clearly emphasizes the narration.
+
+VISUAL COVERAGE IS MANDATORY:
+- At least 60% of NON-TRANSITION semantic/reaction events must use `trigger_source: "visual"`.
+- Aim for one genuine visual semantic event every 6-9 seconds when the footage contains one.
+- A generic cut/scene change is only a `transition`; it does NOT count as a visual semantic event.
+- Do not let easy transcript keywords replace analysis of visible actions, objects, gestures or overlays.
+
+Do not trigger SFX for:
+- normal word-by-word captions
+- overlays that are already visible
+- minor body movement
+- static labels
+- continuous footage without a new emphasis event
+
+4. AUDIO/KEYWORD TRIGGERS (Priority 2):
+Map reaction SFX to the exact start timestamp of high-impact spoken words:
+- Negative absolutes (e.g., "banned", "illegal", "never", "fail") -> "reaction: error_wrong".
+- Crazy facts, rules, or core subjects (e.g., "China", "Japan", "wildest") -> "reaction: shock_reveal" or "reaction: suspense".
+- Enumerations or lists (e.g., "First", "Next", "Number one") -> "reaction: notification".
+- Money/Cost related words -> "reaction: money_cash".
+- Match the OTHER reaction tags to lines whose meaning clearly fits them.
+
+5. PACING & LAYER STYLE (The "Retention" Style):
+This is a fast-paced retention video. You should place approximately 1 to 2 semantic SFX per sentence. The SFX should feel aggressive and perfectly synced to the exact frame a word is spoken or a graphic appears. Never place two SFX within 0.25 seconds of each other (the hook_riser bed is exempt).
+
+OUTPUT FORMAT:
+Respond STRICTLY with valid JSON matching the following schema. Do not include markdown or explanations outside the JSON.
+
+{{
+  "sfx_timeline": [
+    {{
+      "timestamp": 0.00,
+      "end_timestamp": 2.15,
+      "sfx_type": "hook_riser",
+      "trigger_source": "audio",
+      "trigger_detail": "Start of video tension build-up.",
+      "reasoning": "Mandatory hook riser leading into the first major semantic impact."
+    }},
+    {{
+      "timestamp": 2.15,
+      "sfx_type": "impact",
+      "trigger_source": "audio",
+      "trigger_detail": "The word 'banned' was spoken.",
+      "reasoning": "Climax of the hook_riser."
+    }},
+    {{
+      "timestamp": 4.50,
+      "sfx_type": "reaction: notification",
+      "trigger_source": "visual",
+      "trigger_detail": "Red arrow appeared pointing at a student's hair.",
+      "reasoning": "Visual emphasis requires a pop/notification sound to draw the eye."
+    }}
+  ]
+}}"""
+
+
+def _tag_key(value):
+    return re.sub(r"\s*:\s*", ":", str(value or "").strip().lower())
+
+
+def is_visual_semantic_event(event):
+    """A visible-content reaction, excluding generic cuts and the mandatory hook impact."""
+    if str(event.get("trigger_source") or "").strip().lower() != "visual":
+        return False
+    kind = _tag_key(event.get("sfx_type"))
+    if kind in ("hook_riser", "transition"):
+        return False
+    if kind == "impact" and float(event.get("timestamp") or 0.0) <= 6.0:
+        return False
+    return kind == "ui" or kind == "impact" or kind.startswith("reaction:")
+
+
+def visual_semantic_target(duration, sfx_amount="medium"):
+    spacing = {"low": 12.0, "medium": 8.0, "high": 6.0}.get(
+        str(sfx_amount or "medium").strip().lower(), 8.0)
+    return max(3, min(12, int(round(max(1.0, float(duration or 0.0)) / spacing))))
+
+
+def build_visual_repair_prompt(tags, missing, existing_events):
+    usable = [tag for tag in tags if _tag_key(tag) not in ("hook_riser", "transition")]
+    prior = "\n".join(
+        f"- {float(ev.get('timestamp') or 0):.2f}s: {ev.get('sfx_type')} / {ev.get('trigger_detail')}"
+        for ev in existing_events if is_visual_semantic_event(ev)
+    ) or "- none"
+    tag_lines = "\n".join(f'- "{tag}"' for tag in usable)
+    return f"""You are doing a VISUAL-ONLY correction pass on a finished short-form video.
+The first Audio Director pass under-detected visible semantic moments. Add {int(missing)} missing
+VISUAL reaction events. Watch the video frame-by-frame. IGNORE transcript keywords and spoken-word
+meaning for this pass; `trigger_source` must always be `visual`.
+
+Find clear visible triggers such as: a person falls or reacts; an object is used, exchanged, tapped,
+opened, dropped or revealed; money/card/phone/food appears as the visual focus; an arrow/circle/sticker
+appears; a strong hand gesture or facial reaction lands; a camera flash/photo occurs; a message/UI
+appears; a cute, awkward, suspicious, celebratory, sad or surprising visible payoff occurs.
+
+Do NOT return generic cuts, scene changes, ordinary walking, static shots, captions, hook_riser or
+transition. Prefer precise action-peak timestamps. Do not duplicate these existing visual reactions:
+{prior}
+
+Use ONLY these exact tags:
+{tag_lines}
+
+Return strict JSON: {{"sfx_timeline":[{{"timestamp":12.34,"sfx_type":"reaction: camera_photo",
+"trigger_source":"visual","trigger_detail":"A camera flash fires on screen.",
+"reasoning":"Visible action peak."}}]}}"""
+
+
+def merge_visual_repair_events(events, repair_events, tags):
+    """Merge visual-only repairs, replacing a generic transition at the same visible beat."""
+    merged = list(events or [])
+    allowed = {_tag_key(tag) for tag in (tags or [])}
+    added = 0
+    for event in sorted(repair_events or [], key=lambda row: float(row.get("timestamp") or 0.0)):
+        if not is_visual_semantic_event(event) or _tag_key(event.get("sfx_type")) not in allowed:
+            continue
+        timestamp = float(event.get("timestamp") or 0.0)
+        if any(abs(timestamp - float(old.get("timestamp") or 0.0)) < 0.28
+               for old in merged if _tag_key(old.get("sfx_type")) != "transition"):
+            continue
+        # A reaction explains the visible beat better than a generic whoosh/pop at the same cut.
+        merged = [old for old in merged
+                  if not (_tag_key(old.get("sfx_type")) == "transition"
+                          and abs(timestamp - float(old.get("timestamp") or 0.0)) < 0.30)]
+        event = dict(event)
+        event["reasoning"] = "Visual coverage repair: " + str(event.get("reasoning") or "visible trigger")
+        merged.append(event)
+        added += 1
+    merged.sort(key=lambda row: float(row.get("timestamp") or 0.0))
+    return merged, added
+
+
+def parse_sfx_timeline(payload, duration):
+    """Backend parser for the director's JSON schema. Normalizes/clamps every event to
+    {timestamp, end_timestamp?, sfx_type, trigger_source, trigger_detail, reasoning}."""
+    if isinstance(payload, dict):
+        rows = payload.get("sfx_timeline")
+    else:
+        rows = payload
+    if not isinstance(rows, list):
+        return []
+    events = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            t = float(row.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if t < 0 or (duration and t > duration - 0.05):
+            continue
+        ev = {
+            "timestamp": round(t, 3),
+            "sfx_type": str(row.get("sfx_type") or "").strip().lower(),
+            "trigger_source": str(row.get("trigger_source") or "").strip().lower(),
+            "trigger_detail": str(row.get("trigger_detail") or "").strip(),
+            "reasoning": str(row.get("reasoning") or "").strip(),
+        }
+        end = row.get("end_timestamp")
+        if end is not None:
+            try:
+                end = float(end)
+                if end > t:
+                    ev["end_timestamp"] = round(min(end, duration or end), 3)
+            except (TypeError, ValueError):
+                pass
+        if ev["sfx_type"]:
+            events.append(ev)
+    events.sort(key=lambda e: e["timestamp"])
+    return events
+
+
+def prepare_audio_director_proxy(video_path, status_cb=None):
+    """Create a compact 480px-wide MP4 while preserving the source audio.
+
+    The director needs visual timing and the audible mix, not the original render bitrate.
+    Uploading the full 100-170 MB render made transient connection resets much more likely.
+    Returns ``(proxy_path, temp_dir)``; the caller owns cleanup.
+    """
+    ffmpeg = pipeline.find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found; cannot prepare the Audio Director upload.")
+    temp_dir = Path(tempfile.mkdtemp(prefix="sfx_director_"))
+    proxy = temp_dir / "audio_director_480p.mp4"
+    command = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_path),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "scale=480:-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000",
+        "-movflags", "+faststart", str(proxy),
+    ]
+    log(status_cb, "Preparing a compact 480p video + audio proxy for the Audio Director...")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        if result.returncode or not proxy.exists() or proxy.stat().st_size <= 0:
+            detail = (result.stderr or "ffmpeg produced no output").strip()[-500:]
+            raise RuntimeError(f"Could not create Audio Director proxy: {detail}")
+        source_mb = Path(video_path).stat().st_size / (1024 * 1024)
+        proxy_mb = proxy.stat().st_size / (1024 * 1024)
+        log(status_cb, f"Audio Director proxy ready: {source_mb:.1f} MB -> {proxy_mb:.1f} MB.")
+        return proxy, temp_dir
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def upload_audio_director_media(path, key, status_cb=None, attempts=3):
+    """Upload a director proxy with bounded retries for transient connection failures."""
+    attempts = max(1, int(attempts or 1))
+    last_error = None
+    used_attempts = 0
+    for attempt in range(1, attempts + 1):
+        used_attempts = attempt
+        try:
+            log(status_cb, f"Uploading video for the multimodal Audio Director "
+                           f"(attempt {attempt}/{attempts})...")
+            return pipeline.upload_media(Path(path), key)
+        except Exception as exc:  # noqa: BLE001 - urllib exposes several reset/timeout types
+            last_error = exc
+            message = str(exc).lower()
+            permanent = any(marker in message for marker in (
+                "balance is empty", "http 400", "http 401", "http 402", "http 403",
+                "http 404", "http 413", "http 415", "http 422",
+            ))
+            if attempt >= attempts or permanent:
+                break
+            delay = 2 ** attempt  # 2s, then 4s
+            log(status_cb, f"Audio Director upload connection failed ({exc.__class__.__name__}); "
+                           f"retrying in {delay}s.")
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Audio Director video upload failed after {used_attempts} attempt(s): {last_error}"
+    ) from last_error
+
+
+def plan_sfx_with_vision(video_path, duration, cuts, phrases, reasoning_model=None,
+                         status_cb=None, transitions_present=False, tags=None,
+                         sfx_amount="medium", impact_word=None):
+    """Upload the WHOLE video (visuals + audio) and ask the Gemini director for the
+    sfx_timeline. Returns normalized events or None on any failure (callers fall back)."""
+    key = os.environ.get("WAVESPEED_API_KEY", "")
+    if not key or not tags:
+        return None                       # config issue (no key / empty library) - not a call failure
+    model = _vision_model(reasoning_model)
+    # A real failure of the video/audio-URL call must ABORT the run (user rule: no silent fallback
+    # to the deterministic engine). Only a missing key / empty library returns None above.
+    proxy_path, proxy_dir = prepare_audio_director_proxy(Path(video_path), status_cb=status_cb)
+    try:
+        video_url, _ = upload_audio_director_media(
+            proxy_path, key, status_cb=status_cb, attempts=3)
+    finally:
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+    hints = [f"Video duration: {round(duration, 2)} seconds."]
+    if cuts:
+        hints.append("Detected hard-cut timestamps (sync hints): "
+                     + ", ".join(f"{c:.2f}" for c in cuts[:80]))
+    if phrases:
+        lines = [f'{p.get("start", 0):.2f}-{p.get("end", 0):.2f}: {p.get("text", "")}'
+                 for p in phrases[:120]]
+        hints.append("Timed transcript (sync hints):\n" + "\n".join(lines))
+    if impact_word:
+        hints.append(
+            f'IMPACT WORD (user-marked): "{impact_word}" is the single most important beat and occurs '
+            f'in the first ~0-5 seconds. Place the hook-riser CLIMAX and a strong impact hit EXACTLY on '
+            f"that word's timestamp (read it off the timed transcript above). Do NOT guess a different "
+            f"word for the main impact.")
+    hints.append("Analyze the attached video (visuals AND audio) and return the sfx_timeline JSON.")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system",
+             "content": build_sfx_director_prompt(tags, transitions_present=transitions_present)},
+            {"role": "user", "content": [
+                {"type": "video_url", "video_url": {"url": video_url}},
+                {"type": "text", "text": "\n\n".join(hints)},
+            ]},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4000,
+        "response_format": {"type": "json_object"},
+    }
+    log(status_cb, f"Audio Director ({model}) watching the video...")
+    data = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, payload, timeout=600)
+    parsed = agent_core.extract_json_object(data["choices"][0]["message"]["content"])
+    events = parse_sfx_timeline(parsed, duration)
+    if not events:
+        raise RuntimeError("Audio Director returned no usable sfx_timeline events.")
+    target = visual_semantic_target(duration, sfx_amount=sfx_amount)
+    visual_count = sum(1 for event in events if is_visual_semantic_event(event))
+    log(status_cb, f"Audio Director returned {len(events)} timed event(s); "
+                   f"visual semantic coverage {visual_count}/{target}.")
+    if visual_count < target:
+        missing = target - visual_count
+        log(status_cb, f"Audio Director visual coverage is low - scanning the video again for "
+                       f"{missing} visible action/overlay/reaction trigger(s)...")
+        repair_payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": build_visual_repair_prompt(tags, missing, events)},
+                {"role": "user", "content": [
+                    {"type": "video_url", "video_url": {"url": video_url}},
+                    {"type": "text", "text": (
+                        f"Video duration: {duration:.2f}s. Return up to {missing} precise "
+                        "visual-only semantic reaction events now."
+                    )},
+                ]},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2500,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            repair_data = agent_core.post_json_url(
+                agent_core.WAVESPEED_LLM_API, repair_payload, timeout=600)
+            repair_parsed = agent_core.extract_json_object(
+                repair_data["choices"][0]["message"]["content"])
+            repair_events = parse_sfx_timeline(repair_parsed, duration)
+            events, added = merge_visual_repair_events(events, repair_events, tags)
+            log(status_cb, f"Audio Director visual repair added {added} event(s) and replaced "
+                           "overlapping generic transitions where appropriate.")
+        except Exception as exc:  # keep the valid first plan, but make degraded coverage explicit
+            log(status_cb, f"Audio Director visual repair failed ({exc.__class__.__name__}: {exc}); "
+                           "using the first-pass events.")
+    return events
+
+
+def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_amount="medium",
+                            transitions_present=False, ffprobe=None, status_cb=None):
+    """Map the director's tags onto the human-labeled sound pools -> concrete mix segments.
+    Enforces: exactly one hook riser (start 0, duration-matched so it ends at end_timestamp),
+    a guaranteed impact at the riser climax, spacing/density caps, and the transition-redundancy
+    guard against SFX already present in the source audio."""
+    events = events or []                 # director may return None (no key / empty library) - never crash
+    import sfx_library
+    lib = data.get("library", {})
+    dedup = lambda xs: list(dict.fromkeys(xs))
+    transition_pool = dedup((lib.get("bright_whoosh") or []) + (lib.get("swipe_whoosh") or [])
+                            + (lib.get("whoosh_hit_combo") or []))
+    impact_pool = lib.get("impact_hit") or (data.get("reactions", {}).get("shock_reveal") or [])
+    ui_pool = lib.get("ui_click") or lib.get("caption_pop") or []
+    hook_pool = data.get("hook_risers") or data.get("risers") or []
+    reactions = data.get("reactions") or {}
+    existing_onsets = [float(o) for o in (existing_onsets or [])]
+    profile = sfx_amount_profile(sfx_amount)
+    max_events = max(6, int(profile["max_per_minute"] * max(duration, 1.0) / 60.0))
+
+    _dur_cache = {}
+
+    def fdur(path):
+        p = str(path)
+        if p not in _dur_cache:
+            _dur_cache[p] = media_duration(p, ffprobe) or 0.8
+        return _dur_cache[p]
+
+    _MAXDUR = {"impact": 0.7, "ui": 0.3, "transition": 0.5}
+    _DB = {"impact": sfx_library.CAT_DB.get("impact_hit", -5),
+           "ui": sfx_library.CAT_DB.get("ui_click", -15),
+           "transition": sfx_library.CAT_DB.get("bright_whoosh", -8)}
+
+    segments = []
+    rot = {}
+    placed_times = []
+    hook_done = False
+
+    def pick(pool, kind):
+        if not pool:
+            return None
+        k = rot.get(kind, 0)
+        rot[kind] = k + 1
+        return pool[k % len(pool)]
+
+    def spaced(t):
+        # ±0.1s "no additional sound" window (was ±0.22/0.3): reactions can land right on the
+        # spoken word even when it sits close to a cut, without doubling exactly on top of it.
+        return all(abs(t - pt) >= 0.10 for pt in placed_times)
+
+    # -- hook riser first (exactly one; extra risers dropped) --
+    riser_events = [e for e in events if e["sfx_type"] == "hook_riser"]
+    rest = [e for e in events if e["sfx_type"] != "hook_riser"]
+    if riser_events and hook_pool:
+        ev = riser_events[0]
+        end = float(ev.get("end_timestamp") or 0.0)
+        # An explicit director climax is authoritative, whether the hook is short or long.
+        # Reject only impossible/out-of-video values; do not silently replace a valid late beat.
+        if not (0.35 <= end <= max(0.35, duration - 0.05)):
+            # no usable climax time -> aim at the first non-riser event inside the hook window
+            cand = [e["timestamp"] for e in rest if 0.6 <= e["timestamp"] <= 5.5]
+            end = cand[0] if cand else min(2.5, max(1.2, duration * 0.15))
+        item, rlen, playback_rate = sfx_library.choose_riser_for_target(
+            hook_pool, end, duration_getter=fdur)
+        if item:
+            segments.append({"path": Path(item["path"]), "start": 0.0,
+                         "duration": round(end, 3), "source_trim": 0.0,
+                         "source_duration": round(rlen, 3),
+                         "playback_rate": round(playback_rate, 6),
+                         "volume": round(min(0.85, sfx_library.db_to_gain(-12)), 3),
+                         "category": "hook_riser",
+                         "reason": ev.get("trigger_detail") or "hook build-up"})
+            hook_done = True
+            log(status_cb, f"Hook riser: selected {Path(item['path']).name} ({rlen:.2f}s) "
+                           f"for 0.00->{end:.2f}s at {playback_rate:.3f}x.")
+        # guaranteed climax: an impact at the riser end unless the director already put one there
+        if impact_pool and not any(abs(e["timestamp"] - end) <= 0.10 for e in rest
+                                   if e["sfx_type"] in ("impact",) or e["sfx_type"].startswith("reaction")):
+            rest.append({"timestamp": round(end, 3), "sfx_type": "impact",
+                         "trigger_source": "backend", "trigger_detail": "riser climax (auto)",
+                         "reasoning": "guaranteed impact at hook_riser end"})
+            rest.sort(key=lambda e: e["timestamp"])
+
+    # TWO-PASS ORDER (user rule): place ALL structural/cut SFX first (transitions, impacts, ui),
+    # THEN the reaction SFX. This way cut sounds always claim their slot on the boundary and the
+    # reaction sounds fill the remaining gaps ON THE SPOKEN WORD instead of being snapped to the
+    # nearest cut. Each group stays in chronological order.
+    _structural = sorted((e for e in rest if e["sfx_type"] in ("transition", "impact", "ui")),
+                         key=lambda e: e["timestamp"])
+    _reactions = sorted((e for e in rest if str(e["sfx_type"]).startswith("reaction")),
+                        key=lambda e: e["timestamp"])
+    for ev in (_structural + _reactions):
+        if len(segments) >= max_events:
+            break
+        t = ev["timestamp"]
+        kind = ev["sfx_type"]
+        if kind == "hook_riser":
+            continue                                   # only one riser, already handled
+        if kind.startswith("reaction"):
+            slug = kind.split(":", 1)[-1].strip().replace(" ", "_")
+            pool = reactions.get(slug)
+            if not pool or not spaced(t):
+                continue
+            path = pick(pool, f"r:{slug}")
+            db = agent_core.REACTION_DB.get(slug, agent_core._REACTION_DB_DEFAULT)
+            if str(ev.get("trigger_source") or "").lower() == "visual":
+                db = max(db, -8)  # visual hits must remain as audible as the working money trigger
+            dur = min(fdur(path), 1.1)
+            cat = f"reaction_{slug}"
+        elif kind in ("impact", "ui", "transition"):
+            if kind == "transition":
+                if transitions_present:
+                    continue                           # render already has cut sounds
+                if any(abs(t - o) <= 0.14 for o in existing_onsets):
+                    continue                           # source audio already has one here
+            pool = {"impact": impact_pool, "ui": ui_pool, "transition": transition_pool}[kind]
+            if not pool or not spaced(t):
+                continue
+            path = pick(pool, kind)
+            db = _DB[kind]
+            dur = min(fdur(path), _MAXDUR[kind])
+            cat = "impact_hit" if kind == "impact" else ("ui_click" if kind == "ui" else "transition")
+        else:
+            continue                                   # unknown tag -> drop
+        segments.append({"path": Path(path), "start": round(t, 3),
+                         "duration": round(max(0.1, dur), 3),
+                         "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
+                         "category": cat,
+                         "reason": ev.get("trigger_detail") or ev.get("reasoning") or kind})
+        placed_times.append(t)
+
+    segments.sort(key=lambda s: s["start"])
+    log(status_cb, f"Audio Director resolved {len(segments)} event(s) onto the labeled library"
+                   + (" (incl. hook riser)" if hook_done else "") + ".")
+    return segments
+
+
+def apply_semantic_sfx_to_render(video_path, reasoning_model=None, status_cb=None,
+                                 sfx_amount="medium", phrases=None, cuts=None, impact_word=None):
+    """Script-to-Visuals post-render pass: the director watches the FINISHED render (which
+    already has transition whooshes on every cut) and adds semantic/reaction SFX + the hook
+    riser. ``impact_word`` (optional) is the user-marked word to anchor the hook impact on.
+    Mixes in place (same file). Returns the number of added SFX (0 = unchanged)."""
+    video_path = Path(video_path)
+    ffmpeg = pipeline.find_ffmpeg()
+    ffprobe = pipeline.find_ffprobe(ffmpeg)
+    if not ffmpeg or not video_path.exists():
+        return 0
+    duration = media_duration(video_path, ffprobe)
+    data = labeled_sfx_data(status_cb=None)
+    tags = vision_tag_catalog(data, transitions_present=True)
+    events = plan_sfx_with_vision(video_path, duration, cuts or [], phrases or [],
+                                  reasoning_model=reasoning_model, status_cb=status_cb,
+                                  transitions_present=True, tags=tags, impact_word=impact_word,
+                                  sfx_amount=sfx_amount)
+    if not events:
+        return 0
+    segments = resolve_vision_segments(events, data, duration, existing_onsets=None,
+                                       sfx_amount=sfx_amount, transitions_present=True,
+                                       ffprobe=ffprobe, status_cb=status_cb)
+    if not segments:
+        return 0
+    tmp = video_path.with_name(video_path.stem + "_semantic_tmp.mp4")
+    mix_into_video(video_path, segments, tmp, ffmpeg, ffprobe, duration, status_cb=status_cb)
+    os.replace(tmp, video_path)
+    # sidecar report so the placement is auditable
+    try:
+        side = video_path.with_name(video_path.stem + "_semantic_sfx.json")
+        side.write_text(json.dumps({"events": [
+            {"time": s["start"], "category": s["category"], "file": s["path"].name,
+             "reason": s["reason"]} for s in segments]}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return len(segments)
+
+
 def plan_sfx_with_llm(duration, cuts, phrases, catalog, reasoning_model=None, status_cb=None,
                       sfx_amount="medium"):
     if not os.environ.get("WAVESPEED_API_KEY") or not catalog:
@@ -417,10 +1007,17 @@ def mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, st
         input_index = index + 1
         label = f"s{index}"
         delay_ms = int(round(segment["start"] * 1000))
-        end = segment["duration"]
+        end = float(segment["duration"])
         fade_out = max(0.0, end - 0.06)
+        # source_trim: skip into the FILE (risers play their tail so the swell peaks on the beat)
+        src = max(0.0, float(segment.get("source_trim") or 0.0))
+        playback_rate = max(0.01, float(segment.get("playback_rate") or 1.0))
+        source_duration = float(segment.get("source_duration") or (end * playback_rate))
+        tempo = pipeline.atempo_filter_chain(playback_rate)
+        tempo_part = f",{tempo}" if tempo else ""
         filters.append(
-            f"[{input_index}:a]atrim=0:{end:.3f},asetpts=PTS-STARTPTS,"
+            f"[{input_index}:a]atrim={src:.3f}:{src + source_duration:.3f},"
+            f"asetpts=PTS-STARTPTS{tempo_part},atrim=0:{end:.3f},asetpts=PTS-STARTPTS,"
             f"aformat=sample_rates=44100:channel_layouts=stereo,"
             f"afade=t=out:st={fade_out:.3f}:d=0.060,volume={segment['volume']:.3f},"
             f"adelay={delay_ms}:all=1[{label}]"
@@ -581,6 +1178,8 @@ def _write_timeline_project(video_path, segments, scenes, duration, ffmpeg, enha
             "id": f"sfxm-{i:03d}", "scene_id": scene["id"],
             "path": str(seg["path"]), "offset": round(max(0.0, at - scene["start"]), 3),
             "duration": round(float(seg["duration"]), 3), "volume": float(seg["volume"]),
+            "source_duration": round(float(seg.get("source_duration") or 0.0), 3),
+            "playback_rate": round(float(seg.get("playback_rate") or 1.0), 6),
             "enabled": True, "label": Path(str(seg["path"])).stem.replace("_", " "),
         })
     config = {
@@ -669,42 +1268,75 @@ def enhance_video_with_sfx(video_path, reasoning_model=None, status_cb=None, out
     # still adds non-transition SFX (impacts, topic accents) elsewhere.
     existing_onsets = detect_existing_sfx_onsets(video_path, ffmpeg, status_cb=status_cb)
 
-    # Use the EXACT same SFX engine as the normal agent run: agent_core.place_editor_sfx over the
-    # user's local, classified sfx_library (variety rotation across cut sounds, per-category dB
-    # volumes/CAT_DB, short-punchy duration caps, density/spacing gates, big-moment impacts + topic
-    # accents). We synthesize the `scenes` it needs from this uploaded video's cuts + transcript.
+    # PRIMARY: the multimodal Audio Director - the model watches AND hears the whole video,
+    # then returns the sfx_timeline (hook_riser + impacts + semantic reactions + transitions
+    # only where the audio has none). Falls back to the deterministic editor engine on failure.
     plan_source = "editor_pack"
-    profile = sfx_amount_profile(sfx_amount)
     scenes = _scenes_from_cuts_and_phrases(cuts, phrases, duration)
-    sfx_config = {
-        "sfx_enabled": True,
-        "scenes": scenes,
-        "duration": duration,
-        "sfx_amount": str(sfx_amount or "medium"),
-        "editor_sfx_max_per_minute": int(profile["max_per_minute"]),
-        "editor_sfx_budget_cap": int(profile["budget_cap"]),
-        "existing_sfx_onsets": existing_onsets,   # skip NEW cut sounds where one already exists
-    }
-    log(status_cb, f"Placing editor SFX over {len(scenes)} cut point(s) with the local SFX library "
-                   f"(amount: {str(sfx_amount)}, same engine as a normal run)...")
-    agent_core.place_editor_sfx(sfx_config, reasoning_model=reasoning_model, status_cb=status_cb)
-    events = sfx_config.get("ai_content_sfx") or []
-    sfx_report = sfx_config.get("sfx_report") or {}
-    segments = [{
-        "path": Path(e["path"]), "start": float(e["start"]),
-        "duration": float(e["duration"]), "volume": float(e["volume"]),
-        "category": e.get("category") or e.get("sfx_type") or "sfx",
-        "reason": e.get("sfx_type") or e.get("category") or "",
-    } for e in events if e.get("path")]
+    segments = []
+    sfx_report = {}
+    if os.environ.get("WAVESPEED_API_KEY"):
+        # Vision Audio Director is REQUIRED here (a key is present). Any failure of the
+        # video/audio-URL call ABORTS the run - NO silent fallback to the local engine (user rule).
+        data_lib = labeled_sfx_data(status_cb=status_cb)
+        tags = vision_tag_catalog(data_lib, transitions_present=False)
+        vision_events = plan_sfx_with_vision(video_path, duration, cuts, phrases,
+                                             reasoning_model=reasoning_model,
+                                             status_cb=status_cb, transitions_present=False,
+                                             tags=tags, sfx_amount=sfx_amount)   # raises on upload/first-pass failure
+        segments = resolve_vision_segments(vision_events, data_lib, duration,
+                                           existing_onsets=existing_onsets,
+                                           sfx_amount=sfx_amount, transitions_present=False,
+                                           ffprobe=ffprobe, status_cb=status_cb)
+        if not segments:
+            raise RuntimeError("Audio Director produced no placeable SFX for this video.")
+        plan_source = "vision_director"
+        sfx_report = {
+            "vision_timeline": vision_events,
+            "visual_semantic_count": sum(1 for event in vision_events
+                                         if is_visual_semantic_event(event)),
+            "visual_semantic_target": visual_semantic_target(duration, sfx_amount),
+            "audio_semantic_count": sum(
+                1 for event in vision_events
+                if str(event.get("trigger_source") or "").lower() == "audio"
+                and _tag_key(event.get("sfx_type")) not in ("hook_riser", "transition")
+            ),
+        }
+
+    if not segments:
+        # No API key -> the deterministic engine (same as a normal agent run) over cuts + transcript.
+        profile = sfx_amount_profile(sfx_amount)
+        sfx_config = {
+            "sfx_enabled": True,
+            "scenes": scenes,
+            "duration": duration,
+            "sfx_amount": str(sfx_amount or "medium"),
+            "editor_sfx_max_per_minute": int(profile["max_per_minute"]),
+            "editor_sfx_budget_cap": int(profile["budget_cap"]),
+            "existing_sfx_onsets": existing_onsets,   # skip NEW cut sounds where one already exists
+        }
+        log(status_cb, f"Placing editor SFX over {len(scenes)} cut point(s) with the local SFX library "
+                       f"(amount: {str(sfx_amount)}, same engine as a normal run)...")
+        agent_core.place_editor_sfx(sfx_config, reasoning_model=reasoning_model, status_cb=status_cb)
+        events = sfx_config.get("ai_content_sfx") or []
+        sfx_report = sfx_config.get("sfx_report") or {}
+        segments = [{
+            "path": Path(e["path"]), "start": float(e["start"]),
+            "duration": float(e["duration"]), "volume": float(e["volume"]),
+            "source_trim": float(e.get("source_trim") or 0.0),
+            "source_duration": float(e.get("source_duration") or 0.0),
+            "playback_rate": float(e.get("playback_rate") or 1.0),
+            "category": e.get("category") or e.get("sfx_type") or "sfx",
+            "reason": e.get("sfx_type") or e.get("category") or "",
+        } for e in events if e.get("path")]
+        if segments:
+            # FILE-LEVEL review only for the deterministic path (the director already reasoned).
+            segments = refine_segments_with_llm(segments, phrases, reasoning_model=reasoning_model,
+                                                status_cb=status_cb, sfx_amount=sfx_amount)
     log(status_cb, f"Placed {len(segments)} sound effect(s) [{plan_source}].")
     if not segments:
         raise RuntimeError("No sound effects placed - your soundeffects/ library has no usable clips. "
                            "Drop SFX files into the soundeffects/ folder and try again.")
-
-    # FILE-LEVEL review: the reasoning model vetoes/swaps picks that don't fit the moment
-    # (no bells/melodic hits on plain cuts, no repeats, drop instead of wrong sound).
-    segments = refine_segments_with_llm(segments, phrases, reasoning_model=reasoning_model,
-                                        status_cb=status_cb, sfx_amount=sfx_amount)
 
     mix_into_video(video_path, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
     log(status_cb, "SFX enhancement complete.")
