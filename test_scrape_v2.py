@@ -64,6 +64,37 @@ def test_query_diversity():
           v.diversify_queries(["一人ご飯 vlog", "一人ご飯 vlog", "一人ご飯　vlog"]) == ["一人ご飯 vlog"])
 
 
+def test_architect_raw_queries_and_multi_sort():
+    intent = v.VisualIntent(
+        scene_id=1, scene_text="strict school discipline", match_category="shock",
+        subject="students", action="synchronized drill", location="school gym",
+        english_queries=["strict school drill caught", "synchronized students fail"],
+        japanese_queries=["学校 厳しい あるある", "体育 一斉行動", "school 厳しい", "日本語（訳）"])
+    queries = v.queries_for_intent(intent)
+    texts = [q.query for q in queries]
+    check("Architect English strings pass through unchanged", "strict school drill caught" in texts)
+    check("native Japanese string passes through unchanged", "学校 厳しい あるある" in texts)
+    check("Romaji/English is rejected from Japanese queries", "school 厳しい" not in texts)
+    check("annotated Japanese is rejected", "日本語（訳）" not in texts)
+
+    calls = []
+    original = v.clip_scraper.backend_search
+    try:
+        def fake_search(query, limit, status_cb=None, sort=None, platforms=None, deadline=None):
+            calls.append((query, sort))
+            return []
+        v.clip_scraper.backend_search = fake_search
+        state = {}
+        v._search_sources(queries[:1], ["tiktok", "x"], None, None, set(), state, None,
+                          sort="RELEVANCE")
+    finally:
+        v.clip_scraper.backend_search = original
+    check("each raw term searches relevance + likes + views",
+          [mode for _, mode in calls] == ["RELEVANCE", "MOST_LIKED", "MOST_VIEWED"])
+    check("sort passes are reported", state.get("sort_pass_counts") == {
+          "RELEVANCE": 1, "MOST_LIKED": 1, "MOST_VIEWED": 1})
+
+
 # ---- relevance-first ranking ----------------------------------------------
 def test_ranking_relevance_over_likes():
     q = v.SearchQueryV2(query="office worker asleep train", language="en", tier="exact_action",
@@ -214,7 +245,8 @@ def test_v1_untouched():
 
 
 if __name__ == "__main__":
-    for t in (test_settings, test_query_diversity, test_ranking_relevance_over_likes,
+    for t in (test_settings, test_query_diversity, test_architect_raw_queries_and_multi_sort,
+              test_ranking_relevance_over_likes,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)

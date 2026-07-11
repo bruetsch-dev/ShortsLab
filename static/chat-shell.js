@@ -14,6 +14,20 @@ const BOOT = JSON.parse(document.getElementById("chat-boot").textContent);
 const T = BOOT.strings;
 const OPT = BOOT.options;
 const MAN = BOOT.manifest;
+const REASONING = BOOT.reasoningConfig || {};
+
+function reasoningOptions(modelId, previous) {
+  const cfg = REASONING[modelId];
+  if (!cfg) return { options: [], value: "" };
+  const valid = (cfg.options || []).some(o => o.value === previous);
+  return { options: cfg.options || [], value: valid ? previous : cfg.defaultValue };
+}
+function appendReasoningField(card, modelId, holder) {
+  const rm = reasoningOptions(modelId, holder.reasoning_mode);
+  if (!rm.options.length) { holder.reasoning_mode = ""; return; }
+  holder.reasoning_mode = rm.value;
+  card.appendChild(selectField("Reasoning mode", rm.options, rm.value, v => holder.reasoning_mode = v));
+}
 
 /* ------------------------------------------------------------------ tiny dom helpers */
 const $ = (id) => document.getElementById(id);
@@ -85,7 +99,7 @@ let S = {
   draft: true,
 };
 let FILES = {};             // step -> File (not persisted across reload)
-let pollTimer = null, jobsTimer = null, saveTimer = null;
+let pollTimer = null, jobsTimer = null, saveTimer = null, scrapePreviewTimer = null;
 let lastProgressHTML = "", lastMediaHTML = "", lastOutputsHTML = "", announcedPhases = [];
 
 function persist() {
@@ -289,10 +303,19 @@ function renderScriptFlow() {
     } else if (S.step === "reasoning") {
       const c = card();
       c.appendChild(choiceButtons(OPT.reasoning_model, S.values.reasoning_model, v => {
-        S.values.reasoning_model = v; completeStep("reasoning", "voice");
+        S.values.reasoning_model = v;
+        S.values.reasoning_mode = reasoningOptions(v, S.values.reasoning_mode).value;
+        renderAll(); persist();
       }));
+      const rm = reasoningOptions(S.values.reasoning_model, S.values.reasoning_mode);
+      if (rm.options.length) {
+        S.values.reasoning_mode = rm.value;
+        c.appendChild(selectField("Reasoning mode", rm.options, rm.value, v => S.values.reasoning_mode = v));
+        c.appendChild(el("div", "hint", "Higher reasoning can improve difficult tasks but may increase response time and cost."));
+      }
       const foot = el("div", "card-foot");
       foot.appendChild(btn(T.back, () => editStep("source"), "ghost"));
+      foot.appendChild(btn("Continue", () => completeStep("reasoning", "voice"), "primary"));
       c.appendChild(foot);
       setComposer("off"); return;
     }
@@ -710,12 +733,14 @@ function renderMasterFlow(kind) {
     }
     if (kind === "sfx") {
       c.appendChild(selectField(T.planning_agent, OPT.master_reasoning, S.master.reasoning_model,
-        v => S.master.reasoning_model = v));
+        v => { const changed=!!S.master.reasoning_model&&S.master.reasoning_model!==v; S.master.reasoning_model = v; S.master.reasoning_mode = reasoningOptions(v, S.master.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
+      appendReasoningField(c, S.master.reasoning_model || firstVal(OPT.master_reasoning), S.master);
       c.appendChild(selectField(T.sfx_amount, OPT.master_sfx_amount, S.master.sfx_amount || "medium",
         v => S.master.sfx_amount = v));
     } else if (kind === "visual") {
       c.appendChild(selectField(T.analysis_agent, OPT.vfx_reasoning, S.master.reasoning_model,
-        v => S.master.reasoning_model = v));
+        v => { const changed=!!S.master.reasoning_model&&S.master.reasoning_model!==v; S.master.reasoning_model = v; S.master.reasoning_mode = reasoningOptions(v, S.master.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
+      appendReasoningField(c, S.master.reasoning_model || firstVal(OPT.vfx_reasoning), S.master);
       c.appendChild(selectField(T.effect_amount, OPT.vfx_amount, S.master.vfx_amount || "medium",
         v => S.master.vfx_amount = v));
       c.appendChild(toggleField(T.neko_toggle, S.master.add_characters !== false,
@@ -743,9 +768,11 @@ async function submitMaster(kind) {
   fd.append(man.file, FILES.master_video);
   if (kind === "sfx") {
     fd.append("reasoning_model", S.master.reasoning_model || firstVal(OPT.master_reasoning));
+    fd.append("reasoning_mode", S.master.reasoning_mode || "");
     fd.append("sfx_amount", S.master.sfx_amount || "medium");
   } else if (kind === "visual") {
     fd.append("reasoning_model", S.master.reasoning_model || firstVal(OPT.vfx_reasoning));
+    fd.append("reasoning_mode", S.master.reasoning_mode || "");
     fd.append("vfx_amount", S.master.vfx_amount || "medium");
     if (S.master.add_characters !== false) fd.append("add_characters", "on");
   } else {
@@ -879,7 +906,10 @@ function renderLongformFlow() {
   if (S.completed.includes("script") && !S.jobId && (S.step === "settings" || S.step === "review")) {
     const c = card();
     if (OPT.longform_tts.length) c.appendChild(selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model, v => S.longform.tts_model = v));
-    if (OPT.longform_reasoning.length) c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => S.longform.reasoning_model = v));
+    if (OPT.longform_reasoning.length) {
+      c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
+      appendReasoningField(c, S.longform.reasoning_model || firstVal(OPT.longform_reasoning), S.longform);
+    }
     c.appendChild(el("div", "card-cap", esc(T.connections)));
     c.appendChild(connectionRow("higgsfield", T.connect_higgsfield, "/higgsfield-status", "/higgsfield-login"));
     const foot = el("div", "card-foot");
@@ -895,6 +925,7 @@ async function submitLongform() {
   fd.append("script", S.longform.script || "");
   fd.append("tts_model", S.longform.tts_model || firstVal(OPT.longform_tts) || "pro");
   fd.append("reasoning_model", S.longform.reasoning_model || firstVal(OPT.longform_reasoning) || "anthropic/claude-opus-4.8");
+  fd.append("reasoning_mode", S.longform.reasoning_mode || "");
   const c = card(); c.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
   try {
     const r = await fetch("/longform-run", { method: "POST", body: fd });
@@ -1011,6 +1042,9 @@ function renderJobSection() {
   typedMsg(chat, T.project_started);
   // #111 - assigned footage grid (ONLY the clips chosen for scenes) sits at the TOP
   const mwrap = el("div"); mwrap.id = "job-media"; chat.appendChild(mwrap);
+  const scrapeView=el("div","scrape-browser-card"); scrapeView.id="scrape-browser-card"; scrapeView.hidden=true;
+  scrapeView.innerHTML='<div class="scrape-browser-head"><b>Live scrape browser</b><span id="scrape-browser-meta"></span></div><img id="scrape-browser-image" alt="Current TikTok or X scraper page">';
+  chat.appendChild(scrapeView);
   // technical console (terminal-styled, collapsible)
   const tcard = card("term-card"); tcard.id = "job-tech-card";
   const thead = el("div", "term-head");
@@ -1049,9 +1083,24 @@ function renderJobSection() {
   // outputs / result container (appears below the box when the run completes)
   const owrap = el("div"); owrap.id = "job-out"; chat.appendChild(owrap);
   pollJob(); pollTimer = setInterval(pollJob, 2500);
+  pollScrapeBrowser(); scrapePreviewTimer=setInterval(pollScrapeBrowser,3000);
   setComposer("off");
 }
-function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if(scrapePreviewTimer){clearInterval(scrapePreviewTimer);scrapePreviewTimer=null;} }
+
+async function pollScrapeBrowser(){
+  const card=$("scrape-browser-card"), image=$("scrape-browser-image"), meta=$("scrape-browser-meta");
+  if(!card||!image)return;
+  try{
+    const d=await jget('/scrape-browser-status');
+    if(!d.available){card.hidden=true;return;}
+    card.hidden=false;
+    meta.textContent=[d.platform,d.query,d.sort].filter(Boolean).join(' · ');
+    if(String(image.dataset.version||'')!==String(d.version)){
+      image.dataset.version=String(d.version); image.src='/scrape-browser-preview?v='+encodeURIComponent(d.version);
+    }
+  }catch(e){card.hidden=true;}
+}
 
 /* deterministic event → message adapter (template text only; typed like a chatbot) */
 const PHASE_RULES = [
@@ -1388,6 +1437,8 @@ async function renderAssetsView() {
 }
 function assetCard(p) {
   const c = el("div", "asset-card2");
+  const previewKind=p.failed?'failed':(p.kind||p.preview_kind||'');
+  if(previewKind)c.classList.add('project-kind-'+previewKind);
   const hideB = el("button", "ahide", S.showHidden ? "↺" : "✕");
   hideB.title = S.showHidden ? T.unhide : T.hide;
   hideB.setAttribute("aria-label", hideB.title);

@@ -627,15 +627,24 @@ def _caption_display_word(word):
     return (word or "").strip(_CAPTION_EDGE_PUNCT)
 
 
-def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None):
+def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None, fps=None):
     """Turn a spoken line into timed caption chunks (1-`max_words` words each).
 
     When `word_times` (frame-accurate [{word,start,end}] in scene-local seconds) is
     given, the words land exactly on the voice like a real edit. Otherwise each
     word's window is estimated inside the scene by length/syllable weight.
+
+    When `fps` is given, each word onset is snapped to the render frame grid so the
+    highlight flips exactly ON a frame instead of landing sub-frame (which reads as lag).
     """
     if duration <= 0:
         return []
+
+    def _snap(t):
+        if not fps or fps <= 0:
+            return t
+        return round(float(t) * fps) / float(fps)
+
     spans = []
     if word_times:
         # Perceptual sync: flip each word a touch EARLY. Viewers read a caption as "on the
@@ -646,10 +655,10 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
             word = _caption_display_word(wt.get("word") or "")
             if not word:
                 continue
-            start = max(0.0, float(wt.get("start", 0.0)) - CAPTION_SYNC_LEAD)
+            start = _snap(max(0.0, float(wt.get("start", 0.0)) - CAPTION_SYNC_LEAD))
             if spans and start < spans[-1]["start"] + 0.03:
                 start = spans[-1]["start"] + 0.03
-            end = max(start + 0.05, float(wt.get("end", start)) - CAPTION_SYNC_LEAD)
+            end = max(start + 0.05, _snap(float(wt.get("end", start)) - CAPTION_SYNC_LEAD))
             if spans and spans[-1]["end"] > start:
                 spans[-1]["end"] = start           # keep spans gap-free + non-overlapping
             spans.append({
@@ -2900,7 +2909,7 @@ def render_video(config, basename=None):
                 })
             chunks = build_caption_chunks(
                 str(row.get("text") or ""), end - start, caption_max_words,
-                caption_uppercase, word_times=word_times)
+                caption_uppercase, word_times=word_times, fps=fps)
             for chunk in chunks:
                 shifted = dict(chunk)
                 shifted["start"] = float(chunk["start"]) + start
@@ -2916,7 +2925,7 @@ def render_video(config, basename=None):
             sdur = max(0.1, float(scene["end"]) - float(scene["start"]))
             caption_chunks_by_scene[sid] = build_caption_chunks(
                 ctext, sdur, caption_max_words, caption_uppercase,
-                word_times=scene.get("word_timings"),
+                word_times=scene.get("word_timings"), fps=fps,
             )
         if bool(config.get("export_caption_pngs", True)):
             try:

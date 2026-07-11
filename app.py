@@ -64,6 +64,8 @@ import sfx_agent
 import caption_agent
 import visual_agent
 import viral_transformation
+import reasoning_modes
+import scrape_browser_preview
 try:
     from reddit_story_mode import story_generator as reddit_stories
     from reddit_story_mode import orchestrator as reddit_orchestrator
@@ -157,6 +159,7 @@ UI_TEXT_DEFAULTS = {
     "seedance_clip_count": "4",
     "seedance_model": "seedance-2.0",
     "reasoning_model": "openai/gpt-5.5",
+    "reasoning_mode": "medium",
     "loaded_project_mode": "normal",
     "run_type": "normal",
     "speaker_name": "Narrator",
@@ -533,6 +536,8 @@ def project_form_state(project_dir):
         state["video_model"] = "seedance-2.0" 
     if wavespeed.get("reasoning_model"):
         state["reasoning_model"] = str(wavespeed.get("reasoning_model"))
+        state["reasoning_mode"] = reasoning_modes.validate_reasoning_mode(
+            state["reasoning_model"], wavespeed.get("reasoning_mode")) or ""
     state["autonomous_director"] = bool(agent.get("director_enabled", True))
     state["use_audio_timing"] = True
     state["use_llm_search"] = True
@@ -2470,7 +2475,7 @@ def app_script():
             var state = collectFormState();
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","reasoning_mode","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -3007,7 +3012,42 @@ def page(title, body, refresh=None, body_class=""):
                   'document.documentElement.classList.add("theme-dark");}catch(e){}</script>')
     return f"""<!doctype html>
     <html lang="en" translate="no"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google" content="notranslate">{theme_boot}{meta}{icons}<title>{esc(title)}</title>{app_style()}</head>
-    <body{f' class="{esc(body_class)}"' if body_class else ""}><main>{body}</main>{app_script()}</body></html>""".encode("utf-8")
+    <body{f' class="{esc(body_class)}"' if body_class else ""}><main>{body}</main>{app_script()}{reasoning_selector_script()}</body></html>""".encode("utf-8")
+
+
+def reasoning_selector_script():
+    cfg = json.dumps(reasoning_modes.public_config(), ensure_ascii=False).replace("</", "<\\/")
+    return f'''<script>
+    (function(){{
+      const CFG={cfg};
+      function attach(model, index){{
+        if(model.dataset.reasoningAttached)return;
+        model.dataset.reasoningAttached='1';
+        const wrap=document.createElement('label'); wrap.className='reasoning-mode-field';
+        wrap.style.cssText='display:block;min-height:58px;margin-top:7px';
+        const cap=document.createElement('span'); cap.textContent='Reasoning mode';
+        cap.style.cssText='display:block;font-size:11px;font-weight:700;margin-bottom:4px';
+        const select=document.createElement('select');
+        select.name=model.name==='reasoning_model'?'reasoning_mode':'reasoning_mode_'+index;
+        select.setAttribute('aria-label','Reasoning mode');
+        const help=document.createElement('small');
+        help.textContent='Higher reasoning can improve difficult tasks but may increase response time and cost.';
+        help.style.cssText='display:block;opacity:.65;font-size:10px;margin-top:3px';
+        wrap.append(cap,select,help); model.insertAdjacentElement('afterend',wrap);
+        function sync(){{
+          const c=CFG[model.value], previous=select.value;
+          if(!c){{wrap.hidden=true;select.innerHTML='';select.disabled=true;return;}}
+          wrap.hidden=false;select.disabled=false;select.innerHTML='';
+          c.options.forEach(o=>{{const x=document.createElement('option');x.value=o.value;x.textContent=o.label;select.appendChild(x);}});
+          const initial=model.dataset.reasoningValue||'';
+          select.value=c.options.some(o=>o.value===previous)?previous:(c.options.some(o=>o.value===initial)?initial:c.defaultValue);
+          model.dataset.reasoningValue='';
+          help.textContent=(c.apiMode==='responses-pro'&&select.value==='pro')?'Pro mode uses deeper reasoning and may be slower and more expensive.':'Higher reasoning can improve difficult tasks but may increase response time and cost.';
+        }}
+        model.addEventListener('change',sync);select.addEventListener('change',sync);sync();
+      }}
+      document.querySelectorAll('select[name="reasoning_model"]').forEach(attach);
+    }})();</script>'''
 
 
 def scrape_trainer_runs():
@@ -3307,7 +3347,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <div class="cbar-cell reasoning-cell">
             <span class="cbar-cap">Reasoning model</span>
-            <select name="reasoning_model">
+            <select name="reasoning_model" data-reasoning-value="{esc(state.get('reasoning_mode') or '')}">
               <option value="anthropic/claude-fable-5"{' selected' if state.get("reasoning_model") == "anthropic/claude-fable-5" else ""}>Claude Fable 5 (newest, top quality)</option>
               <option value="anthropic/claude-sonnet-5"{' selected' if state.get("reasoning_model") == "anthropic/claude-sonnet-5" else ""}>Claude Sonnet 5 (fast, high quality)</option>
               <option value="anthropic/claude-opus-4.8"{' selected' if state.get("reasoning_model") == "anthropic/claude-opus-4.8" else ""}>Claude Opus 4.8 (best 4.x quality)</option>
@@ -3316,6 +3356,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="openai/gpt-5.6-terra"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-terra" else ""}>GPT-5.6 Terra</option>
               <option value="openai/gpt-5.6-luna"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-luna" else ""}>GPT-5.6 Luna</option>
               <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
+              <option value="google/gemini-3.1-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-flash-lite" else ""}>Gemini 3.1 Flash Lite</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
             </select>
           </div>
@@ -3616,6 +3657,7 @@ def sfx_page():
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
+            <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent detects scene changes, reads the timed transcript, and chooses sound effects from your local <code>soundeffects/</code> library.</div>
@@ -3670,6 +3712,7 @@ def visual_page():
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
+            <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent looks at real frames + the timed transcript, finds the concrete on-screen target per punchy moment, and only then places an arrow at it.</div>
@@ -3837,6 +3880,7 @@ def longform_page():
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
+            <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
           </select>
         </div>
 
@@ -4077,6 +4121,7 @@ def start_sfx_job(fields, files):
     fields = dict(fields)
     video_path = save_upload(files.get("video_file"), job_id)
     reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
+    reasoning_mode = fields.get("reasoning_mode")
     sfx_amount = str(fields.get("sfx_amount", "medium") or "medium").strip().lower()
     if sfx_amount not in ("low", "medium", "high"):
         sfx_amount = "medium"
@@ -4110,6 +4155,7 @@ def start_sfx_job(fields, files):
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             status_cb("Started.")
             result = sfx_agent.enhance_video_with_sfx(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb,
@@ -4139,7 +4185,7 @@ def start_sfx_job(fields, files):
     return job_id
 
 
-def start_redo_sfx_job(slug, reasoning_model=None, sfx_amount="medium", mode="redo", regen_captions=False):
+def start_redo_sfx_job(slug, reasoning_model=None, reasoning_mode=None, sfx_amount="medium", mode="redo", regen_captions=False):
     """Timeline "Redo SFX": run a NORMAL SFX-Master pass over the project's LATEST render
     (no upload). Same engine as /sfx-run - the multimodal Audio Director watches the render.
     ``regen_captions`` re-aligns captions FIRST (so a combined "redo captions + redo SFX" rework
@@ -4176,6 +4222,7 @@ def start_redo_sfx_job(slug, reasoning_model=None, sfx_amount="medium", mode="re
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             if regen_captions:
                 _regenerate_project_captions(slug, status_cb=status_cb)
             status_cb(f"{'Add more' if mode == 'add' else 'Redo'} SFX on {Path(render).name}...")
@@ -4209,6 +4256,7 @@ def start_visual_job(fields, files):
     fields = dict(fields)
     video_path = save_upload(files.get("video_file"), job_id)
     reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
+    reasoning_mode = fields.get("reasoning_mode")
     add_characters = str(fields.get("add_characters", "")).lower() in ("on", "true", "1", "yes")
     vfx_amount = str(fields.get("vfx_amount", "medium") or "medium").strip().lower()
     if vfx_amount not in ("low", "medium", "high"):
@@ -4237,6 +4285,7 @@ def start_visual_job(fields, files):
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             status_cb("Started.")
             result = visual_agent.enhance_video_with_arrows(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb,
@@ -4494,6 +4543,7 @@ def start_longform_video_job(fields):
     if tts_model not in ("pro", "flash"):
         tts_model = "pro"
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
+    reasoning_mode = fields.get("reasoning_mode")
     cancel_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -4530,6 +4580,7 @@ def start_longform_video_job(fields):
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = longform_video.run_longform_video(
                 script, tts_model=tts_model, reasoning_model=reasoning_model,
                 status_cb=status_cb, cancel_event=cancel_event)
@@ -5577,15 +5628,19 @@ def project_summary(project_dir):
 def asset_card(summary, hidden_view=False):
     thumb = summary.get("thumb")
     has_video = bool(summary.get("video") and Path(summary["video"]).exists())
+    preview_status = "failed" if summary.get("failed") else str(summary.get("preview_kind") or "")
+    preview_label = {"sfx": "SFX", "vfx": "VFX", "failed": "FAILED"}.get(preview_status, "")
+    status_class = f" preview-status preview-{preview_status}" if preview_label else ""
+    badge_html = (f'<span class="asset-preview-label">{preview_label}</span>' if preview_label else "")
     if thumb and Path(thumb).exists() and is_image_path(thumb):
         thumb_html = (
-            f'<button class="asset-figure preview-button" type="button" data-preview-src="{link_for(thumb)}" data-preview-title="{esc(summary["title"])}">'
-            f'<img class="asset-thumb" loading="lazy" src="{link_for(thumb)}" alt="{esc(summary["title"])}"></button>'
+            f'<button class="asset-figure preview-button{status_class}" type="button" data-preview-src="{link_for(thumb)}" data-preview-title="{esc(summary["title"])}">'
+            f'<img class="asset-thumb" loading="lazy" src="{link_for(thumb)}" alt="{esc(summary["title"])}">{badge_html}</button>'
         )
     elif has_video:
-        thumb_html = f'<div class="asset-figure"><video class="asset-thumb" preload="none" muted data-lazy-src="{link_for(summary["video"])}"></video></div>'
+        thumb_html = f'<div class="asset-figure{status_class}"><video class="asset-thumb" preload="none" muted data-lazy-src="{link_for(summary["video"])}"></video>{badge_html}</div>'
     else:
-        thumb_html = '<div class="asset-figure"><div class="asset-thumb"></div></div>'
+        thumb_html = f'<div class="asset-figure{status_class}"><div class="asset-thumb"></div>{badge_html}</div>'
 
     slug = summary["slug"]
     # "Check results" opens the final video if it exists, otherwise the project folder.
@@ -5613,7 +5668,7 @@ def asset_card(summary, hidden_view=False):
                       f'delete anything)" aria-label="Hide project" '
                       f'onclick="setAssetHidden(\'{esc(slug)}\', true, this)">&#10005;</button>')
     return f"""
-    <article class="panel asset-card">
+    <article class="panel asset-card{' project-' + preview_status if preview_label else ''}">
       {corner_btn}
       {thumb_html}
       <div class="asset-body">
@@ -5748,6 +5803,20 @@ def assets_page(show_hidden=False):
     {toggle}
     <style>
       .asset-card {{ position: relative; }}
+      .asset-card .asset-figure.preview-status {{ position:relative; border-width:3px; border-style:solid;
+        box-sizing:border-box; }}
+      .asset-card .asset-figure.preview-sfx {{ border-color:#7c5cff; }}
+      .asset-card .asset-figure.preview-vfx {{ border-color:#f0912b; }}
+      .asset-card .asset-figure.preview-failed {{ border-color:var(--danger, #d84b4b); }}
+      .asset-preview-label {{ position:absolute; z-index:5; left:8px; top:8px; padding:3px 8px;
+        border-radius:5px; color:#fff; font-size:10px; line-height:1.25; font-weight:800;
+        letter-spacing:.06em; box-shadow:0 1px 4px rgba(0,0,0,.45); }}
+      .preview-sfx .asset-preview-label {{ background:#7c5cff; }}
+      .preview-vfx .asset-preview-label {{ background:#f0912b; }}
+      .preview-failed .asset-preview-label {{ background:var(--danger, #d84b4b); }}
+      .asset-card.project-sfx {{ border-color:#7c5cff; }}
+      .asset-card.project-vfx {{ border-color:#f0912b; }}
+      .asset-card.project-failed {{ border-color:var(--danger, #d84b4b); }}
       .asset-titlerow {{ display: flex; align-items: flex-start; gap: 8px; }}
       .asset-titlerow h2 {{ flex: 1 1 auto; min-width: 0; margin: 0; }}
       /* Selector must out-specify the global `button:not(.preview-button)` rule (0,1,1) which sets
@@ -5852,7 +5921,7 @@ TIMELINE_SKELETON = """
           <label class="tl-chk" id="tl-rw-add-sfx-wrap"><input type="checkbox" id="tl-rw-add-sfx"> add more SFX</label>
           <label class="tl-chk" id="tl-rw-redo-cap-wrap"><input type="checkbox" id="tl-rw-redo-captions"> redo captions</label>
           <label class="tl-pop-field" for="tl-rw-model">Rework model</label>
-          <select id="tl-rw-model">
+          <select id="tl-rw-model" name="reasoning_model">
             <option value="anthropic/claude-fable-5">Claude Fable 5</option>
             <option value="anthropic/claude-sonnet-5">Claude Sonnet 5</option>
             <option value="anthropic/claude-opus-4.8">Claude Opus 4.8</option>
@@ -5861,6 +5930,7 @@ TIMELINE_SKELETON = """
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
+            <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
           </select>
           <button type="button" id="tl-script-btn" hidden>Change script</button>
@@ -6389,6 +6459,7 @@ TIMELINE_ASSETS = """
   }
   if(replaceLabel&&model.clip_source==='scrape') replaceLabel.textContent='search TikTok/X for selected clips';
   var reworkModelSelect=document.getElementById('tl-rw-model');
+  if(reworkModelSelect) reworkModelSelect.dataset.reasoningValue=model.reasoning_mode||'';
   if(reworkModelSelect) reworkModelSelect.value=model.reasoning_model||'openai/gpt-5.5';
   var slug = rootEl.getAttribute('data-slug');
   var scenes = (model.scenes||[]).map(function(s){ return Object.assign({}, s); });
@@ -7568,6 +7639,7 @@ TIMELINE_ASSETS = """
     var doAddSfx=document.getElementById('tl-rw-add-sfx').checked;
     var doRedoCaptions=(redoCapToggle&&redoCapToggle.checked)||false;
     var reworkModel=document.getElementById('tl-rw-model').value||model.reasoning_model||'openai/gpt-5.5';
+    var reworkReasoning=(document.querySelector('#tl-rw-model + .reasoning-mode-field select')||{}).value||'';
     if(!doReplace && !doRecut && !doRevoice && !doRedoSfx && !doAddSfx && !doRedoCaptions){ alert('Pick at least one rework option.'); return; }
     // Multiple options CAN be combined in one run. Only two genuine conflicts remain:
     if(doRedoSfx&&doAddSfx){ alert('Choose either redo SFX or add more SFX (not both).'); return; }
@@ -7575,7 +7647,7 @@ TIMELINE_ASSETS = """
     if((doReplace||doRecut||doRevoice)&&(doRedoSfx||doAddSfx)){ alert('Run the SFX rework separately from media/speech changes.'); return; }
     if(doReplace && !Object.keys(markedReplace).length){ alert('Mark at least one clip\\'s media to replace (select a clip, then tick \"Mark this clip\\'s media to be replaced\").'); return; }
     var btn=this; btn.disabled=true; btn.textContent='Starting…';
-    fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, redo_sfx:doRedoSfx, add_more_sfx:doAddSfx, redo_captions:doRedoCaptions, sfx_amount:reworkSfxAmount, reasoning_model:reworkModel, replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
+    fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, redo_sfx:doRedoSfx, add_more_sfx:doAddSfx, redo_captions:doRedoCaptions, sfx_amount:reworkSfxAmount, reasoning_model:reworkModel, reasoning_mode:reworkReasoning, replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
       .then(function(r){return r.json();})
       .then(function(d){ if(d&&d.ok&&d.job){ window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert((d&&d.error)||'Could not start rework.'); } })
       .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert('Could not start rework.'); });
@@ -8838,6 +8910,9 @@ def timeline_model(slug):
         "clip_source": str(config.get("clip_source") or "generate"),
         "reasoning_model": str((config.get("wavespeed") or {}).get("reasoning_model")
                                or "openai/gpt-5.5"),
+        "reasoning_mode": reasoning_modes.validate_reasoning_mode(
+            str((config.get("wavespeed") or {}).get("reasoning_model") or "openai/gpt-5.5"),
+            (config.get("wavespeed") or {}).get("reasoning_mode")),
         "scrape_sort": str(config.get("scrape_sort") or "MOST_LIKED"),
         "script_text": _project_script_text(project_dir, config),
         "hook_text": str(_project_run_form(project_dir).get("hook_text") or "").strip(),
@@ -8970,7 +9045,7 @@ def start_timeline_job(slug, edits, regen_captions=False):
     return job_id
 
 
-def start_timeline_social_replace_job(slug, scene_ids, reasoning_model=None):
+def start_timeline_social_replace_job(slug, scene_ids, reasoning_model=None, reasoning_mode=None):
     """Background job for targeted TikTok/X replacement of marked timeline scenes."""
     job_id = str(int(time.time() * 1000))
     cancel_event = threading.Event()
@@ -8994,6 +9069,7 @@ def start_timeline_social_replace_job(slug, scene_ids, reasoning_model=None):
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = agent_core.replace_timeline_scrape_scenes(
                 slug, scene_ids, status_cb=status_cb, cancel_event=cancel_event,
                 reasoning_model_override=reasoning_model)
@@ -9081,7 +9157,7 @@ def _persist_job_error(project_dir, kind, exc, tb):
         pass
 
 
-def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=None):
+def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=None, reasoning_mode=None):
     """Regenerate narration, retime the saved timeline, and optionally replace marked social clips."""
     replace_scene_ids = [str(value) for value in (replace_scene_ids or []) if str(value)]
     job_id = str(int(time.time() * 1000))
@@ -9106,6 +9182,7 @@ def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=Non
 
     def worker():
         try:
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = agent_core.regenerate_timeline_speech(
                 slug, status_cb=status_cb, cancel_event=cancel_event,
                 render=not bool(replace_scene_ids))
@@ -10225,6 +10302,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(tiktok_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/higgsfield-status":
             self.send_bytes(higgsfield_status_payload(), "application/json; charset=utf-8")
+        elif parsed.path == "/scrape-browser-status":
+            self.send_bytes(json.dumps(scrape_browser_preview.status()).encode("utf-8"),
+                            "application/json; charset=utf-8")
+        elif parsed.path == "/scrape-browser-preview":
+            shot = scrape_browser_preview.snapshot().get("jpeg") or b""
+            if not shot:
+                self.send_error(404)
+            else:
+                self.send_bytes(shot, "image/jpeg")
         elif parsed.path == "/job":
             job_id = q_all.get("id", [""])[0]
             if legacy:
@@ -10788,8 +10874,11 @@ class Handler(BaseHTTPRequestHandler):
             if reasoning_model not in {"anthropic/claude-fable-5", "anthropic/claude-sonnet-5",
                                        "anthropic/claude-opus-4.8", "openai/gpt-5.5",
                                        "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
-                                       "google/gemini-3.5-flash", "google/gemini-3.1-pro-preview"}:
+                                       "google/gemini-3.5-flash", "google/gemini-3.1-flash-lite",
+                                       "google/gemini-3.1-pro-preview"}:
                 reasoning_model = "openai/gpt-5.5"
+            reasoning_mode = reasoning_modes.validate_reasoning_mode(reasoning_model, data.get("reasoning_mode"))
+            reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             # 1) persist the current timeline (order/durations/etc.) so the rework builds on it
             try:
                 agent_core.save_timeline_edits(slug, data.get("edits") or {})
@@ -10804,7 +10893,7 @@ class Handler(BaseHTTPRequestHandler):
                 if do_redo_sfx and do_add_more_sfx:
                     self.send_bytes(json.dumps({"ok": False, "error": "Choose either redo SFX or add more SFX."}).encode("utf-8"), "application/json; charset=utf-8")
                     return
-                job_id = start_redo_sfx_job(slug, reasoning_model=reasoning_model, sfx_amount=sfx_amount,
+                job_id = start_redo_sfx_job(slug, reasoning_model=reasoning_model, reasoning_mode=reasoning_mode, sfx_amount=sfx_amount,
                                             mode="add" if do_add_more_sfx else "redo",
                                             regen_captions=do_redo_captions)
                 self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
@@ -10833,7 +10922,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_bytes(json.dumps({"ok": False, "error": "Mark at least one scrape clip for replacement."}).encode("utf-8"), "application/json; charset=utf-8")
                         return
                 job_id = start_timeline_revoice_job(slug, replace_ids if do_replace else None,
-                                                    reasoning_model=reasoning_model)
+                                                    reasoning_model=reasoning_model,
+                                                    reasoning_mode=reasoning_mode)
                 self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
             # Scrape projects replace marked scenes by running a NEW targeted TikTok/X search.
@@ -10849,7 +10939,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_bytes(json.dumps({"ok": False, "error": "Mark at least one scrape clip for replacement."}).encode("utf-8"), "application/json; charset=utf-8")
                         return
                     job_id = start_timeline_social_replace_job(slug, replace_ids,
-                                                               reasoning_model=reasoning_model)
+                                                               reasoning_model=reasoning_model,
+                                                               reasoning_mode=reasoning_mode)
                     self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
                     return
             # 2) resolve the marked clips' replaceable media paths
@@ -10867,6 +10958,7 @@ class Handler(BaseHTTPRequestHandler):
             fields["slug"] = slug
             fields["loaded_project_mode"] = "recut_existing_only"
             fields["reasoning_model"] = reasoning_model
+            fields["reasoning_mode"] = reasoning_mode or ""
             if replace_paths:
                 fields["initial_replace_media_path"] = replace_paths
             job_id = start_job(fields, {})

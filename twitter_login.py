@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import threading
+import scrape_browser_preview
 import time
 from pathlib import Path
 
@@ -393,14 +394,17 @@ class Session:
                 nav_ms = 45000 if deadline is None else max(
                     1000, min(45000, int((deadline - time.monotonic()) * 1000)))
                 page.goto(url, timeout=nav_ms, wait_until="domcontentloaded")
+                scrape_browser_preview.capture(page, "X", query, sort)
             except Exception as exc:
                 _status(cb, f"X search: navigation failed for {query!r} ({exc.__class__.__name__}).")
             page.wait_for_timeout(2200)
+            scrape_browser_preview.capture(page, "X", query, sort)
             scrolls, stagnant, last_n = 0, 0, len(collected)
             while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)
+                scrape_browser_preview.capture(page, "X", query, sort)
                 scrolls += 1
                 if len(collected) <= last_n:
                     stagnant += 1

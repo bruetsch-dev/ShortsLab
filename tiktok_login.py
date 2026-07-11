@@ -31,6 +31,7 @@ import json
 import subprocess
 import time
 import threading
+import scrape_browser_preview
 from pathlib import Path
 
 try:
@@ -608,12 +609,14 @@ class Session:
                 nav_ms = 45000 if deadline is None else max(
                     1000, min(45000, int((deadline - time.monotonic()) * 1000)))
                 page.goto(url, timeout=nav_ms, wait_until="domcontentloaded")
+                scrape_browser_preview.capture(page, "TikTok", query, sort)
             except Exception as exc:
                 _status(cb, f"TikTok search: navigation failed for {query!r} ({exc.__class__.__name__}).")
             # let the first XHR settle, then scroll ADAPTIVELY: a dead query fails FAST (settle +
             # one probe scroll ~4s instead of a fixed 8-scroll ~14s), and a productive query stops
             # as soon as two consecutive scrolls add nothing new (results stagnated).
             page.wait_for_timeout(1800)
+            scrape_browser_preview.capture(page, "TikTok", query, sort)
             self._maybe_dismiss_overlays(page)
             scrolls = 0
             stagnant = 0
@@ -622,6 +625,7 @@ class Session:
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)
+                scrape_browser_preview.capture(page, "TikTok", query, sort)
                 scrolls += 1
                 if len(collected) <= last_n:
                     stagnant += 1

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import reasoning_modes
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -252,7 +253,7 @@ RUN_MANIFEST = {
     ],
     # text/select fields: always posted with their current value
     "text": [
-        "loaded_project_source", "loaded_project_mode", "reasoning_model",
+        "loaded_project_source", "loaded_project_mode", "reasoning_model", "reasoning_mode",
         "clip_source", "video_model", "image_model", "scraping_engine",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "script",
         "hook_text", "impact_word", "script_relevancy", "visual_script", "speaker_name",
@@ -425,7 +426,7 @@ def projects_list_payload(show_hidden=False, limit=200):
                                     else app.view_for(s.get("project_dir"), "assets")),
                     "has_timeline": bool(app.project_has_render(s.get("slug"))),
                     # sidebar/asset overlay: "sfx" / "vfx" for a Master-processed upload, else "".
-                    "kind": _project_kind(s.get("slug"), s.get("title")),
+                    "kind": s.get("preview_kind") or _project_kind(s.get("slug"), s.get("title")),
                 }
                 items.append(item)
             except Exception:
@@ -479,6 +480,7 @@ def chat_shell_page(initial=None):
         "version": CHAT_UI_VERSION,
         "strings": UI_STRINGS,
         "options": opts,
+        "reasoningConfig": reasoning_modes.public_config(),
         "manifest": {"run": RUN_MANIFEST, "masters": MASTER_MANIFESTS},
         "uiState": app.load_ui_state(),
         "connections": connections,

@@ -21,6 +21,7 @@ import wave
 from pathlib import Path
 
 import pipeline
+import reasoning_modes
 
 
 ROOT = Path(__file__).resolve().parent
@@ -53,6 +54,7 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".webm", ".mp4", 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WAVESPEED_LLM_API = "https://llm.wavespeed.ai/v1/chat/completions"
+WAVESPEED_RESPONSES_API = "https://llm.wavespeed.ai/v1/responses"
 # DuckDuckGo's unofficial image endpoint constantly returns 403 / times out (bot
 # blocking), which stalled every search. Bing + Wikimedia are reliable, so DDG is
 # dropped from the active providers (the duckduckgo_* helpers are kept but unused).
@@ -2403,6 +2405,24 @@ def assert_paid_api_allowed(what="paid API"):
 
 
 def post_json_url(url, payload, timeout=75):
+    payload = dict(payload or {})
+    model_id = str(payload.get("model") or "")
+    requested_mode = payload.pop("reasoning_mode", None)
+    selected_mode = reasoning_modes.validate_reasoning_mode(
+        model_id, requested_mode if requested_mode is not None else reasoning_modes.current_reasoning_mode(model_id))
+    reasoning_payload = reasoning_modes.build_reasoning_payload(model_id, selected_mode)
+    endpoint = reasoning_modes.get_wavespeed_endpoint(model_id, selected_mode)
+    if url == WAVESPEED_LLM_API:
+        payload.update(reasoning_payload)
+        if endpoint == "responses":
+            url = WAVESPEED_RESPONSES_API
+            messages = payload.pop("messages", [])
+            payload["input"] = reasoning_modes.responses_input(messages)
+            if "max_tokens" in payload:
+                payload["max_output_tokens"] = payload.pop("max_tokens")
+            payload.pop("response_format", None)
+    print(f"WaveSpeed request: model={model_id} reasoning={selected_mode or 'unsupported'} "
+          f"endpoint={endpoint} payload={reasoning_payload}")
     assert_paid_api_allowed(url)
     # Thinking models (Gemini 2.x/3.x, GLM, Qwen, DeepSeek...) spend output tokens
     # on internal reasoning; a low max_tokens then yields EMPTY content
@@ -2430,7 +2450,16 @@ def post_json_url(url, payload, timeout=75):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            result = json.loads(response.read().decode("utf-8"))
+            if endpoint == "responses" and "choices" not in result:
+                text = str(result.get("output_text") or "")
+                if not text:
+                    for item in result.get("output", []) or []:
+                        for content in item.get("content", []) or []:
+                            if content.get("type") in ("output_text", "text"):
+                                text += str(content.get("text") or "")
+                result["choices"] = [{"message": {"role": "assistant", "content": text}}]
+            return result
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -8579,6 +8608,9 @@ def run_project(form, status_cb=None):
     check_cancel(form)
     script = clean_text(form.get("script", ""))
     reasoning_model = form.get("reasoning_model", "openai/gpt-5.5")
+    reasoning_mode = reasoning_modes.set_current_reasoning_mode(
+        reasoning_model, form.get("reasoning_mode"))
+    log(status_cb, f"Reasoning: model={reasoning_model}, mode={reasoning_mode or 'unsupported'}")
     # Collaborative reasoning: GPT-5.5 drafts, Opus 4.8 critiques & corrects (edit map + review).
     # Default False here so an unchecked box (absent) is honoured; the UI renders it on by default.
     collaborate_reasoning = form_flag(form, "collaborative_reasoning", False)
@@ -8717,8 +8749,13 @@ def run_project(form, status_cb=None):
             import voice_align
             if voice_align.available():
                 log(status_cb, "Aligning script to voice (faster-whisper) for frame-accurate timing...")
+                # The voiceover we generated is sped to voice_speed; tell the aligner so it
+                # de-speeds a copy to x1.0 for tighter word boundaries (uploaded audio = x1.0).
+                _align_speed = (resolve_voice_speed(form, form.get("clip_source"))
+                                if form_flag(form, "generate_voice", True) else 1.0)
                 audio_analysis, word_timeline_cache = voice_align.analysis_from_audio(
                     audio_path, script_text=script, duration=audio_duration, status_cb=status_cb,
+                    speed=_align_speed,
                 )
                 if audio_analysis:
                     if not script:
@@ -10052,6 +10089,8 @@ def run_project(form, status_cb=None):
     config["wavespeed"]["video_enable_web_search"] = seedance_model_choice in ("seedance-2.0", "seedance-2.0-fast")
     config["wavespeed"]["image_model"] = image_model_choice  # resolved before plan_config
     config["wavespeed"]["reasoning_model"] = form.get("reasoning_model", "openai/gpt-5.5")
+    config["wavespeed"]["reasoning_mode"] = reasoning_modes.validate_reasoning_mode(
+        config["wavespeed"]["reasoning_model"], form.get("reasoning_mode"))
     # The music PICKER is the single source of truth: "None" means NO background music, even
     # when the "Background music" output toggle is on. Previously the toggle alone enabled the
     # mood-based auto-pick in generate mode, silently attaching a bed the user never chose.
@@ -10213,7 +10252,10 @@ def run_project(form, status_cb=None):
             timeline = word_timeline_cache
             if not timeline and voice_align.available():
                 log(status_cb, "Aligning script to voice for frame-accurate word timing...")
-                timeline = voice_align.word_timeline(str(audio_path), script_text=script, status_cb=status_cb)
+                _align_speed = (resolve_voice_speed(form, form.get("clip_source"))
+                                if form_flag(form, "generate_voice", True) else 1.0)
+                timeline = voice_align.word_timeline(str(audio_path), script_text=script,
+                                                     status_cb=status_cb, speed=_align_speed)
             if timeline:
                 voice_align.snap_scene_boundaries(
                     config["scenes"], timeline, float(config.get("duration") or 0.0)

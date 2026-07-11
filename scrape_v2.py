@@ -135,6 +135,8 @@ class AlternativeVisualIntent:
     jp_subject: str = ""
     jp_action: str = ""
     jp_location: str = ""
+    english_queries: list = field(default_factory=list)
+    japanese_queries: list = field(default_factory=list)
 
 
 @dataclass
@@ -155,6 +157,10 @@ class VisualIntent:
     jp_subject: str = ""
     jp_action: str = ""
     jp_location: str = ""
+    # Architect Agent output: raw, directly executable platform search strings.
+    match_category: str = "vibe"       # literal | vibe | shock
+    english_queries: list = field(default_factory=list)
+    japanese_queries: list = field(default_factory=list)
 
     @property
     def intent_id(self) -> str:
@@ -364,6 +370,38 @@ def queries_for_intent(intent: VisualIntent):
     real TikTok search finds nothing with an 8-word phrase. English phrases are kept only as a low
     backup tier. Every block is length-capped and the relevance-`expected_*` carry the Japanese
     tokens so metadata ranking matches the (Japanese) captions. Diversified per tier."""
+    # New Architect plans already contain exact raw strings. Preserve them byte-for-byte after
+    # validation; do not recombine/translate them in the Scraper Agent.
+    direct = []
+    primary_tier = "exact_action" if intent.match_category == "literal" else (
+        "semantic_action" if intent.match_category == "vibe" else "creator_style")
+
+    def add_direct(values, language, tier, subject, action, location):
+        for raw in values or []:
+            direct.append(SearchQueryV2(
+                query=raw, language=language, tier=tier, visual_intent_id=intent.intent_id,
+                expected_subject=subject, expected_action=action, expected_location=location,
+                negative_terms=list(intent.avoid_elements or [])))
+
+    add_direct(_clean_english_queries(intent.english_queries), "en", primary_tier,
+               intent.subject, intent.action, intent.location)
+    add_direct(_clean_japanese_queries(intent.japanese_queries), "ja", primary_tier,
+               intent.subject, intent.action, intent.location)
+    for alt in (intent.alternative_visuals or [])[:3]:
+        add_direct(_clean_english_queries(alt.english_queries, 2), "en", "semantic_action",
+                   alt.subject, alt.action, alt.location)
+        add_direct(_clean_japanese_queries(alt.japanese_queries, 2), "ja", "semantic_action",
+                   alt.subject, alt.action, alt.location)
+    if direct:
+        out, seen = [], set()
+        for query in direct:
+            key = (query.language, query.query.casefold())
+            if key not in seen:
+                seen.add(key)
+                out.append(query)
+        return out[:SCRAPE_V2_CONFIG["max_queries_per_bucket"]]
+
+    # Backward-compatible fallback for old cached plans that predate raw query arrays.
     # English (backup only) - capped so even these stay short.
     subj = _cap_tokens(intent.subject, 3)
     act = _cap_tokens(intent.action, 4)
@@ -541,8 +579,8 @@ def rank_metadata_candidates_v2(candidates, query: SearchQueryV2, platform_count
 
 # ---------------------------------------------------------------- planner (LLM)
 
-def build_social_search_plan_v2(title, script, scenes, understanding=None, reasoning_model=None,
-                                status_cb=None):
+def _build_social_search_plan_v2_legacy(title, script, scenes, understanding=None, reasoning_model=None,
+                                        status_cb=None):
     """Turn each scene into a CONCRETE, OBSERVABLE VisualIntent (+ >=2 alternatives). The planner is
     explicitly forbidden from emitting abstract themes ('loneliness', 'work culture') as the final
     search unit - it must produce visible situations ('office worker asleep on late train')."""
@@ -626,6 +664,160 @@ def build_social_search_plan_v2(title, script, scenes, understanding=None, reaso
     _log(status_cb, f"Scrape V2: planned {len(intents)} visible visual intent(s) "
                     f"(+{sum(len(it.alternative_visuals) for it in intents)} alternatives).")
     return intents
+
+
+_JP_QUERY_ALLOWED_RE = re.compile(r"^[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f0-9#\s]+$")
+
+
+def _clean_english_queries(values, limit=4):
+    """Accept only plain, short raw search strings (never notes/labels/JSON fragments)."""
+    out = []
+    for value in values if isinstance(values, list) else []:
+        query = " ".join(str(value or "").split()).strip()
+        if not query or len(query) > 90 or any(ch in query for ch in "()[]{}:/"):
+            continue
+        if len(re.findall(r"[A-Za-z0-9]+", query)) < 2:
+            continue
+        if query.lower().startswith(("english", "query", "search")):
+            continue
+        if query.lower() not in {item.lower() for item in out}:
+            out.append(query)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _clean_japanese_queries(values, limit=4):
+    """Enforce raw native Japanese strings: no Romaji, translations or annotations can leak."""
+    out = []
+    for value in values if isinstance(values, list) else []:
+        query = " ".join(str(value or "").split()).strip()
+        if not query or len(query) > 50 or not _JP_QUERY_ALLOWED_RE.fullmatch(query):
+            continue
+        if not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", query):
+            continue
+        if query not in out:
+            out.append(query)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_viral_search_plan_v2(title, script, scenes, understanding=None, reasoning_model=None,
+                                status_cb=None):
+    """Architect Agent: tangible viral B-roll concepts + raw EN/JA platform search strings."""
+    ac = _ac()
+    if not (script or "").strip():
+        return []
+    numbered = "\n".join(
+        f"scene {i}: {(ac.scene_text_for_planning(s) or s.get('script', ''))[:180]}"
+        for i, s in enumerate(scenes))
+    system = (
+        "You are the Architect Agent for fast viral B-roll in the 'Wildest School Rules' style. "
+        "Your JSON is executed autonomously by a TikTok/X Scraper Agent. Never make a boring "
+        "sentence translation. Extract the underlying object, action, emotion, awkwardness or shock, "
+        "then describe what it physically looks like in authentic phone footage. JSON only.")
+    prompt = ac.understanding_brief(understanding) + f"""
+For every scene choose exactly one visual_match_category:
+- literal: direct visual proof is important.
+- vibe: turn an abstract feeling into a concrete scannable action.
+- shock: use exaggeration, awkwardness, surprise or meme humor as a retention hook.
+
+Examples: "no free time" -> student asleep at desk or massive textbook pile. "strict discipline"
+-> perfectly synchronized drill. "romance banned" -> awkward teenage couple or teacher intervening.
+Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
+visible subject, visible action and plausible location.
+
+For the primary concept return 2-4 english_queries and 2-4 japanese_queries. For each alternative
+return 1-2 of each. These arrays are exact raw strings sent directly to TikTok and X. English phrases
+must be targeted and organic; use POV/caught/fail only when it naturally finds user footage.
+Japanese strings must be what local users write, including useful native slang such as あるある or
+厳しい. ABSOLUTE RULE: every japanese_queries string contains ONLY Kanji, Hiragana, Katakana, spaces,
+digits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.
+Never translate the full narration sentence. Arrays contain strings only.
+
+Scenes:
+{numbered}
+
+Return exactly:
+{{"intents":[{{"scene_id":0,"visual_type":"concrete|context|abstract",
+"visual_match_category":"literal|vibe|shock","subject":"...","action":"...","location":"...",
+"camera_style":"pov|handheld|vlog|static|walking","mood":"...",
+"required_elements":["..."],"optional_elements":["..."],"avoid_elements":["..."],
+"english_queries":["raw phrase"],"japanese_queries":["日本語検索"],
+"alternatives":[{{"subject":"...","action":"...","location":"...","camera_style":"...",
+"mood":"...","english_queries":["raw phrase"],"japanese_queries":["日本語検索"]}}]}}]}}
+"""
+    data = _llm_json([{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                     max_tokens=10000, temperature=0.35, reasoning_model=reasoning_model)
+    rows = data.get("intents") if isinstance(data.get("intents"), list) else []
+    if not rows:
+        _log(status_cb, "Scrape V2 Architect returned no executable plan; retrying once with lower variance...")
+        data = _llm_json([{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                         max_tokens=8000, temperature=0.1, reasoning_model=reasoning_model)
+        rows = data.get("intents") if isinstance(data.get("intents"), list) else []
+    intents, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            sid = int(row.get("scene_id"))
+        except (TypeError, ValueError):
+            continue
+        if sid in seen or not 0 <= sid < len(scenes):
+            continue
+        seen.add(sid)
+        category = str(row.get("visual_match_category") or "vibe").strip().lower()
+        if category not in ("literal", "vibe", "shock"):
+            category = "vibe"
+        visual_type = str(row.get("visual_type") or "context").strip().lower()
+        if visual_type not in ("concrete", "context", "abstract"):
+            visual_type = "context"
+        alternatives = []
+        for alt in (row.get("alternatives") or [])[:3]:
+            if isinstance(alt, dict):
+                alternatives.append(AlternativeVisualIntent(
+                    subject=str(alt.get("subject") or ""), action=str(alt.get("action") or ""),
+                    location=str(alt.get("location") or ""),
+                    camera_style=str(alt.get("camera_style") or ""), mood=str(alt.get("mood") or ""),
+                    english_queries=_clean_english_queries(alt.get("english_queries"), 2),
+                    japanese_queries=_clean_japanese_queries(alt.get("japanese_queries"), 2)))
+        intents.append(VisualIntent(
+            scene_id=sid, scene_text=(ac.scene_text_for_planning(scenes[sid]) or "")[:200],
+            visual_type=visual_type, match_category=category,
+            subject=str(row.get("subject") or ""), action=str(row.get("action") or ""),
+            location=str(row.get("location") or ""), camera_style=str(row.get("camera_style") or ""),
+            mood=str(row.get("mood") or ""), required_elements=list(row.get("required_elements") or []),
+            optional_elements=list(row.get("optional_elements") or []),
+            avoid_elements=list(row.get("avoid_elements") or []), alternative_visuals=alternatives,
+            english_queries=_clean_english_queries(row.get("english_queries")),
+            japanese_queries=_clean_japanese_queries(row.get("japanese_queries"))))
+    missing = [sid for sid in range(len(scenes)) if sid not in seen]
+    if missing:
+        _log(status_cb, f"Scrape V2 Architect omitted {len(missing)} scene(s); using the legacy visual "
+                        "planner only for those scenes (never raw narration fragments).")
+        legacy = _build_social_search_plan_v2_legacy(
+            title, script, scenes, understanding=understanding, reasoning_model=reasoning_model,
+            status_cb=status_cb)
+        legacy_by_id = {item.scene_id: item for item in legacy
+                        if item.subject or item.location or item.jp_subject or item.jp_action}
+        for sid in missing:
+            if sid in legacy_by_id:
+                intents.append(legacy_by_id[sid])
+    intents.sort(key=lambda item: item.scene_id)
+    _log(status_cb, "Scrape V2 Architect: %d tangible visual intent(s), %d raw EN/JA queries." %
+         (len(intents), sum(len(i.english_queries) + len(i.japanese_queries) for i in intents)))
+    if not intents or not any(queries_for_intent(item) for item in intents):
+        raise RuntimeError("Scrape V2 Architect could not generate any valid visual search phrases after retry.")
+    return intents
+
+
+def build_social_search_plan_v2(title, script, scenes, understanding=None, reasoning_model=None,
+                                status_cb=None):
+    """Public V2 planner entry point retained for trainers/callers; now uses the viral Architect."""
+    return build_viral_search_plan_v2(
+        title, script, scenes, understanding=understanding, reasoning_model=reasoning_model,
+        status_cb=status_cb)
 
 
 # ---------------------------------------------------------------- proxy download + segments
@@ -1275,6 +1467,7 @@ def build_debug_report(state: dict) -> dict:
         "engine": "scrape_v2",
         "analysis_version": V2_ANALYSIS_VERSION,
         "queries_executed": state.get("queries_executed", 0),
+        "sort_pass_counts": dict(state.get("sort_pass_counts") or {}),
         "raw_results": state.get("raw_results", 0),
         "metadata_candidates": state.get("metadata_candidates", 0),
         "downloaded_sources": state.get("downloaded_sources", 0),
@@ -1316,8 +1509,11 @@ def _hook_presenter_queries_v2():
     Reuses the same query pool as the V1 hook finder (agent_core.HOOK_PRESENTER_QUERIES)."""
     pools = getattr(_ac(), "HOOK_PRESENTER_QUERIES", {}) or {}
     out = []
+    # Six strong terms are enough. Each is searched under relevance/likes/views, so the old
+    # 18-term pool caused ~54 serial browser searches and could spend 15 minutes on the hook alone.
+    limits = {"exact": 2, "social": 1, "english": 2, "hashtag": 1}
     for group, lang in (("exact", "ja"), ("social", "ja"), ("english", "en"), ("hashtag", "ja")):
-        for q in (pools.get(group) or [])[:6]:
+        for q in (pools.get(group) or [])[:limits[group]]:
             out.append(SearchQueryV2(
                 query=q, language=lang, tier="exact_action", visual_intent_id="hook_influencer",
                 expected_subject="young adult Japanese female creator",
@@ -1329,31 +1525,44 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
                     sort="RELEVANCE"):
     """Run a batch of SearchQueryV2 through the dual backend, dedupe by source_id, relevance-rank.
 
-    ``sort`` is the backend result order (RELEVANCE | MOST_LIKED | MOST_VIEWED | MOST_RECENT).
-    Default RELEVANCE = TikTok's own topical order, which returns far more on-topic Japanese
-    footage for a Japanese query than MOST_LIKED (which surfaces big Western viral clips)."""
+    Every raw Architect query is executed through multiple result orders. This combines topical
+    relevance with the most-liked/most-viewed pools instead of betting a scene on one ranking."""
     ranked_all = []
     plat_counts, creator_counts = {}, {}
+    preferred = str(sort or "RELEVANCE").upper()
+    if preferred == "ALL":
+        preferred = "RELEVANCE"
+    sort_passes = list(dict.fromkeys(
+        [preferred, "RELEVANCE", "MOST_LIKED", "MOST_VIEWED"]))
+    sort_passes = [mode for mode in sort_passes
+                   if mode in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT")]
     for q in queries:
         if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
             break
-        items = clip_scraper.backend_search(q.query, 12, status_cb=status_cb, sort=sort,
-                                            platforms=platforms, deadline=deadline) or []
-        state["queries_executed"] = state.get("queries_executed", 0) + 1
-        state["raw_results"] = state.get("raw_results", 0) + len(items)
-        fresh = []
-        for it in items:
-            src = _item_to_source(it, q)
-            if src is None or src.source_id in seen_source_ids:
-                continue
-            seen_source_ids.add(src.source_id)
-            fresh.append(src)
-        state["metadata_candidates"] = state.get("metadata_candidates", 0) + len(fresh)
-        ranked = rank_metadata_candidates_v2(fresh, q, plat_counts, creator_counts)
-        for s in ranked:
-            plat_counts[s.platform.lower()] = plat_counts.get(s.platform.lower(), 0) + 1
-            creator_counts[s.creator_id.lower()] = creator_counts.get(s.creator_id.lower(), 0) + 1
-        ranked_all.extend(ranked)
+        for sort_mode in sort_passes:
+            if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
+                break
+            if status_cb:
+                _log(status_cb, f'Scrape V2 query [{sort_mode}]: "{q.query}"')
+            items = clip_scraper.backend_search(q.query, 8, status_cb=status_cb, sort=sort_mode,
+                                                platforms=platforms, deadline=deadline) or []
+            state["queries_executed"] = state.get("queries_executed", 0) + 1
+            state.setdefault("sort_pass_counts", {})[sort_mode] = (
+                state.setdefault("sort_pass_counts", {}).get(sort_mode, 0) + 1)
+            state["raw_results"] = state.get("raw_results", 0) + len(items)
+            fresh = []
+            for it in items:
+                src = _item_to_source(it, q)
+                if src is None or src.source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(src.source_id)
+                fresh.append(src)
+            state["metadata_candidates"] = state.get("metadata_candidates", 0) + len(fresh)
+            ranked = rank_metadata_candidates_v2(fresh, q, plat_counts, creator_counts)
+            for source in ranked:
+                plat_counts[source.platform.lower()] = plat_counts.get(source.platform.lower(), 0) + 1
+                creator_counts[source.creator_id.lower()] = creator_counts.get(source.creator_id.lower(), 0) + 1
+            ranked_all.extend(ranked)
     ranked_all.sort(key=lambda s: s.rank_score, reverse=True)
     return ranked_all
 
@@ -1512,6 +1721,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     V1-compatible 7-tuple. Stashes assignments + debug report on config['_scrape_v2']. Loops until
     enough final usable segments exist for every scene or a budget is hit."""
     cfg = SCRAPE_V2_CONFIG
+    try:
+        import scrape_browser_preview
+        scrape_browser_preview.clear()
+    except Exception:
+        pass
     # Backend result order chosen by the user (default RELEVANCE = TikTok's topical order, which
     # returns far more on-topic Japanese footage than MOST_LIKED's Western viral bias).
     sort_mode = str(config.get("scrape_sort") or config.get("search_sort") or "RELEVANCE").upper()
@@ -1528,9 +1742,9 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     state = {"rejections": {}, "scene_reports": [], "_downloaded_ids": set()}
 
     _log(status_cb, "Scrape V2: Visual scenes planning...")
-    intents = build_social_search_plan_v2(config.get("title") or "", script_text or "", scenes,
-                                          understanding=understanding, reasoning_model=reasoning_model,
-                                          status_cb=status_cb)
+    intents = build_viral_search_plan_v2(config.get("title") or "", script_text or "", scenes,
+                                         understanding=understanding, reasoning_model=reasoning_model,
+                                         status_cb=status_cb)
     body_intents = [it for it in intents if it.scene_id != 0]
     hook_intent = next((it for it in intents if it.scene_id == 0), None)
 
