@@ -5339,6 +5339,39 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
 
     events, sfx_events_report = [], []
     hit_scenes = set()   # scenes that already got an impact hit -> reaction pass skips them
+
+    # ---- word-accurate timing helpers (voice_align word timeline) ----
+    _words = [w for w in (config.get("canonical_words") or [])
+              if isinstance(w, dict) and w.get("word")]
+
+    def _norm_word(x):
+        return re.sub(r"[^\w']+", "", str(x or "").lower())
+
+    def _find_word_time(token, t_min=0.0, t_max=None):
+        """(start, end) of the first occurrence of `token` in the voice timeline window."""
+        token = _norm_word(token)
+        if not token:
+            return None
+        for w in _words:
+            try:
+                ws, we = float(w.get("start") or 0.0), float(w.get("end") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ws < t_min - 0.05 or (t_max is not None and ws > t_max + 0.05):
+                continue
+            if _norm_word(w.get("word")) == token:
+                return ws, we
+        return None
+
+    # HOOK ARC (user spec): the hook riser runs 0 -> the IMPACT WORD, and the impact hit fires
+    # exactly there - never at 0.0 (that placed a random impact-pool sound on frame one).
+    _hook_end = float(scenes[1].get("start", 0.0) or 0.0) if len(scenes) > 1 else 0.0
+    _hook_beat = _hook_end
+    _iw = str(config.get("impact_word") or "").strip()
+    if _iw:
+        hit = _find_word_time(_iw, 0.0, (_hook_end + 1.5) if _hook_end > 0 else None)
+        if hit:
+            _hook_beat = hit[0]          # riser peaks ON the word onset; impact fires there
     # Script-to-Visuals semantic-vision mode: the multimodal Audio Director adds hook riser,
     # impacts, reactions and callout sounds AFTER the render (it watches the finished video).
     # Here we then place ONLY the frame-accurate cut transitions - everything else is skipped
@@ -5369,10 +5402,16 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         if i == 0:
             if semantic_vision:
                 continue                       # the vision pass owns the hook (riser + climax impact)
-            cat, reason, t, loud, link_visual = "impact_hit", "hook_opening", start, True, "hook_start"
+            # impact lands where the hook riser peaks (impact word / body start) - NOT at 0.0
+            cat, reason, t, loud, link_visual = "impact_hit", "hook_opening", max(0.4, _hook_beat), True, "hook_start"
         elif fx.get("freeze_frame") and not semantic_vision:
             cat, reason, t, link_visual = "camera_flash", "freeze_frame", start, "freeze"
         elif (not semantic_vision) and (fx.get("impact_shake") or _scene_is_big_moment(sc)):
+            # a line that literally says death belongs to the WORD-TIMED death gong (reaction
+            # pass) - a generic impact at the scene start would fire seconds before the word
+            if any(w in txt for w in REACTION_TRIGGERS.get("death", ())) \
+                    and (data.get("reactions", {}) or {}).get("death"):
+                continue
             if any(w in txt for w in DARK) and (start - last_low) >= 5.0 and lib.get("low_impact"):
                 cat, reason, loud = "low_impact", "major_reveal", True
             else:
@@ -5485,9 +5524,15 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                 if not pool or react_count.get(slug, 0) >= _REACT_CAP:
                     continue
                 trigs = REACTION_TRIGGERS.get(slug) or (slug.replace("_", " "),)
-                if not any(w in txt for w in trigs):
+                trig_hit = next((w for w in trigs if w in txt), None)
+                if not trig_hit:
                     continue
-                t = min(e0 - 0.15, s0 + 0.35)             # a beat after the cut, on the line
+                # WORD-ACCURATE: the reaction fires RIGHT AFTER the trigger word is spoken
+                # (user: death gong "GLEICH nach dem wort", never seconds before it).
+                t = min(e0 - 0.15, s0 + 0.35)             # fallback: a beat after the cut
+                _w = _find_word_time(trig_hit.split()[0], s0 - 0.2, e0 + 0.4)
+                if _w:
+                    t = _w[1] + 0.03                      # word END + a hair, never before it
                 if t <= 0.1 or not density_ok(t):
                     continue
                 k = react_rot.get(slug, 0); path = pool[k % len(pool)]; react_rot[slug] = k + 1
@@ -5519,12 +5564,21 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     #   boom:   on frame 1 of every SHOCK scene (acoustic weight for the visual punchline)
     if str(config.get("pipeline_version") or "") == "v0.2":
         _lib = data.get("library", {}) or {}
-        _whoosh_pool = (_lib.get("bright_whoosh") or []) + (_lib.get("swipe_whoosh") or [])
-        _pop_pool = _lib.get("ui_click") or _lib.get("caption_pop") or []
+        # VARIETY: pools are stored alphabetically, so a plain rotation played 3 near-identical
+        # pops in a row, then 3 mouse clicks... Merge the whole click/pop family and SHUFFLE
+        # once per render - every transition sound gets used, neighbours never sound alike.
+        import random as _rnd
+        _whoosh_pool = list(dict.fromkeys((_lib.get("bright_whoosh") or [])
+                                          + (_lib.get("swipe_whoosh") or [])))
+        _pop_pool = list(dict.fromkeys((_lib.get("ui_click") or [])
+                                       + (_lib.get("caption_pop") or [])))
+        _rnd.shuffle(_whoosh_pool)
+        _rnd.shuffle(_pop_pool)
         import glob as _glob
         _boom_pool = [p for pat in ("*boom*", "*vine*", "*sub*bass*")
                       for p in _glob.glob(str(ROOT / "soundeffects" / pat))]
         _boom_pool = [{"path": p} for p in dict.fromkeys(_boom_pool)]
+        _rnd.shuffle(_boom_pool)
         _boom_fallback = _lib.get("impact_hit") or []
         _v2n = {"whoosh": 0, "pop": 0, "boom": 0}
         _placed_t = {round(e["start"], 2) for e in events}
@@ -5557,10 +5611,13 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             elif i > 0 and _pop_pool:
                 _v2_add(_pop_pool[_rot["p"] % len(_pop_pool)], s0, "ui_click", -15, 0.25)
                 _rot["p"] += 1; _v2n["pop"] += 1
-            # whoosh 0.13s before each overlay/arrow of this scene appears
+            # whoosh 0.13s before each overlay/arrow of this scene appears. Never inside the
+            # opening moment: 0.0 belongs to the hook riser alone (user rule).
             for ov in (sc.get("overlays") or []):
                 if _whoosh_pool:
                     t_ov = float(ov.get("start") or ov.get("time") or s0)
+                    if t_ov - 0.13 < 0.5:
+                        continue
                     _v2_add(_whoosh_pool[_rot["w"] % len(_whoosh_pool)], t_ov - 0.13,
                             "bright_whoosh", -8, 0.4)
                     _rot["w"] += 1; _v2n["whoosh"] += 1
@@ -5614,8 +5671,9 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
 
     hook_pool = data.get("hook_risers") or []   # hook opening = dedicated hook_riser files ONLY
     if hook_pool and len(scenes) > 1 and not semantic_vision:
-        # -12dB read as "no riser at all" under the full-level voice (user feedback) -> -6dB
-        _place_riser(float(scenes[1].get("start", 0.0) or 0.0), hook_pool, "hook_riser", -6)
+        # -12dB read as "no riser at all" under the full-level voice (user feedback) -> -6dB.
+        # Peak = the IMPACT WORD when marked (riser 0 -> impact word -> impact hit), else body start.
+        _place_riser(_hook_beat, hook_pool, "hook_riser", -6)
     body_pool = data.get("risers") or []
     if body_pool and not semantic_vision:
         placed = 0

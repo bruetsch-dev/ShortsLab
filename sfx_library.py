@@ -62,7 +62,14 @@ REACTION_TO_CATEGORIES = {
 }
 # The hook-opening + big-moment slots (impact_hit / low_impact). Impact-ROLE sounds fill them first;
 # these heavy reactions only BACKFILL an otherwise-empty bucket (so it still works with 0 impacts).
-IMPACT_FROM_REACTIONS = {"impact_hit": ["shock_reveal"], "low_impact": ["death", "sad_downer"]}
+# death/sad_downer are NOT backfill material: the death gong fired on every generic big moment
+# and at scene starts ("2s before the word death") - meaning-bound sounds only fire via the
+# word-triggered reaction pass.
+IMPACT_FROM_REACTIONS = {"impact_hit": ["shock_reveal"]}
+
+# Reactions whose sound is so meaning-specific (death gong, sad aww, cute sparkle) that it must
+# NEVER play as a generic impact even when the file also carries the "impact" role label.
+MEANING_BOUND_REACTIONS = {"death", "sad_downer", "cute_aww"}
 
 
 def choose_riser_for_target(pool, target_duration, duration_getter=None):
@@ -162,8 +169,13 @@ def route_by_labels(data, meme_enabled=False):
             risers.append(_riser_item)
         if "hook_riser" in roles:
             hook_risers.append(_riser_item)
+        meaning_bound = any(s in MEANING_BOUND_REACTIONS for s in rxs)
         for role in roles:
             for cat in ROLE_TO_CATEGORIES.get(role, []):
+                # a death gong / aww labeled "impact" must not fire on generic big moments -
+                # it only plays word-triggered through its reaction slug
+                if meaning_bound and cat in ("impact_hit", "low_impact"):
+                    continue
                 library[cat].append(path)
         for slug in rxs:
             reactions.setdefault(slug, []).append(path)

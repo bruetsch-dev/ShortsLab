@@ -161,6 +161,12 @@ def detect_scene_cuts(video_path, ffmpeg, threshold=0.30, min_gap=0.45):
     return spaced
 
 
+# word-level ASR times of the LAST transcription (same in-process job) - lets the resolver
+# snap meaning-bound reactions (death gong...) onto the exact spoken word instead of trusting
+# the vision director's rough timestamp (which used to land the gong seconds early, on a cut).
+LAST_ASR_WORDS = []
+
+
 def _phrases_from_words(words, max_gap=0.6, max_words=12):
     """Group frame-accurate ASR words into short timed phrases for the LLM prompt."""
     phrases, cur = [], []
@@ -206,6 +212,10 @@ def transcribe_with_timing(video_path, ffmpeg, ffprobe, duration, status_cb=None
                 log(status_cb, "Transcribing speech with local word aligner...")
                 asr_words = voice_align.transcribe_words(str(audio_path), status_cb=status_cb)
                 if asr_words:
+                    # keep the WORD-level times: resolve_vision_segments snaps reaction
+                    # sounds (death gong etc.) onto the exact spoken word
+                    global LAST_ASR_WORDS
+                    LAST_ASR_WORDS = list(asr_words)
                     return _phrases_from_words(asr_words)
         except Exception as exc:
             log(status_cb, f"Local transcription failed ({exc}); trying Gemini...")
@@ -831,7 +841,22 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
         if kind.startswith("reaction"):
             slug = kind.split(":", 1)[-1].strip().replace(" ", "_")
             pool = reactions.get(slug)
-            if not pool or not spaced(t):
+            if not pool:
+                continue
+            # WORD-ACCURATE: snap the reaction onto the END of its trigger word (the director's
+            # vision timestamp put the death gong on the nearest cut, seconds before the word).
+            _trigs = tuple(tr.split()[0] for tr in
+                           (agent_core.REACTION_TRIGGERS.get(slug) or ()))
+            for _w in LAST_ASR_WORDS or []:
+                try:
+                    _ws, _we = float(_w.get("start") or 0.0), float(_w.get("end") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                _tok = str(_w.get("word") or "").lower().strip(" .,!?…\"'")
+                if abs(_ws - t) <= 2.5 and any(_tok.startswith(tr) for tr in _trigs if tr):
+                    t = round(_we + 0.03, 3)
+                    break
+            if not spaced(t):
                 continue
             path = pick(pool, f"r:{slug}")
             db = agent_core.REACTION_DB.get(slug, agent_core._REACTION_DB_DEFAULT)
