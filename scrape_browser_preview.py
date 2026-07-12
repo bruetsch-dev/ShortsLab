@@ -11,7 +11,7 @@ def capture(page, platform, query="", sort="", force=False):
     """Capture on Playwright's owning thread, at most once every three seconds globally."""
     now = time.monotonic()
     with _LOCK:
-        if not force and now - float(_STATE["captured_at"] or 0) < 3.0:
+        if not force and now - float(_STATE["captured_at"] or 0) < 1.5:
             return False
     try:
         jpeg = page.screenshot(type="jpeg", quality=58, full_page=False)

@@ -114,6 +114,9 @@ MATCH_THRESHOLDS_V2 = {
     "concrete": {"script_floor": 5.8, "overall": 6.5},
     "context":  {"script_floor": 4.8, "overall": 6.0},
     "abstract": {"script_floor": 3.8, "overall": 5.5},
+    # shock/meme scenes: the visual punchline may ignore the script (that IS the joke), but the
+    # segment must actually be absurd (absurdity gate enforced in the matcher loop)
+    "shock":    {"script_floor": 2.5, "overall": 5.0},
 }
 
 # segment quality: only genuinely unusable material is a HARD reject; everything else scores soft.
@@ -621,6 +624,10 @@ def rank_metadata_candidates_v2(candidates, query: SearchQueryV2, platform_count
         eng = min(10.0, math.log10(int(c.likes or 0) + 1) * 1.7)   # log-normalised, capped
         blob = (c.caption + " " + " ".join(c.hashtags)).lower()
         risk = 2.5 if any(t in blob for t in _RISK_TERMS) else 0.0
+        # 9:16 output - landscape sources (X is ~all landscape) must never outrank an available
+        # portrait clip; they stay usable as fallback but sort behind.
+        if c.width and c.height and c.width > c.height:
+            risk += 1.2
         # diversity bonus: reward platforms/creators not already dominant this bucket
         div = 5.0
         div -= 1.5 * platform_counts.get(str(c.platform).lower(), 0) / 5.0
@@ -726,8 +733,22 @@ def _build_social_search_plan_v2_legacy(title, script, scenes, understanding=Non
 _JP_QUERY_ALLOWED_RE = re.compile(r"^[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f0-9#\s]+$")
 
 
+# decorative fillers dropped BEFORE the 3-token trim so the content nouns survive
+# ("steaming traditional japanese onsen pov" must become "japanese onsen pov", never
+# "steaming traditional japanese" - proven by the onsen run where that query carried 8 clips).
+_EN_QUERY_FILLER = {"the", "a", "an", "of", "in", "on", "at", "with", "and", "to", "for",
+                    "is", "are", "very", "super", "really", "extremely", "beautiful",
+                    "stunning", "gorgeous", "amazing", "breathtaking", "steaming",
+                    "traditional"}
+
+
 def _clean_english_queries(values, limit=4):
-    """Accept only plain, short raw search strings (never notes/labels/JSON fragments)."""
+    """Accept only plain, short raw search strings (never notes/labels/JSON fragments).
+
+    BROAD-DISCOVERY CAP (2026-07-12): real TikTok/X search returns ~0 results for specific
+    multi-word phrases, so every query is hard-trimmed to 3 tokens no matter what the model
+    produced (fillers dropped first). The vision matcher finds the exact moment inside the
+    videos - the query only has to land in the right neighbourhood."""
     out = []
     for value in values if isinstance(values, list) else []:
         query = " ".join(str(value or "").split()).strip()
@@ -737,6 +758,12 @@ def _clean_english_queries(values, limit=4):
             continue
         if query.lower().startswith(("english", "query", "search")):
             continue
+        toks = query.split()
+        if len(toks) > 3:
+            kept = [t for t in toks if t.lower() not in _EN_QUERY_FILLER]
+            if len(kept) >= 2:
+                toks = kept
+        query = " ".join(toks[:3])
         if query.lower() not in {item.lower() for item in out}:
             out.append(query)
         if len(out) >= limit:
@@ -745,7 +772,8 @@ def _clean_english_queries(values, limit=4):
 
 
 def _clean_japanese_queries(values, limit=4):
-    """Enforce raw native Japanese strings: no Romaji, translations or annotations can leak."""
+    """Enforce raw native Japanese strings: no Romaji, translations or annotations can leak.
+    BROAD-DISCOVERY CAP: hard-trimmed to the first 2 tokens (what a real user types)."""
     out = []
     for value in values if isinstance(values, list) else []:
         query = " ".join(str(value or "").split()).strip()
@@ -753,6 +781,7 @@ def _clean_japanese_queries(values, limit=4):
             continue
         if not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", query):
             continue
+        query = " ".join(query.split()[:2])
         if query not in out:
             out.append(query)
         if len(out) >= limit:
@@ -782,9 +811,19 @@ Examples: "no free time" -> student asleep at desk or massive textbook pile. "st
 Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
 visible subject, visible action and plausible location.
 
-For the primary concept return 2-4 english_queries and 2-4 japanese_queries. For each alternative
-return 1-2 of each. These arrays are exact raw strings sent directly to TikTok and X. English phrases
-must be targeted and organic; use POV/caught/fail only when it naturally finds user footage.
+QUERIES ARE BROAD DISCOVERY SEARCHES, NOT SCENE DESCRIPTIONS. Real TikTok/X search returns ZERO
+results for a specific phrase - a downstream vision agent watches every found video and picks the
+exact matching seconds, so a query only needs to land in the right content NEIGHBOURHOOD.
+japanese_queries: 1-2 words a real Japanese user actually types (満員電車 / 日本 学校 / あるある /
+東京 夜). english_queries: 2-3 words max (japan school / tokyo train / japan rules). NEVER stack
+adjectives, NEVER put a whole situation into one query, NEVER exceed these word counts.
+For the primary concept return 2-3 japanese_queries and 1-2 english_queries. For each alternative
+return 1 of each. These arrays are exact raw strings sent directly to TikTok and X.
+VIBE scenes: ONE query may add a single emotion word (疲れた / awkward japan). SHOCK scenes: ONE
+query may chase the punchline with a single meme word (ハプニング / japan fail).
+PLACEMENT RULE: scene 0 and roughly every 5th scene (the end of
+each thought block, every 10-15 seconds) MUST be visual_match_category "shock" - the dopamine
+reset. All other scenes are literal or vibe.
 Japanese strings must be what local users write, including useful native slang such as あるある or
 厳しい. ABSOLUTE RULE: every japanese_queries string contains ONLY Kanji, Hiragana, Katakana, spaces,
 digits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.
@@ -879,6 +918,17 @@ Return exactly:
             if sid in legacy_by_id:
                 intents.append(legacy_by_id[sid])
     intents.sort(key=lambda item: item.scene_id)
+    # SHOCK CADENCE (deterministic backstop for the prompt rule): the dopamine reset needs a
+    # shock/meme punchline every 10-15s. Scenes run ~2s, so enforce >=1 shock per 5-scene
+    # window - if the LLM tagged none in a window, flip the window's last scene to shock.
+    if intents:
+        for w0 in range(0, len(intents), 5):
+            win = intents[w0:w0 + 5]
+            if win and not any(getattr(x, "match_category", "") == "shock" for x in win):
+                win[-1].match_category = "shock"
+        _n_shock = sum(1 for x in intents if getattr(x, "match_category", "") == "shock")
+        _log(status_cb, f"Scrape V2 Architect: shock cadence enforced - {_n_shock} shock "
+                        f"scene(s) across {len(intents)} (>=1 per ~10-15s).")
     _log(status_cb, "Scrape V2 Architect: %d tangible visual intent(s), %d raw EN/JA queries." %
          (len(intents), sum(len(i.english_queries) + len(i.japanese_queries) for i in intents)))
     if not intents or not any(queries_for_intent(item) for item in intents):
@@ -896,9 +946,10 @@ def build_social_search_plan_v2(title, script, scenes, understanding=None, reaso
 
 # ---------------------------------------------------------------- proxy download + segments
 
-def download_proxy_v2(item, dest, status_cb=None):
+def download_proxy_v2(item, dest, status_cb=None, fmt=None):
     """Download a LOW-RES analysis proxy of the WHOLE video (<=720p, no audio, size-capped) so we
-    can find usable segments anywhere in the timeline - not just the first seconds. Returns path|None."""
+    can find usable segments anywhere in the timeline - not just the first seconds. Returns path|None.
+    `fmt`: override the yt-dlp format (e.g. full-quality+audio for the timeline agent fetch)."""
     if yt_dlp is None:
         return None
     url = (item.get("webVideoUrl") or item.get("url") or "") if isinstance(item, dict) else ""
@@ -908,7 +959,7 @@ def download_proxy_v2(item, dest, status_cb=None):
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmpl = str(dest.with_suffix("")) + ".%(ext)s"
     h = int(SCRAPE_V2_CONFIG["proxy_max_height"])
-    fmt = f"bestvideo[height<={h}]/best[height<={h}]/best"
+    fmt = fmt or f"bestvideo[height<={h}]/best[height<={h}]/best"
     opts = {
         "quiet": True, "no_warnings": True, "noprogress": True, "outtmpl": tmpl,
         "format": fmt, "merge_output_format": "mp4",
@@ -1072,7 +1123,14 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     if black_bar > SEGMENT_HARD_REJECT_BLACKBAR:
         reasons.append("massive_black_bars")
     if h < w and vertical_quality < 2.0:
-        reasons.append("landscape_no_crop")
+        # Landscape (X is ~all 16:9) is CROPPABLE: _finalize_segment_clip center-crops every
+        # accepted clip to 1080x1920 anyway, so aspect ratio alone must never reject an
+        # otherwise good clip. Only sources whose 9:16 strip would be too small survive-wise
+        # (< ~360px wide after crop) are still out.
+        if h * 9.0 / 16.0 >= 360.0:
+            vertical_quality = 4.0        # usable via crop - still ranks behind native portrait
+        else:
+            reasons.append("landscape_too_small_to_crop")
 
     # OCR: text load + AI watermark (hard) using the reusable stats
     areas, lines, texts = _ocr_window(src, ffmpeg, seg.start_time, seg.end_time)
@@ -1298,7 +1356,11 @@ def describe_segments_v2(segments, project_dir, ffmpeg, reasoning_model=None, st
             '"camera_style":"..","shot_size":"..","motion":"low|moderate|high","visible_text":"..",'
             '"creator_overlay":true|false,"burned_captions":true|false,"raw_footage_score":0-10,'
             '"edit_stability":0-10,"visual_quality":0-10,"action_visibility":0-10,'
-            '"age_confidence":"adult|teen|child|unknown","sexualized_content":true|false,"usable":true|false}\n'
+            '"age_confidence":"adult|teen|child|unknown","sexualized_content":true|false,'
+            '"absurdity":0-10,"intensity":0-10,"usable":true|false}\n'
+            '(absurdity: how exaggerated/meme-like/bizarre the clip is - 0 mundane, 10 '
+            'alien-costume level. intensity: visual energy/craziness, used for escalation '
+            'ordering within a topic block.)\n'
             'Return {"segments": {"0": {..}, "1": {..}, ...}}')
         data = _vision_json(prompt, sheet, max_tokens=4000, temperature=0.1,
                             reasoning_model=reasoning_model)
@@ -1383,14 +1445,17 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
     intent_lines = []
     for it in intents:
         intent_lines.append(
-            f'scene {it.scene_id} [{it.visual_type}]: subject="{it.subject}", action="{it.action}", '
+            f'scene {it.scene_id} [{it.visual_type}/{str(getattr(it, "match_category", "") or "vibe")}]: '
+            f'subject="{it.subject}", action="{it.action}", '
             f'location="{it.location}", mood="{it.mood}", avoid={it.avoid_elements}; text="{it.scene_text[:80]}"')
     prompt = (
         "You match short video SEGMENTS to narration SCENES for a found-footage short. For EACH scene, "
         "pick the best-fitting segments and score the fit. A segment fits when its subject/action/"
         "location genuinely support the scene's visible intent. Fragments/abstract scenes accept a "
         "topically coherent segment; for those, a topically related Japanese slice-of-life segment is "
-        "a VALID candidate (score it honestly rather than returning nothing). Only genuinely off-topic "
+        "a VALID candidate (score it honestly rather than returning nothing). Scenes tagged /shock "
+        "want the visual PUNCHLINE: absurd, exaggerated, cringe/awkward/fail or meme-like footage - "
+        "the script relation matters less there. Only genuinely off-topic "
         "footage gets no candidate.\n\n"
         "SEGMENTS:\n" + "\n".join(seg_lines) + "\n\nSCENES:\n" + "\n".join(intent_lines) + "\n\n"
         'Return STRICT JSON: {"scenes": {"1": [{"seg": <seg index>, "subject_match":0-10,'
@@ -1434,7 +1499,17 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
             script_m = g("script_match")
             style_m = g("style_match")
             overall = semantic_match_score(subj, act, loc, mood, script_m)
-            if not passes_match_floors(script_m, overall, it.visual_type):
+            _cat = str(getattr(it, "match_category", "") or "").lower()
+            if _cat == "shock":
+                th_s = MATCH_THRESHOLDS_V2["shock"]
+                try:
+                    _absurd = float((seg.visual_description or {}).get("absurdity") or 0)
+                except (TypeError, ValueError):
+                    _absurd = 0.0
+                if not (script_m >= th_s["script_floor"] and overall >= th_s["overall"]
+                        and _absurd >= 6.0):
+                    continue
+            elif not passes_match_floors(script_m, overall, it.visual_type):
                 continue
             scored.append({
                 "segment": seg, "subject_match": subj, "action_match": act, "location_match": loc,
@@ -1661,36 +1736,52 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
         [preferred, "RELEVANCE", "MOST_LIKED", "MOST_VIEWED"]))
     sort_passes = [mode for mode in sort_passes
                    if mode in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT")]
+    def _run_pass(q, text, sort_mode):
+        """One backend search for one text under one sort order. Returns raw item count."""
+        if status_cb:
+            _log(status_cb, f'Scrape V2 query [{sort_mode}]: "{text}"')
+        items = clip_scraper.backend_search(text, 10, status_cb=status_cb, sort=sort_mode,
+                                            platforms=platforms, deadline=deadline) or []
+        state["queries_executed"] = state.get("queries_executed", 0) + 1
+        qt = state.setdefault("query_texts", [])
+        if text not in qt:
+            qt.append(text)
+        state.setdefault("sort_pass_counts", {})[sort_mode] = (
+            state.setdefault("sort_pass_counts", {}).get(sort_mode, 0) + 1)
+        state["raw_results"] = state.get("raw_results", 0) + len(items)
+        fresh = []
+        for it in items:
+            src = _item_to_source(it, q)
+            if src is None or src.source_id in seen_source_ids:
+                continue
+            seen_source_ids.add(src.source_id)
+            fresh.append(src)
+        state["metadata_candidates"] = state.get("metadata_candidates", 0) + len(fresh)
+        ranked = rank_metadata_candidates_v2(fresh, q, plat_counts, creator_counts)
+        for source in ranked:
+            plat_counts[source.platform.lower()] = plat_counts.get(source.platform.lower(), 0) + 1
+            creator_counts[source.creator_id.lower()] = creator_counts.get(source.creator_id.lower(), 0) + 1
+        ranked_all.extend(ranked)
+        return len(items)
+
     for q in queries:
         if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
             break
+        raw_total = 0
         for sort_mode in sort_passes:
             if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
                 break
-            if status_cb:
-                _log(status_cb, f'Scrape V2 query [{sort_mode}]: "{q.query}"')
-            items = clip_scraper.backend_search(q.query, 8, status_cb=status_cb, sort=sort_mode,
-                                                platforms=platforms, deadline=deadline) or []
-            state["queries_executed"] = state.get("queries_executed", 0) + 1
-            qt = state.setdefault("query_texts", [])
-            if q.query not in qt:
-                qt.append(q.query)
-            state.setdefault("sort_pass_counts", {})[sort_mode] = (
-                state.setdefault("sort_pass_counts", {}).get(sort_mode, 0) + 1)
-            state["raw_results"] = state.get("raw_results", 0) + len(items)
-            fresh = []
-            for it in items:
-                src = _item_to_source(it, q)
-                if src is None or src.source_id in seen_source_ids:
-                    continue
-                seen_source_ids.add(src.source_id)
-                fresh.append(src)
-            state["metadata_candidates"] = state.get("metadata_candidates", 0) + len(fresh)
-            ranked = rank_metadata_candidates_v2(fresh, q, plat_counts, creator_counts)
-            for source in ranked:
-                plat_counts[source.platform.lower()] = plat_counts.get(source.platform.lower(), 0) + 1
-                creator_counts[source.creator_id.lower()] = creator_counts.get(source.creator_id.lower(), 0) + 1
-            ranked_all.extend(ranked)
+            raw_total += _run_pass(q, q.query, sort_mode)
+        # ZERO-RESULT AUTO-BROADENING (2026-07-12): a query that finds NOTHING under every sort
+        # order was too specific for real platform search - retry ONCE with just its first token
+        # before moving on, so the run keeps gathering material instead of burning the queue.
+        toks = q.query.split()
+        if (raw_total == 0 and len(toks) >= 2
+                and not (cancel_check and cancel_check())
+                and not (deadline and time.monotonic() >= deadline)):
+            _log(status_cb, f'Scrape V2: 0 results for "{q.query}" -> broadened to "{toks[0]}"')
+            state["broadened_queries"] = state.get("broadened_queries", 0) + 1
+            _run_pass(q, toks[0], sort_passes[0] if sort_passes else "RELEVANCE")
     ranked_all.sort(key=lambda s: s.rank_score, reverse=True)
     return ranked_all
 
@@ -1885,6 +1976,36 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     intents = build_viral_search_plan_v2(config.get("title") or "", script_text or "", scenes,
                                          understanding=understanding, reasoning_model=reasoning_model,
                                          status_cb=status_cb)
+    _ref_rules = str(config.get("pipeline_version") or "v0.2") != "v0.1"
+    if _ref_rules:
+        # v0.2 MULTI-CLIP PER SENTENCE: sub-beats split from one sentence (scene["beat_group"])
+        # share ONE search intent - identical candidate lists + the 1-scene-per-segment cap make
+        # the global assignment spread the matcher's top candidates across the sub-beats
+        # ("mass proves the thesis") without any extra searching.
+        _by_id = {it.scene_id: it for it in intents}
+        _groups = {}
+        for _i, _sc in enumerate(scenes):
+            _bg = str(_sc.get("beat_group") or "")
+            if _bg:
+                _groups.setdefault(_bg, []).append(_i)
+        _prop = 0
+        import copy as _copy
+        for _bg, _ids in _groups.items():
+            _lead = next((_by_id[i] for i in _ids if i in _by_id), None)
+            if _lead is None:
+                continue
+            for _i in _ids:
+                if _i == _lead.scene_id or _i not in _by_id:
+                    continue
+                _clone = _copy.copy(_lead)
+                _clone.scene_id = _i
+                _clone.scene_text = _by_id[_i].scene_text
+                _by_id[_i] = _clone
+                _prop += 1
+        if _prop:
+            intents = sorted(_by_id.values(), key=lambda x: x.scene_id)
+            _log(status_cb, f"v0.2 pacing: {_prop} sub-beat(s) share their sentence's intent "
+                            "(top candidates will spread across them).")
     body_intents = [it for it in intents if it.scene_id != 0]
     hook_intent = next((it for it in intents if it.scene_id == 0), None)
 
@@ -1895,6 +2016,22 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     for it in body_intents:
         query_queue.extend(queries_for_intent(it))
     query_queue.sort(key=lambda q: V2_QUERY_TIERS.index(q.tier) if q.tier in V2_QUERY_TIERS else 9)
+    # BROAD-DISCOVERY DEDUPE (2026-07-12): after the 2/3-token trim many intents collapse onto
+    # the same broad query (東京 / 日本 学校 ...). Search each text ONCE globally - the vision
+    # matcher assigns the found segments to every scene anyway, so per-intent repeats only
+    # burn browser time.
+    _seen_qtext = set()
+    _dq = []
+    for q in query_queue:
+        key = q.query.casefold()
+        if key in _seen_qtext:
+            continue
+        _seen_qtext.add(key)
+        _dq.append(q)
+    if len(_dq) != len(query_queue):
+        _log(status_cb, "Scrape V2: %d broad queries after global dedupe (was %d)."
+             % (len(_dq), len(query_queue)))
+    query_queue = _dq
 
     all_segments = []
     # --- OPENING HOOK gathering (RE-ADDED 2026-07-11): a dedicated search for a young-adult
@@ -2032,6 +2169,27 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     _log(status_cb, "Scrape V2: final assignment...")
     assignments = assign_segments_globally_v2(body_intents, scene_candidates, cfg, status_cb=status_cb)
 
+    if _ref_rules:
+        # v0.2 ESCALATION LADDER: within one sentence's sub-beats, order the assigned clips
+        # normal -> crazy (ascending vision "intensity") so every topic block builds up.
+        _seg_by_id2 = {sg.segment_id: sg for sg in all_segments}
+        for _bg, _ids in (_groups or {}).items():
+            _assigned = [(i, assignments[i]) for i in _ids
+                         if i in assignments and assignments[i].segment_id]
+            if len(_assigned) < 2:
+                continue
+            def _inten(a):
+                sg = _seg_by_id2.get(a.segment_id)
+                try:
+                    return float(((sg.visual_description or {}) if sg else {}).get("intensity") or 5.0)
+                except (TypeError, ValueError):
+                    return 5.0
+            _slots = sorted(i for i, _a in _assigned)
+            _order = sorted((_a for _i, _a in _assigned), key=_inten)
+            for _slot, _a in zip(_slots, _order):
+                _a.scene_id = _slot
+                assignments[_slot] = _a
+
     used_seg_ids = {a.segment_id for a in assignments.values() if a.segment_id}
     # For filling unmatched scenes, rank spares by RELEVANCE to THIS scene, not by raw quality:
     # a topically-closest Japanese clip beats a shiny but off-topic filler. Relevance is computed
@@ -2109,8 +2267,13 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     scene_clips_out = [None] * len(scenes)
     clip_decision_log = [None] * len(scenes)
 
+    _intent_cat = {it.scene_id: getattr(it, "match_category", "") for it in intents}
+
     def _write_scene(scene_idx, seg, atype, flevel, sem, mclass, visual_role=None):
         sc0 = scenes[scene_idx]
+        # v0.2 boom rule keys on this: shock scenes get the sub-bass on frame 1
+        if _intent_cat.get(scene_idx):
+            sc0["visual_match_category"] = _intent_cat[scene_idx]
         try:
             scene_need = max(0.0, float(sc0.get("end", 0) or 0) - float(sc0.get("start", 0) or 0))
         except (TypeError, ValueError):

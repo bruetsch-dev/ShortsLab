@@ -1596,6 +1596,120 @@ def normalize_micro_beat_plan(raw_beats, title, script, target_duration):
         last = normalized[-1]["end"]
     return normalized
 
+SCRIPT_CREATOR_MODEL = "google/gemini-3.1-pro-preview"
+
+# Curated JAPAN angles for the no-topic case. The model alone converges on the same 1-2
+# topics every call ("schools banned brown hair"); rotating through this pool with a
+# persisted history guarantees variety across consecutive generations.
+SCRIPT_CREATOR_ANGLES = (
+    "school rules", "dating rules", "work culture rules", "beauty standards",
+    "train and commuting etiquette", "convenience store culture", "apartment renting rules",
+    "onsen and tattoo rules", "garbage separation rules", "vending machine culture",
+    "customer service rules", "eating and restaurant etiquette", "shoes and indoor rules",
+    "gift giving rules", "drinking with coworkers culture", "school lunch system",
+    "school club activities", "senpai-kohai hierarchy", "childhood independence",
+    "public silence rules", "hanko stamp bureaucracy", "driving license process",
+    "capsule hotel rules", "theme cafe culture", "lost wallet honesty culture",
+    "wedding and funeral etiquette", "neighborhood association rules",
+)
+_SCRIPT_TOPIC_HISTORY = ROOT / "generated_assets" / "script_creator_history.json"
+
+
+def generate_viral_script(topic="", status_cb=None):
+    """Write a reference-style viral short script from a topic (empty topic = the model picks
+    its own high-potential topic in the same style). Returns {"topic","script","hook_keywords"}.
+
+    hook_keywords are returned for the color-coded caption pass (pipeline v0.2 phase 4): the
+    strong VERBS and toxic/extreme ADJECTIVES (NEVER/ILLEGAL/BANNED/CRIME/FORCED class) plus
+    shock nouns, spelled EXACTLY as they appear in the script.
+    """
+    topic = clean_text(topic or "").strip()
+    system = (
+        "You are an elite short-form scriptwriter for viral 'dark facts' style TikTok/Shorts "
+        "narration (the Japan-facts reference style: punchy, factual-sounding, slightly "
+        "outrageous, zero fluff). You write EXACTLY in that voice. "
+        "FACTS ARE NON-NEGOTIABLE: every claim must be TRUE and describe a real, widely "
+        "documented Japanese practice. Never invent statistics - use a number only when it is "
+        "a well-known real figure, otherwise state the claim without one. The outrageousness "
+        "must come from the REAL rule itself, never from exaggerating it into falsehood. "
+        "THE #1 FAILURE MODE TO AVOID: upgrading a custom or social norm into a law or ban. "
+        "banned / illegal / forced / legally required are allowed ONLY when literally true. "
+        "A strong social norm is written truthfully and STILL hits hard: 'an unwritten rule', "
+        "'expected of everyone', 'you will be silently judged', 'many companies demand it'. "
+        "The weird TRUE detail IS the viral part - one claim a Japanese viewer would call "
+        "false kills the whole video in the comments. JSON only.")
+    if topic:
+        ask = f'Topic: "{topic}" (about JAPAN unless the topic itself names another subject).'
+        temperature = 0.7
+    else:
+        # rotate through curated angles + exclude recent topics -> real variety per click
+        import random
+        recent = []
+        try:
+            recent = json.loads(_SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))[-12:]
+        except Exception:
+            recent = []
+        used_angles = {str(r.get("angle") or "") for r in recent if isinstance(r, dict)}
+        fresh = [a for a in SCRIPT_CREATOR_ANGLES if a not in used_angles] or list(SCRIPT_CREATOR_ANGLES)
+        angle = random.choice(fresh)
+        avoid = ", ".join(f'"{str(r.get("topic") or "")[:60]}"' for r in recent
+                          if isinstance(r, dict) and r.get("topic"))
+        ask = (f"Write about JAPAN ONLY (never South Korea, China or any other country). "
+               f"Your assigned angle: JAPANESE {angle.upper()}. Pick one specific, surprising, "
+               f"REAL aspect of it." + (f" Do NOT reuse these recent topics: {avoid}." if avoid else ""))
+        temperature = 0.9
+    prompt = f"""{ask}
+
+Write ONE narration script following ALL of these rules:
+- HOOK: the first sentence is a shocking claim of AT MOST 12 words (a real number, a REAL
+  ban, or a jaw-dropping TRUE practice - NEVER a fake ban).
+- STRUCTURE: exactly 3 thought blocks after the hook, each 2-3 sentences. Escalate between
+  blocks; open the final block with an escalation like "But the craziest part?" or
+  "But the harshest reality?".
+- EVERY claim must be PHYSICALLY FILMABLE as real phone footage (a visible person, action,
+  object or place). Never state an abstraction without its visible physical consequence.
+- 100-140 words total. Simple spoken language, present tense, no lists, no emojis, no
+  hashtags, no camera directions - narration text only.
+- Weave in strong hook words - but ONLY where literally true: NEVER / ILLEGAL / BANNED /
+  FORCED only for actual laws and actual bans; for norms use truthful hard words instead
+  (unwritten, ruthless, obsessed, humiliating, judged, rejected, shamed), plus real numbers.
+- SELF FACT-CHECK before returning: re-read every sentence and rewrite any claim a Japanese
+  person would call false - a custom presented as law, an invented consequence, an invented
+  number, or a rare edge case presented as universal.
+
+Return STRICT JSON:
+{{"topic": "<short topic label>",
+ "script": "<the narration text>",
+ "hook_keywords": ["8-14 words: the strong VERBS, toxic/extreme ADJECTIVES and shock NOUNS/
+numbers from the script, spelled EXACTLY as written in the script"]}}"""
+    log(status_cb, "Script creator: writing a reference-style script"
+        + (f' for "{topic}"...' if topic else " (model picks the topic)..."))
+    data = _post_llm_json(SCRIPT_CREATOR_MODEL,
+                          [{"role": "system", "content": system},
+                           {"role": "user", "content": prompt}], 4000, temperature)
+    if not isinstance(data, dict) or not str(data.get("script") or "").strip():
+        raise RuntimeError("Script creator returned no usable script - try again.")
+    script = clean_text(str(data.get("script") or "")).strip()
+    kws = [str(k).strip() for k in (data.get("hook_keywords") or []) if str(k).strip()]
+    out_topic = str(data.get("topic") or topic or "").strip()
+    # ALWAYS record the generated script (user-topic runs too) so past outputs can be
+    # reviewed/fact-checked later - previously only the topic label survived.
+    try:
+        if topic:
+            recent = json.loads(_SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))[-12:]
+    except Exception:
+        recent = []
+    try:
+        recent.append({"angle": (angle if not topic else "user-topic"), "topic": out_topic,
+                       "at": time.strftime("%Y-%m-%d %H:%M"), "script": script})
+        _SCRIPT_TOPIC_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        _SCRIPT_TOPIC_HISTORY.write_text(json.dumps(recent[-12:], ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+    except Exception:
+        pass
+    return {"topic": out_topic, "script": script, "hook_keywords": kws[:14]}
+
+
 def llm_generate_project_title(script, reasoning_model=None, status_cb=None):
     if not os.environ.get("WAVESPEED_API_KEY") or not script.strip():
         return ""
@@ -4906,6 +5020,9 @@ def enforce_reference_pacing(scenes, max_s=2.4):
             sub["start"] = round(start + i * step, 3)
             sub["end"] = round(end if i == n - 1 else start + (i + 1) * step, 3)
             sub["micro_beat"] = True
+            # v0.2 sub-beats of ONE sentence share a group: they inherit one search intent and
+            # the matcher's top candidates are spread across them (mass proves the thesis)
+            sub["beat_group"] = f"bg_{round(start, 2)}"
             # A proportional split is a safe fallback.  The forced/estimated word timeline pass
             # later replaces this with the exact words spoken in each interval.
             if tokens:
@@ -5396,6 +5513,63 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             events.sort(key=lambda e: e["start"])
             log(status_cb, f"SFX: placed {react_placed} content-matched reaction sound(s).")
 
+    # ---- PIPELINE v0.2 PRECISION SFX (reference-edit rules, deterministic timing) ----
+    #   whoosh: 3-5 frames (0.13s) BEFORE every overlay/arrow appears (ear precedes eye)
+    #   pop:    on frame 1 of EVERY cut (attention reset / finger snap)
+    #   boom:   on frame 1 of every SHOCK scene (acoustic weight for the visual punchline)
+    if str(config.get("pipeline_version") or "") == "v0.2":
+        _lib = data.get("library", {}) or {}
+        _whoosh_pool = (_lib.get("bright_whoosh") or []) + (_lib.get("swipe_whoosh") or [])
+        _pop_pool = _lib.get("ui_click") or _lib.get("caption_pop") or []
+        import glob as _glob
+        _boom_pool = [p for pat in ("*boom*", "*vine*", "*sub*bass*")
+                      for p in _glob.glob(str(ROOT / "soundeffects" / pat))]
+        _boom_pool = [{"path": p} for p in dict.fromkeys(_boom_pool)]
+        _boom_fallback = _lib.get("impact_hit") or []
+        _v2n = {"whoosh": 0, "pop": 0, "boom": 0}
+        _placed_t = {round(e["start"], 2) for e in events}
+
+        def _v2_add(path, t, cat, db, dur=0.5):
+            t = max(0.0, round(float(t), 3))
+            if round(t, 2) in _placed_t:
+                return
+            _placed_t.add(round(t, 2))
+            events.append({"path": str(path), "start": t, "duration": dur,
+                           "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
+                           "category": cat, "id": f"sfx-{len(events):02d}", "sfx_type": cat})
+            sfx_events_report.append({"time": round(t, 2), "scene_id": None, "type": cat,
+                                      "asset_file": Path(path).name, "used_trimmed_version": False,
+                                      "volume_db": db, "reason": f"v0.2 {cat} rule",
+                                      "linked_cut_time": None, "linked_word": None,
+                                      "linked_visual_event": None, "allowed_by_policy": True})
+
+        _rot = {"w": 0, "p": 0, "b": 0}
+        for i, sc in enumerate(scenes):
+            s0 = float(sc.get("start", 0.0) or 0.0)
+            _is_shock = str(sc.get("visual_match_category") or "").lower() == "shock"
+            # frame 1 of a SHOCK scene gets the boom (visual punchline weight); a normal cut
+            # gets the pop (attention reset). Never both on the same frame.
+            if _is_shock and i > 0:
+                _bp = _boom_pool or [{"path": p} for p in _boom_fallback]
+                if _bp:
+                    _v2_add(_bp[_rot["b"] % len(_bp)]["path"], s0, "impact_hit", -5, 0.8)
+                    _rot["b"] += 1; _v2n["boom"] += 1
+            elif i > 0 and _pop_pool:
+                _v2_add(_pop_pool[_rot["p"] % len(_pop_pool)], s0, "ui_click", -15, 0.25)
+                _rot["p"] += 1; _v2n["pop"] += 1
+            # whoosh 0.13s before each overlay/arrow of this scene appears
+            for ov in (sc.get("overlays") or []):
+                if _whoosh_pool:
+                    t_ov = float(ov.get("start") or ov.get("time") or s0)
+                    _v2_add(_whoosh_pool[_rot["w"] % len(_whoosh_pool)], t_ov - 0.13,
+                            "bright_whoosh", -8, 0.4)
+                    _rot["w"] += 1; _v2n["whoosh"] += 1
+        if any(_v2n.values()):
+            events.sort(key=lambda e: e["start"])
+            log(status_cb, f"v0.2 SFX rules: {_v2n['pop']} cut pop(s), {_v2n['whoosh']} "
+                           f"pre-overlay whoosh(es), {_v2n['boom']} shock boom(s)"
+                           + ("" if _boom_pool or not _v2n['boom'] else " (impact fallback - add a vine-boom file)") + ".")
+
     # ---- RISER PASSES: build-ups that swell INTO a beat and drop on it. Hook risers always
     # occupy 0.0..hook-end using the closest-duration labeled file + atempo; body risers retain
     # tail trimming. Long by design -> guard allows riser/hook_riser.
@@ -5440,7 +5614,8 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
 
     hook_pool = data.get("hook_risers") or []   # hook opening = dedicated hook_riser files ONLY
     if hook_pool and len(scenes) > 1 and not semantic_vision:
-        _place_riser(float(scenes[1].get("start", 0.0) or 0.0), hook_pool, "hook_riser", -12)
+        # -12dB read as "no riser at all" under the full-level voice (user feedback) -> -6dB
+        _place_riser(float(scenes[1].get("start", 0.0) or 0.0), hook_pool, "hook_riser", -6)
     body_pool = data.get("risers") or []
     if body_pool and not semantic_vision:
         placed = 0
@@ -8920,6 +9095,31 @@ def run_project(form, status_cb=None):
                 scenes_override = sync_scenes_to_voice_timeline(
                     scenes_override, canonical_words, target_duration=target_duration)
                 log(status_cb, "Pacing: cuts re-snapped to spoken word onsets after the merge.")
+        # v0.2 ASYNCHRONOUS CUTS: never cut where a sentence ends - picture and thought
+        # resolving together signals "you can scroll now". Boundaries inside +-0.4s of a
+        # sentence-end are moved onto the onset of the SECOND word of the next sentence
+        # (a cut mid-thought), keeping scenes contiguous and >=1.2s.
+        if canonical_words and str(form.get("pipeline_version") or "v0.2") != "v0.1":
+            _sent_ends = [w["end"] for w in canonical_words if str(w["word"]).rstrip()[-1:] in ".!?"]
+            _onsets = [w["start"] for w in canonical_words]
+            _moved = 0
+            for _i in range(len(scenes_override) - 1):
+                _b = float(scenes_override[_i]["end"])
+                _near = next((se for se in _sent_ends if abs(_b - se) <= 0.4), None)
+                if _near is None:
+                    continue
+                _after = [o for o in _onsets if o > _near + 0.05]
+                if len(_after) < 2:
+                    continue
+                _newb = round(_after[1], 3)          # onset of the 2nd word of the next sentence
+                if (_newb - float(scenes_override[_i]["start"]) >= 1.2
+                        and float(scenes_override[_i + 1]["end"]) - _newb >= 1.2):
+                    scenes_override[_i]["end"] = _newb
+                    scenes_override[_i + 1]["start"] = _newb
+                    _moved += 1
+            if _moved:
+                log(status_cb, f"v0.2 pacing: moved {_moved} cut(s) off sentence ends into "
+                               "mid-sentence (asynchronous cut rule).")
     log(status_cb, f"Using {len(scenes_override)} micro-beat(s) as the edit map.")
     if visual_script:
         log(status_cb, "Visual Ablauf prompt applied to scene planning, image prompts, Seedance prompts, and review.")
@@ -9291,7 +9491,8 @@ def run_project(form, status_cb=None):
                     # and stash its result on. The scene fields it writes go onto scenes_override
                     # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
                     _v2cfg = {"title": title, "voice_speed": resolve_voice_speed(form, "scrape"),
-                              "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE")}
+                              "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE"),
+                              "pipeline_version": str(form.get("pipeline_version") or "v0.2")}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
                         _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
@@ -10532,6 +10733,36 @@ def run_project(form, status_cb=None):
     if impact_word:
         config["impact_word"] = impact_word
         log(status_cb, f"Impact word marked for the SFX Master: {impact_word!r}")
+    # hook_keywords: strong verbs / toxic adjectives from the Script Creator - persisted for
+    # the pipeline-v0.2 color-coded caption pass (phase 4).
+    try:
+        _hkw = json.loads(str(form.get("hook_keywords") or "[]"))
+        if isinstance(_hkw, list) and _hkw:
+            config["hook_keywords"] = [str(k) for k in _hkw][:14]
+    except Exception:
+        pass
+    # edit pipeline version: v0.2 = reference-edit rules (phases land incrementally and gate on
+    # this flag); v0.1 = the classic pipeline, byte-identical behavior.
+    _pver = str(form.get("pipeline_version") or "v0.2").strip().lower()
+    config["pipeline_version"] = "v0.1" if _pver == "v0.1" else "v0.2"
+    log(status_cb, f"Edit pipeline: {config['pipeline_version']}"
+        + (" (reference edit rules)" if config["pipeline_version"] == "v0.2" else " (classic)"))
+    if config["pipeline_version"] == "v0.2" and not config.get("hook_keywords"):
+        # uploaded script without Script-Creator keywords -> rule-based fallback so the
+        # color-coded captions still light up the toxic/extreme words and numbers
+        _kw_re = re.compile(
+            r"\b(never|illegal|bann?ed|crime|forced?|forbidden|strictly|insane|obsess\w*|"
+            r"extreme\w*|dump\w*|brutal\w*|shocking|violat\w*|punish\w*|arrest\w*|fined?|"
+            r"caught|exhaust\w*|worst|harshest|craziest|\d+%?)\b", re.IGNORECASE)
+        _seen_kw, _found = set(), []
+        for _m in _kw_re.finditer(script or ""):
+            _w = _m.group(0)
+            if _w.lower() not in _seen_kw:
+                _seen_kw.add(_w.lower())
+                _found.append(_w)
+        if _found:
+            config["hook_keywords"] = _found[:14]
+            log(status_cb, f"Caption keywords (rule-based): {', '.join(_found[:8])}...")
 
     check_cancel(form)
     log(status_cb, "Rendering final 9:16 MP4...")

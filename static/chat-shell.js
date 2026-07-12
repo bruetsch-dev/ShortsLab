@@ -112,7 +112,7 @@ function persist() {
 
 /* ------------------------------------------------------------------ flow definitions */
 const FLOW_STEPS = {
-  script: ["script", "hook", "source", "reasoning", "voice", "outputs", "review"],
+  script: ["script", "hook", "version", "source", "reasoning", "voice", "outputs", "review"],
   viraltrans: ["topic", "review"],
   reddit: ["discover", "pick"],
   longform: ["script", "settings"],
@@ -254,6 +254,34 @@ function renderScriptFlow() {
     const ta = el("textarea", "script-box"); ta.id = "script-edit";
     ta.placeholder = T.script_placeholder; ta.value = S.values.script || "";
     c.appendChild(ta);
+    // Script Creator: topic -> gemini writes a reference-style script into the field
+    // (empty topic = the model picks its own viral topic). The generated script always stays
+    // here for review/edit - the run never starts from this step, so a halt toggle is noise.
+    {
+      const row = el("div", "card-foot");
+      const ti = document.createElement("input");
+      ti.type = "text"; ti.placeholder = T.gen_topic_ph; ti.style.flex = "1";
+      ti.value = S.values.gen_topic || "";
+      ti.addEventListener("input", () => { S.values.gen_topic = ti.value; });
+      row.appendChild(ti);
+      const gb = btn("✨ " + T.gen_script, async (ev) => {
+        const b = ev.currentTarget; b.disabled = true; b.textContent = T.gen_script_busy;
+        try {
+          const r = await fetch("/generate-script", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ topic: ti.value.trim() }) });
+          const d = await r.json();
+          if (!d.ok) throw new Error(d.error || "no script");
+          ta.value = d.script; S.values.script = d.script;
+          S.values.hook_keywords = JSON.stringify(d.hook_keywords || []);
+          persist();
+          msgA(esc(T.gen_script_done)); renderAll();
+        } catch (e) { errorCard(T.gen_script_err, String(e)); }
+        b.disabled = false; b.textContent = "✨ " + T.gen_script;
+      }, "secondary");
+      row.appendChild(gb);
+      c.appendChild(row);
+    }
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.upload_txt, () => pickFile(".txt,text/plain", f => {
       f.text().then(txt => { ta.value = txt; });
@@ -283,8 +311,36 @@ function renderScriptFlow() {
     }
   }
 
-  // step: visual source
+  // step: edit pipeline version (v0.2 reference edit rules vs v0.1 classic)
   if (done("hook")) {
+    msgA(esc(T.pipeline_q));
+    if (done("version")) {
+      msgU(S.values.pipeline_version === "v0.1" ? esc(T.pipeline_v01) : esc(T.pipeline_v02), "version");
+    } else if (S.step === "version") {
+      const c = card();
+      const seg = el("div", "choices");
+      [["v0.2", T.pipeline_v02, T.pipeline_v02_d],
+       ["v0.1", T.pipeline_v01, T.pipeline_v01_d]].forEach(([v, t, d]) => {
+        const b = el("button", "choice" + ((S.values.pipeline_version || "v0.2") === v ? " sel" : ""),
+          `${esc(t)}<small>${esc(d)}</small>`);
+        b.addEventListener("click", () => { S.values.pipeline_version = v; renderAll(); persist(); });
+        seg.appendChild(b);
+      });
+      c.appendChild(seg);
+      const foot = el("div", "card-foot");
+      foot.appendChild(btn(T.back, () => editStep("hook"), "ghost"));
+      foot.appendChild(el("span", "spacer"));
+      foot.appendChild(btn(T.continue, () => {
+        if (!S.values.pipeline_version) S.values.pipeline_version = "v0.2";
+        completeStep("version", "source");
+      }, "primary"));
+      c.appendChild(foot);
+      setComposer("off"); return;
+    }
+  }
+
+  // step: visual source
+  if (done("version")) {
     msgA(esc(T.visual_source_q));
     if (done("source")) {
       msgU(S.values.clip_source === "scrape"
@@ -402,7 +458,7 @@ function renderHookCard() {
     st.className = "hook-status off"; st.textContent = T.no_hook; paintImpactStatus();
   }, "ghost"));
   foot.appendChild(el("span", "spacer"));
-  foot.appendChild(btn(T.continue, () => completeStep("hook", "source"), "primary"));
+  foot.appendChild(btn(T.continue, () => completeStep("hook", "version"), "primary"));
   c.appendChild(foot);
 }
 function paintHook(view) {
@@ -491,6 +547,7 @@ function renderSourceCard() {
     wrap.appendChild(el("div", "card-cap", esc(T.connections)));
     wrap.appendChild(connectionRow("tiktok", T.connect_tiktok, "/tiktok-status", "/tiktok-login"));
     wrap.appendChild(connectionRow("x", T.connect_x, "/twitter-status", "/twitter-login"));
+    wrap.appendChild(connectionRow("instagram", T.connect_instagram || "Connect Instagram", "/instagram-status", "/instagram-login"));
     // background music
     wrap.appendChild(el("div", "card-cap", esc(T.background_music)));
     const mrow = el("div", "chip-add");
@@ -629,7 +686,8 @@ function renderReviewCard() {
   const g = el("div", "sum-grid");
   const rows = [
     ["Mode", T.mode_script_t, null],
-    ["Visual source", S.values.clip_source === "scrape" ? T.src_scrape : T.src_generate, "source"],
+    ["Edit pipeline", (S.values.pipeline_version === "v0.1" ? T.pipeline_v01 : T.pipeline_v02), "version"],
+   ["Visual source", S.values.clip_source === "scrape" ? T.src_scrape : T.src_generate, "source"],
   ];
   if (S.values.clip_source === "scrape") {
     rows.push([T.scrape_engine, S.values.scraping_engine === "v1" ? "Scrape V1" : "Scrape V2", "source"]);
@@ -967,7 +1025,7 @@ function renderProjectFlow() {
     S.values.loaded_project_mode = mode;
     S.values.loaded_project_source = S.projectSlug;
     S.flow = "script";
-    S.completed = ["script", "hook", "source", "reasoning", "voice", "outputs"];
+    S.completed = ["script", "hook", "version", "source", "reasoning", "voice", "outputs"];
     S.step = "review";
     renderAll(); persist();
   }, "small")));

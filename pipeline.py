@@ -601,6 +601,17 @@ CAPTION_ACCENT = (255, 219, 26)      # punchy yellow for the currently spoken wo
 CAPTION_BODY = (255, 255, 255)       # already-spoken / idle words
 CAPTION_UPCOMING = (216, 220, 226)   # words not reached yet (slightly dimmed)
 CAPTION_HIGHLIGHT = (35, 209, 96)    # signature green box behind the active word (ref style)
+# pipeline v0.2 color-coded captions: hook keywords (NEVER/BANNED/FORCED class) light up in
+# rotating colors even when not the active word; filler words stay white.
+CAPTION_KW_COLORS = ((255, 219, 26), (255, 92, 168), (87, 227, 137))   # yellow / pink / green
+
+
+def caption_keyword_colors(keywords):
+    """Map lowercase keyword -> rotating RGB. Accepts the Script Creator's hook_keywords."""
+    out = {}
+    for i, k in enumerate([str(k).strip().lower() for k in (keywords or []) if str(k).strip()]):
+        out[k] = CAPTION_KW_COLORS[i % len(CAPTION_KW_COLORS)]
+    return out
 
 
 def _caption_word_weight(word):
@@ -627,7 +638,8 @@ def _caption_display_word(word):
     return (word or "").strip(_CAPTION_EDGE_PUNCT)
 
 
-def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None, fps=None):
+def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None, fps=None,
+                         kw_colors=None):
     """Turn a spoken line into timed caption chunks (1-`max_words` words each).
 
     When `word_times` (frame-accurate [{word,start,end}] in scene-local seconds) is
@@ -665,6 +677,7 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
                 "text": word.upper() if uppercase else word,
                 "start": start,
                 "end": end,
+                "kw": (kw_colors or {}).get(word.strip(".,!?…\"'").lower()),
             })
     else:
         text = (text or "").strip()
@@ -679,7 +692,8 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
             cursor = lead
             for word, weight in zip(words, weights):
                 span_d = usable * weight / total
-                spans.append({"text": word, "start": cursor, "end": cursor + span_d})
+                spans.append({"text": word, "start": cursor, "end": cursor + span_d,
+                              "kw": (kw_colors or {}).get(raw_words[len(spans)].strip(".,!?…\"'").lower()) if len(spans) < len(raw_words) else None})
                 cursor += span_d
     if not spans:
         return []
@@ -698,11 +712,12 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
 
 
 def _caption_color_for(word, local):
-    if local >= word["end"]:
-        return CAPTION_BODY        # already spoken
-    if local >= word["start"]:
-        return CAPTION_ACCENT      # active word
-    return CAPTION_UPCOMING        # not reached yet
+    if word["start"] <= local < word["end"]:
+        return CAPTION_ACCENT      # active word (highlight wins over keyword color)
+    kw = word.get("kw")
+    if kw:
+        return kw                  # v0.2: hook keywords stay lit in their color
+    return CAPTION_BODY if local >= word["end"] else CAPTION_UPCOMING
 
 
 def _draw_caption_word(draw, text, cx, cy, font, color, alpha, stroke):
@@ -2870,6 +2885,9 @@ def render_video(config, basename=None):
 
     # Precompute viral word-by-word caption timelines (sourced from spoken script).
     captions_enabled = animated_captions_enabled(config)
+    # v0.2 color-coded captions: hook keywords light up yellow/pink/green, fillers stay white
+    _cap_kw = (caption_keyword_colors(config.get("hook_keywords"))
+               if str(config.get("pipeline_version") or "") == "v0.2" else None)
     caption_max_words = int(config.get("caption_max_words", 3))
     caption_uppercase = bool(config.get("caption_uppercase", True))
     caption_chunks_by_scene = {}
@@ -2909,7 +2927,7 @@ def render_video(config, basename=None):
                 })
             chunks = build_caption_chunks(
                 str(row.get("text") or ""), end - start, caption_max_words,
-                caption_uppercase, word_times=word_times, fps=fps)
+                caption_uppercase, word_times=word_times, fps=fps, kw_colors=_cap_kw)
             for chunk in chunks:
                 shifted = dict(chunk)
                 shifted["start"] = float(chunk["start"]) + start
@@ -2925,7 +2943,7 @@ def render_video(config, basename=None):
             sdur = max(0.1, float(scene["end"]) - float(scene["start"]))
             caption_chunks_by_scene[sid] = build_caption_chunks(
                 ctext, sdur, caption_max_words, caption_uppercase,
-                word_times=scene.get("word_timings"), fps=fps,
+                word_times=scene.get("word_timings"), fps=fps, kw_colors=_cap_kw,
             )
         if bool(config.get("export_caption_pngs", True)):
             try:

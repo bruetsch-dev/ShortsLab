@@ -616,7 +616,7 @@ class Session:
             # one probe scroll ~4s instead of a fixed 8-scroll ~14s), and a productive query stops
             # as soon as two consecutive scrolls add nothing new (results stagnated).
             page.wait_for_timeout(1800)
-            scrape_browser_preview.capture(page, "TikTok", query, sort)
+            scrape_browser_preview.capture(page, "TikTok", query, sort, force=True)
             self._maybe_dismiss_overlays(page)
             scrolls = 0
             stagnant = 0
@@ -625,7 +625,7 @@ class Session:
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)
-                scrape_browser_preview.capture(page, "TikTok", query, sort)
+                scrape_browser_preview.capture(page, "TikTok", query, sort, force=True)
                 scrolls += 1
                 if len(collected) <= last_n:
                     stagnant += 1

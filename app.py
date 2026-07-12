@@ -184,6 +184,8 @@ UI_TEXT_DEFAULTS = {
     "image_model": "openai/gpt-image-2/text-to-image",
     "hook_text": "",
     "impact_word": "",
+    "hook_keywords": "",
+    "pipeline_version": "v0.2",
     "reasoning_mode": "",
     "hook_pause_s": "0.45",
     "speaker_image_path": "",
@@ -3491,6 +3493,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <input type="hidden" name="hook_text" id="hook-text" value="{esc(state.get('hook_text'))}">
           <input type="hidden" name="impact_word" id="impact-word" value="{esc(state.get('impact_word'))}">
+          <input type="hidden" name="hook_keywords" value="{esc(state.get('hook_keywords'))}">
+          <input type="hidden" name="pipeline_version" value="{esc(state.get('pipeline_version'))}">
           <input type="hidden" name="reasoning_mode" value="{esc(state.get('reasoning_mode'))}">
           <div class="hook-controls">
             <button type="button" class="button secondary hook-btn" onclick="markHook()">&#9733; Mark hook</button>
@@ -6201,6 +6205,11 @@ TIMELINE_SKELETON = """
       </div>
       <span class="tl-lib-hint">drag onto the timeline</span>
     </div>
+    <div class="tl-agent-bar">
+      <input type="text" id="tl-agent-input" placeholder="AI fetch — e.g. &quot;find me a tiktok hook clip about onsen&quot;" autocomplete="off">
+      <button type="button" id="tl-agent-go" title="Let the agent search + download clips">✨ Fetch</button>
+    </div>
+    <div class="tl-agent-status" id="tl-agent-status" hidden></div>
     <div class="tl-lib-body" id="tl-lib-media"><div class="media-loading" role="status"><div class="ml-spinner"></div><div class="ml-bar"><i></i></div><div class="ml-text">Loading media</div></div></div>
     <div class="tl-lib-body" id="tl-lib-sfx" hidden><div class="media-loading" role="status"><div class="ml-spinner"></div><div class="ml-bar"><i></i></div><div class="ml-text">Loading sounds</div></div></div>
   </div>
@@ -6439,6 +6448,15 @@ TIMELINE_ASSETS = """
   .tl-sfx-search { width:100%; margin-bottom:10px; position:sticky; top:0; }
   .tl-lib-body[hidden] { display:none; }
   .tl-lib-loading { color:var(--faint); font-size:13px; }
+  /* AI clip fetch bar (scoped: inputs/buttons otherwise inherit the global full-width styles) */
+  .tl-agent-bar { display:flex; gap:6px; margin:0 0 8px; }
+  .tl-agent-bar input { flex:1 1 auto; width:auto; min-width:0; margin:0; padding:8px 11px; font-size:12.5px; }
+  .tl-agent-bar button { width:auto; min-width:0; flex:0 0 auto; padding:8px 14px; font-size:12.5px; font-weight:600; background:var(--accent-subtle); border:1px solid var(--accent); color:var(--text); box-shadow:none; border-radius:var(--r-md); }
+  .tl-agent-bar button::after { display:none; }
+  .tl-agent-bar button:disabled { opacity:.55; cursor:default; }
+  .tl-agent-status { margin:0 0 8px; font-size:12px; color:var(--muted); }
+  .tl-agent-status.ok { color:var(--good, #3dbf6e); }
+  .tl-agent-status.err { color:var(--bad, #e0564f); }
   .tl-lib-item { position:relative; border:1px solid var(--line); border-radius:var(--r-md); overflow:hidden; background:var(--bg-input); cursor:grab; }
   .tl-lib-item:hover { border-color:var(--accent); }
   .tl-lib-item.dragging { opacity:.5; }
@@ -7904,7 +7922,11 @@ TIMELINE_ASSETS = """
         document.getElementById('tl-lib-sfx').hidden = which!=='sfx';
       });
     });
-    fetch('/timeline-library?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
+    loadLibraryData();
+    setupAgentFetch();
+  }
+  function loadLibraryData(){
+    return fetch('/timeline-library?slug='+encodeURIComponent(slug)).then(function(r){return r.json();}).then(function(d){
       window.SFX_TAX = (d&&d.sfx_taxonomy) || {roles:[],reactions:[]};
       renderMediaLib(document.getElementById('tl-lib-media'), (d&&d.media)||[], (d&&d.global_media)||[]);
       renderSfxLib(document.getElementById('tl-lib-sfx'), (d&&d.sfx)||[]);
@@ -7912,6 +7934,51 @@ TIMELINE_ASSETS = """
       document.getElementById('tl-lib-media').innerHTML='<div class="tl-lib-loading">Could not load media.</div>';
       document.getElementById('tl-lib-sfx').innerHTML='<div class="tl-lib-loading">Could not load sounds.</div>';
     });
+  }
+  // ---- AI clip fetch: free-text request -> agent searches TikTok/X/IG + downloads ----
+  function setupAgentFetch(){
+    var input=document.getElementById('tl-agent-input'), btn=document.getElementById('tl-agent-go'),
+        status=document.getElementById('tl-agent-status');
+    if(!input||!btn||!status) return;
+    var pollT=null;
+    function setStatus(msg, cls){
+      status.hidden=false; status.textContent=msg;
+      status.className='tl-agent-status'+(cls?(' '+cls):'');
+    }
+    function poll(){
+      fetch('/timeline-agent-fetch-status?slug='+encodeURIComponent(slug))
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.running){
+            var last=(d.log&&d.log.length)?d.log[d.log.length-1]:'Working...';
+            setStatus('\\u23F3 '+last);
+            pollT=setTimeout(poll, 1500);
+            return;
+          }
+          btn.disabled=false; input.disabled=false;
+          if(d.error){ setStatus('\\u26A0 '+d.error, 'err'); return; }
+          var n=(d.added||[]).length;
+          setStatus('\\u2705 '+n+' clip(s) added to the library.', 'ok');
+          loadLibraryData().then(function(){
+            var t=document.querySelector('.tl-sublib-tab[data-k="agent"]');
+            if(t) t.click();   // jump straight to the new AI-fetch category
+          });
+        }).catch(function(){ pollT=setTimeout(poll, 2500); });
+    }
+    function go(){
+      var text=(input.value||'').trim();
+      if(!text) return;
+      btn.disabled=true; input.disabled=true;
+      setStatus('\\u23F3 Sending request to the agent...');
+      fetch('/timeline-agent-fetch', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({slug:slug, request:text})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(!d.ok){ btn.disabled=false; input.disabled=false; setStatus('\\u26A0 '+(d.error||'Failed.'), 'err'); return; }
+          if(pollT) clearTimeout(pollT);
+          poll();
+        }).catch(function(){ btn.disabled=false; input.disabled=false; setStatus('\\u26A0 Request failed.', 'err'); });
+    }
+    btn.addEventListener('click', go);
+    input.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); go(); } });
   }
   // one shared audio player so previewing a sound stops the previous one
   var libAudio=null;
@@ -7925,6 +7992,32 @@ TIMELINE_ASSETS = """
       libAudio.addEventListener('ended', function(){ if(btn) btn.classList.remove('playing'); });
     }catch(e){}
   }
+  // ONE live hover-preview video at a time. Poster tiles are fully released on leave
+  // (src removed + load()) so their decoder/buffer dies immediately; the poster keeps the
+  // tile painted. No-poster tiles keep their metadata (releasing would blank them).
+  var tlHoverCur=null;
+  function tlHoverStop(vid){
+    try{ vid.pause(); }catch(e){}
+    if(vid.hasAttribute('poster')){
+      vid.removeAttribute('src');
+      try{ vid.load(); }catch(e){}
+    } else {
+      try{ vid.currentTime=0; }catch(e){}
+    }
+    if(tlHoverCur===vid) tlHoverCur=null;
+  }
+  function tlHoverPlay(vid){
+    if(tlHoverCur && tlHoverCur!==vid) tlHoverStop(tlHoverCur);
+    tlHoverCur=vid;
+    if(window.LazyVideo) window.LazyVideo.ensure(vid);
+    vid.muted=true;
+    // preload="none": nothing loads until play() itself kicks off the fetch - so ALWAYS call
+    // play() right away, and re-try once data arrives in case the first call got swallowed by
+    // the load restart. The guard stops a late 'loadeddata' from starting an already-left tile.
+    var tryPlay=function(){ if(tlHoverCur!==vid) return; var p=vid.play(); if(p&&p.catch)p.catch(function(){}); };
+    tryPlay();
+    if(vid.readyState<2){ vid.addEventListener('loadeddata', tryPlay, {once:true}); }
+  }
   function libItemEl(it, kind){
     var el=document.createElement('div'); el.className='tl-lib-item'; el.draggable=true;
     if(kind==='media'){
@@ -7935,9 +8028,18 @@ TIMELINE_ASSETS = """
         el.innerHTML='<div class="tl-lib-vidwrap"><video data-lazy-src="'+esc(it.url)+'"'+poster+' muted preload="none" playsinline></video></div>'
           +'<div class="tl-lib-name">'+esc(it.name)+'</div>'+sub;
         var vid=el.querySelector('video');
-        // Keep the lightweight muted hover preview, but no play/pause control overlays the media.
-        el.addEventListener('mouseenter', function(){ if(window.LazyVideo)window.LazyVideo.ensure(vid); vid.muted=true; vid.play().catch(function(){}); });
-        el.addEventListener('mouseleave', function(){ vid.pause(); try{ vid.currentTime=0; }catch(e){} });
+        // Muted hover preview WITHOUT decoder pile-up: start only after the pointer RESTS on
+        // the tile (skimming across the grid must not spin up players), keep at most ONE live
+        // hover video, and fully release the media element on leave - dozens of loaded
+        // <video>s otherwise accumulate decoders/buffers and the whole library starts lagging.
+        var hoverT=null;
+        el.addEventListener('mouseenter', function(){
+          hoverT=setTimeout(function(){ hoverT=null; tlHoverPlay(vid); }, 130);
+        });
+        el.addEventListener('mouseleave', function(){
+          if(hoverT){ clearTimeout(hoverT); hoverT=null; }
+          tlHoverStop(vid);
+        });
       } else {
         el.innerHTML='<img src="'+esc(it.url)+'" alt="">'+'<div class="tl-lib-name">'+esc(it.name)+'</div>';
       }
@@ -7966,14 +8068,15 @@ TIMELINE_ASSETS = """
     // Primary tabs by TYPE: Videos (mp4), Images (pictures), Hook (female-influencer clips
     // from the hook finder, pooled across ALL projects), Declined (passed-over scraped
     // clips), and All projects (scraped footage from EVERY project, newest first).
-    var groups={videos:[], images:[], hook:[], declined:[], global:globalItems};
+    var groups={videos:[], agent:[], images:[], hook:[], declined:[], global:globalItems};
     items.forEach(function(it){
-      if(it.kind==='hook'){ groups.hook.push(it); }
+      if(it.kind==='agent'){ groups.agent.push(it); }
+      else if(it.kind==='hook'){ groups.hook.push(it); }
       else if(it.kind==='declined'){ groups.declined.push(it); }
       else if(it.type==='video'){ groups.videos.push(it); }
       else { groups.images.push(it); }
     });
-    var defs=[['videos','\\uD83C\\uDFAC Videos'],['images','\\uD83D\\uDDBC Images'],['hook','\\uD83D\\uDC83 Hook'],['declined','\\uD83D\\uDEAB Declined'],['global','\\uD83C\\uDF10 All projects']];
+    var defs=[['videos','\\uD83C\\uDFAC Videos'],['agent','\\u2728 AI fetch'],['images','\\uD83D\\uDDBC Images'],['hook','\\uD83D\\uDC83 Hook'],['declined','\\uD83D\\uDEAB Declined'],['global','\\uD83C\\uDF10 All projects']];
     var keys=defs.filter(function(d){ return groups[d[0]].length; });
     box.innerHTML='<div class="tl-sublib-tabs"></div><input type="text" class="tl-sublib-search" placeholder="Filter clips\\u2026" hidden><div class="tl-sublib-grid"></div>';
     var tabsEl=box.querySelector('.tl-sublib-tabs'), gridEl=box.querySelector('.tl-sublib-grid');
@@ -7986,12 +8089,13 @@ TIMELINE_ASSETS = """
         if(q && (it.name||'').toLowerCase().indexOf(q)===-1 && (it.project||'').toLowerCase().indexOf(q)===-1) return;
         gridEl.appendChild(libItemEl(it,'media'));
       });
-      // Load the first frame of THIS tab's clips immediately (no hover needed). The huge
-      // "All projects" tab stays lazy so it doesn't spin up hundreds of decoders at once.
+      // Poster tiles need NO video load at all (the poster IS the thumbnail) - eagerly
+      // loading every clip of a tab spun up ~100 decoders at once and the library lagged
+      // hard. Only posterless clips still load metadata for a first frame.
       if(window.LazyVideo){
-        if(k==='global'){ window.LazyVideo.observe(gridEl); }
-        else { Array.prototype.forEach.call(gridEl.querySelectorAll('video[data-lazy-src]'), function(v){
-          v.preload='metadata'; window.LazyVideo.ensure(v); }); }
+        Array.prototype.forEach.call(
+          gridEl.querySelectorAll('video[data-lazy-src]:not([poster])'), function(v){
+            v.preload='metadata'; window.LazyVideo.ensure(v); });
       }
     }
     function show(k){
@@ -8631,6 +8735,9 @@ def timeline_library_payload(slug):
             if is_image_path(path) or is_video_path(path):
                 key = str(path.resolve())
                 seen.add(key)
+                # clips downloaded by the timeline AI-fetch agent get their own library category
+                if path.name.startswith("agent_") and is_video_path(path):
+                    kind = "agent"
                 media.append({
                     "kind": kind, "name": path.name, "path": key,
                     "url": link_for(path), "type": "video" if is_video_path(path) else "image",
@@ -8696,9 +8803,172 @@ def timeline_library_payload(slug):
     unique_media = [item for item in media if _is_new(item["path"])]
     global_media = [item for item in all_projects_scraped_media(current_slug=slug)
                     if _is_new(item["path"])]
+    # Server-side poster thumbnails: the tile shows a static JPEG instead of a live <video>,
+    # so opening/hovering the library never accumulates video decoders (the hover-lag killer).
+    # /clip-poster extracts + caches the frame on demand.
+    for item in unique_media + global_media:
+        if item.get("type") == "video" and not item.get("poster"):
+            item["poster"] = "/clip-poster?path=" + urllib.parse.quote(item["path"])
     return {"media": unique_media, "sfx": global_sfx_library(),
             "sfx_taxonomy": sfx_taxonomy(),
             "global_media": global_media}
+
+
+def clip_poster_path(video_path):
+    """Cached 360px poster JPEG for a library video ('<stem>.poster.jpg' - a pattern the media
+    listings already exclude). Generated on first request, then served from disk."""
+    video_path = Path(video_path)
+    cache = video_path.parent / (video_path.stem + ".poster.jpg")
+    if cache.exists() and cache.stat().st_size > 512:
+        return cache
+    ffmpeg = pipeline.find_ffmpeg()
+    if not ffmpeg:
+        return None
+    import subprocess
+    try:
+        subprocess.run([ffmpeg, "-y", "-ss", "0.5", "-i", str(video_path),
+                        "-frames:v", "1", "-vf", "scale=360:-2", "-q:v", "5", str(cache)],
+                       check=True, capture_output=True, timeout=30)
+    except Exception:
+        return None
+    return cache if cache.exists() and cache.stat().st_size > 512 else None
+
+
+# ---------------------------------------------------------------- timeline AI clip fetch
+# "such mir auf tiktok einen hook clip mit onsen" -> an agent turns the request into broad
+# discovery searches, runs the logged-in scrape backends, downloads the best portrait clips
+# into the project's media folder, and the library refreshes with them.
+
+TL_FETCH_JOBS = {}
+
+
+def _agent_fetch_plan(text, log):
+    """Parse the user's free-text request into {queries, platforms, want}. LLM first,
+    deterministic keyword fallback so the feature works even when the LLM call fails."""
+    text = str(text or "").strip()
+    low = " " + text.lower() + " "
+    platforms = []
+    if "instagram" in low or "insta" in low or "reel" in low:
+        platforms.append("instagram")
+    if "twitter" in low or " x " in low or " auf x" in low:
+        platforms.append("twitter")
+    if "tiktok" in low or not platforms:
+        platforms.insert(0, "tiktok")
+    plan = {"queries": [], "platforms": platforms, "want": 4}
+    try:
+        import scrape_v2 as _s2
+        data = _s2._llm_json([
+            {"role": "system", "content":
+             "You turn a user's footage request (German or English) into BROAD TikTok/X/Instagram "
+             "discovery searches. Real platform search finds nothing for specific phrases - "
+             "queries are 1-3 words a real user types. JSON only."},
+            {"role": "user", "content":
+             'Request: "' + text + '"\n'
+             'Return exactly {"queries":["..."],"count":n} - 2-3 broad queries (Japanese preferred '
+             'for Japan-related content plus one English), count = how many clips the user asked '
+             "for (default 4, max 8)."}],
+            max_tokens=400, temperature=0.3)
+        qs = [" ".join(str(q).split()[:3]) for q in (data.get("queries") or []) if str(q).strip()]
+        plan["queries"] = list(dict.fromkeys(qs))[:4]
+        plan["want"] = max(1, min(8, int(data.get("count") or 4)))
+    except Exception as exc:  # noqa: BLE001
+        log(f"Planner LLM unavailable ({exc.__class__.__name__}) - using keyword fallback.")
+    if not plan["queries"]:
+        stop = {"such", "mir", "auf", "einen", "eine", "ein", "clip", "clips", "mit", "und",
+                "der", "die", "das", "von", "für", "bitte", "hook", "mal", "noch",
+                "find", "me", "a", "an", "on", "for", "the", "with", "search", "get",
+                "tiktok", "instagram", "insta", "twitter", "x", "reel", "reels", "video", "videos"}
+        words = [w for w in re.findall(r"[\w#぀-ヿ㐀-鿿]+", text) if w.lower() not in stop]
+        if words:
+            plan["queries"] = [" ".join(words[:3])]
+    return plan
+
+
+def _timeline_agent_fetch_worker(slug, project_dir, text, job):
+    def log(msg):
+        job["log"].append(str(msg))
+
+    try:
+        import clip_scraper
+        import scrape_v2 as _s2
+        plan = _agent_fetch_plan(text, log)
+        if not plan["queries"]:
+            job["error"] = "Could not understand the request - try naming the subject directly."
+            return
+        log("Search plan: " + ", ".join('"%s"' % q for q in plan["queries"])
+            + " on " + "/".join(plan["platforms"]))
+        items, seen = [], set()
+        for q in plan["queries"]:
+            log(f'Searching "{q}" ...')
+            try:
+                got = clip_scraper.backend_search(q, 12, status_cb=None, sort="MOST_LIKED",
+                                                  platforms=plan["platforms"]) or []
+            except Exception as exc:  # noqa: BLE001
+                log(f"Search failed for {q!r}: {exc.__class__.__name__}")
+                got = []
+            for it in got:
+                meta = clip_scraper._item_meta(it)
+                sid = meta.get("id") or meta.get("url")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    items.append((meta, it))
+            log(f"{len(items)} candidate clip(s) so far.")
+        if not items:
+            job["error"] = "No clips found - try a broader request."
+            return
+        # portrait first, then most likes (landscape still usable - the render crops to 9:16)
+        items.sort(key=lambda pair: (1 if int(pair[0].get("h") or 0) > int(pair[0].get("w") or 0) else 0,
+                                     int(pair[0].get("likes") or 0)), reverse=True)
+        dest_dir = project_dir / "seedance 2.0"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%H%M%S")
+        added = 0
+        for meta, it in items:
+            if added >= plan["want"]:
+                break
+            log(f'Downloading {meta.get("platform", "clip")} {meta.get("id", "")} '
+                f'({int(meta.get("likes") or 0):,} likes)...')
+            dest = dest_dir / f"agent_{stamp}_{added:02d}.mp4"
+            got = _s2.download_proxy_v2(it, dest, fmt="bestvideo[height<=1920]+bestaudio/"
+                                                      "best[height<=1920]/best")
+            if got and Path(got).exists() and Path(got).stat().st_size > 65536:
+                job["added"].append(Path(got).name)
+                added += 1
+            else:
+                log("Download failed - skipping.")
+        if not job["added"]:
+            job["error"] = "Every download failed - the sources may be region-locked."
+        else:
+            log(f"Done - {len(job['added'])} clip(s) added to the library.")
+    except Exception as exc:  # noqa: BLE001
+        job["error"] = f"{exc.__class__.__name__}: {exc}"
+    finally:
+        job["running"] = False
+
+
+def start_timeline_agent_fetch(slug, text):
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return {"ok": False, "error": "Unknown project."}
+    if not str(text or "").strip():
+        return {"ok": False, "error": "Empty request."}
+    job = TL_FETCH_JOBS.get(slug)
+    if job and job.get("running"):
+        return {"ok": False, "error": "A fetch is already running for this project."}
+    job = {"running": True, "log": ["Understanding your request..."], "added": [], "error": ""}
+    TL_FETCH_JOBS[slug] = job
+    threading.Thread(target=_timeline_agent_fetch_worker,
+                     args=(slug, project_dir, str(text).strip(), job),
+                     name=f"tlfetch_{slug}", daemon=True).start()
+    return {"ok": True}
+
+
+def timeline_agent_fetch_status(slug):
+    job = TL_FETCH_JOBS.get(slug)
+    if not job:
+        return {"running": False, "log": [], "added": [], "error": ""}
+    return {"running": bool(job.get("running")), "log": list(job.get("log") or [])[-6:],
+            "added": list(job.get("added") or []), "error": str(job.get("error") or "")}
 
 
 def save_sfx_label(payload):
@@ -8730,14 +9000,16 @@ def save_sfx_label(payload):
     rec.setdefault("policy", "core")
     rec.setdefault("note", "")
     data["labels"][fn] = rec
-    data["active"] = False           # labels changed -> next render re-reads them
+    # Do NOT touch data["active"]: route_by_labels re-reads this file on EVERY build_library
+    # call, so an edit is live at the next render anyway - flipping active to False here
+    # silently DISABLED the whole human ground truth until a manual re-activate in the trainer.
     data["updated"] = int(time.time())
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "file": fn, "roles": roles,
-            "reactions": rec["reactions"], "active": False}
+            "reactions": rec["reactions"], "active": bool(data.get("active"))}
 
 
 def all_projects_hook_media(current_slug=None, limit=2000):
@@ -10536,6 +10808,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.send_bytes(json.dumps(timeline_library_payload(slug)).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/clip-poster":
+            resolved = safe_requested_path(urllib.parse.parse_qs(parsed.query).get("path", [""])[0])
+            if not resolved or resolved.is_dir() or not is_video_path(resolved):
+                self.send_error(404)
+                return
+            poster = clip_poster_path(resolved)
+            if not poster:
+                self.send_error(404)
+                return
+            self.serve_file_ranged(poster, "image/jpeg")
+        elif parsed.path == "/timeline-agent-fetch-status":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            self.send_bytes(json.dumps(timeline_agent_fetch_status(slug)).encode("utf-8"),
+                            "application/json; charset=utf-8")
         elif parsed.path == "/music-list":
             self.send_bytes(music_list_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/voice-preview":
@@ -10705,6 +10991,27 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             start_instagram_login()
             self.send_bytes(instagram_status_payload(), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/generate-script":
+            # topic -> reference-style viral script (empty topic = model picks its own).
+            # Returns {"topic","script","hook_keywords"} for the script step + caption coloring.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            except Exception:
+                body = ""
+            topic = ""
+            try:
+                topic = str((json.loads(body) or {}).get("topic") or "")
+            except Exception:
+                topic = urllib.parse.parse_qs(body).get("topic", [""])[0]
+            try:
+                result = agent_core.generate_viral_script(topic)
+                self.send_bytes(json.dumps({"ok": True, **result}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self.send_bytes(json.dumps({"ok": False, "error": str(exc)[:300]}).encode("utf-8"),
+                                "application/json; charset=utf-8")
             return
         if parsed.path == "/longform-speech-decide":
             # per-part approve/decline for the longform "Halt after speech" gate
@@ -11086,6 +11393,17 @@ class Handler(BaseHTTPRequestHandler):
             fields["initial_replace_media_path"] = [media_path]
             job_id = start_job(fields, {})
             self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/timeline-agent-fetch":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                data = {}
+            result = start_timeline_agent_fetch(str(data.get("slug", "")),
+                                                str(data.get("request", "")))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/timeline-save":
             length = int(self.headers.get("Content-Length", "0"))

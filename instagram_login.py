@@ -60,7 +60,15 @@ _LOCALE = os.environ.get("INSTAGRAM_LOCALE", "ja-JP").strip() or "ja-JP"
 _SEARCH_XHR_MARKERS = ("fbsearch", "top_serp", "/api/v1/clips/", "sections/")
 
 _SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0, "captcha": 0,
-                 "timeline_responses": 0, "health_checks": 0, "unavailable": 0}
+                 "timeline_responses": 0, "health_checks": 0, "unavailable": 0,
+                 "nsfw_skipped": 0}
+
+# PRE-DOWNLOAD NSFW GATE: dropped at metadata time (never downloaded) when the caption,
+# hashtags or username hit obvious adult terms. (Mirrored in twitter_login.py - keep in sync.)
+NSFW_RE = re.compile(
+    r"(?i)\b(porn|nsfw|xxx|onlyfans|fansly|hentai|nudes?|lewd|bdsm|fetish|camgirl|escort|"
+    r"stripper|milf)\b|18\s*[+＋]|18plus|エロ|裏垢|無修正|アダルト|オフパコ|セフレ|av女優|"
+    r"風俗|デリヘル|パパ活|えっち|性感")
 _EXECUTOR = None
 _EXEC_LOCK = threading.Lock()
 _SESSION = [None]                       # only ever touched from the executor thread
@@ -72,7 +80,8 @@ def search_stats():
 
 def reset_search_stats():
     _SEARCH_STATS.update(searches=0, items=0, login_wall=0, captcha=0,
-                         timeline_responses=0, health_checks=0, unavailable=0)
+                         timeline_responses=0, health_checks=0, unavailable=0,
+                         nsfw_skipped=0)
 
 
 def _status(cb, msg):
@@ -275,6 +284,10 @@ def _extract_reels(payload):
         desc = str((cap or {}).get("text") or "")
         user = m.get("user") if isinstance(m.get("user"), dict) else {}
         uname = str(user.get("username") or "")
+        # NSFW gate BEFORE the item ever reaches ranking/download
+        if NSFW_RE.search(desc + " " + uname):
+            _SEARCH_STATS["nsfw_skipped"] += 1
+            continue
         try:
             likes = int(m.get("like_count") or 0)
         except (TypeError, ValueError):
@@ -414,13 +427,13 @@ class Session:
                 _status(cb, f"Instagram search: navigation failed for {query!r} "
                             f"({exc.__class__.__name__}).")
             page.wait_for_timeout(2600)
-            scrape_browser_preview.capture(page, "Instagram", query, sort)
+            scrape_browser_preview.capture(page, "Instagram", query, sort, force=True)
             scrolls, stagnant, last_n = 0, 0, len(collected)
             while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1200)
-                scrape_browser_preview.capture(page, "Instagram", query, sort)
+                scrape_browser_preview.capture(page, "Instagram", query, sort, force=True)
                 scrolls += 1
                 if len(collected) <= last_n:
                     stagnant += 1

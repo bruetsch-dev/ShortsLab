@@ -755,19 +755,19 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
     # -- hook riser first (exactly one; extra risers dropped) --
     riser_events = [e for e in events if e["sfx_type"] == "hook_riser"]
     rest = [e for e in events if e["sfx_type"] != "hook_riser"]
+    # The opening riser MUST be one of the dedicated hook_riser*.MP3 files. Catalog entries
+    # are label-driven and a mislabeled sound once played under the NAME hook_riser while
+    # being a completely different sound (user caught it on the timeline). Trust the scanned
+    # sound library (filename-matched pool) FIRST; the passed catalog is only a fallback.
+    try:
+        _full = sfx_library.build_library()
+        _lib_hooks = list(_full.get("hook_risers") or [])
+    except Exception:
+        _lib_hooks = []
+    if _lib_hooks:
+        hook_pool = _lib_hooks
     if not hook_pool:
-        # the passed catalog may carry no riser entries (e.g. label-only catalogs) - the riser
-        # FILES exist in the scanned sound library, so fall back to it; without this the final
-        # mix opened with a bare reaction sound instead of the mandatory hook riser.
-        try:
-            _full = sfx_library.build_library()
-            # hook_risers ONLY - a generic body riser at 0.0s is not an opening hook riser
-            hook_pool = list(_full.get("hook_risers") or [])
-            if hook_pool:
-                log(status_cb, f"Hook riser pool loaded from the sound library "
-                               f"({len(hook_pool)} file(s)) - the catalog had none.")
-        except Exception:
-            hook_pool = []
+        log(status_cb, "No dedicated hook_riser files found - the opening riser is skipped.")
     if hook_pool and not riser_events:
         # The director is REQUIRED to open with a hook_riser at 0.00 but LLMs sometimes omit
         # it - then the video used to open with whatever reaction landed first (e.g. an "aww"
@@ -792,7 +792,7 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
                          "duration": round(end, 3), "source_trim": 0.0,
                          "source_duration": round(rlen, 3),
                          "playback_rate": round(playback_rate, 6),
-                         "volume": round(min(0.85, sfx_library.db_to_gain(-12)), 3),
+                         "volume": round(min(0.85, sfx_library.db_to_gain(-6)), 3),
                          "category": "hook_riser",
                          "reason": ev.get("trigger_detail") or "hook build-up"})
             hook_done = True

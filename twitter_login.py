@@ -25,6 +25,7 @@ Public surface used by clip_scraper / app:
 import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import threading
 import scrape_browser_preview
@@ -51,10 +52,19 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _LOCALE = os.environ.get("TWITTER_LOCALE", "ja-JP").strip() or "ja-JP"
 
 _SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0, "captcha": 0,
-                 "timeline_responses": 0, "health_checks": 0, "unavailable": 0}
+                 "timeline_responses": 0, "health_checks": 0, "unavailable": 0,
+                 "nsfw_skipped": 0}
 _EXECUTOR = None
 _EXEC_LOCK = threading.Lock()
 _SESSION = [None]                       # only ever touched from the executor thread
+
+# PRE-DOWNLOAD NSFW GATE: X carries plenty of adult content. Items are dropped at METADATA
+# time (never even downloaded) when X's own `possibly_sensitive` flag is set OR the
+# text/hashtags/handle hit obvious adult terms. (Mirrored in instagram_login.py - keep in sync.)
+NSFW_RE = re.compile(
+    r"(?i)\b(porn|nsfw|xxx|onlyfans|fansly|hentai|nudes?|lewd|bdsm|fetish|camgirl|escort|"
+    r"stripper|milf)\b|18\s*[+＋]|18plus|エロ|裏垢|無修正|アダルト|オフパコ|セフレ|av女優|"
+    r"風俗|デリヘル|パパ活|えっち|性感")
 
 
 def search_stats():
@@ -63,7 +73,8 @@ def search_stats():
 
 def reset_search_stats():
     _SEARCH_STATS.update(searches=0, items=0, login_wall=0, captcha=0,
-                         timeline_responses=0, health_checks=0, unavailable=0)
+                         timeline_responses=0, health_checks=0, unavailable=0,
+                         nsfw_skipped=0)
 
 
 def _status(cb, msg):
@@ -277,6 +288,12 @@ def _extract_video_tweets(payload):
         tags = [{"name": str(h.get("text") or "")}
                 for h in ((legacy.get("entities") or {}).get("hashtags") or [])
                 if isinstance(h, dict) and h.get("text")]
+        # NSFW gate BEFORE the item ever reaches ranking/download
+        blob = " ".join([str(legacy.get("full_text") or ""), sn]
+                        + [t["name"] for t in tags])
+        if legacy.get("possibly_sensitive") or NSFW_RE.search(blob):
+            _SEARCH_STATS["nsfw_skipped"] += 1
+            continue
         try:
             likes = int(legacy.get("favorite_count") or 0)
         except (TypeError, ValueError):
@@ -389,7 +406,10 @@ class Session:
         page.on("response", _on_response)
         try:
             from urllib.parse import quote
-            url = f"https://x.com/search?q={quote(query, safe='')}&src=typed_query&f=video"
+            # f=video is DEAD on today's X (no Videos tab anymore; it silently falls back to
+            # "Top" = mostly photos/text, which made every X search look video-less). f=media
+            # is the only remaining filter tab; the XHR extraction keeps only native videos.
+            url = f"https://x.com/search?q={quote(query, safe='')}&src=typed_query&f=media"
             try:
                 nav_ms = 45000 if deadline is None else max(
                     1000, min(45000, int((deadline - time.monotonic()) * 1000)))
@@ -398,17 +418,19 @@ class Session:
             except Exception as exc:
                 _status(cb, f"X search: navigation failed for {query!r} ({exc.__class__.__name__}).")
             page.wait_for_timeout(2200)
-            scrape_browser_preview.capture(page, "X", query, sort)
+            scrape_browser_preview.capture(page, "X", query, sort, force=True)
             scrolls, stagnant, last_n = 0, 0, len(collected)
-            while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
+            while (len(collected) < want and scrolls < max_scrolls and stagnant < 3
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)
-                scrape_browser_preview.capture(page, "X", query, sort)
+                scrape_browser_preview.capture(page, "X", query, sort, force=True)
                 scrolls += 1
                 if len(collected) <= last_n:
                     stagnant += 1
-                    if not collected:
+                    # X's SearchTimeline XHR often lands only after 2-3 scrolls - giving up on
+                    # the first empty scroll made every search look at "just the first result".
+                    if not collected and scrolls >= 3:
                         break
                 else:
                     stagnant = 0
@@ -422,6 +444,26 @@ class Session:
                         _SEARCH_STATS["captcha"] += 1
                 except Exception:
                     pass
+                # Media tab can be consent/verify-gated (empty column) while "Top" still
+                # renders - fall back once so X keeps contributing its few native videos.
+                if deadline is None or time.monotonic() < deadline:
+                    try:
+                        top_url = f"https://x.com/search?q={quote(query, safe='')}&src=typed_query"
+                        nav_ms = 30000 if deadline is None else max(
+                            1000, min(30000, int((deadline - time.monotonic()) * 1000)))
+                        page.goto(top_url, timeout=nav_ms, wait_until="domcontentloaded")
+                        page.wait_for_timeout(2200)
+                        scrape_browser_preview.capture(page, "X", query, sort, force=True)
+                        for _ in range(3):
+                            if collected or (deadline and time.monotonic() >= deadline):
+                                break
+                            page.mouse.wheel(0, 2600)
+                            page.wait_for_timeout(1100)
+                        if collected:
+                            _status(cb, f"X search: media tab empty for {query!r} - "
+                                        f"Top fallback found {len(collected)} video(s).")
+                    except Exception:
+                        pass
         finally:
             try:
                 page.close()

@@ -72,8 +72,13 @@ def test_architect_raw_queries_and_multi_sort():
         japanese_queries=["学校 厳しい あるある", "体育 一斉行動", "school 厳しい", "日本語（訳）"])
     queries = v.queries_for_intent(intent)
     texts = [q.query for q in queries]
-    check("Architect English strings pass through unchanged", "strict school drill caught" in texts)
-    check("native Japanese string passes through unchanged", "学校 厳しい あるある" in texts)
+    # BROAD-DISCOVERY (2026-07-12): specific multi-word phrases find ~0 results on real
+    # TikTok/X search, so every query is hard-trimmed (EN: 3 tokens, JA: 2 tokens). The
+    # vision matcher finds the exact matching seconds inside the found videos.
+    check("English query trimmed to 3 broad tokens", "strict school drill" in texts)
+    check("Japanese query trimmed to 2 broad tokens", "学校 厳しい" in texts)
+    check("no query exceeds the broad caps",
+          all(len(q.query.split()) <= (2 if q.language == "ja" else 3) for q in queries))
     check("Romaji/English is rejected from Japanese queries", "school 厳しい" not in texts)
     check("annotated Japanese is rejected", "日本語（訳）" not in texts)
 
@@ -89,10 +94,15 @@ def test_architect_raw_queries_and_multi_sort():
                           sort="RELEVANCE")
     finally:
         v.clip_scraper.backend_search = original
+    q0 = queries[0].query
     check("each raw term searches relevance + likes + views",
-          [mode for _, mode in calls] == ["RELEVANCE", "MOST_LIKED", "MOST_VIEWED"])
+          calls[:3] == [(q0, "RELEVANCE"), (q0, "MOST_LIKED"), (q0, "MOST_VIEWED")])
+    # zero results everywhere -> ONE extra broadened pass with just the first token
+    check("0-result query is auto-broadened to its first token",
+          len(calls) == 4 and calls[3] == (q0.split()[0], "RELEVANCE"))
+    check("broadening is counted", state.get("broadened_queries") == 1)
     check("sort passes are reported", state.get("sort_pass_counts") == {
-          "RELEVANCE": 1, "MOST_LIKED": 1, "MOST_VIEWED": 1})
+          "RELEVANCE": 2, "MOST_LIKED": 1, "MOST_VIEWED": 1})
 
 
 # ---- relevance-first ranking ----------------------------------------------
