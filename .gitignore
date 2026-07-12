@@ -89,3 +89,6 @@ static/*.bak
 chat_session.json
 soundeffects_backup_original/
 instagram-profile/
+
+# local push helper (not source)
+push_to_github.bat

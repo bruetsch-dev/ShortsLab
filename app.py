@@ -6404,6 +6404,9 @@ TIMELINE_ASSETS = """
   .tl-fx { position:absolute; top:6px; bottom:6px; z-index:8; border-radius:7px; background:var(--bg-overlay); border:1px solid var(--line-strong); cursor:pointer; touch-action:none; display:flex; align-items:center; padding:0 8px; font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; box-sizing:border-box; }
   .tl-fx.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-subtle); z-index:9; }
   .tl-fx.disabled { opacity:.4; }
+  /* collision lane: an overlapping event drops to the lower half so it never fully hides the
+     block underneath (both labels stay readable + clickable) */
+  .tl-fx.tl-fx-lo { top:auto; bottom:3px; height:46%; z-index:9; font-size:10px; padding:0 6px; }
   .tl-mixer-wrap { margin-top:16px; }
   .tl-mixer { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
   .tl-slider label { display:flex; justify-content:space-between; margin-bottom:6px; }
@@ -6734,6 +6737,10 @@ TIMELINE_ASSETS = """
         trEl.appendChild(node);
       }
     });
+    // two-lane collision layout: with 20+ events the absolutely positioned blocks used to
+    // hide each other completely (a whoosh drawn later sat exactly on top of a riser ->
+    // "invisible riser" that still played). Overlapping blocks now drop to the lower half.
+    var _laneEnd=[-1e9,-1e9];
     sfx.forEach(function(fx){                     // appended onto the SAME merged track (no re-clear)
       if(fx.deleted) return;
       var at=fxAbsStart(fx);
@@ -6741,6 +6748,11 @@ TIMELINE_ASSETS = """
       var node=document.createElement('div');
       var isStart=at<=0.001;
       node.className='tl-fx'+(isStart?' at-start':'')+(sel&&sel.type==='fx'&&sel.id===fx.id?' selected':'')+(fx.enabled===false?' disabled':'');
+      var _wSec=Math.max(60/SCALE,(fx.duration||0.5));
+      var _lane=0;
+      if(at<_laneEnd[0]-0.01){ _lane=(at<_laneEnd[1]-0.01)?(_laneEnd[0]<=_laneEnd[1]?0:1):1; }
+      _laneEnd[_lane]=Math.max(_laneEnd[_lane],at+_wSec);
+      if(_lane===1) node.classList.add('tl-fx-lo');
       // Keep a true 0.00s event at 0.00s, but inset its block by two pixels so the track
       // border/playhead cannot visually cover its leading edge.
       node.style.left=((at*SCALE)+(isStart?2:0))+'px'; node.style.width=Math.max(60,(fx.duration||0.5)*SCALE)+'px';
