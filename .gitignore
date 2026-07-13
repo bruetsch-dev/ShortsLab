@@ -92,3 +92,6 @@ instagram-profile/
 
 # local push helper (not source)
 push_to_github.bat
+
+# large demo preview videos (regenerable, not needed to run the app)
+static/previews/*.mp4

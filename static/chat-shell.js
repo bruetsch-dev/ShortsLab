@@ -47,8 +47,8 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 function projThumb(p, cls) {
   // Overlay label + colored border: failed (red) wins, else an SFX/VFX-Master upload gets its
   // own colored tag; an ordinary generated/scraped project gets no overlay.
-  const kind = p.failed ? "failed" : (p.kind || p.preview_kind || "");
-  const txt = kind === "failed" ? "failed" : kind === "sfx" ? "SFX" : kind === "vfx" ? "VFX" : "";
+  const kind = p.running ? "running" : p.failed ? "failed" : (p.kind || p.preview_kind || "");
+  const txt = kind === "running" ? "running" : kind === "failed" ? "failed" : kind === "sfx" ? "SFX" : kind === "vfx" ? "VFX" : "";
   const tag = txt ? `<span class="pv-tag pv-tag-${kind}">${txt}</span>` : "";
   const inner = p.thumb_url
     ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">`
@@ -101,6 +101,7 @@ let S = {
 let FILES = {};             // step -> File (not persisted across reload)
 let pollTimer = null, jobsTimer = null, saveTimer = null, scrapePreviewTimer = null;
 let lastProgressHTML = "", lastMediaHTML = "", lastOutputsHTML = "", announcedPhases = [];
+let prototypeMode = false;
 
 function persist() {
   clearTimeout(saveTimer);
@@ -119,9 +120,26 @@ const FLOW_STEPS = {
   sfx: ["upload", "settings"],
   visual: ["upload", "settings"],
   captions: ["upload", "settings"],
+  enhance: ["choose"],
   project: ["summary"],
 };
-function stepsFor(flow) { return FLOW_STEPS[flow] || []; }
+function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
+function isVisualsFromScript() { return S.flow === "script" && !!S.values.visuals_from_script_mode; }
+function applyCultureFactsPreset() {
+  S.values.culture_facts_mode = true;
+  S.values.clip_source = "scrape";
+  S.values.scraping_engine = "v2";
+  S.values.enable_speaker_hook = false;
+  S.values.speaker_image_path = "";
+  FILES.speaker_image_file = null;
+  S.values.out_web_images = false;
+  S.values.out_wikimedia = false;
+  S.values.out_gpt_images = false;
+  S.values.out_video_clips = true;
+}
+function stepsFor(flow) {
+  return FLOW_STEPS[flow] || [];
+}
 function stepIndex(step) { return stepsFor(S.flow).indexOf(step); }
 
 function goto(step) { S.step = step; S.draft = true; renderAll(); persist(); }
@@ -171,21 +189,86 @@ function scrollDown() { const sc = $("chat-scroll"); sc.scrollTop = sc.scrollHei
 function renderAll() {
   stopPolling();
   chat.innerHTML = "";
+  const app = $("app");
+  // Sidebar selection follows application state on every render. Previously it was mostly set
+  // by the clicked nav button, so returning from Assets through an in-page Back action left the
+  // Assets button visually selected over the New Creation screen.
+  markNav(S.view === "assets" ? "assets" : "new");
+  app.classList.toggle("proto-home", prototypeMode && S.view !== "assets" && !S.flow && !S.jobId);
+  app.classList.toggle("proto-flow", prototypeMode && S.view !== "assets" && (!!S.flow || !!S.jobId));
+  app.classList.toggle("proto-assets", prototypeMode && S.view === "assets");
+  app.classList.toggle("proto-job", prototypeMode && S.view !== "assets" && !!S.jobId);
   renderTopbar();
   if (S.view === "assets") { renderAssetsView(); setComposer("off"); scrollDown(); return; }
   if (!S.flow) {
     // an active job renders even without a flow (e.g. reattached via deep link)
     if (S.jobId) { renderJobSection(); scrollDown(); return; }
-    renderModeMenu(); setComposer("off"); scrollDown(); return;
+    if (prototypeMode) {
+      renderPrototypeHome();
+      $("chat-scroll").scrollTop = 0;
+    } else {
+      renderModeMenu(); scrollDown();
+    }
+    setComposer("off"); return;
+  }
+
+  if (prototypeMode && S.jobId) {
+    renderJobSection(); scrollDown(); return;
   }
 
   ({ script: renderScriptFlow, viraltrans: renderViralFlow, reddit: renderRedditFlow,
      longform: renderLongformFlow, sfx: () => renderMasterFlow("sfx"),
      visual: () => renderMasterFlow("visual"), captions: () => renderMasterFlow("captions"),
+     enhance: renderEnhanceFlow,
      project: renderProjectFlow }[S.flow] || renderModeMenu)();
 
+  if (prototypeMode && !S.jobId) decoratePrototypeFlow();
   if (S.jobId) renderJobSection();
   scrollDown();
+}
+
+function decoratePrototypeFlow() {
+  chat.querySelectorAll(":scope > .msg").forEach(m => m.classList.add("proto-flow-context"));
+  const cards = chat.querySelectorAll(":scope > .chat-card");
+  if (cards.length) {
+    const active = cards[cards.length - 1];
+    active.classList.add("proto-active-card", "proto-step-surface", `proto-step-${S.step || "default"}`);
+    active.dataset.step = S.step || "default";
+    const copy = {
+      script:["STORY", "Add your script", "Paste it or generate a fresh one."],
+      hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
+      version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
+      source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
+              isCultureFacts() ? "Set relevance, ranking and optional search terms." : "Pick how the visuals should be generated."],
+      reasoning:["DIRECTOR", "Choose the AI director", "Select the model that plans the production."],
+      voice:["VOICE", "Choose the narrator", "Pick a voice and preview the delivery."],
+      outputs:["FINISH", "Select the final layers", "Choose sound, captions and approval behavior."],
+      review:["REVIEW", "Ready to create", "Check the essentials and start the production."],
+      topic:["TOPIC", "Define the idea", "Give the agent one clear direction."],
+      discover:["DISCOVER", "Find the story", "Choose where the search should begin."],
+      pick:["SELECT", "Choose the strongest story", "Pick the version worth producing."],
+      upload:["SOURCE", "Add your video", "Drop in the cut you want to enhance."],
+      settings:["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
+      choose:["UPGRADE", "Choose an enhancement", "Pick one production pass."],
+      summary:["PROJECT", "Project overview", "Choose the next action."],
+    }[S.step] || ["SETTINGS", "Configure this step", "Make your choices and continue."];
+    const flowSteps = stepsFor(S.flow);
+    const stepIndex = Math.max(0, flowSteps.indexOf(S.step));
+    const prev = stepIndex > 0 ? flowSteps[stepIndex - 1] : null;
+    const head = el("header", "proto-config-head");
+    const back = el("button", "proto-config-back", `${protoIcon("arrow")}<span>${prev ? "Back" : "All modes"}</span>`);
+    back.type = "button";
+    back.addEventListener("click", () => prev ? editStep(prev) : resetToMode());
+    head.innerHTML = `<div class="proto-config-nav"></div><div class="proto-config-title"><small>${esc(copy[0])}</small><h1>${esc(copy[1])}</h1><p>${esc(copy[2])}</p></div>`;
+    head.querySelector(".proto-config-nav").appendChild(back);
+    head.querySelector(".proto-config-nav").appendChild(el("span", "proto-config-count",
+      `${String(stepIndex + 1).padStart(2,"0")} / ${String(flowSteps.length).padStart(2,"0")}`));
+    active.insertBefore(head, active.firstChild);
+    active.querySelectorAll(".card-foot .btn").forEach(button => {
+      if (button.textContent.trim().toLowerCase() === String(T.back || "Back").trim().toLowerCase())
+        button.classList.add("proto-redundant-back");
+    });
+  }
 }
 
 /* ------------------------------------------------------------------ topbar */
@@ -209,6 +292,8 @@ function renderTopbar() {
 
 /* ------------------------------------------------------------------ mode menu (empty state) */
 const MODES = [
+  { id: "culture", grp: 0, ico: "🌏", t: "Clip Short", d: "Turn facts, strange stories and fascinating topics into a short using real sourced footage from TikTok, Instagram and X matching your script." },
+  { id: "visualscript", grp: 0, ico: "✦", t: "AI Short", d: "Create a short using AI-generated visuals and scraped web imagery matching the script." },
   { id: "script", grp: 0, ico: "🎬", t: T.mode_script_t, d: T.mode_script_d },
   { id: "viraltrans", grp: 0, ico: "🧪", t: T.mode_viral_t, d: T.mode_viral_d },
   { id: "reddit", grp: 0, ico: "💬", t: T.mode_reddit_t, d: T.mode_reddit_d },
@@ -223,7 +308,9 @@ function renderModeMenu() {
     const c = card();
     c.appendChild(el("div", "card-cap", esc(cap)));
     const grid = el("div", "mode-grid");
-    MODES.filter(m => m.grp === g).forEach(m => {
+    const visibleModes = MODES.filter(m => m.grp === g && !["sfx", "visual", "captions"].includes(m.id));
+    if (g === 1) visibleModes.unshift({ id:"enhance", ico:"✦", t:"Enhance video", d:"Choose SFX Master, Visual Master or Caption Master after opening." });
+    visibleModes.forEach(m => {
       const b = el("button", "mode-card");
       b.innerHTML = `<span class="mh"><span class="mi">${m.ico}</span>${esc(m.t)}</span><span class="md">${esc(m.d)}</span>`;
       b.addEventListener("click", () => selectMode(m.id));
@@ -232,9 +319,261 @@ function renderModeMenu() {
     c.appendChild(grid);
   });
 }
+
+/* ------------------------------------------------------------------ opt-in Creator Launchpad prototype
+   This is a second presentation layer over the existing deterministic flow state. It never
+   invents a route or duplicates a backend operation: every action below calls the same
+   selectMode/showAssets/loadProject/startJob functions as the classic shell. */
+function protoIcon(name) {
+  const paths = {
+    spark: '<path d="M12 3l1.4 4.1L17.5 8.5l-4.1 1.4L12 14l-1.4-4.1-4.1-1.4 4.1-1.4L12 3Z"/><path d="M5 14l.8 2.2L8 17l-2.2.8L5 20l-.8-2.2L2 17l2.2-.8L5 14Z"/>',
+    sound: '<path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15 9a5 5 0 0 1 0 6"/><path d="M18 6a9 9 0 0 1 0 12"/>',
+    visual: '<path d="M3 7V4h3M18 4h3v3M21 17v3h-3M6 20H3v-3"/><circle cx="12" cy="12" r="3"/><path d="M5 12s2.5-4 7-4 7 4 7 4-2.5 4-7 4-7-4-7-4Z"/>',
+    captions: '<path d="M4 5h16v12H8l-4 3V5Z"/><path d="M8 10h8M8 13h5"/>',
+    flask: '<path d="M9 3h6M10 3v5l-5 9a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 17l-5-9V3"/><path d="M7.5 15h9"/>',
+    reddit: '<circle cx="12" cy="12" r="8"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><path d="M8 15c2 1.5 6 1.5 8 0M14 4l1-2 3 1"/>',
+    longform: '<path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h8M8 17h5"/>',
+    arrow: '<path d="M5 12h14M14 7l5 5-5 5"/>',
+    folder: '<path d="M3 6h7l2 2h9v10H3V6Z"/>',
+    activity: '<path d="M3 12h4l2-6 4 12 2-6h6"/>',
+    more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+  };
+  return `<svg class="proto-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.spark}</svg>`;
+}
+function renderPrototypeHome() {
+  const home = el("div", "proto-launchpad");
+  home.innerHTML = `
+    <header class="proto-hero">
+      <div class="proto-kicker"><span></span> CREATOR WORKSPACE</div>
+      <h1>Pick the format.<br><em>Shape the story.</em></h1>
+      <p>Choose a starting point, configure your production, and let AI handle the rest.</p>
+    </header>
+    <section class="proto-primary-tools" aria-label="Production tools">
+      <button type="button" class="proto-tool proto-creator-card proto-tool-culture" data-mode="culture">
+        <video id="proto-culture-preview" muted autoplay loop playsinline preload="auto" poster="/file?path=static%2Fpreviews%2Fclip_short_poster.jpg" src="/file?path=static%2Fpreviews%2Fclip_short_real_20s_hd.mp4" aria-hidden="true"></video>
+        <span class="proto-culture-shade"></span>
+        <span class="proto-tool-icon">${protoIcon("activity")}</span>
+        <span class="proto-tool-copy"><small>SCRAPE V2 · COMPLETE SHORT</small><strong>Culture Facts</strong>
+          <em>Script → relevance-first TikTok, X and Instagram footage → voice, sound and captions.</em></span>
+        <span class="proto-tool-go">Create Culture Facts ${protoIcon("arrow")}</span>
+      </button>
+      <button type="button" class="proto-tool proto-creator-card proto-tool-main" data-mode="script">
+        <span class="proto-tool-icon">${protoIcon("spark")}</span>
+        <span class="proto-tool-copy"><small>START FROM AN IDEA</small><strong>Create a short</strong>
+          <em>Script, voice, footage and sound — built as one directed production.</em></span>
+        <span class="proto-tool-go">Start creating ${protoIcon("arrow")}</span><i class="proto-orbit"></i>
+      </button>
+      <button type="button" class="proto-tool proto-creator-card proto-tool-visualscript" data-mode="visualscript">
+        <video muted autoplay loop playsinline preload="auto" poster="/file?path=static%2Fpreviews%2Fai_short_motion_poster.jpg" src="/file?path=static%2Fpreviews%2Fai_short_pig_war_motion_20s_hd.mp4" aria-hidden="true"></video>
+        <span class="proto-culture-shade"></span>
+        <span class="proto-tool-icon">${protoIcon("spark")}</span>
+        <span class="proto-tool-copy"><small>NO SCRAPING · GENERATIVE MEDIA</small><strong>Visuals from Script</strong>
+          <em>Direct a complete short with AI video, AI images, web images and Wikimedia footage.</em></span>
+        <span class="proto-tool-go">Build from script ${protoIcon("arrow")}</span>
+      </button>
+      <button type="button" class="proto-tool proto-creator-card proto-tool-reddit" data-mode="reddit">
+        <video muted autoplay loop playsinline preload="auto" poster="/file?path=static%2Fpreviews%2Fstory_flow_poster.jpg" src="/file?path=static%2Fpreviews%2Fstory_flow_20s_hd.mp4" aria-hidden="true"></video>
+        <span class="proto-culture-shade"></span>
+        <span class="proto-reddit-caption"><b>r/AskReddit</b><span>What is a secret you were never supposed to find out?</span></span>
+        <span class="proto-tool-copy"><small>STORY + GAMEPLAY</small><strong>Reddit Story</strong>
+          <em>Turn a thread into a narrated short over Minecraft parkour.</em></span>
+        <span class="proto-tool-go">Find a story ${protoIcon("arrow")}</span>
+      </button>
+    </section>
+    <section class="proto-secondary-tools" aria-label="More creation modes">
+      <button type="button" data-mode="enhance">${protoIcon("visual")}<span><b>Enhance video</b><small>SFX, visual effects or captions</small></span></button>
+      <button type="button" data-mode="viraltrans">${protoIcon("flask")}<span><b>Viral Transcriber</b><small>Rebuild a proven format</small></span></button>
+      <button type="button" data-mode="longform">${protoIcon("longform")}<span><b>Longform Visuals</b><small>Illustrate longer narration</small></span></button>
+    </section>
+    <section class="proto-home-section">
+      <header><div><small>CONTINUE WORKING</small><h2>Recent projects</h2></div><button type="button" data-open-assets>View all ${protoIcon("arrow")}</button></header>
+      <div class="proto-project-grid" id="proto-project-grid"><div class="proto-skeleton"></div><div class="proto-skeleton"></div><div class="proto-skeleton"></div></div>
+    </section>
+    <section class="proto-live-dock" id="proto-live-dock" hidden aria-live="polite"></section>`;
+  chat.appendChild(home);
+  // Prototype creation menu: keep the four distinct production modes only.
+  home.querySelector('[data-mode="script"]')?.remove();
+  home.querySelector('[data-mode="viraltrans"]')?.remove();
+  const labelCard = (mode, eyebrow, title, description, action) => {
+    const node = home.querySelector(`[data-mode="${mode}"]`);
+    if (!node) return node;
+    const small = node.querySelector(".proto-tool-copy small"); if (small) small.textContent = eyebrow;
+    const strong = node.querySelector(".proto-tool-copy strong"); if (strong) strong.textContent = title;
+    const em = node.querySelector(".proto-tool-copy em"); if (em) em.textContent = description;
+    const go = node.querySelector(".proto-tool-go"); if (go && action) go.innerHTML = `${esc(action)} ${protoIcon("arrow")}`;
+    return node;
+  };
+  labelCard("culture", "REAL FOOTAGE SHORT", "Clip Short",
+    "Turn facts, strange stories and fascinating topics into a short using real sourced footage from TikTok, Instagram and X matching your script.", "Create Clip Short");
+  const aiShort = home.querySelector('[data-mode="visualscript"]');
+  labelCard("visualscript", "AI VISUAL SHORT", "AI Short",
+    "Create a short using AI-generated visuals and scraped web imagery matching the script.", "Build AI Short");
+  const story = home.querySelector('[data-mode="reddit"]');
+  if (story) {
+    story.querySelector(".proto-reddit-caption")?.remove();
+  }
+  labelCard("reddit", "STORY B-ROLL", "Story Flow",
+    "Tell Reddit, 4chan or other stories over satisfying background footage.", "Create Story Flow");
+  const longform = home.querySelector('[data-mode="longform"]');
+  if (longform) {
+    longform.className = "proto-tool proto-creator-card proto-tool-longform";
+    longform.innerHTML = `<span class="proto-sketch-preview sketch-originals" aria-hidden="true">
+      <img class="sketch-original original-1" src="/file?path=static%2Fpreviews%2Fsketch_longform%2Fscene_04.jpg" alt="">
+      <img class="sketch-original original-2" src="/file?path=static%2Fpreviews%2Fsketch_longform%2Fscene_05.jpg" alt="">
+      <img class="sketch-original original-3" src="/file?path=static%2Fpreviews%2Fsketch_longform%2Fscene_01.png" alt="">
+      <img class="sketch-original original-4" src="/file?path=static%2Fpreviews%2Fsketch_longform%2Fscene_09.jpeg" alt="">
+      <b class="sketch-motion motion-a">→</b><b class="sketch-motion motion-b">✦</b><b class="sketch-motion motion-c">···</b></span>
+      <span class="proto-sketch-shade"></span><span class="proto-tool-icon">${protoIcon("longform")}</span>
+      <span class="proto-tool-copy"><small>STICKMAN LONGFORM</small><strong>Sketch Explainer</strong>
+      <em>Create long-form narrated videos with AI generated stickman sketch visuals.</em></span>
+      <span class="proto-tool-go">Create Sketch Explainer ${protoIcon("arrow")}</span>`;
+    home.querySelector(".proto-primary-tools").appendChild(longform);
+  }
+  const enhance = home.querySelector('[data-mode="enhance"]');
+  if (enhance) {
+    const upgradeSection = enhance.parentElement;
+    if (upgradeSection) {
+      upgradeSection.className = "proto-upgrade-section";
+      const upgradeHead = el("header", "proto-section-heading");
+      upgradeHead.innerHTML = `<div class="proto-kicker"><span></span> FINISHING STUDIO</div><h2>Upgrade your video</h2>`;
+      upgradeSection.insertBefore(upgradeHead, enhance);
+    }
+    enhance.className = "proto-enhance-showcase";
+    enhance.innerHTML = `<span class="proto-enhance-preview">
+      <span class="proto-vfx-demo" aria-hidden="true"><i class="vfx-focus"><b></b><b></b><b></b><b></b></i>
+      <i class="vfx-arrow">➜</i><i class="vfx-arrow vfx-arrow-two">➜</i><i class="vfx-ring"></i>
+      <i class="vfx-speed-lines"><b></b><b></b><b></b></i><strong class="vfx-pop-label">LOOK HERE</strong>
+      ${Array.from({length:10}, (_, i) => `<b class="vfx-particle p-${i + 1}"></b>`).join("")}</span>
+      <span class="proto-caption-demo" aria-hidden="true"><b style="--word:0">MAKE</b><b style="--word:1">EVERY</b><b style="--word:2">SECOND</b><b class="hot" style="--word:3">HIT</b></span>
+      <i class="proto-sfx-wave" aria-hidden="true">${Array.from({length:18}, (_, i) => `<b style="--i:${i}"></b>`).join("")}</i>
+      </span>
+      <span class="proto-enhance-copy"><small>POLISH AN EXISTING CUT</small><strong>Enhance video</strong>
+      <em>Add cinematic sound effects, animated captions and attention-guiding visual effects to an existing video.</em><span>Enhance a video ${protoIcon("arrow")}</span></span>`;
+  }
+  home.querySelectorAll(".proto-primary-tools .proto-tool-icon").forEach(icon => icon.remove());
+  home.querySelectorAll(".proto-tool-copy small,.proto-enhance-copy small").forEach(label => label.remove());
+  home.querySelectorAll(".proto-primary-tools .proto-tool-go,.proto-enhance-copy > span").forEach(action => action.remove());
+  home.querySelector(".proto-home-section")?.remove();
+  home.querySelectorAll("video").forEach(video => {
+    video.muted = true; video.defaultMuted = true;
+    const start = () => video.play().catch(() => {});
+    if (video.readyState >= 2) start(); else video.addEventListener("loadeddata", start, { once:true });
+  });
+  home.querySelectorAll("[data-mode]").forEach(b => {
+    b.addEventListener("click", () => enterModeFromCard(b, b.dataset.mode));
+    if (b.classList.contains("proto-tool")) {
+      b.addEventListener("pointermove", e => {
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        const r = b.getBoundingClientRect();
+        b.style.setProperty("--mx", ((e.clientX - r.left) / r.width * 100).toFixed(1) + "%");
+        b.style.setProperty("--my", ((e.clientY - r.top) / r.height * 100).toFixed(1) + "%");
+        b.style.setProperty("--tx", ((e.clientX - r.left - r.width / 2) * .018).toFixed(2) + "px");
+        b.style.setProperty("--ty", ((e.clientY - r.top - r.height / 2) * .018).toFixed(2) + "px");
+      });
+      b.addEventListener("pointerleave", () => { b.style.removeProperty("--tx"); b.style.removeProperty("--ty"); });
+    }
+  });
+  home.querySelector("[data-open-assets]").addEventListener("click", () => showAssets(false));
+  refreshPrototypeHomeData();
+}
+function enterModeFromCard(source, mode) {
+  if (!source || document.body.classList.contains("mode-entering") ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    selectMode(mode); return;
+  }
+  const rect = source.getBoundingClientRect();
+  if (mode === "culture") prepareUiWhoosh();
+  const clone = source.cloneNode(true);
+  clone.removeAttribute("data-mode"); clone.classList.add("proto-mode-zoom");
+  Object.assign(clone.style, {
+    left:rect.left + "px", top:rect.top + "px", width:rect.width + "px", height:rect.height + "px"
+  });
+  document.body.classList.add("mode-entering");
+  source.style.opacity = "0";
+  document.body.appendChild(clone);
+  clone.querySelectorAll("video").forEach(video => { video.muted = true; video.play().catch(() => {}); });
+  requestAnimationFrame(() => requestAnimationFrame(() => clone.classList.add("expand")));
+  // Clip Short begins revealing its first configuration surface during the final 160ms of
+  // the card expansion. The expanding preview remains above it and fades away, producing one
+  // continuous spatial transition instead of zoom -> blank beat -> sudden wizard.
+  const revealAt = mode === "culture" ? 455 : 620;
+  setTimeout(() => {
+    selectMode(mode);
+    document.body.classList.add("mode-arriving");
+    if (mode === "culture") {
+      document.body.classList.add("mode-arriving-clip");
+      // Start audio on the same painted frame as the 820ms card flight. Starting it directly
+      // after the DOM class change made the sound lead the visible motion by one frame.
+      requestAnimationFrame(() => playUiWhoosh());
+      // Keep the expanded footage visibly layered over the already-arriving script box. Only
+      // after the overlap has registered does the preview complete its fade.
+      requestAnimationFrame(() => clone.classList.add("ui-visible"));
+      setTimeout(() => clone.classList.add("finish"), 480);
+      // Pin the rendered card to the animation's exact end state before mode-arriving-clip is
+      // removed. Without this handoff Chromium briefly rebuilt the layer on the CPU and flashed
+      // the underlying unanimated card for one frame.
+      setTimeout(() => {
+        const card = chat.querySelector(":scope > .proto-active-card");
+        if (card) card.classList.add("proto-flight-landed");
+      }, 835);
+    } else {
+      requestAnimationFrame(() => clone.classList.add("finish"));
+    }
+    setTimeout(() => {
+      clone.remove(); source.style.opacity = "";
+      document.body.classList.remove("mode-entering", "mode-arriving", "mode-arriving-clip");
+    }, mode === "culture" ? 1020 : 480);
+  }, revealAt);
+}
+async function refreshPrototypeHomeData() {
+  if (!prototypeMode || !$("app").classList.contains("proto-home")) return;
+  const grid = $("proto-project-grid");
+  try {
+    const d = await jget("/projects-list");
+    if (grid) {
+      grid.innerHTML = "";
+      (d.projects || []).slice(0, 3).forEach((p, idx) => {
+      const b = el("button", "proto-project");
+      const fallback = `<span class="proto-poster-fallback proto-poster-${idx + 1}">${protoIcon("folder")}</span>`;
+      const preview = p.thumb_url ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">` : fallback;
+      const status = p.running ? "Run in progress" : p.failed ? "Needs attention" : p.has_timeline ? "Ready to edit" : "In progress";
+      b.innerHTML = `<span class="proto-project-poster">${preview}${p.kind ? `<i>${esc(p.kind)}</i>` : ""}</span>
+        <span class="proto-project-copy"><b>${esc(p.title || p.slug)}</b><small>${esc(status)} · ${esc(fmtDate(p.edited))}</small></span>${protoIcon("more")}`;
+      b.addEventListener("click", () => loadProject(p.slug));
+        grid.appendChild(b);
+      });
+      if (!grid.children.length) grid.innerHTML = '<div class="proto-empty">Your first production will appear here.</div>';
+    }
+  } catch (e) { if (grid) grid.innerHTML = '<div class="proto-empty">Projects are temporarily unavailable.</div>'; }
+  const dock = $("proto-live-dock");
+  try {
+    const d = await jget("/jobs-list");
+    if (!dock) return;
+    const active = (d.jobs || []).filter(j => ["running", "cancelling", "awaiting_approval"].includes(j.status));
+    dock.hidden = !active.length;
+    dock.innerHTML = "";
+    active.slice(0, 2).forEach((j, idx) => {
+      const b = el("button", "proto-live-job");
+      const progress = Math.max(8, Math.min(94, Number(j.progress || j.percent || (idx ? 34 : 67))));
+      b.innerHTML = `<span class="proto-live-thumb">${protoIcon("activity")}</span><span class="proto-live-copy"><small>LIVE · ${esc(j.kind || "PRODUCTION")}</small>
+        <b>${esc(j.project_slug || "Active production")}</b><em>${esc(j.last_log || j.status)}</em><i><span style="width:${progress}%"></span></i></span>
+        <strong>${progress}%</strong>${protoIcon("arrow")}`;
+      b.addEventListener("click", () => startJob(j.id)); dock.appendChild(b);
+    });
+  } catch (e) { if (dock) dock.hidden = true; }
+}
 function selectMode(id) {
-  S.flow = id; S.completed = [];
-  S.step = stepsFor(id)[0];
+  const culture = id === "culture";
+  const visualScript = id === "visualscript";
+  S.flow = (culture || visualScript) ? "script" : id; S.completed = [];
+  S.values.culture_facts_mode = culture;
+  S.values.visuals_from_script_mode = visualScript;
+  if (culture) applyCultureFactsPreset();
+  else if (id === "script" || visualScript) {
+    S.values.clip_source = "generate";
+    S.values.scraping_engine = "v2";
+  }
+  S.step = stepsFor(S.flow)[0];
   renderAll(); persist();
 }
 
@@ -249,11 +588,16 @@ function renderScriptFlow() {
     const sc = S.values.script || "";
     msgU(esc(sc.length > 220 ? sc.slice(0, 220) + "…" : sc), "script");
   } else if (S.step === "script") {
-    const c = card();
-    c.appendChild(el("div", "card-cap", "Script"));
+    const c = card("script-config-card");
     const ta = el("textarea", "script-box"); ta.id = "script-edit";
     ta.placeholder = T.script_placeholder; ta.value = S.values.script || "";
     c.appendChild(ta);
+    const sizeScriptBox = () => {
+      ta.style.height = "auto";
+      ta.style.height = Math.min(Math.max(360, ta.scrollHeight + 2), Math.round(window.innerHeight * .72)) + "px";
+    };
+    ta.addEventListener("input", sizeScriptBox);
+    requestAnimationFrame(sizeScriptBox);
     // Script Creator: topic -> gemini writes a reference-style script into the field
     // (empty topic = the model picks its own viral topic). The generated script always stays
     // here for review/edit - the run never starts from this step, so a halt toggle is noise.
@@ -264,12 +608,26 @@ function renderScriptFlow() {
       ti.value = S.values.gen_topic || "";
       ti.addEventListener("input", () => { S.values.gen_topic = ti.value; });
       row.appendChild(ti);
+      const instructionWrap = el("label", "generator-instructions");
+      instructionWrap.innerHTML = `<span>GENERATOR INSTRUCTIONS <em>OPTIONAL</em></span>`;
+      const instructionInput = el("textarea", "generator-instructions-input");
+      instructionInput.rows = 3;
+      instructionInput.placeholder = "e.g. Make it less exaggerated, keep the facts broader, or structure it as three distinct facts.";
+      instructionInput.value = S.values.script_generator_instructions || "";
+      instructionInput.addEventListener("input", () => {
+        S.values.script_generator_instructions = instructionInput.value;
+        persist();
+      });
+      instructionWrap.appendChild(instructionInput);
       const gb = btn("✨ " + T.gen_script, async (ev) => {
         const b = ev.currentTarget; b.disabled = true; b.textContent = T.gen_script_busy;
         try {
           const r = await fetch("/generate-script", { method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ topic: ti.value.trim() }) });
+            body: JSON.stringify({
+              topic: ti.value.trim(),
+              instructions: instructionInput.value.trim(),
+            }) });
           const d = await r.json();
           if (!d.ok) throw new Error(d.error || "no script");
           ta.value = d.script; S.values.script = d.script;
@@ -280,13 +638,41 @@ function renderScriptFlow() {
         b.disabled = false; b.textContent = "✨ " + T.gen_script;
       }, "secondary");
       row.appendChild(gb);
+      // Recent-scripts library: every previously GENERATED script + (separately) every script
+      // previously USED in a project; the preview is always the script's first sentence.
+      row.appendChild(btn("📚 " + T.recent_scripts, async () => {
+        const old = c.querySelector(".recent-scripts");
+        if (old) { old.remove(); return; }          // toggle closed
+        let d = { generated: [], used: [] };
+        try { d = await jget("/recent-scripts"); } catch (e) {}
+        const box = el("div", "recent-scripts");
+        const addGroup = (label, items, isGen) => {
+          if (!items || !items.length) return;
+          box.appendChild(el("div", "card-cap", esc(label)));
+          items.forEach(it => {
+            const r = el("button", "rs-row");
+            r.innerHTML = `<b>${esc(isGen ? (it.topic || "Generated") : it.project)}</b>
+              <span>${esc(it.preview)}</span>`;
+            r.title = it.preview;
+            r.addEventListener("click", () => {
+              ta.value = it.script; S.values.script = it.script; persist(); box.remove();
+            });
+            box.appendChild(r);
+          });
+        };
+        addGroup(T.recent_generated, d.generated, true);
+        addGroup(T.recent_used, d.used, false);
+        if (!box.children.length) box.appendChild(el("div", "card-note", "No scripts yet."));
+        const foots = c.querySelectorAll(".card-foot");
+        c.insertBefore(box, foots[foots.length - 1]);   // between the generate row and the foot
+      }, "ghost"));
       c.appendChild(row);
+      c.appendChild(instructionWrap);
     }
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.upload_txt, () => pickFile(".txt,text/plain", f => {
       f.text().then(txt => { ta.value = txt; });
     }), "ghost"));
-    foot.appendChild(btn(T.load_project, openProjectPicker, "ghost"));
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
@@ -332,6 +718,7 @@ function renderScriptFlow() {
       foot.appendChild(el("span", "spacer"));
       foot.appendChild(btn(T.continue, () => {
         if (!S.values.pipeline_version) S.values.pipeline_version = "v0.2";
+        if (isCultureFacts()) applyCultureFactsPreset();
         completeStep("version", "source");
       }, "primary"));
       c.appendChild(foot);
@@ -344,7 +731,7 @@ function renderScriptFlow() {
     msgA(esc(T.visual_source_q));
     if (done("source")) {
       msgU(S.values.clip_source === "scrape"
-        ? `${esc(T.src_scrape)} · ${esc(S.values.scraping_engine === "v1" ? T.engine_v1 : T.engine_v2)}`
+        ? `${esc(T.src_scrape)} · ${esc(T.engine_v2)}`
         : `${esc(T.src_generate)} · ${esc(S.values.video_model)}`, "source");
     } else if (S.step === "source") {
       renderSourceCard(); setComposer("off"); return;
@@ -482,15 +869,14 @@ function paintHook(view) {
 
 function renderSourceCard() {
   const c = card();
-  const seg = el("div", "choices");
-  [["generate", T.src_generate, T.src_generate_d], ["scrape", T.src_scrape, T.src_scrape_d]].forEach(([v, t, d]) => {
-    const b = el("button", "choice" + (S.values.clip_source === v ? " sel" : ""),
-      `${esc(t)}<small>${esc(d)}</small>`);
-    b.addEventListener("click", () => { S.values.clip_source = v; renderAll(); persist(); });
-    seg.appendChild(b);
-  });
-  c.appendChild(seg);
-  const wrap = el("div"); wrap.style.marginTop = "12px"; c.appendChild(wrap);
+  if (isCultureFacts()) applyCultureFactsPreset();
+  if (isCultureFacts()) {
+    c.appendChild(el("div", "card-note", "Clip Short uses relevance-first Scrape V2 across TikTok, X and Instagram. Tune its search below."));
+  } else {
+    S.values.clip_source = "generate";
+    c.appendChild(el("div", "card-note", "Create a short uses generated visual media. Choose the video and image models below."));
+  }
+  const wrap = el("div", "proto-source-settings"); c.appendChild(wrap);
 
   if (S.values.clip_source === "generate") {
     wrap.appendChild(selectField(T.video_model, OPT.video_model, S.values.video_model,
@@ -498,15 +884,7 @@ function renderSourceCard() {
     wrap.appendChild(selectField(T.image_model, OPT.image_model, S.values.image_model,
       v => S.values.image_model = v));
   } else {
-    // engine
-    wrap.appendChild(el("div", "card-cap", esc(T.scrape_engine)));
-    const engs = el("div", "choices");
-    [["v2", T.engine_v2], ["v1", T.engine_v1]].forEach(([v, t]) => {
-      const b = el("button", "choice" + ((S.values.scraping_engine || "v2") === v ? " sel" : ""), esc(t));
-      b.addEventListener("click", () => { S.values.scraping_engine = v; renderAll(); persist(); });
-      engs.appendChild(b);
-    });
-    wrap.appendChild(engs);
+    S.values.scraping_engine = "v2";
     // relevancy
     wrap.appendChild(el("div", "card-cap", esc(T.script_relevancy)));
     const rr = el("div", "range-row");
@@ -573,7 +951,7 @@ function renderSourceCard() {
   }
 
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("hook"), "ghost"));
+  foot.appendChild(btn(T.back, () => editStep("version"), "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => {
     // scrape disables the AI-image outputs exactly like the legacy form did
@@ -592,6 +970,7 @@ function renderSourceCard() {
 
 function renderVoiceCard() {
   const c = card();
+  if (isCultureFacts()) applyCultureFactsPreset();
   const row = el("div", "fld-row");
   row.appendChild(selectField(T.tts_voice, OPT.tts_voice, S.values.tts_voice, v => S.values.tts_voice = v));
   row.appendChild(selectField(T.tts_model, OPT.tts_model, S.values.tts_model, v => S.values.tts_model = v));
@@ -602,10 +981,10 @@ function renderVoiceCard() {
   }, "ghost small");
   c.appendChild(prev);
   c.appendChild(toggleField(T.fresh_take, S.values.force_regenerate, v => S.values.force_regenerate = v));
-  c.appendChild(toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {
+  if (!isCultureFacts()) c.appendChild(toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {
     S.values.enable_speaker_hook = v; renderAll(); persist();
   }));
-  if (S.values.enable_speaker_hook) {
+  if (!isCultureFacts() && S.values.enable_speaker_hook) {
     c.appendChild(el("div", "card-cap", esc(T.speaker_image)));
     const grid = el("div", "spk-grid"); grid.id = "spk-grid";
     c.appendChild(grid);
@@ -654,9 +1033,10 @@ const OUTPUT_FIELDS = [
 ];
 function renderOutputsCard() {
   const c = card();
+  if (isCultureFacts()) applyCultureFactsPreset();
   const grid = el("div", "tgl-grid");
   const scrape = S.values.clip_source === "scrape";
-  OUTPUT_FIELDS.forEach(([k, label]) => {
+  visibleOutputFields().forEach(([k, label]) => {
     const dis = scrape && ["out_web_images", "out_wikimedia", "out_gpt_images"].includes(k);
     const t = toggleField(label, S.values[k], v => S.values[k] = v, dis);
     grid.appendChild(t);
@@ -664,6 +1044,7 @@ function renderOutputsCard() {
   c.appendChild(grid);
   c.appendChild(el("div", "card-cap", "Run"));
   c.appendChild(toggleField(T.halt_after_speech, S.values.halt_after_speech, v => S.values.halt_after_speech = v));
+  c.appendChild(el("div", "card-note", "A marked hook is always cut from the body and joined with exactly 0.5 seconds of silence before voice approval."));
   c.appendChild(selectField(T.sfx_amount, OPT.sfx_amount, S.values.sfx_amount, v => S.values.sfx_amount = v));
   const foot = el("div", "card-foot");
   foot.appendChild(btn(T.back, () => editStep("voice"), "ghost"));
@@ -672,8 +1053,32 @@ function renderOutputsCard() {
   foot.appendChild(btn(T.continue, () => completeStep("outputs", "review"), "primary"));
   c.appendChild(foot);
 }
+
+function renderEnhanceFlow() {
+  msgA("What do you want to enhance?");
+  const c = card("enhance-picker");
+  const grid = el("div", "mode-grid");
+  [
+    ["sfx", protoIcon("sound"), "SFX Master", "Add transition, reaction and word-triggered sound effects."],
+    ["visual", protoIcon("visual"), "Visual Master", "Add arrows, focus cues and motion-aware visual effects."],
+    ["captions", protoIcon("captions"), "Caption Master", "Generate or restyle captions for an existing video."],
+  ].forEach(([id, icon, title, desc]) => {
+    const b = el("button", "mode-card");
+    b.innerHTML = `<span class="mh"><span class="mi">${icon}</span>${esc(title)}</span><span class="md">${esc(desc)}</span>`;
+    b.addEventListener("click", () => selectMode(id));
+    grid.appendChild(b);
+  });
+  c.appendChild(grid);
+  c.appendChild(btn(T.back, resetToMode, "ghost"));
+  setComposer("off");
+}
+function visibleOutputFields() {
+  return isCultureFacts()
+    ? OUTPUT_FIELDS.filter(([k]) => ["out_sfx", "out_transition_sfx", "out_background_music", "out_captions"].includes(k))
+    : OUTPUT_FIELDS;
+}
 function outputsSummary() {
-  const on = OUTPUT_FIELDS.filter(([k]) => S.values[k]).map(([, l]) => l);
+  const on = visibleOutputFields().filter(([k]) => S.values[k]).map(([, l]) => l);
   let s = on.join(", ") || "No outputs";
   if (S.values.halt_after_speech) s += " · " + T.halt_after_speech;
   s += " · " + T.sfx_amount + ": " + (S.values.sfx_amount || "medium");
@@ -685,21 +1090,21 @@ function renderReviewCard() {
   c.appendChild(el("h3", "", esc(T.ready_create)));
   const g = el("div", "sum-grid");
   const rows = [
-    ["Mode", T.mode_script_t, null],
+    ["Mode", isCultureFacts() ? "Clip Short" : isVisualsFromScript() ? "AI Short" : T.mode_script_t, null],
     ["Edit pipeline", (S.values.pipeline_version === "v0.1" ? T.pipeline_v01 : T.pipeline_v02), "version"],
-   ["Visual source", S.values.clip_source === "scrape" ? T.src_scrape : T.src_generate, "source"],
+   ["Visual source", isCultureFacts() ? "TikTok, X & Instagram · Scrape V2" : (S.values.clip_source === "scrape" ? T.src_scrape : T.src_generate), isCultureFacts() ? null : "source"],
   ];
   if (S.values.clip_source === "scrape") {
-    rows.push([T.scrape_engine, S.values.scraping_engine === "v1" ? "Scrape V1" : "Scrape V2", "source"]);
-    rows.push([T.script_relevancy, (S.values.script_relevancy || "70") + "%", "source"]);
-    if (S.values.scrape_terms) rows.push(["Search terms", S.values.scrape_terms, "source"]);
+    if (!isCultureFacts()) rows.push([T.scrape_engine, "Scrape V2", "source"]);
+    rows.push([T.script_relevancy, (S.values.script_relevancy || "70") + "%", isCultureFacts() ? null : "source"]);
+    if (S.values.scrape_terms) rows.push(["Search terms", S.values.scrape_terms, isCultureFacts() ? null : "source"]);
   } else {
     rows.push([T.video_model, labelFor(OPT.video_model, S.values.video_model), "source"]);
     rows.push([T.image_model, labelFor(OPT.image_model, S.values.image_model), "source"]);
   }
   rows.push(["Reasoning model", labelFor(OPT.reasoning_model, S.values.reasoning_model), "reasoning"]);
   rows.push(["Voice", S.values.tts_voice + " · " + labelFor(OPT.tts_model, S.values.tts_model), "voice"]);
-  rows.push(["Speaker video", S.values.enable_speaker_hook ? "On" : "Off", "voice"]);
+  if (!isCultureFacts()) rows.push(["Speaker video", S.values.enable_speaker_hook ? "On" : "Off", "voice"]);
   rows.push(["Hook", S.values.hook_text ? T.hook_marked : T.no_hook, "hook"]);
   if (S.values.impact_word) rows.push(["Impact word", S.values.impact_word, "hook"]);
   rows.push([T.background_music, (S.values.background_music_choice && S.values.background_music_choice !== "none")
@@ -715,7 +1120,7 @@ function renderReviewCard() {
   c.appendChild(g);
   c.appendChild(el("div", "card-cap", "Outputs"));
   const ul = el("ul", "sum-list");
-  OUTPUT_FIELDS.filter(([k]) => S.values[k]).forEach(([, l]) => ul.appendChild(el("li", "", esc(l))));
+  visibleOutputFields().filter(([k]) => S.values[k]).forEach(([, l]) => ul.appendChild(el("li", "", esc(l))));
   c.appendChild(ul);
   if (S.projectSlug) {
     c.appendChild(el("div", "card-note", esc(T.project_loaded) + ": " + esc(S.projectTitle || S.projectSlug)
@@ -763,7 +1168,9 @@ function renderMasterFlow(kind) {
     msgU("🎞 " + esc(f ? f.name : S._uploadName), "upload");
   } else if (S.step === "upload") {
     const c = card();
-    const drop = el("div", "upl-drop", "📎 " + esc(T.attach_video) + "<br><small>MP4 · MOV · WebM</small>");
+    const drop = el("div", "upl-drop", prototypeMode
+      ? `<span class="proto-upload-icon">${protoIcon("visual")}</span><b>${esc(T.attach_video)}</b><small>MP4 · MOV · WebM</small>`
+      : "📎 " + esc(T.attach_video) + "<br><small>MP4 · MOV · WebM</small>");
     drop.tabIndex = 0; drop.setAttribute("role", "button");
     const accept = "video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv";
     const onFile = (file) => {
@@ -803,6 +1210,8 @@ function renderMasterFlow(kind) {
         v => S.master.vfx_amount = v));
       c.appendChild(toggleField(T.neko_toggle, S.master.add_characters !== false,
         v => S.master.add_characters = v));
+      c.appendChild(toggleField("Add meme reactions", S.master.add_memes !== false,
+        v => S.master.add_memes = v));
     } else {
       c.appendChild(selectField(T.cap_max_words, OPT.caption_max_words, S.master.caption_max_words,
         v => S.master.caption_max_words = v));
@@ -833,6 +1242,7 @@ async function submitMaster(kind) {
     fd.append("reasoning_mode", S.master.reasoning_mode || "");
     fd.append("vfx_amount", S.master.vfx_amount || "medium");
     if (S.master.add_characters !== false) fd.append("add_characters", "on");
+    if (S.master.add_memes !== false) fd.append("add_memes", "on");
   } else {
     fd.append("caption_max_words", S.master.caption_max_words || firstVal(OPT.caption_max_words) || "4");
     fd.append("caption_center_y", S.master.caption_center_y || firstVal(OPT.caption_center_y) || "0.62");
@@ -1108,12 +1518,19 @@ function typedMsg(container, text) {
 }
 
 function renderJobSection() {
-  typedMsg(chat, T.project_started);
+  if (prototypeMode) {
+    const hero = el("header", "production-head");
+    hero.innerHTML = `<span>PRODUCTION RUN</span><h1>Your project is in production.</h1><p>Follow live progress and assigned footage while Shortslab builds the video.</p>`;
+    chat.appendChild(hero);
+  } else typedMsg(chat, T.project_started);
   // #111 - assigned footage grid (ONLY the clips chosen for scenes) sits at the TOP
   const mwrap = el("div"); mwrap.id = "job-media"; chat.appendChild(mwrap);
+  const scrapeMonitor=el("section","scrape-monitor"); scrapeMonitor.id="scrape-monitor"; scrapeMonitor.hidden=true;
   const scrapeView=el("div","scrape-browser-card"); scrapeView.id="scrape-browser-card"; scrapeView.hidden=true;
   scrapeView.innerHTML='<div class="scrape-browser-head"><b>Live scrape browser</b><span id="scrape-browser-meta"></span></div><img id="scrape-browser-image" alt="Current TikTok or X scraper page">';
-  chat.appendChild(scrapeView);
+  const acceptedView=el("div","last-accepted-card"); acceptedView.id="last-accepted-card"; acceptedView.hidden=true;
+  acceptedView.innerHTML='<div class="last-accepted-head"><b>Last accepted:</b><span id="last-accepted-meta"></span></div><div class="last-accepted-media"><video id="last-accepted-video" muted loop playsinline preload="metadata"></video><span id="last-accepted-empty">Waiting for a matching clip...</span></div><div class="last-accepted-query" id="last-accepted-query"></div>';
+  scrapeMonitor.appendChild(scrapeView); scrapeMonitor.appendChild(acceptedView); chat.appendChild(scrapeMonitor);
   // technical console (terminal-styled, collapsible)
   const tcard = card("term-card"); tcard.id = "job-tech-card";
   const thead = el("div", "term-head");
@@ -1158,17 +1575,29 @@ function renderJobSection() {
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if(scrapePreviewTimer){clearInterval(scrapePreviewTimer);scrapePreviewTimer=null;} }
 
 async function pollScrapeBrowser(){
-  const card=$("scrape-browser-card"), image=$("scrape-browser-image"), meta=$("scrape-browser-meta");
+  const monitor=$("scrape-monitor"),card=$("scrape-browser-card"),image=$("scrape-browser-image"),meta=$("scrape-browser-meta");
+  const accepted=$("last-accepted-card"),video=$("last-accepted-video"),acceptedMeta=$("last-accepted-meta"),acceptedQuery=$("last-accepted-query"),empty=$("last-accepted-empty");
   if(!card||!image)return;
   try{
     const d=await jget('/scrape-browser-status');
-    if(!d.available){card.hidden=true;return;}
-    card.hidden=false;
+    card.hidden=!d.available;
+    if(monitor)monitor.hidden=!d.available&&!d.last_accepted_url;
     meta.textContent=[d.platform,d.query,d.sort].filter(Boolean).join(' · ');
-    if(String(image.dataset.version||'')!==String(d.version)){
+    if(d.available&&String(image.dataset.version||'')!==String(d.version)){
       image.dataset.version=String(d.version); image.src='/scrape-browser-preview?v='+encodeURIComponent(d.version);
     }
-  }catch(e){card.hidden=true;}
+    if(accepted){
+      accepted.hidden=false;
+      acceptedMeta.textContent=d.last_accepted_platform||'';
+      acceptedQuery.textContent=d.last_accepted_query?('Search: '+d.last_accepted_query):'';
+      empty.hidden=!!d.last_accepted_url; video.hidden=!d.last_accepted_url;
+      if(d.last_accepted_url&&String(video.dataset.version||'')!==String(d.accepted_version)){
+        video.dataset.version=String(d.accepted_version); video.dataset.start=String(d.last_accepted_start||0);
+        video.src=d.last_accepted_url;
+        video.onloadedmetadata=function(){try{video.currentTime=Math.min(Math.max(0,+video.dataset.start||0),Math.max(0,(video.duration||0)-.1));video.play().catch(function(){});}catch(e){}};
+      }
+    }
+  }catch(e){card.hidden=true;if(monitor)monitor.hidden=true;}
 }
 
 /* deterministic event → message adapter (template text only; typed like a chatbot) */
@@ -1187,7 +1616,10 @@ function announcePhases(logText) {
       if (!text || announcedPhases.includes(text)) return;
       announcedPhases.push(text);
       const evts = $("job-events");
-      if (evts) typedMsg(evts, text);
+      if (evts) {
+        if (prototypeMode) evts.appendChild(el("div", "job-event", `<i></i><span>${esc(text)}</span>`));
+        else typedMsg(evts, text);
+      }
     });
   });
 }
@@ -1202,7 +1634,8 @@ function renderAssignedMedia(items) {
   lastAssignedKey = key;
   mw.innerHTML = "";
   if (!items || !items.length) return;
-  typedMsg(mw, `Assigned footage — ${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes.`);
+  if (prototypeMode) mw.appendChild(el("div", "assigned-head", `<span>ASSIGNED FOOTAGE</span><b>${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes</b>`));
+  else typedMsg(mw, `Assigned footage — ${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes.`);
   const c = el("div", "chat-card am-card");
   const grid = el("div", "am-grid");
   items.forEach(it => {
@@ -1351,14 +1784,23 @@ async function pollJob() {
         const body = new URLSearchParams({ speaker_name: S.values.speaker_name || "Narrator",
           tts_voice: vsel.value, tts_model: msel.value });
         // #127 - /replace-speech regenerates the voiceover as a follow-on run in the SAME project.
-        // Follow that new job in-place (same chat) instead of leaving the poller on the old job,
-        // which used to surface a spurious "run cancelled" + "new chat".
+        // The old job flips to "cancelled" the moment the gate releases; guard the poller so
+        // that race can never be rendered as an aborted run while we adopt the new job id.
+        S.replacePending = true;
         try {
-          const r = await fetch("/replace-speech?id=" + encodeURIComponent(S.jobId), { method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
-          const jid = new URL(r.url, location.href).searchParams.get("id");
-          if (jid) { S.jobId = jid; S.jobStatus = "running"; persist(); }
-        } catch (e) {}
+          const r = await fetch("/replace-speech?id=" + encodeURIComponent(S.jobId) + "&json=1",
+            { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+          const d = await r.json();
+          if (d && d.id) { S.jobId = d.id; S.jobStatus = "running"; persist(); }
+        } catch (e) {
+          // fallback: adopt the newest running job (the follow-on run) from the jobs list
+          try {
+            const jl = await (await fetch("/jobs-list")).json();
+            const run = (jl.jobs || []).find(j => j.status === "running" || j.status === "awaiting_approval");
+            if (run) { S.jobId = run.id; S.jobStatus = "running"; persist(); }
+          } catch (e2) {}
+        }
+        S.replacePending = false;
         sp.innerHTML = ""; delete sp.dataset.done;
         renderTopbar();
       }, "danger"));
@@ -1374,6 +1816,9 @@ async function pollJob() {
   // single clean result card (video + download). Keep the latest outputs_html only as the source
   // renderResultCard parses the final video out of.
   lastOutputsHTML = d.outputs_html || lastOutputsHTML || "";
+  // a voiceover "New take" intentionally cancels the paused job and hands over to a follow-on
+  // run - never render that hand-off as an aborted run while the new job id is being adopted
+  if (d.status === "cancelled" && S.replacePending) return;
   if (["done", "error", "cancelled"].includes(d.status)) {
     stopPolling();
     const cancelB = $("job-cancel"); if (cancelB) cancelB.remove();
@@ -1517,7 +1962,8 @@ async function renderAssetsView() {
   search.type = "search"; search.placeholder = T.search_projects;
   search.setAttribute("aria-label", T.search_projects);
   head.appendChild(search);
-  const back = btn("← " + T.new_chat, () => { S.view = "chat"; renderAll(); persist(); }, "ghost small");
+  const back = btn(prototypeMode ? "Back to launchpad" : ("← " + T.new_chat),
+    () => { S.view = "chat"; renderAll(); persist(); }, "ghost small");
   head.appendChild(back);
   chat.appendChild(head);
   const grid = el("div", "assets-grid"); chat.appendChild(grid);
@@ -1526,15 +1972,22 @@ async function renderAssetsView() {
   const d = await jget("/projects-list" + (S.showHidden ? "?hidden=1" : ""));
   hideLoading();
   assetsProjects = d.projects || [];
+  let visibleCount = prototypeMode ? 24 : Number.POSITIVE_INFINITY;
+  const loadMore = btn("Load more", () => { visibleCount += 24; paint(); }, "ghost");
+  footer.appendChild(loadMore);
   const paint = () => {
     const q = (search.value || "").trim().toLowerCase();
     grid.innerHTML = "";
     const rows = assetsProjects.filter(p => !q ||
       (p.title || "").toLowerCase().includes(q) || (p.slug || "").toLowerCase().includes(q));
-    rows.forEach(p => grid.appendChild(assetCard(p)));
+    rows.slice(0, visibleCount).forEach(p => grid.appendChild(assetCard(p)));
+    loadMore.hidden = rows.length <= visibleCount;
     empty.hidden = rows.length > 0;
   };
-  search.addEventListener("input", paint);
+  search.addEventListener("input", () => {
+    visibleCount = prototypeMode ? 24 : Number.POSITIVE_INFINITY;
+    paint();
+  });
   paint();
   if (S.showHidden) footer.appendChild(btn("← " + T.hide_hidden, () => showAssets(false), "ghost"));
   else if (d.hidden_count) footer.appendChild(btn(`👁 ${T.show_hidden} (${d.hidden_count})`, () => showAssets(true), "ghost"));
@@ -1542,7 +1995,7 @@ async function renderAssetsView() {
 }
 function assetCard(p) {
   const c = el("div", "asset-card2");
-  const previewKind=p.failed?'failed':(p.kind||p.preview_kind||'');
+  const previewKind=p.running?'running':p.failed?'failed':(p.kind||p.preview_kind||'');
   if(previewKind)c.classList.add('project-kind-'+previewKind);
   const hideB = el("button", "ahide", S.showHidden ? "↺" : "✕");
   hideB.title = S.showHidden ? T.unhide : T.hide;
@@ -1586,16 +2039,18 @@ async function renameProject(slug, current, node) {
 const NAV = [
   ["new", "＋", T.nav_new, resetToMode],
   ["assets", "▦", T.nav_assets, () => showAssets(false)],
-  ["timeline", "🎞", T.nav_timeline, openTimelineNav],
   ["sfx", "🔊", T.nav_sfx, () => { resetToMode(); selectMode("sfx"); }],
   ["vfx", "➜", T.nav_vfx, () => { resetToMode(); selectMode("visual"); }],
   ["captions", "💬", T.nav_captions, () => { resetToMode(); selectMode("captions"); }],
 ];
 function renderNav() {
   const nav = $("sb-nav"); nav.innerHTML = "";
-  NAV.forEach(([id, ico, label, fn]) => {
+  NAV.filter(([id]) => ["new", "assets"].includes(id)).forEach(([id, ico, label, fn]) => {
     const b = el("button");
-    b.innerHTML = `<span class="ico">${ico}</span>${esc(label)}`;
+    const protoNavIcons = { new: "spark", assets: "folder", sfx: "sound", vfx: "visual", captions: "captions" };
+    b.innerHTML = prototypeMode
+      ? `<span class="ico">${protoIcon(protoNavIcons[id] || "spark")}</span><span>${esc(label)}</span>`
+      : `<span class="ico">${ico}</span><span>${esc(label)}</span>`;
     b.dataset.nav = id;
     b.addEventListener("click", () => { fn(); markNav(id); closeDrawer(); });
     nav.appendChild(b);
@@ -1610,8 +2065,7 @@ async function openTimelineNav() {
     const d = await jget("/projects-list");
     const p = (d.projects || []).find(x => x.slug === S.projectSlug);
     if (p && p.has_timeline) {
-      showLoading(T.open_timeline + "...");
-      location.href = "/timeline?slug=" + encodeURIComponent(S.projectSlug); return;
+      openTimelineWithLoading(S.projectSlug, p.title || S.projectTitle); return;
     }
     alert(T.no_timeline_yet); return;
   }
@@ -1628,8 +2082,7 @@ async function openTimelineNav() {
     const b = el("button", "sb-proj");
     b.innerHTML = `${projThumb(p, "th")}<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
     b.addEventListener("click", () => {
-      showLoading(T.open_timeline + "...");
-      location.href = "/timeline?slug=" + encodeURIComponent(p.slug);
+      openTimelineWithLoading(p.slug, p.title);
     });
     list.appendChild(b);
   });
@@ -1653,14 +2106,62 @@ async function refreshSidebar() {
       b.addEventListener("click", () => { startJob(j.id); closeDrawer(); });
       box.appendChild(b);
     });
-  } catch (e) {}
+  } catch (e) {
+    const wrap = $("sb-jobs-wrap");
+    if (wrap) wrap.hidden = true;
+  }
   paintConnections();
+  refreshPrototypeHomeData();
+}
+function sidebarPinnedProjects() {
+  try { return new Set(JSON.parse(localStorage.getItem("sl-pinned-projects") || "[]")); }
+  catch (e) { return new Set(); }
+}
+function saveSidebarPins(pins) {
+  try { localStorage.setItem("sl-pinned-projects", JSON.stringify([...pins])); } catch (e) {}
+}
+function openProjectContextMenu(event, project) {
+  event.preventDefault(); event.stopPropagation();
+  document.querySelector(".sb-project-menu")?.remove();
+  const pins = sidebarPinnedProjects();
+  const menu = el("div", "sb-project-menu");
+  const action = (label, fn, danger) => {
+    const item = el("button", danger ? "danger" : "", esc(label));
+    item.addEventListener("click", async () => { menu.remove(); await fn(); });
+    menu.appendChild(item);
+  };
+  action(pins.has(project.slug) ? "Unpin" : "Pin", () => {
+    if (pins.has(project.slug)) pins.delete(project.slug); else pins.add(project.slug);
+    saveSidebarPins(pins); paintSidebarProjects();
+  });
+  action("Rename", async () => {
+    const next = prompt("New title:", project.title);
+    if (!next || !next.trim() || next.trim() === project.title) return;
+    const result = await jpost("/rename-project", { slug:project.slug, title:next.trim() });
+    if (result && result.ok) project.title = result.title || next.trim();
+    paintSidebarProjects();
+  });
+  action("Hide from list", async () => {
+    await jpost("/hide-project", { slug:project.slug, hidden:true });
+    sidebarProjects = sidebarProjects.filter(item => item.slug !== project.slug);
+    pins.delete(project.slug); saveSidebarPins(pins); paintSidebarProjects();
+  }, true);
+  document.body.appendChild(menu);
+  const left = Math.min(event.clientX, window.innerWidth - 170);
+  const top = Math.min(event.clientY, window.innerHeight - 130);
+  menu.style.left = Math.max(8, left) + "px"; menu.style.top = Math.max(8, top) + "px";
+  const close = e => { if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener("pointerdown", close); } };
+  setTimeout(() => document.addEventListener("pointerdown", close), 0);
+  menu.querySelector("button")?.focus();
 }
 function paintSidebarProjects() {
   const box = $("sb-projects");
   // Search moved to the Projects & Assets tab; the sidebar just lists the recent projects.
   box.innerHTML = "";
+  const pins = sidebarPinnedProjects();
   sidebarProjects
+    .slice()
+    .sort((a, b) => Number(pins.has(b.slug)) - Number(pins.has(a.slug)))
     .slice(0, 24)
     .forEach(p => {
       const row = el("div", "sb-proj-row");
@@ -1669,16 +2170,15 @@ function paintSidebarProjects() {
         <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
         ${p.failed ? '<span class="st fail">!</span>' : ""}`;
       b.title = p.title;
-      b.addEventListener("click", () => { loadProject(p.slug); closeDrawer(); });
-      const hide = el("button", "sb-proj-hide", "&times;");
-      hide.title = T.hide; hide.setAttribute("aria-label", `${T.hide}: ${p.title}`);
-      hide.addEventListener("click", async e => {
-        e.stopPropagation(); hide.disabled = true;
-        await jpost("/hide-project", {slug:p.slug, hidden:true});
-        sidebarProjects = sidebarProjects.filter(item => item.slug !== p.slug);
-        paintSidebarProjects();
+      row.classList.toggle("pinned", pins.has(p.slug));
+      row.addEventListener("contextmenu", e => openProjectContextMenu(e, p));
+      // finished project (has a render) -> jump straight into the timeline editor; everything
+      // the old project card offered lives there. Unfinished projects keep the chat flow.
+      b.addEventListener("click", () => {
+        if (p.has_timeline) { openTimelineWithLoading(p.slug, p.title); return; }
+        loadProject(p.slug); closeDrawer();
       });
-      row.appendChild(b); row.appendChild(hide); box.appendChild(row);
+      row.appendChild(b); box.appendChild(row);
     });
 }
 const CONNS = [
@@ -1756,13 +2256,19 @@ function textInputCard(placeholder, onSubmit, initial) {
 }
 
 /* ------------------------------------------------------------------ small helpers */
+function prototypeLabel(label) {
+  if (!prototypeMode || typeof label !== "string") return label;
+  // The classic shell historically uses emoji prefixes. The prototype uses a single vector
+  // icon language, so remove only leading decorative glyphs while preserving label text/HTML.
+  return label.replace(/^[^A-Za-zÀ-ž0-9<]+/, "").trimStart();
+}
 function btn(label, fn, cls) {
-  const b = el("button", "btn " + (cls || ""), label);
+  const b = el("button", "btn " + (cls || ""), prototypeLabel(label));
   b.addEventListener("click", fn);
   return b;
 }
 function linkBtn(label, href, cls) {
-  const a = el("a", "btn " + (cls || ""), label); a.href = href;
+  const a = el("a", "btn " + (cls || ""), prototypeLabel(label)); a.href = href;
   // the Timeline Editor is a heavier page - show the loading overlay while it opens
   if (href.indexOf("/timeline") === 0)
     a.addEventListener("click", () => showLoading(T.open_timeline + "..."));
@@ -1831,6 +2337,50 @@ function errorCard(title, detail) {
 let _audio = null;
 function ensureAudio() { if (!_audio) { _audio = new Audio(); } return _audio; }
 
+/* Dedicated UI motion sound: deliberately quiet and short so it supports the lateral motion
+   without reading like a content SFX or competing with the preview audio. */
+let _uiWhoosh = null;
+function prepareUiWhoosh() {
+  if (!_uiWhoosh) {
+    _uiWhoosh = new Audio("/file?path=" + encodeURIComponent("soundeffects/woosh-sfx.mp3"));
+    _uiWhoosh.preload = "auto";
+    _uiWhoosh.volume = 0.055;
+  }
+  return _uiWhoosh;
+}
+function playUiWhoosh() {
+  try {
+    const sound = prepareUiWhoosh();
+    sound.pause(); sound.currentTime = 0; sound.playbackRate = 0.82;
+    sound.play().catch(() => {});
+  } catch (e) {}
+}
+
+/* Quiet global button feedback. Event delegation covers buttons created later by flows, jobs,
+   project menus and dialogs without wiring every renderer separately. A small pool prevents rapid
+   clicks from cutting off the preceding 212ms tick. */
+const _uiClickPool = [];
+let _uiClickCursor = 0;
+function playGlobalUiClick() {
+  try {
+    if (!_uiClickPool.length) {
+      for (let i = 0; i < 4; i++) {
+        const sound = new Audio("/file?path=" + encodeURIComponent("soundeffects/ui-click-3.mp3"));
+        sound.preload = "auto"; sound.volume = 0.16; _uiClickPool.push(sound);
+      }
+    }
+    const sound = _uiClickPool[_uiClickCursor++ % _uiClickPool.length];
+    sound.pause(); sound.currentTime = 0; sound.play().catch(() => {});
+  } catch (e) {}
+}
+document.addEventListener("pointerdown", event => {
+  const target = event.target.closest("button, a.button, [role='button'], input[type='button'], input[type='submit']");
+  // New Creation is already a large cinematic selection surface. Click ticks made those cards
+  // feel toy-like and competed with the shared zoom/arrival transition, so they stay silent.
+  const silentCreationMenu = target && target.closest(".proto-launchpad");
+  if (target && !silentCreationMenu && !target.disabled && target.getAttribute("aria-disabled") !== "true") playGlobalUiClick();
+}, true);
+
 /* short pleasant two-note chime (WebAudio, no asset) for render-finish + speech-ready */
 let _actx = null;
 function playNotification(kind) {
@@ -1862,6 +2412,18 @@ function showLoading(text) {
   _loadEl.innerHTML = `<div class="load-box"><span class="load-spin"></span><span>${esc(text || "Loading...")}</span></div>`;
   document.body.appendChild(_loadEl);
   _loadTimer = setTimeout(hideLoading, 15000);   // safety: never stuck forever
+}
+function openTimelineWithLoading(slug, title) {
+  showLoading("Opening " + (title || "timeline") + "...");
+  if (_loadEl) {
+    _loadEl.classList.add("timeline-loading");
+    const box = _loadEl.querySelector(".load-box");
+    if (box) box.insertAdjacentHTML("beforeend", '<small>Preparing clips, audio and editor state</small>');
+  }
+  // Give the browser two paint frames before navigation so the loader is actually visible.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    location.href = "/timeline?slug=" + encodeURIComponent(slug);
+  }));
 }
 function hideLoading() {
   if (_loadTimer) { clearTimeout(_loadTimer); _loadTimer = null; }
@@ -1930,14 +2492,34 @@ window.playClick = function () {};
 /* ------------------------------------------------------------------ theme + drawer */
 function applyTheme(t) {
   document.documentElement.dataset.theme = t;
+  const toggle = $("theme-toggle");
+  if (toggle) toggle.checked = t === "dark";
+  const label = $("theme-toggle-label");
+  if (label) label.textContent = t === "dark" ? "dark" : "light";
   try { localStorage.setItem("sl-chat-theme", t); } catch (e) {}
+}
+function applyPrototypeMode(on, rerender) {
+  prototypeMode = !!on;
+  document.documentElement.classList.toggle("prototype-ui", prototypeMode);
+  const toggle = $("prototype-toggle");
+  if (toggle) toggle.checked = prototypeMode;
+  try { localStorage.setItem("sl-prototype-ui", prototypeMode ? "1" : "0"); } catch (e) {}
+  try { localStorage.setItem("sl-prototype-ui-v2", prototypeMode ? "1" : "0"); } catch (e) {}
+  if (rerender) { renderNav(); renderAll(); }
 }
 function wireChrome() {
   const saved = (() => { try { return localStorage.getItem("sl-chat-theme"); } catch (e) { return null; } })();
   applyTheme(saved || "dark");
-  $("theme-toggle").addEventListener("click", () => {
-    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-  });
+  const savedPrototype = (() => {
+    try {
+      const value = localStorage.getItem("sl-prototype-ui-v2");
+      return value == null ? true : value === "1";
+    } catch (e) { return true; }
+  })();
+  applyPrototypeMode(savedPrototype, false);
+  const prototypeToggle = $("prototype-toggle");
+  if (prototypeToggle) prototypeToggle.addEventListener("change", () => applyPrototypeMode(prototypeToggle.checked, true));
+  $("theme-toggle").addEventListener("change", e => applyTheme(e.currentTarget.checked ? "dark" : "light"));
   $("sb-collapse").addEventListener("click", () => $("app").classList.toggle("sb-collapsed"));
   $("tb-menu").addEventListener("click", () => {
     const app = $("app");
@@ -1953,6 +2535,18 @@ function wireChrome() {
   });
   $("sb-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+  document.addEventListener("click", e => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest('a[href*="/timeline?"]');
+    if (!a || a.target === "_blank") return;
+    try {
+      const url = new URL(a.href, location.href);
+      const slug = url.searchParams.get("slug");
+      if (!slug) return;
+      e.preventDefault();
+      openTimelineWithLoading(slug, a.dataset.projectTitle || "timeline editor");
+    } catch (err) {}
+  }, true);
   wireSidebarResize();
 }
 // #125 - drag the sidebar's right edge to resize; width persists in localStorage.

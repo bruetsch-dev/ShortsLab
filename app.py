@@ -492,14 +492,18 @@ def list_previous_projects(limit=80):
 
 def project_title_from_files(project_dir):
     report = read_json_file(project_dir / "review" / "agent_report.json")
-    if report.get("title"):
+    if report.get("title") and not re.fullmatch(r"Short\s+\d+", str(report["title"]), flags=re.I):
         return str(report["title"])
     config = read_json_file(project_dir / "config" / "project.json")
-    if config.get("title"):
+    if config.get("title") and not re.fullmatch(r"Short\s+\d+", str(config["title"]), flags=re.I):
         return str(config["title"])
     run_form = read_json_file(project_dir / "input" / "run_form.json")
-    if run_form.get("title"):
+    if run_form.get("title") and not re.fullmatch(r"Short\s+\d+", str(run_form["title"]), flags=re.I):
         return str(run_form["title"])
+    script = read_text_file(project_dir / "input" / "script.txt")
+    derived = agent_core.derive_project_title_from_script(script)
+    if derived:
+        return derived
     return project_dir.name.replace("_", " ").strip().title()
 
 
@@ -2487,7 +2491,7 @@ def app_script():
           };
           window.onClipToggle = function (cb) { window.setClipSource(cb.checked ? "scrape" : "generate"); };
           window.setScrapeEngine = function (eng) {
-            eng = (eng === "v1") ? "v1" : "v2";
+            eng = "v2";
             var hid = document.getElementById("scraping-engine"); if (hid) hid.value = eng;
             var seg = document.getElementById("engine-seg"); if (seg) seg.setAttribute("data-eng", eng);
             try { if (typeof playClick === "function") playClick(); } catch (e) {}
@@ -2611,19 +2615,17 @@ def app_script():
             return _uiCtx;
           } catch (e) { return null; }
         }
+        var _uiClickPool = [], _uiClickCursor = 0;
         function playClick() {
-          var ctx = uiCtx(); if (!ctx) return;
           try {
-            var now = ctx.currentTime;
-            var osc = ctx.createOscillator(), g = ctx.createGain();
-            osc.type = "triangle";
-            osc.frequency.setValueAtTime(540, now);
-            osc.frequency.exponentialRampToValueAtTime(320, now + 0.05);
-            g.gain.setValueAtTime(0.0001, now);
-            g.gain.exponentialRampToValueAtTime(0.05, now + 0.005);
-            g.gain.exponentialRampToValueAtTime(0.0001, now + 0.07);
-            osc.connect(g); g.connect(ctx.destination);
-            osc.start(now); osc.stop(now + 0.09);
+            if (!_uiClickPool.length) {
+              for (var i = 0; i < 4; i++) {
+                var a = new Audio("/file?path=" + encodeURIComponent("soundeffects/ui-click-3.mp3"));
+                a.preload = "auto"; a.volume = 0.16; _uiClickPool.push(a);
+              }
+            }
+            var sound = _uiClickPool[_uiClickCursor++ % _uiClickPool.length];
+            sound.pause(); sound.currentTime = 0; sound.play().catch(function () {});
           } catch (e) {}
         }
         function playKeyTick() {
@@ -3413,13 +3415,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
             <input type="hidden" name="scrape_platforms" value="tiktok,x,instagram">
             <input type="hidden" name="influencer_hook" value="on">
-            <label class="scrape-lbl">Scraping engine {help_tip("V2 (Relevance-first) plans concrete visible situations, finds usable SEGMENTS anywhere inside a video, ranks by relevance (not likes) and matches per scene - fewer hard rejects, more on-topic footage. V1 (Legacy) is the original bucket + like-gated scrape. V2 is the default.")}</label>
-            <div class="seg-switch" id="engine-seg" data-eng="{esc((state.get('scraping_engine') or 'v2'))}" style="margin-bottom:10px;">
-              <span class="seg-thumb" aria-hidden="true"></span>
-              <button type="button" class="seg-opt" data-eng="v2" onclick="setScrapeEngine('v2')">&#9889; Scrape V2 &middot; Relevance-first</button>
-              <button type="button" class="seg-opt" data-eng="v1" onclick="setScrapeEngine('v1')">&#128230; Scrape V1 &middot; Legacy</button>
-            </div>
-            <input type="hidden" name="scraping_engine" id="scraping-engine" value="{esc((state.get('scraping_engine') or 'v2'))}">
+            <input type="hidden" name="scraping_engine" id="scraping-engine" value="v2">
             <div class="scrape-auto-note">&#129504; Search terms are derived from visual intent. TikTok handles native action/lifestyle searches; X receives only validated proof, event and exact-action phrases. The opening hook still requires 20K+ likes; body clips have no minimum-like gate. {help_tip("Body footage is ranked using your selected result order and still passes technical, caption and semantic quality gates.")}</div>
             <label class="scrape-lbl">Add your own terms (optional) {help_tip("Extra search terms on top of what the agent derives — they are ALWAYS included. Add English or Japanese words/hashtags (e.g. 原宿 ファッション). Press + or Enter to add.")}</label>
             <div class="chip-add">
@@ -3467,7 +3463,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <label class="otoggle"><input type="checkbox" name="out_transition_sfx"{checked("out_transition_sfx")}><span>Transition SFX</span></label>
             <label class="otoggle"><input type="checkbox" name="out_background_music"{checked("out_background_music")}><span>Background music</span></label>
             <label class="otoggle"><input type="checkbox" name="out_captions"{checked("out_captions")}><span>Captions</span></label>
-            <label class="otoggle"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after speech</span></label>
+            <label class="otoggle"><input type="checkbox" name="halt_after_speech"{checked("halt_after_speech")}><span>Halt after speech generation</span></label>
+            <div class="hint">A marked hook is always cut from the body and joined with exactly 0.5 seconds of silence before voice approval.</div>
           </div>
           <div class="cbar-cell" style="margin-top:10px;">
             <span class="cbar-cap">SFX amount {help_tip("How dense the sound design is. Low = the previous sparse feel (~1 effect every 2-4s). Medium = lively, every cut + every emphasised word (~1 per 1.5-2.5s). High = hyper-edited TikTok density (~1 per 0.8-1.5s). Applies to normal runs and the timeline SFX engine.")}</span>
@@ -3721,7 +3718,7 @@ def visual_page():
           <label>Finished Short (video)</label>
           <label class="filepick" for="vis-video-file"><span class="filepick-btn">&#128193; Choose video file</span><span class="filepick-name" id="vis-video-name">No file chosen</span></label>
           <input type="file" name="video_file" id="vis-video-file" class="filepick-input" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required onchange="var n=document.getElementById('vis-video-name'); if(n) n.textContent=this.files.length?this.files[0].name:'No file chosen';">
-          <div class="hint">Rendered vertical MP4 / MOV / WebM. Opus&nbsp;4.8 DIRECTS a dense visual pass: thick red arrows fly in and point at the subject of each punchy line, plus cute neko reactions &mdash; each with its own animation and a fitting click/ding.</div>
+          <div class="hint">Rendered vertical MP4 / MOV / WebM. The vision director adds targeted animated arrows plus optional neko or categorized meme reactions, each with a matched local sound. Visual Master never generates captions or text overlays.</div>
         </div>
         <div class="panel">
           <label>Analysis agent</label>
@@ -3750,6 +3747,10 @@ def visual_page():
         <div class="panel">
           <label class="otoggle" style="margin:0;"><input type="checkbox" name="add_characters" value="on" checked><span>Add kawaii neko reactions (AI-directed)</span></label>
           <div class="hint">Optional. The same AI also bounces a cute pixel cat (shocked, laughing, love, angry, crying&hellip;) into a corner when a moment&rsquo;s mood calls for a reaction &mdash; matched to the spoken line.</div>
+        </div>
+        <div class="panel">
+          <label class="otoggle" style="margin:0;"><input type="checkbox" name="add_memes" value="on" checked><span>Add meme reactions (AI-directed)</span></label>
+          <div class="hint">Uses the categorized transparent reaction stickers and each meme&rsquo;s assigned impact/reaction sound. At most one neko or meme reaction is used per moment.</div>
         </div>
         <button type="submit">&#10132; Add intelligent arrows</button>
       </section>
@@ -4280,6 +4281,7 @@ def start_visual_job(fields, files):
     reasoning_model = fields.get("reasoning_model") or "anthropic/claude-opus-4.8"
     reasoning_mode = fields.get("reasoning_mode")
     add_characters = str(fields.get("add_characters", "")).lower() in ("on", "true", "1", "yes")
+    add_memes = str(fields.get("add_memes", "")).lower() in ("on", "true", "1", "yes")
     vfx_amount = str(fields.get("vfx_amount", "medium") or "medium").strip().lower()
     if vfx_amount not in ("low", "medium", "high"):
         vfx_amount = "medium"
@@ -4311,7 +4313,7 @@ def start_visual_job(fields, files):
             status_cb("Started.")
             result = visual_agent.enhance_video_with_arrows(
                 video_path, reasoning_model=reasoning_model, status_cb=status_cb,
-                add_characters=add_characters, vfx_amount=vfx_amount)
+                add_characters=add_characters, add_memes=add_memes, vfx_amount=vfx_amount)
             with JOB_LOCK:
                 if cancel_event.is_set():
                     JOBS[job_id]["status"] = "cancelled"
@@ -5977,6 +5979,7 @@ TIMELINE_SKELETON = """
 <div id="timeline-root" data-slug="__SLUG__">
   <div class="tl-toolbar panel">
     <div class="tl-actions">
+      <a class="button secondary tl-editor-exit" id="tl-editor-exit" href="/assets" title="Back to projects and assets">&#8592; Back</a>
       <button type="button" class="button secondary tl-save-btn" id="tl-save" title="Save timeline changes">&#128190; Save</button>
       <div class="tl-popwrap">
         <button type="button" class="button secondary tl-save-btn" id="tl-versions-open" title="Load a timeline from before a redo or replacement">&#128337; Versions</button>
@@ -5999,8 +6002,9 @@ TIMELINE_SKELETON = """
           <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"><span id="tl-rw-replace-label">replace selected media</span></label>
           <label class="tl-chk"><input type="checkbox" id="tl-rw-recut"> reorder &amp; recut</label>
           <label class="tl-chk" title="Creates a fresh take with the saved voice, then force-aligns captions and clip cuts to it"><input type="checkbox" id="tl-rw-revoice"> regenerate speech + retime</label>
+          <label class="tl-chk" id="tl-rw-change-script-wrap"><input type="checkbox" id="tl-rw-change-script"> change script</label>
           <label class="tl-chk" id="tl-rw-redo-sfx-wrap"><input type="checkbox" id="tl-rw-redo-sfx"> redo SFX</label>
-          <label class="tl-chk" id="tl-rw-add-sfx-wrap"><input type="checkbox" id="tl-rw-add-sfx"> add more SFX</label>
+          <label class="tl-chk" id="tl-rw-add-sfx-wrap"><input type="checkbox" id="tl-rw-add-sfx"> add SFX</label>
           <label class="tl-chk" id="tl-rw-redo-cap-wrap"><input type="checkbox" id="tl-rw-redo-captions"> redo captions</label>
           <label class="tl-pop-field" for="tl-rw-model">Rework model</label>
           <select id="tl-rw-model" name="reasoning_model">
@@ -6019,7 +6023,6 @@ TIMELINE_SKELETON = """
           <button type="button" class="button tl-rework-btn" id="tl-rework">&#129302; Start rework</button>
         </div>
       </div>
-      <button type="button" class="button secondary tl-rework-btn" id="tl-script-open" title="Rewrite the narration - fresh voiceover + recut (its own workflow)">&#128221; Script</button>
     </div>
     <div class="tl-script-overlay" id="tl-script-modal" hidden>
       <div class="tl-script-box panel">
@@ -6028,6 +6031,14 @@ TIMELINE_SKELETON = """
           UNCHANGED keep their current media. Changed or new lines get a fresh voiceover and
           media &mdash; matched from this project's existing clips first, then TikTok/X for
           whatever is still missing &mdash; and the whole Short is retimed and re-rendered.</div>
+        <div class="tl-script-regen">
+          <label for="tl-script-regen-instructions">Regenerate from the original script <span>optional instruction</span></label>
+          <div class="tl-script-regen-row">
+            <textarea id="tl-script-regen-instructions" rows="2" placeholder="e.g. Make it simpler, use three facts, reduce exaggeration, or change the pacing."></textarea>
+            <button type="button" class="button secondary" id="tl-script-regenerate">&#8635; Regenerate</button>
+          </div>
+          <div class="hint">Keeps the original topic and factual direction, but rebuilds the narration.</div>
+        </div>
         <textarea id="tl-script-text" spellcheck="false"></textarea>
         <div class="tl-script-hookbar">
           <button type="button" class="button secondary" id="tl-script-markhook" title="Select the opening line(s) in the script above, then click to mark them as the hook (spoken with the hook pause)">&#9733; Mark hook</button>
@@ -6233,6 +6244,13 @@ TIMELINE_ASSETS = """
   .tl-script-overlay[hidden] { display:none; }
   .tl-script-box { width:min(760px, 94vw); max-height:88vh; display:flex; flex-direction:column; gap:12px; }
   .tl-script-box textarea { flex:1 1 auto; min-height:320px; max-height:56vh; resize:vertical; font-family:var(--mono); font-size:13.5px; line-height:1.55; }
+  .tl-script-regen { display:flex; flex-direction:column; gap:7px; padding:11px; border:1px solid var(--line); border-radius:10px; background:var(--bg-input); }
+  .tl-script-regen > label { margin:0; color:var(--text); font-size:12px; font-weight:700; }
+  .tl-script-regen > label span { margin-left:5px; color:var(--faint); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  .tl-script-regen-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:stretch; }
+  .tl-script-regen-row textarea { min-height:62px; max-height:130px; margin:0; resize:vertical; font-family:var(--sans); font-size:12.5px; }
+  .tl-script-regen-row .button { width:auto; min-width:126px; margin:0; }
+  .tl-script-regen .hint { margin:0; font-size:10.5px; }
   .tl-script-actions { display:flex; justify-content:flex-end; gap:10px; }
   .tl-script-actions .button { width:auto; min-width:0; margin:0; padding:10px 18px; }
   .tl-script-hookbar { display:flex; align-items:center; gap:10px; }
@@ -6498,7 +6516,7 @@ TIMELINE_ASSETS = """
   var addMoreSfx=document.getElementById('tl-rw-add-sfx');
   if(addMoreSfx && !model.has_sfx){
     addMoreSfx.disabled=true;
-    document.getElementById('tl-rw-add-sfx-wrap').title='Add more SFX becomes available after this timeline has at least one sound effect.';
+    document.getElementById('tl-rw-add-sfx-wrap').title='Add SFX becomes available after this timeline has at least one editable sound effect.';
   }
   var versionsOpen=document.getElementById('tl-versions-open');
   var versionsPop=document.getElementById('tl-versions-pop');
@@ -7668,10 +7686,12 @@ TIMELINE_ASSETS = """
     scriptModal.hidden=false;
     document.getElementById('tl-script-text').focus();
   });
-  // dedicated toolbar "Script" button opens the change-script workflow directly (it is its OWN
-  // flow, no longer a checkbox mixed into the combinable Agent-rework options).
-  var _scriptOpenBtn=document.getElementById('tl-script-open');
-  if(_scriptOpenBtn) _scriptOpenBtn.addEventListener('click', function(){ document.getElementById('tl-script-btn').click(); });
+  // Change Script uses the same switch presentation as every other rework option. Turning it on
+  // immediately opens the existing script workflow; there is no duplicate toolbar/menu button.
+  var _scriptToggle=document.getElementById('tl-rw-change-script');
+  if(_scriptToggle) _scriptToggle.addEventListener('change', function(){
+    if(this.checked) document.getElementById('tl-script-btn').click();
+  });
   // clip density: Few / Medium / Many -> how many clips the recut uses
   var scriptDensity = 'medium';
   var DENSITY_HINT = {few:'Fewer, longer clips - slower, cinematic cuts.',
@@ -7711,6 +7731,20 @@ TIMELINE_ASSETS = """
   });
   document.getElementById('tl-script-clearhook').addEventListener('click', function(){ scriptHook=''; syncHookStatus(); });
   document.getElementById('tl-script-text').addEventListener('input', syncHookStatus);
+  document.getElementById('tl-script-regenerate').addEventListener('click', function(){
+    var btn=this,old=btn.innerHTML;
+    var instructions=(document.getElementById('tl-script-regen-instructions').value||'').trim();
+    btn.disabled=true;btn.textContent='Regenerating...';
+    fetch('/regenerate-script',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      original_script:model.script_text||'', instructions:instructions
+    })}).then(function(r){return r.json();}).then(function(d){
+      btn.disabled=false;btn.innerHTML=old;
+      if(!d||!d.ok||!d.script){alert((d&&d.error)||'Could not regenerate the script.');return;}
+      document.getElementById('tl-script-text').value=d.script;
+      if(scriptHook&&normWs(d.script).toLowerCase().indexOf(normWs(scriptHook).toLowerCase())===-1)scriptHook='';
+      syncHookStatus();
+    }).catch(function(){btn.disabled=false;btn.innerHTML=old;alert('Could not regenerate the script.');});
+  });
   document.getElementById('tl-script-cancel').addEventListener('click', function(){ scriptModal.hidden=true; });
   scriptModal.addEventListener('pointerdown', function(e){ if(e.target===scriptModal) scriptModal.hidden=true; });
   document.getElementById('tl-script-run').addEventListener('click', function(){
@@ -7750,7 +7784,7 @@ TIMELINE_ASSETS = """
     var reworkReasoning=(document.querySelector('#tl-rw-model + .reasoning-mode-field select')||{}).value||'';
     if(!doReplace && !doRecut && !doRevoice && !doRedoSfx && !doAddSfx && !doRedoCaptions){ alert('Pick at least one rework option.'); return; }
     // Multiple options CAN be combined in one run. Only two genuine conflicts remain:
-    if(doRedoSfx&&doAddSfx){ alert('Choose either redo SFX or add more SFX (not both).'); return; }
+    if(doRedoSfx&&doAddSfx){ alert('Choose either redo SFX or add SFX (not both).'); return; }
     // the heavy media/speech re-plans still can't share a run with an SFX redo
     if((doReplace||doRecut||doRevoice)&&(doRedoSfx||doAddSfx)){ alert('Run the SFX rework separately from media/speech changes.'); return; }
     if(doReplace && !Object.keys(markedReplace).length){ alert('Mark at least one clip\\'s media to replace (select a clip, then tick \"Mark this clip\\'s media to be replaced\").'); return; }
@@ -8278,6 +8312,44 @@ TIMELINE_ASSETS = """
   });
   setupLibrary();
 
+  // Every explicit link out of the editor gets a three-way decision instead of silently
+  // discarding work: Save & leave / Leave without saving / Stay. Browser reload, close and
+  // history navigation still receive the native beforeunload safety net below.
+  var leavePrompt=null;
+  function closeLeavePrompt(){ if(leavePrompt){leavePrompt.remove();leavePrompt=null;} }
+  function navigateFromTimeline(destination){
+    if(!dirty){ window.location.href=destination; return; }
+    closeLeavePrompt();
+    var scrim=document.createElement('div'); scrim.className='tl-leave-scrim';
+    scrim.innerHTML='<div class="tl-leave-dialog" role="dialog" aria-modal="true" aria-labelledby="tl-leave-title">'
+      +'<small>UNSAVED TIMELINE</small><h2 id="tl-leave-title">Save before leaving?</h2>'
+      +'<p>Your clips, visuals or sound changes have not been saved yet.</p>'
+      +'<div class="tl-leave-actions"><button type="button" class="button secondary" data-leave="stay">Stay here</button>'
+      +'<button type="button" class="button secondary danger" data-leave="discard">Leave without saving</button>'
+      +'<button type="button" class="button" data-leave="save">Save &amp; leave</button></div></div>';
+    document.body.appendChild(scrim); leavePrompt=scrim;
+    var stay=scrim.querySelector('[data-leave="stay"]'), discard=scrim.querySelector('[data-leave="discard"]'), save=scrim.querySelector('[data-leave="save"]');
+    stay.addEventListener('click',closeLeavePrompt);
+    discard.addEventListener('click',function(){ dirty=false; closeLeavePrompt(); window.location.href=destination; });
+    save.addEventListener('click',function(){
+      save.disabled=true; save.textContent='Saving…';
+      fetch('/timeline-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,edits:collectEdits()})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(!d||!d.ok)throw new Error((d&&d.error)||'Could not save.');
+          dirty=false; var sb=document.getElementById('tl-save'); if(sb)sb.classList.remove('tl-unsaved');
+          closeLeavePrompt(); window.location.href=destination;
+        }).catch(function(err){ save.disabled=false; save.textContent='Save & leave'; alert(err.message||'Could not save.'); });
+    });
+    scrim.addEventListener('click',function(e){if(e.target===scrim)closeLeavePrompt();});
+    stay.focus();
+  }
+  document.addEventListener('click',function(e){
+    if(e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+    var a=e.target.closest('a[href]'); if(!a||a.target==='_blank'||a.hasAttribute('download'))return;
+    var href=a.getAttribute('href'); if(!href||href.charAt(0)==='#'||href.indexOf('javascript:')===0)return;
+    if(!dirty)return;
+    e.preventDefault(); e.stopPropagation(); navigateFromTimeline(a.href);
+  },true);
   window.addEventListener('beforeunload', function(e){ if(dirty){ e.preventDefault(); e.returnValue=''; } });
   layout(); if(typeof fitZoom==='function') fitZoom(); seekTo(0); updatePlayhead();
   hist=[]; hIdx=-1; pushHistory(); syncHistButtons();
@@ -8296,6 +8368,15 @@ TIMELINE_ASSETS = """
   .tl-pop .tl-cap-toggle, .tl-pop .tl-chk { padding:2px 0; border:0; background:none; }
   .tl-pop-field { margin:2px 0 -5px; color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
   .tl-pop select { width:100%; margin:0; }
+  .tl-leave-scrim { position:fixed; inset:0; z-index:2147483640; display:grid; place-items:center; padding:20px;
+    background:rgba(3,5,4,.68); backdrop-filter:blur(12px); }
+  .tl-leave-dialog { width:min(460px,100%); padding:22px; border:1px solid var(--line-strong); border-radius:14px;
+    background:var(--bg-raised); box-shadow:0 28px 90px rgba(0,0,0,.58); }
+  .tl-leave-dialog small { color:var(--accent); font-size:10px; font-weight:800; letter-spacing:.13em; }
+  .tl-leave-dialog h2 { margin:5px 0 7px; color:var(--text); font-size:23px; }
+  .tl-leave-dialog p { margin:0; color:var(--muted); font-size:13px; }
+  .tl-leave-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; flex-wrap:wrap; }
+  .tl-leave-actions .button { width:auto; min-width:0; margin:0; }
   /* histzoom strip + total + audio mixer: keyboard/mouse cover these - hide the chrome
      (elements stay in the DOM so the editor JS keeps working) */
   .tl-meta, .tl-mixer-wrap { display:none !important; }
@@ -8411,10 +8492,55 @@ TIMELINE_ASSETS = """
   /* change-script modal: centered fixed overlay (was opening at a weird offset) */
   body.page-timeline .tl-script-overlay:not([hidden]) { position:fixed; inset:0; z-index:950;
     display:flex; align-items:center; justify-content:center; }
+  /* Creator Surface skin: same ink/panel/luminous-rule language as New Creation. Geometry and
+     timeline behavior stay untouched; this is deliberately presentation-only. */
+  body.page-timeline main { background:
+    radial-gradient(720px 460px at 8% -10%,rgba(167,255,131,.065),transparent 64%),
+    radial-gradient(620px 520px at 104% 36%,rgba(112,131,255,.035),transparent 68%),#080a09; }
+  body.page-timeline main::after { content:""; position:fixed; inset:0; z-index:99999; pointer-events:none; opacity:.025;
+    background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.78' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.7'/%3E%3C/svg%3E"); mix-blend-mode:soft-light; }
+  body.page-timeline #timeline-root .panel { position:relative; overflow:hidden; border-color:rgba(238,242,236,.095);
+    border-radius:14px; background:#101310; box-shadow:0 20px 58px rgba(0,0,0,.17); }
+  body.page-timeline #timeline-root .panel::before { content:""; position:absolute; z-index:2; left:24px; right:24px; top:0; height:1px;
+    background:linear-gradient(90deg,transparent,rgba(238,242,236,.2),transparent); pointer-events:none; }
+  body.page-timeline #timeline-root .tl-toolbar::before { background:linear-gradient(90deg,transparent,rgba(167,255,131,.58),transparent); }
+  body.page-timeline #timeline-root h2 { color:#eef2ec; font-weight:570; letter-spacing:-.025em; }
+  body.page-timeline #timeline-root .button,body.page-timeline .tl-pop .button,
+  body.page-timeline .tl-leave-actions .button { border-color:rgba(238,242,236,.095); border-radius:9px;
+    background:#171b17; color:#eef2ec; box-shadow:none; transition:transform 240ms cubic-bezier(.16,1,.3,1),border-color 180ms ease,background 180ms ease; }
+  body.page-timeline #timeline-root .button:hover,body.page-timeline .tl-pop .button:hover { transform:translateY(-1px);
+    border-color:rgba(238,242,236,.19); background:#1c211c; }
+  body.page-timeline #timeline-root .button.primary,body.page-timeline .tl-pop .button.primary { border-color:#a7ff83; background:#a7ff83; color:#0b2608;
+    box-shadow:0 9px 26px rgba(167,255,131,.12); }
+  body.page-timeline #timeline-root input,body.page-timeline #timeline-root select,body.page-timeline #timeline-root textarea,
+  body.page-timeline .tl-pop select { border-color:rgba(238,242,236,.095); border-radius:9px; background:#171b17; color:#eef2ec; }
+  body.page-timeline #timeline-root input:focus,body.page-timeline #timeline-root select:focus,body.page-timeline #timeline-root textarea:focus {
+    outline:none; border-color:rgba(167,255,131,.52); box-shadow:0 0 0 3px rgba(167,255,131,.08); }
+  body.page-timeline .tl-pop,body.page-timeline .tl-catpop,body.page-timeline #timeline-root .tl-inspector.open,
+  body.page-timeline .tl-leave-dialog { border-color:rgba(238,242,236,.19); border-radius:14px; background:#101310;
+    box-shadow:0 30px 95px rgba(0,0,0,.5); }
+  body.page-timeline .tl-pop::before,body.page-timeline .tl-catpop::before,body.page-timeline .tl-leave-dialog::before {
+    content:""; position:absolute; left:24px; right:24px; top:0; height:1px;
+    background:linear-gradient(90deg,transparent,rgba(167,255,131,.55),transparent); }
+  body.page-timeline #timeline-root .tl-lib-item,body.page-timeline #timeline-root .tl-lib-sound {
+    border-color:rgba(238,242,236,.095); border-radius:10px; background:#171b17;
+    transition:transform 240ms cubic-bezier(.16,1,.3,1),border-color 180ms ease,background 180ms ease; }
+  body.page-timeline #timeline-root .tl-lib-item:hover,body.page-timeline #timeline-root .tl-lib-sound:hover {
+    transform:translateY(-1px); border-color:rgba(238,242,236,.19); background:#1c211c; }
+  body.page-timeline #timeline-root .tl-track { border-color:rgba(238,242,236,.08); background:#0d100d; }
+  body.page-timeline #timeline-root .tl-clip { border-color:rgba(238,242,236,.14); border-radius:7px; box-shadow:0 7px 18px rgba(0,0,0,.18); }
+  body.page-timeline #timeline-root .tl-ruler { color:#889188; font-family:var(--mono); }
+  body.page-timeline #timeline-root .tl-playhead { background:#a7ff83; box-shadow:0 0 10px rgba(167,255,131,.42); }
+  body.page-timeline .top .back-arrow { color:#889188; border-color:rgba(238,242,236,.095); background:#101310; }
+  body.page-timeline .top .back-arrow:hover { color:#eef2ec; border-color:rgba(167,255,131,.4); background:#171b17; }
   @media (max-width: 1000px) {
     #timeline-root { grid-template-columns:1fr; grid-template-rows:auto auto auto minmax(160px,1fr);
       grid-template-areas:"toolbar" "stagearea" "library" "tracks"; }
     body:has(#timeline-root) main { height:auto; max-height:none; overflow:visible; }
+  }
+  @media (prefers-reduced-motion:reduce) {
+    body.page-timeline * { animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; }
+    body.page-timeline main::after { display:none; }
   }
 </style>
 <script>
@@ -8824,6 +8950,50 @@ def timeline_library_payload(slug):
     return {"media": unique_media, "sfx": global_sfx_library(),
             "sfx_taxonomy": sfx_taxonomy(),
             "global_media": global_media}
+
+
+def recent_scripts_payload(limit=15):
+    """Script-step library: previously GENERATED scripts (script-creator history) and,
+    separately, previously USED scripts (each project's input/script.txt). The preview shown
+    in the picker is always the script's FIRST SENTENCE."""
+    def first_sentence(text):
+        text = " ".join(str(text or "").split())
+        m = re.match(r"[^.!?]{5,}?[.!?]", text)
+        return (m.group(0) if m else text[:110]).strip()
+
+    generated = []
+    try:
+        hist = json.loads(agent_core._SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))
+    except Exception:
+        hist = []
+    for row in reversed(hist if isinstance(hist, list) else []):
+        s = str((row or {}).get("script") or "").strip()
+        if not s:
+            continue
+        generated.append({"topic": str(row.get("topic") or ""), "at": str(row.get("at") or ""),
+                          "preview": first_sentence(s), "script": s})
+        if len(generated) >= limit:
+            break
+    used, rows = [], []
+    root = agent_core.PROJECTS_DIR
+    if root.exists():
+        for proj in root.iterdir():
+            f = proj / "input" / "script.txt"
+            if proj.is_dir() and not proj.name.startswith("_") and f.exists():
+                try:
+                    rows.append((f.stat().st_mtime, proj, f))
+                except OSError:
+                    continue
+    for _, proj, f in sorted(rows, key=lambda r: r[0], reverse=True)[:limit]:
+        try:
+            s = f.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if not s:
+            continue
+        used.append({"project": project_title_from_files(proj) or proj.name,
+                     "preview": first_sentence(s), "script": s})
+    return {"generated": generated, "used": used}
 
 
 def clip_poster_path(video_path):
@@ -9628,7 +9798,8 @@ def _persist_job_error(project_dir, kind, exc, tb):
         pass
 
 
-def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=None, reasoning_mode=None):
+def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=None, reasoning_mode=None,
+                               regen_captions=False):
     """Regenerate narration, retime the saved timeline, and optionally replace marked social clips."""
     replace_scene_ids = [str(value) for value in (replace_scene_ids or []) if str(value)]
     job_id = str(int(time.time() * 1000))
@@ -9657,6 +9828,8 @@ def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=Non
             result = agent_core.regenerate_timeline_speech(
                 slug, status_cb=status_cb, cancel_event=cancel_event,
                 render=not bool(replace_scene_ids))
+            if regen_captions:
+                status_cb("Redo captions: rebuilt and aligned the editable caption track to the fresh voiceover.")
             if replace_scene_ids:
                 status_cb("Speech timing saved. Searching replacement media against the retimed lines...")
                 result = agent_core.replace_timeline_scrape_scenes(
@@ -9834,18 +10007,18 @@ def reddit_page():
 def timeline_page(slug):
     project_dir = safe_project_dir(slug)
     if not project_dir:
-        return page("Shortslab", brand_header(back=True) + '<section class="panel"><div class="hint">Unknown project.</div></section>')
+        return page("Shortslab", brand_header(back=False) + '<section class="panel"><div class="hint">Unknown project.</div></section>')
     # The timeline editor is only available once the agent has produced a first render.
     if not project_has_render(slug):
         msg = ('<section class="panel"><h2>Timeline not ready yet</h2>'
                '<div class="hint">The timeline editor opens once this project has its first complete render. '
                'Run the agent (Create Short) first &mdash; then come back here to fine-tune and re-render.</div></section>')
-        return page("Shortslab", brand_header(back=True) + msg)
+        return page("Shortslab", brand_header(back=False) + msg)
     try:
         model = timeline_model(slug)
     except Exception as exc:
-        return page("Shortslab", brand_header(back=True) + f'<section class="panel"><div class="hint">Could not load timeline: {esc(str(exc))}</div></section>')
-    header = brand_header(back=True)
+        return page("Shortslab", brand_header(back=False) + f'<section class="panel"><div class="hint">Could not load timeline: {esc(str(exc))}</div></section>')
+    header = brand_header(back=False)
     model_tag = '<script id="timeline-model" type="application/json">' + json.dumps(model) + '</script>'
     # Chat-shell theme for the editor's VISUAL SHELL only (colors/radii/fonts via CSS variable
     # remap; zero behavior changes). Follows the chat theme preference and rewires the header
@@ -9863,8 +10036,146 @@ def timeline_page(slug):
         'window.addEventListener("load",function(){window.toggleTheme=mine;});'
         '}catch(e){}})();</script>'
     )
-    body = theme_tag + header + model_tag + TIMELINE_SKELETON.replace("__SLUG__", esc(slug)) + TIMELINE_ASSETS
+    # The timeline is a full-canvas editing surface. Project navigation stays in the main app;
+    # no duplicate sidebar or edge-hover overlay is mounted inside the editor.
+    sidebar = ""
+    body = theme_tag + sidebar + header + model_tag + TIMELINE_SKELETON.replace("__SLUG__", esc(slug)) + TIMELINE_ASSETS
     return page("Timeline Editor", body, body_class="page-timeline")
+
+
+# Collapsible project sidebar for the timeline editor: jump between finished projects without
+# leaving the editor, rename inline, back-link to the app. Collapse state persists.
+TIMELINE_SIDEBAR = """
+<div id="tlsb" class="tlsb">
+  <div class="tlsb-head">
+    <img class="tlsb-logo" src="/static/app_icon.png" alt="" width="34" height="34">
+    <div class="tlsb-brand"><b>Shortslab</b><span>Creator workspace</span></div>
+    <button type="button" id="tlsb-toggle" title="Collapse sidebar" aria-label="Collapse sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect><path d="M9 4v16M15.5 9l-3 3 3 3"></path></svg></button>
+  </div>
+  <nav class="tlsb-nav" aria-label="Sections">
+    <a href="/">&#10022;<span>New project</span></a>
+    <a href="/assets">&#9638;<span>Projects &amp; Assets</span></a>
+  </nav>
+  <div class="tlsb-cap">Recent projects</div>
+  <div id="tlsb-list" class="tlsb-list"><div class="tlsb-note">Loading&hellip;</div></div>
+  <div class="tlsb-conns"><span>Connections</span><b id="tlsb-conns-count">0/4</b></div>
+  <div class="tlsb-foot"><a href="/dev-tools">dev</a><a href="/">Back to app</a></div>
+</div>
+<div id="tlsb-edge" class="tlsb-edge" aria-hidden="true"></div>
+<style>
+  .tlsb { position:fixed; left:0; top:0; bottom:0; width:282px; z-index:80; box-sizing:border-box;
+          background:#111311; border-right:1px solid rgba(255,255,255,.08); color:#f1f3f1;
+          display:flex; flex-direction:column; padding:14px 12px 10px; gap:12px; overflow:hidden;
+          font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+          transition:transform 160ms cubic-bezier(.3,.7,.4,1); }
+  body.page-timeline { padding-left:282px !important; transition:padding-left 160ms cubic-bezier(.3,.7,.4,1); }
+  body.page-timeline.tlsb-min { padding-left:0 !important; }
+  body.tlsb-min .tlsb { transform:translateX(-100%); }
+  body.tlsb-min.tlsb-peek .tlsb { transform:translateX(0); box-shadow:18px 0 52px rgba(0,0,0,.46); }
+  .tlsb-edge { display:none; position:fixed; z-index:79; left:0; top:0; bottom:0; width:14px; cursor:e-resize; }
+  body.tlsb-min .tlsb-edge { display:block; }
+  .tlsb-head { display:flex; align-items:center; justify-content:space-between; gap:6px; }
+  .tlsb-logo { border-radius:9px; flex:0 0 auto; }
+  .tlsb-brand { flex:1; min-width:0; line-height:1.2; }
+  .tlsb-brand b { display:block; font-size:15px; }
+  .tlsb-brand span { display:block; font-size:11px; color:#646a64; }
+  #tlsb-toggle { width:30px; height:30px; min-width:30px; padding:0; display:grid; place-items:center;
+                 line-height:1; background:transparent; border:1px solid rgba(255,255,255,.08);
+                 color:#a0a6a0; border-radius:8px; box-shadow:none; cursor:pointer; }
+  #tlsb-toggle svg { width:17px; height:17px; display:block; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+  #tlsb-toggle:hover { background:rgba(43,46,43,.96); border-color:rgba(255,255,255,.14); color:#f1f3f1; }
+  #tlsb-toggle::after { display:none; }
+  .tlsb-nav { display:flex; flex-direction:column; gap:2px; }
+  .tlsb-nav a { display:flex; align-items:center; gap:9px; padding:7px 10px; border-radius:8px; border-left:2px solid transparent;
+    color:#a0a6a0; text-decoration:none; font-size:13.5px; font-weight:550; }
+  .tlsb-nav a:hover { background:rgba(43,46,43,.96); color:#f1f3f1; }
+  .tlsb-nav a.active { color:#f1f3f1; background:rgba(57,255,20,.11); border-left-color:#39ff14; }
+  .tlsb-cap { padding:0 4px; font-size:10.5px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#646a64; }
+  .tlsb-list { flex:1 1 0; min-height:90px; overflow-y:auto; display:flex; flex-direction:column; gap:3px; }
+  .tlsb-note { color:#646a64; font-size:12px; }
+  .tlsb-row { display:flex; align-items:center; min-width:0; position:relative; }
+  button.tlsb-proj { flex:1 1 auto; min-width:0; width:100%; display:flex; align-items:center; gap:9px; text-align:left;
+               padding:6px 34px 6px 7px; background:transparent; border:1px solid transparent; color:#f1f3f1;
+               border-radius:8px; box-shadow:none; transform:none; }
+  button.tlsb-proj::after { display:none; }
+  button.tlsb-proj:hover { background:#181a18; border-color:rgba(255,255,255,.08); box-shadow:none; transform:none; }
+  button.tlsb-proj.cur { background:rgba(57,255,20,.11); border-color:rgba(57,255,20,.42); }
+  button.tlsb-proj.norender { opacity:.45; }
+  .tlsb-thumb { width:34px; height:44px; flex:0 0 auto; overflow:hidden; position:relative; border-radius:6px;
+    background:#232623; border:1px solid rgba(255,255,255,.08); }
+  .tlsb-thumb img,.tlsb-thumb video { width:100%; height:100%; display:block; object-fit:cover; }
+  .tlsb-tag { position:absolute; left:2px; top:2px; padding:1px 3px; border-radius:3px; color:white; font-size:7px; font-weight:800; text-transform:uppercase; background:#7c5cff; }
+  .tlsb-tag.vfx { background:#f0912b; }.tlsb-tag.failed { background:#ef665c; }.tlsb-tag.running { background:#e6b450; color:#171208; }
+  .tlsb-meta { min-width:0; flex:1; }.tlsb-meta b { display:block; font-size:12.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tlsb-meta span { display:block; color:#646a64; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.tlsb-ren { position:absolute; right:5px; top:50%; transform:translateY(-50%); width:22px; height:22px; min-width:0; padding:0;
+              font-size:11px; background:transparent; border:none; border-radius:6px; color:#646a64; box-shadow:none; opacity:.35; }
+  button.tlsb-ren::after { display:none; }
+  .tlsb-row:hover button.tlsb-ren { opacity:1; }button.tlsb-ren:hover { color:#39ff14; background:rgba(57,255,20,.11); box-shadow:none; transform:translateY(-50%); }
+  .tlsb-conns { display:flex; justify-content:space-between; align-items:center; padding:0 4px; color:#646a64; font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+  .tlsb-conns b { color:#a0a6a0; background:#181a18; border-radius:99px; padding:1px 7px; font-family:ui-monospace,monospace; }
+  .tlsb-foot { display:flex; align-items:center; gap:8px; padding-top:10px; border-top:1px solid rgba(255,255,255,.08); }
+  .tlsb-foot a { padding:5px 10px; border:1px solid rgba(255,255,255,.08); border-radius:8px; color:#a0a6a0; font-size:12px; text-decoration:none; }
+  .tlsb-foot a:first-child { font-size:10px; opacity:.55; }.tlsb-foot a:hover { color:#f1f3f1; border-color:rgba(255,255,255,.14); }
+</style>
+<script>
+(function(){
+  try { if (localStorage.getItem("tlsb-min") === "1") document.body.classList.add("tlsb-min"); } catch(e){}
+  document.getElementById("tlsb-toggle").addEventListener("click", function(){
+    var min = document.body.classList.toggle("tlsb-min");
+    document.body.classList.remove("tlsb-peek");
+    try { localStorage.setItem("tlsb-min", min ? "1" : "0"); } catch(e){}
+  });
+  var edge=document.getElementById("tlsb-edge"), side=document.getElementById("tlsb"), peekTimer=null;
+  function showPeek(){ if(!document.body.classList.contains("tlsb-min"))return; clearTimeout(peekTimer); document.body.classList.add("tlsb-peek"); }
+  function hidePeek(){ clearTimeout(peekTimer); peekTimer=setTimeout(function(){
+    if(!side.matches(":hover")&&!edge.matches(":hover"))document.body.classList.remove("tlsb-peek");
+  },140); }
+  edge.addEventListener("pointerenter",showPeek); edge.addEventListener("pointerleave",hidePeek);
+  side.addEventListener("pointerenter",function(){clearTimeout(peekTimer);}); side.addEventListener("pointerleave",hidePeek);
+  var CUR = "__SLUG__";
+  function safe(s){ var d=document.createElement("div"); d.textContent=String(s||""); return d.innerHTML; }
+  function paint(projects){
+    var box = document.getElementById("tlsb-list");
+    box.innerHTML = "";
+    projects.slice(0, 40).forEach(function(p){
+      var row = document.createElement("div"); row.className = "tlsb-row";
+      var b = document.createElement("button"); b.type = "button";
+      b.className = "tlsb-proj" + (p.slug === CUR ? " cur" : "") + (p.has_timeline ? "" : " norender");
+      var kind = p.running ? "running" : p.failed ? "failed" : (p.kind || p.preview_kind || "");
+      var media = p.thumb_url ? '<img loading="lazy" src="'+safe(p.thumb_url)+'" alt="">' :
+                  (p.video_url ? '<video muted preload="none" src="'+safe(p.video_url)+'"></video>' : '');
+      var tag = kind ? '<span class="tlsb-tag '+safe(kind)+'">'+safe(kind)+"</span>" : "";
+      b.innerHTML = '<span class="tlsb-thumb">'+media+tag+'</span><span class="tlsb-meta"><b>'+safe(p.title||p.slug)+'</b><span>'+safe(p.edited||"")+'</span></span>';
+      b.title = p.title || p.slug;
+      b.addEventListener("click", function(){
+        if (p.slug === CUR) return;
+        location.href = p.has_timeline ? ("/timeline?slug=" + encodeURIComponent(p.slug))
+                                       : ("/?project=" + encodeURIComponent(p.slug));
+      });
+      var r = document.createElement("button"); r.type = "button"; r.className = "tlsb-ren";
+      r.innerHTML = "&#9998;"; r.title = "Rename";
+      r.addEventListener("click", function(ev){
+        ev.stopPropagation();
+        var t = prompt("New title:", p.title || p.slug);
+        if (!t || !t.trim() || t.trim() === p.title) return;
+        fetch("/rename-project", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({slug: p.slug, title: t.trim()}) })
+          .then(function(){ p.title = t.trim(); paint(projects); });
+      });
+      row.appendChild(b); row.appendChild(r); box.appendChild(row);
+    });
+    if (!box.children.length) box.innerHTML = '<div class="tlsb-note">No projects.</div>';
+  }
+  fetch("/projects-list").then(function(r){ return r.json(); })
+    .then(function(d){ paint(d.projects || []); })
+    .catch(function(){ document.getElementById("tlsb-list").innerHTML = '<div class="tlsb-note">Could not load.</div>'; });
+  Promise.all(["tiktok","twitter","instagram","higgsfield"].map(function(k){
+    return fetch("/"+k+"-status").then(function(r){return r.json();}).catch(function(){return {};});
+  })).then(function(rows){ document.getElementById("tlsb-conns-count").textContent=rows.filter(function(x){return x.ready;}).length+"/4"; });
+})();
+</script>
+"""
 
 
 def render_done_view(job, job_id):
@@ -10830,6 +11141,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.serve_file_ranged(poster, "image/jpeg")
+        elif parsed.path == "/recent-scripts":
+            self.send_bytes(json.dumps(recent_scripts_payload()).encode("utf-8"),
+                            "application/json; charset=utf-8")
         elif parsed.path == "/timeline-agent-fetch-status":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             self.send_bytes(json.dumps(timeline_agent_fetch_status(slug)).encode("utf-8"),
@@ -10856,7 +11170,12 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/higgsfield-status":
             self.send_bytes(higgsfield_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/scrape-browser-status":
-            self.send_bytes(json.dumps(scrape_browser_preview.status()).encode("utf-8"),
+            scrape_status = scrape_browser_preview.status()
+            accepted_path = safe_requested_path(scrape_status.pop("last_accepted_path", ""))
+            scrape_status["last_accepted_url"] = (
+                link_for(accepted_path) if accepted_path and accepted_path.exists() else "")
+            scrape_status["last_accepted_name"] = accepted_path.name if accepted_path else ""
+            self.send_bytes(json.dumps(scrape_status).encode("utf-8"),
                             "application/json; charset=utf-8")
         elif parsed.path == "/scrape-browser-preview":
             shot = scrape_browser_preview.snapshot().get("jpeg") or b""
@@ -11013,12 +11332,30 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 body = ""
             topic = ""
+            instructions = ""
             try:
-                topic = str((json.loads(body) or {}).get("topic") or "")
+                request_data = json.loads(body) or {}
+                topic = str(request_data.get("topic") or "")
+                instructions = str(request_data.get("instructions") or "")
             except Exception:
                 topic = urllib.parse.parse_qs(body).get("topic", [""])[0]
+                instructions = urllib.parse.parse_qs(body).get("instructions", [""])[0]
             try:
-                result = agent_core.generate_viral_script(topic)
+                result = agent_core.generate_viral_script(topic, instructions=instructions)
+                self.send_bytes(json.dumps({"ok": True, **result}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self.send_bytes(json.dumps({"ok": False, "error": str(exc)[:300]}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+            return
+        if parsed.path == "/regenerate-script":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                payload = json.loads(body) if body else {}
+                result = agent_core.regenerate_script_from_reference(
+                    str(payload.get("original_script") or ""),
+                    instructions=str(payload.get("instructions") or ""))
                 self.send_bytes(json.dumps({"ok": True, **result}).encode("utf-8"),
                                 "application/json; charset=utf-8")
             except Exception as exc:  # noqa: BLE001
@@ -11192,6 +11529,13 @@ class Handler(BaseHTTPRequestHandler):
             restart_fields["halt_after_speech"] = "on"
             restart_fields["loaded_project_source"] = restart_fields.get("loaded_project_source") or (Path(proj).name if proj else "")
             new_job = start_job(restart_fields, {})
+            # chat shell calls with json=1: hand the follow-on job id back DIRECTLY instead of
+            # a 303 the client has to re-parse (URL-parse failures left the poller on the old,
+            # now-cancelled job -> the user saw "run cancelled" after rejecting a voiceover).
+            if urllib.parse.parse_qs(parsed.query).get("json", ["0"])[0] == "1":
+                self.send_bytes(json.dumps({"ok": True, "id": new_job}).encode("utf-8"),
+                                "application/json; charset=utf-8")
+                return
             self.send_response(303)
             self.send_header("Location", f"/job?id={urllib.parse.quote(new_job)}")
             self.end_headers()
@@ -11502,13 +11846,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_bytes(json.dumps({"ok": False, "error": f"Could not save edits: {exc}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
-            snapshot_timeline_version(slug, "Before " + ("adding more SFX" if do_add_more_sfx else
+            snapshot_timeline_version(slug, "Before " + ("adding SFX" if do_add_more_sfx else
                                                          "redo captions" if do_redo_captions else "redo/replacement rework"))
             # COMBINED reworks: an SFX redo/add can run together with "redo captions" in ONE job
             # (captions are re-aligned first, then the SFX pass renders the final with both).
             if do_redo_sfx or do_add_more_sfx:
                 if do_redo_sfx and do_add_more_sfx:
-                    self.send_bytes(json.dumps({"ok": False, "error": "Choose either redo SFX or add more SFX."}).encode("utf-8"), "application/json; charset=utf-8")
+                    self.send_bytes(json.dumps({"ok": False, "error": "Choose either redo SFX or add SFX."}).encode("utf-8"), "application/json; charset=utf-8")
                     return
                 job_id = start_redo_sfx_job(slug, reasoning_model=reasoning_model, reasoning_mode=reasoning_mode, sfx_amount=sfx_amount,
                                             mode="add" if do_add_more_sfx else "redo",
@@ -11540,7 +11884,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 job_id = start_timeline_revoice_job(slug, replace_ids if do_replace else None,
                                                     reasoning_model=reasoning_model,
-                                                    reasoning_mode=reasoning_mode)
+                                                    reasoning_mode=reasoning_mode,
+                                                    regen_captions=do_redo_captions)
                 self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
             # Scrape projects replace marked scenes by running a NEW targeted TikTok/X search.

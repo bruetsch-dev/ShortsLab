@@ -4,7 +4,10 @@ import time
 
 _LOCK = threading.Lock()
 _STATE = {"jpeg": b"", "version": 0, "captured_at": 0.0, "platform": "",
-          "query": "", "sort": ""}
+          "query": "", "sort": "", "accepted_version": 0,
+          "last_accepted_path": "", "last_accepted_platform": "",
+          "last_accepted_query": "", "last_accepted_clip_id": "",
+          "last_accepted_at": 0.0, "last_accepted_start": 0.0}
 
 
 def capture(page, platform, query="", sort="", force=False):
@@ -35,7 +38,25 @@ def status():
             "available": bool(_STATE["jpeg"])}
 
 
+def mark_accepted(path, platform="", query="", clip_id="", start=0.0):
+    """Publish the latest clip that passed semantic matching for at least one scene."""
+    with _LOCK:
+        _STATE.update(
+            accepted_version=int(_STATE["accepted_version"]) + 1,
+            last_accepted_path=str(path or ""),
+            last_accepted_platform=str(platform or ""),
+            last_accepted_query=str(query or ""),
+            last_accepted_clip_id=str(clip_id or ""),
+            last_accepted_at=time.time(),
+            last_accepted_start=max(0.0, float(start or 0.0)),
+        )
+
+
 def clear():
     with _LOCK:
         _STATE.update(jpeg=b"", version=int(_STATE["version"]) + 1,
-                      captured_at=0.0, platform="", query="", sort="")
+                      captured_at=0.0, platform="", query="", sort="",
+                      accepted_version=int(_STATE["accepted_version"]) + 1,
+                      last_accepted_path="", last_accepted_platform="",
+                      last_accepted_query="", last_accepted_clip_id="",
+                      last_accepted_at=0.0, last_accepted_start=0.0)

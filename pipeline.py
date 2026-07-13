@@ -142,7 +142,7 @@ def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER
     return out_path
 
 
-def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.45,
+def concat_audio_with_pause(first_path, second_path, out_path, pause_s=0.5,
                             sample_rate=44100, ffmpeg=None):
     """Join two audio clips with a short silent gap between them.
 

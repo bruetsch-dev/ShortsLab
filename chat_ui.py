@@ -87,6 +87,9 @@ UI_STRINGS = {
     "gen_script_busy": "Writing your script...",
     "gen_script_done": "Script generated - review or edit it below.",
     "gen_script_err": "Script generation failed",
+    "recent_scripts": "Recent scripts",
+    "recent_generated": "Generated scripts",
+    "recent_used": "Used in projects",
     "script_placeholder": "Paste or type your script...",
     "load_project": "Load a project",
     "upload_txt": "Upload .txt",
@@ -115,7 +118,6 @@ UI_STRINGS = {
     "image_model": "Image model",
     "scrape_engine": "Scraping engine",
     "engine_v2": "Scrape V2 · Relevance-first",
-    "engine_v1": "Scrape V1 · Legacy",
     "script_relevancy": "Script relevancy",
     "scrape_sort": "Search result order",
     "custom_terms": "Add your own search terms (optional)",
@@ -141,7 +143,7 @@ UI_STRINGS = {
     "speaker_image": "Speaker image",
     "upload_image": "Upload image",
     "outputs_q": "Select the outputs you want to include.",
-    "halt_after_speech": "Halt after speech",
+    "halt_after_speech": "Halt after speech generation",
     "sfx_amount": "SFX amount",
     "presets": "Presets",
     "load_preset": "Load preset",
@@ -414,6 +416,16 @@ def projects_list_payload(show_hidden=False, limit=200):
     import app
     import agent_core
     projects_dir = agent_core.PROJECTS_DIR
+    # An unfinished directory is not a failed project while a live job owns it. Resolve the
+    # state once here so sidebar, launchpad and Projects & Assets always agree.
+    active_project_slugs = set()
+    with app.JOB_LOCK:
+        for job in app.JOBS.values():
+            if str(job.get("status") or "") not in {"running", "cancelling", "awaiting_approval"}:
+                continue
+            project_dir = job.get("project_dir")
+            if project_dir:
+                active_project_slugs.add(Path(project_dir).name)
     items = []
     if projects_dir.exists():
         dirs = [p for p in projects_dir.iterdir() if p.is_dir()]
@@ -429,11 +441,13 @@ def projects_list_payload(show_hidden=False, limit=200):
                 video = s.get("video")
                 has_video = bool(video and Path(video).exists())
                 thumb = s.get("thumb")
+                running = str(s.get("slug") or p.name) in active_project_slugs
                 item = {
                     "slug": s.get("slug"),
                     "title": s.get("title"),
                     "edited": s.get("edited_at") or s.get("created_at") or "",
-                    "failed": bool(s.get("failed")),
+                    "failed": bool(s.get("failed")) and not running,
+                    "running": running,
                     "hidden": hidden,
                     "has_video": has_video,
                     "counters": {"web": s.get("web_images", 0), "gpt": s.get("gpt_images", 0),
@@ -526,8 +540,10 @@ def chat_shell_page(initial=None):
   <aside class="sidebar" id="sidebar" aria-label="Navigation">
     <div class="sb-head">
       <img class="sb-logo" src="/static/app_icon.png" alt="" width="34" height="34">
-      <div class="sb-title"><b>Shortslab</b><span>{UI_STRINGS["workspace"]}</span></div>
-      <button type="button" class="sb-collapse" id="sb-collapse" title="{UI_STRINGS["collapse"]}" aria-label="{UI_STRINGS["collapse"]}">&#171;</button>
+      <div class="sb-title"><b><span>SHORTS</span>LAB<i></i></b></div>
+      <button type="button" class="sb-collapse" id="sb-collapse" title="{UI_STRINGS["collapse"]}" aria-label="{UI_STRINGS["collapse"]}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect><path d="M9 4v16M15.5 9l-3 3 3 3"></path></svg>
+      </button>
     </div>
     <nav class="sb-nav" id="sb-nav" aria-label="Sections"></nav>
     <div class="sb-section" id="sb-jobs-wrap" hidden>
@@ -544,7 +560,16 @@ def chat_shell_page(initial=None):
     </div>
     <div class="sb-foot">
       <a class="sb-foot-btn sb-dev-btn" id="sb-dev" href="/dev-tools" title="Open local developer and trainer tools">dev</a>
-      <button type="button" class="sb-foot-btn" id="theme-toggle" aria-label="Toggle theme">&#9788; {UI_STRINGS["theme"]}</button>
+      <label class="sb-proto-switch" for="prototype-toggle" title="Try the new Creator Launchpad interface">
+        <input type="checkbox" id="prototype-toggle" role="switch" aria-label="Creator Launchpad prototype">
+        <span class="sb-proto-track" aria-hidden="true"><i></i></span>
+        <span class="sb-proto-label">prototype</span>
+      </label>
+      <label class="sb-proto-switch sb-theme-switch" for="theme-toggle" title="Switch between dark and light mode">
+        <input type="checkbox" id="theme-toggle" role="switch" aria-label="Dark mode">
+        <span class="sb-proto-track" aria-hidden="true"><i></i></span>
+        <span class="sb-proto-label" id="theme-toggle-label">dark</span>
+      </label>
       <span class="sb-version">{CHAT_UI_VERSION}</span>
     </div>
     <div class="sb-resize" id="sb-resize" title="Drag to resize the sidebar" aria-hidden="true"></div>
@@ -553,7 +578,9 @@ def chat_shell_page(initial=None):
 
   <main class="canvas" id="canvas">
     <header class="topbar" id="topbar">
-      <button type="button" class="tb-menu" id="tb-menu" aria-label="{UI_STRINGS["expand"]}">&#9776;</button>
+      <button type="button" class="tb-menu" id="tb-menu" aria-label="{UI_STRINGS["expand"]}" title="Open sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect><path d="M9 4v16M12.5 9l3 3-3 3"></path></svg>
+      </button>
       <div class="tb-ctx" id="tb-ctx"></div>
       <div class="tb-actions" id="tb-actions"></div>
     </header>

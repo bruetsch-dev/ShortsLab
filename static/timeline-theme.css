@@ -146,3 +146,44 @@ body.page-timeline .back-arrow:hover {
 
 /* selection + focus states pick up the accent automatically via the vars above */
 body.page-timeline ::selection { background: var(--accent-subtle); }
+
+/* Creator Surface skin. Visual-only: timeline layout, dimensions and behavior remain intact. */
+body.page-timeline { --accent:#a7ff83; --accent-hover:#b7ff9b; --accent-active:#93e874; --accent-subtle:rgba(167,255,131,.1); --accent-fg:#10200d; }
+body.page-timeline .panel {
+  border:1px solid var(--line) !important; border-radius:16px !important;
+  background:linear-gradient(155deg,color-mix(in srgb,var(--bg-raised) 96%,var(--accent) 4%),var(--bg-raised)) !important;
+  box-shadow:0 20px 60px rgba(0,0,0,.18) !important;
+}
+body.page-timeline .tl-toolbar { padding:10px 12px !important; }
+body.page-timeline button,body.page-timeline .button {
+  border-radius:9px !important; border-color:var(--line) !important; box-shadow:none !important;
+  transition:background 180ms ease,border-color 180ms ease,color 180ms ease,opacity 180ms ease !important;
+}
+body.page-timeline button:hover,body.page-timeline .button:hover { border-color:var(--line-strong) !important; background:var(--bg-overlay) !important; }
+body.page-timeline .tl-render-btn,body.page-timeline button.primary,body.page-timeline .button.primary {
+  background:var(--accent) !important; border-color:var(--accent) !important; color:var(--accent-fg) !important;
+}
+body.page-timeline input:not([type="checkbox"]):not([type="range"]),body.page-timeline select,body.page-timeline textarea {
+  border:1px solid var(--line) !important; border-radius:10px !important; background:var(--bg-input) !important; color:var(--text) !important;
+  box-shadow:none !important; transition:border-color 180ms ease,box-shadow 180ms ease !important;
+}
+body.page-timeline input:focus,body.page-timeline select:focus,body.page-timeline textarea:focus {
+  outline:none !important; border-color:rgba(167,255,131,.52) !important; box-shadow:0 0 0 3px rgba(167,255,131,.08) !important;
+}
+body.page-timeline input[type="range"] { accent-color:var(--accent); }
+body.page-timeline .tl-pop {
+  border:1px solid var(--line-strong) !important; border-radius:13px !important;
+  background:color-mix(in srgb,var(--bg-raised) 94%,transparent) !important; backdrop-filter:blur(20px) !important;
+  box-shadow:0 24px 70px rgba(0,0,0,.38) !important;
+}
+body.page-timeline .tl-stage-view { border-radius:13px !important; overflow:hidden; background:#050705 !important; }
+body.page-timeline .tl-player-bar { background:linear-gradient(transparent,rgba(5,8,6,.94)) !important; backdrop-filter:none !important; }
+body.page-timeline .tl-track { border-color:var(--line) !important; background:color-mix(in srgb,var(--bg-input) 88%,transparent) !important; }
+body.page-timeline .tl-rlabel { color:var(--muted) !important; background:var(--bg-raised) !important; border-color:var(--line) !important; }
+body.page-timeline .tl-playhead { filter:drop-shadow(0 0 5px rgba(167,255,131,.42)); }
+body.page-timeline .tl-lib-tab.active,body.page-timeline .tl-density-seg button.on { background:var(--accent) !important; color:var(--accent-fg) !important; }
+body.page-timeline .tl-lib-body { scrollbar-width:thin; scrollbar-color:rgba(167,255,131,.14) transparent; }
+body.page-timeline .tl-lib-body::-webkit-scrollbar,body.page-timeline .tl-scroll::-webkit-scrollbar,.tlsb-list::-webkit-scrollbar { width:3px; height:3px; }
+body.page-timeline .tl-lib-body::-webkit-scrollbar-thumb,body.page-timeline .tl-scroll::-webkit-scrollbar-thumb,.tlsb-list::-webkit-scrollbar-thumb { background:rgba(167,255,131,.14); border-radius:99px; }
+body.page-timeline :focus-visible { outline:2px solid rgba(167,255,131,.7) !important; outline-offset:2px !important; }
+@media (prefers-reduced-motion:reduce) { body.page-timeline *,body.page-timeline *::before,body.page-timeline *::after { scroll-behavior:auto!important; transition-duration:.01ms!important; animation-duration:.01ms!important; animation-iteration-count:1!important; } }

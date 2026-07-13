@@ -104,6 +104,25 @@ def test_architect_raw_queries_and_multi_sort():
     check("sort passes are reported", state.get("sort_pass_counts") == {
           "RELEVANCE": 2, "MOST_LIKED": 1, "MOST_VIEWED": 1})
 
+    calls = []
+    try:
+        v.clip_scraper.backend_search = fake_search
+        v._search_sources(queries[:1], ["tiktok", "x"], None, None, set(), {}, None,
+                          coverage_pass=True)
+    finally:
+        v.clip_scraper.backend_search = original
+    check("coverage wave uses relevance before popularity expansion",
+          calls and all(mode == "RELEVANCE" for _, mode in calls))
+
+
+def test_platform_query_sanitizer():
+    check("TikTok suffix removed from Japanese platform query",
+          v.sanitize_platform_query("アイドル ダンス TikTok") == "アイドル ダンス")
+    check("platform word removed without damaging content",
+          v.sanitize_platform_query("cute Japan TikTok dance") == "cute Japan dance")
+    check("X and Instagram meta terms removed",
+          v.sanitize_platform_query("Japan office x.com Instagram") == "Japan office")
+
 
 # ---- relevance-first ranking ----------------------------------------------
 def test_ranking_relevance_over_likes():
@@ -263,6 +282,7 @@ def test_v1_untouched():
 
 if __name__ == "__main__":
     for t in (test_settings, test_query_diversity, test_architect_raw_queries_and_multi_sort,
+              test_platform_query_sanitizer,
               test_ranking_relevance_over_likes,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):

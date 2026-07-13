@@ -960,6 +960,63 @@ def find_existing_hook_audio(project_dir):
     return None
 
 
+def find_existing_body_audio(project_dir):
+    """Return the separately-saved body narration used for the mandatory hook edit."""
+    input_dir = Path(project_dir) / "input"
+    for ext in sorted(AUDIO_EXTS):
+        candidate = input_dir / f"body{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+HOOK_BODY_PAUSE_S = 0.5
+
+
+def _hook_edit_marker_path(project_dir):
+    return Path(project_dir) / "input" / "voiceover_hook_edit.json"
+
+
+def _hook_edit_signature(script, hook_text):
+    payload = json.dumps({
+        "script": re.sub(r"\s+", " ", str(script or "")).strip(),
+        "hook": re.sub(r"\s+", " ", str(hook_text or "")).strip(),
+        "pause_s": HOOK_BODY_PAUSE_S,
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hook_edit_cache_valid(project_dir, script, hook_text, voiceover_path):
+    """Only reuse a voiceover when it is proven to contain the required 0.500s hook edit."""
+    try:
+        data = json.loads(_hook_edit_marker_path(project_dir).read_text(encoding="utf-8"))
+        hook, body = split_hook_from_script(script, hook_text)
+        if not (hook and body):
+            return True
+        return bool(
+            data.get("signature") == _hook_edit_signature(script, hook_text)
+            and abs(float(data.get("pause_s", 0)) - HOOK_BODY_PAUSE_S) < 0.0005
+            and data.get("voiceover") == Path(voiceover_path).name
+            and find_existing_hook_audio(project_dir)
+            and find_existing_body_audio(project_dir)
+        )
+    except Exception:
+        return False
+
+
+def write_hook_edit_marker(project_dir, script, hook_text, voiceover_path):
+    marker = {
+        "signature": _hook_edit_signature(script, hook_text),
+        "pause_s": HOOK_BODY_PAUSE_S,
+        "voiceover": Path(voiceover_path).name,
+        "hook_audio": Path(find_existing_hook_audio(project_dir) or "").name,
+        "body_audio": Path(find_existing_body_audio(project_dir) or "").name,
+    }
+    path = _hook_edit_marker_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(marker, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def split_hook_from_script(script, hook_text):
     """Split the script into (hook, body) using the user-marked hook substring.
 
@@ -1022,16 +1079,43 @@ def apply_approved_voice_speed(audio_path, chosen, form, status_cb=None):
     ffmpeg = pipeline.find_ffmpeg()
     if not ffmpeg:
         return None
-    src = Path(audio_path)
-    tmp = src.with_name(src.stem + "_respeed" + src.suffix)
     factor = chosen / current
-    r = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
-                        "-af", f"atempo={factor:.5f}", str(tmp)],
-                       capture_output=True, text=True, timeout=300)
-    if not tmp.exists() or tmp.stat().st_size < 1000:
-        log(status_cb, f"Speed change failed ({(r.stderr or '')[-120:]}); keeping {current:.2f}x.")
+    src = Path(audio_path)
+
+    def _retempo_in_place(part):
+        part = Path(part)
+        tmp = part.with_name(part.stem + "_respeed" + part.suffix)
+        result = subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(part),
+             "-af", f"atempo={factor:.5f}", str(tmp)],
+            capture_output=True, text=True, timeout=300)
+        if not tmp.exists() or tmp.stat().st_size < 1000:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError((result.stderr or "voice speed conversion failed")[-180:])
+        os.replace(tmp, part)
+
+    hook_raw = str(form.get("_hook_audio_path") or "").strip() if isinstance(form, dict) else ""
+    body_raw = str(form.get("_body_audio_path") or "").strip() if isinstance(form, dict) else ""
+    hook_part = Path(hook_raw) if hook_raw else None
+    body_part = Path(body_raw) if body_raw else None
+    try:
+        if hook_part and body_part and hook_part.exists() and body_part.exists():
+            # Re-tempo speech segments, never the silent edit: rejoining afterwards guarantees
+            # that the final render still contains exactly 0.500 seconds of silence.
+            _retempo_in_place(hook_part)
+            _retempo_in_place(body_part)
+            joined = pipeline.concat_audio_with_pause(
+                hook_part, body_part, src, pause_s=HOOK_BODY_PAUSE_S, ffmpeg=ffmpeg)
+            if not joined:
+                raise RuntimeError("hook/body rejoin failed")
+        else:
+            _retempo_in_place(src)
+    except Exception as exc:
+        log(status_cb, f"Speed change failed ({str(exc)[-180:]}); keeping {current:.2f}x.")
         return None
-    os.replace(tmp, src)
     if isinstance(form, dict):
         form["voice_speed"] = chosen
     log(status_cb, f"Voiceover re-tempoed to {chosen:.2f}x per your choice (was {current:.2f}x).")
@@ -1066,12 +1150,21 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
         prior_script_path = Path(project_dir) / "input" / "script.txt"
         prior_script = prior_script_path.read_text(encoding="utf-8") if prior_script_path.exists() else ""
         if prior_script.strip() and prior_script.strip() == script.strip():
-            log(status_cb, f"Reusing existing voiceover (script unchanged): {existing.name}")
-            if is_form:
-                hook_audio = find_existing_hook_audio(project_dir)
-                if hook_audio:
-                    form["_hook_audio_path"] = str(hook_audio)
-            return existing
+            _reuse_hook_text = form.get("hook_text", "") if is_form else ""
+            _reuse_hook, _reuse_body = split_hook_from_script(script, _reuse_hook_text)
+            _pause_ok = not (_reuse_hook and _reuse_body) or hook_edit_cache_valid(
+                project_dir, script, _reuse_hook_text, existing)
+            if _pause_ok:
+                log(status_cb, f"Reusing existing voiceover (script unchanged): {existing.name}")
+                if is_form:
+                    hook_audio = find_existing_hook_audio(project_dir)
+                    body_audio = find_existing_body_audio(project_dir)
+                    if hook_audio:
+                        form["_hook_audio_path"] = str(hook_audio)
+                    if body_audio:
+                        form["_body_audio_path"] = str(body_audio)
+                return existing
+            log(status_cb, "Cached voiceover predates the mandatory 0.500s hook edit; regenerating it.")
 
     speaker = (str(form.get("speaker_name") or "").strip() or pipeline.DEFAULT_TTS_SPEAKER) if is_form else pipeline.DEFAULT_TTS_SPEAKER
     voice = (str(form.get("tts_voice") or "").strip() or pipeline.DEFAULT_TTS_VOICE) if is_form else pipeline.DEFAULT_TTS_VOICE
@@ -1093,8 +1186,14 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
         voice_speed = _default_speed
 
     try:
-        if hook and body and ffmpeg:
-            log(status_cb, "Generating hook + body voiceover separately (with pause between)...")
+        # The hook edit is a production invariant, not an optional TTS setting. Whenever a
+        # marked hook and a body exist, create both parts and join them with exactly 0.500s of
+        # digital silence BEFORE the approval gate receives this path. `split_hook_tts` remains
+        # accepted for preset/backward compatibility but can no longer disable the edit.
+        if hook and body:
+            if not ffmpeg:
+                raise RuntimeError("ffmpeg is required for the mandatory hook/body voice edit")
+            log(status_cb, "Generating hook + body narration for the mandatory 0.500s edit...")
             hook_path = pipeline.generate_speech_gemini(
                 hook, input_dir / "hook", speaker=speaker, voice=voice, model=model,
                 cancel_event=cancel_event, status_cb=status_cb)
@@ -1103,21 +1202,18 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
                 cancel_event=cancel_event, status_cb=status_cb)
             pipeline.apply_voice_postprocess(hook_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
             pipeline.apply_voice_postprocess(body_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
-            pause_s = 0.45
-            if is_form:
-                try:
-                    pause_s = float(form.get("hook_pause_s", 0.45) or 0.45)
-                except (TypeError, ValueError):
-                    pause_s = 0.45
             full = input_dir / f"voiceover{hook_path.suffix}"
             joined = pipeline.concat_audio_with_pause(
-                hook_path, body_path, full, pause_s=pause_s, ffmpeg=ffmpeg)
+                hook_path, body_path, full, pause_s=HOOK_BODY_PAUSE_S, ffmpeg=ffmpeg)
             if joined:
                 if is_form:
                     form["_hook_audio_path"] = str(hook_path)
-                log(status_cb, f"Voiceover generated with hook + {pause_s:.2f}s pause ({speaker} / {voice}).")
+                    form["_body_audio_path"] = str(body_path)
+                    form["hook_pause_s"] = HOOK_BODY_PAUSE_S
+                write_hook_edit_marker(project_dir, script, hook_text, joined)
+                log(status_cb, f"Voiceover cut at hook/body boundary with exactly {HOOK_BODY_PAUSE_S:.3f}s silence ({speaker} / {voice}).")
                 return joined
-            log(status_cb, "Hook/body join failed; falling back to single-pass voiceover.")
+            raise RuntimeError("mandatory hook/body voiceover join failed")
 
         path = pipeline.generate_speech_gemini(
             script, input_dir / "voiceover", speaker=speaker, voice=voice, model=model,
@@ -1128,6 +1224,11 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     except pipeline.PipelineCancelled:
         raise
     except Exception as exc:
+        if hook and body:
+            # Never silently continue with estimated timing or a seamless take: that would let
+            # a run bypass the mandatory edit and present the wrong audio for approval.
+            log(status_cb, f"Mandatory hook/body voice edit failed: {exc}")
+            raise
         log(status_cb, f"Voiceover generation failed ({exc}); continuing with estimated timing.")
         return None
 
@@ -1614,8 +1715,43 @@ SCRIPT_CREATOR_ANGLES = (
 )
 _SCRIPT_TOPIC_HISTORY = ROOT / "generated_assets" / "script_creator_history.json"
 
+SCRIPT_CREATOR_LENSES = (
+    "a day-in-the-life human consequence",
+    "the most surprising physical ritual people perform",
+    "a contradiction between the public image and everyday reality",
+    "the money, time, or effort the subject costs ordinary people",
+    "the visible enforcement mechanism and what happens in practice",
+    "an overlooked object or design detail that reveals the larger story",
+    "a before-versus-now change with a visible modern consequence",
+    "three escalating settings where the same theme appears differently",
+    "the awkward social interaction a phone camera could actually capture",
+    "the gap between what outsiders assume and what locals physically do",
+)
 
-def generate_viral_script(topic="", status_cb=None):
+
+def _script_creator_history():
+    try:
+        data = json.loads(_SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))
+        return [item for item in data if isinstance(item, dict)][-24:]
+    except Exception:
+        return []
+
+
+def _script_text_similarity(left, right):
+    """Conservative duplicate detector; wording and identical hooks both matter."""
+    import difflib
+    import re
+    norm = lambda value: re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower()).split()
+    a, b = norm(left), norm(right)
+    if not a or not b:
+        return 0.0
+    sequence = difflib.SequenceMatcher(None, a, b).ratio()
+    aset, bset = set(a), set(b)
+    overlap = len(aset & bset) / max(1, len(aset | bset))
+    return max(sequence, overlap)
+
+
+def generate_viral_script(topic="", status_cb=None, instructions=""):
     """Write a reference-style viral short script from a topic (empty topic = the model picks
     its own high-potential topic in the same style). Returns {"topic","script","hook_keywords"}.
 
@@ -1623,7 +1759,11 @@ def generate_viral_script(topic="", status_cb=None):
     strong VERBS and toxic/extreme ADJECTIVES (NEVER/ILLEGAL/BANNED/CRIME/FORCED class) plus
     shock nouns, spelled EXACTLY as they appear in the script.
     """
+    import random
+    import secrets
     topic = clean_text(topic or "").strip()
+    instructions = clean_text(instructions or "").strip()[:2000]
+    recent = _script_creator_history()
     system = (
         "You are an elite short-form scriptwriter for viral 'dark facts' style TikTok/Shorts "
         "narration (the Japan-facts reference style: punchy, factual-sounding, slightly "
@@ -1637,18 +1777,40 @@ def generate_viral_script(topic="", status_cb=None):
         "A strong social norm is written truthfully and STILL hits hard: 'an unwritten rule', "
         "'expected of everyone', 'you will be silently judged', 'many companies demand it'. "
         "The weird TRUE detail IS the viral part - one claim a Japanese viewer would call "
-        "false kills the whole video in the comments. JSON only.")
+        "false kills the whole video in the comments. "
+        "RESEARCH DEEPLY, WRITE SIMPLY: your internal fact-check may be technical, but the final "
+        "narration must sound like one friend telling another a surprising story. Never expose "
+        "research jargon, legalistic qualifications, institutional terminology, academic wording, "
+        "or a pile of exceptions. Preserve truth by choosing a simpler defensible claim, not by "
+        "stuffing the sentence with caveats. Use words a 13-year-old understands immediately. "
+        "SCOPE & CERTAINTY: never present a local, rare, disputed, historical or conditional "
+        "fact as universal - keep the who/where/when that makes it true. Do not invent motives, "
+        "consequences, emotions, statistics or causal links between facts. Dramatic wording may "
+        "raise intensity but must never distort scope, certainty, frequency, cause or severity. "
+        "Before returning, INTERNALLY classify every claim as verified / partly true / "
+        "misleading / unsupported and rewrite or qualify everything below 'verified' - return "
+        "only the final coherent, factually defensible script. JSON only.")
     if topic:
-        ask = f'Topic: "{topic}" (about JAPAN unless the topic itself names another subject).'
-        temperature = 0.7
+        # A user topic is a hard content constraint, not a suggestion. Rotate the editorial
+        # lens and show the model its own recent habits so repeated clicks do not converge on
+        # the same hook/facts. A per-request nonce also defeats upstream prompt caching.
+        lens = random.choice(SCRIPT_CREATOR_LENSES)
+        same_topic = [r for r in recent if str(r.get("requested_topic") or r.get("topic") or "").casefold() == topic.casefold()][-6:]
+        avoid = "\n".join(
+            f'- Do not reuse this previous angle or wording: {str(r.get("script") or "")[:420]}'
+            for r in same_topic if r.get("script")
+        )
+        ask = (
+            f'USER-LOCKED TOPIC: "{topic}". The complete script MUST be specifically about this exact topic. '
+            "Do not replace it with a familiar Japan-school, women-at-work, sumo, or social-rules topic unless "
+            "the user explicitly named that subject. About JAPAN only when the topic says or clearly implies Japan.\n"
+            f"Fresh editorial lens for this generation: {lens}.\n"
+            f"Uniqueness token: {secrets.token_hex(6)}. This token is not script content."
+            + (f"\nRECENT OUTPUTS FOR THIS TOPIC — actively choose different facts, hook and structure:\n{avoid}" if avoid else "")
+        )
+        temperature = 0.92
     else:
         # rotate through curated angles + exclude recent topics -> real variety per click
-        import random
-        recent = []
-        try:
-            recent = json.loads(_SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))[-12:]
-        except Exception:
-            recent = []
         used_angles = {str(r.get("angle") or "") for r in recent if isinstance(r, dict)}
         fresh = [a for a in SCRIPT_CREATOR_ANGLES if a not in used_angles] or list(SCRIPT_CREATOR_ANGLES)
         angle = random.choice(fresh)
@@ -1658,16 +1820,44 @@ def generate_viral_script(topic="", status_cb=None):
                f"Your assigned angle: JAPANESE {angle.upper()}. Pick one specific, surprising, "
                f"REAL aspect of it." + (f" Do NOT reuse these recent topics: {avoid}." if avoid else ""))
         temperature = 0.9
-    prompt = f"""{ask}
+    custom_direction = ""
+    if instructions:
+        custom_direction = f"""
+
+USER SCRIPT DIRECTIONS (follow these closely):
+{instructions}
+
+These directions MAY override the default tone, specificity, number of facts, block structure,
+and level of dramatic language below. They may NOT override factual accuracy, the locked topic,
+the 100-140 word target, narration-only requirement, or strict JSON output.
+"""
+    prompt = f"""{ask}{custom_direction}
 
 Write ONE narration script following ALL of these rules:
 - HOOK: the first sentence is a shocking claim of AT MOST 12 words (a real number, a REAL
   ban, or a jaw-dropping TRUE practice - NEVER a fake ban).
+- ONE CENTRAL THEME: the hook names it; every following fact is framed as another example,
+  consequence, contrast or escalation of that SAME theme. Facts from different settings are
+  welcome when the link is explicit - drop a fact only if its connection to the theme cannot
+  be stated in one transition sentence.
 - STRUCTURE: exactly 3 thought blocks after the hook, each 2-3 sentences. Escalate between
   blocks; open the final block with an escalation like "But the craziest part?" or
   "But the harshest reality?".
+- TRANSITIONS carry the theme: each block opener says how the next fact relates ("This
+  extends beyond the workplace...", "The same ideal also appears in..."). Never imply one
+  fact CAUSED another unless that link is verified. Order the facts so the strongest one
+  lands last.
 - EVERY claim must be PHYSICALLY FILMABLE as real phone footage (a visible person, action,
   object or place). Never state an abstraction without its visible physical consequence.
+- SIMPLE, NATURAL LANGUAGE: write like a clear viral storyteller, never like a researcher,
+  lawyer, consultant, textbook or news report. Prefer common everyday words and short sentences.
+- STAY BROAD ENOUGH TO FOLLOW: use only the detail needed to understand why the fact is
+  surprising. Avoid obscure organizations, policy names, technical processes, dates, formal job
+  titles and niche terminology unless that exact detail is the payoff.
+- ONE IDEA PER SENTENCE. Most sentences should be 8-16 words. Explain any unavoidable unfamiliar
+  term immediately in plain language, or replace it with a familiar description.
+- READ-ALOUD TEST: every sentence must sound natural when spoken once at normal speed. Rewrite
+  anything that feels dense, formal, overqualified, oddly specific or difficult to remember.
 - 100-140 words total. Simple spoken language, present tense, no lists, no emojis, no
   hashtags, no camera directions - narration text only.
 - Weave in strong hook words - but ONLY where literally true: NEVER / ILLEGAL / BANNED /
@@ -1684,30 +1874,90 @@ Return STRICT JSON:
 numbers from the script, spelled EXACTLY as written in the script"]}}"""
     log(status_cb, "Script creator: writing a reference-style script"
         + (f' for "{topic}"...' if topic else " (model picks the topic)..."))
-    data = _post_llm_json(SCRIPT_CREATOR_MODEL,
-                          [{"role": "system", "content": system},
-                           {"role": "user", "content": prompt}], 4000, temperature)
-    if not isinstance(data, dict) or not str(data.get("script") or "").strip():
+    prior_scripts = [str(r.get("script") or "") for r in recent if r.get("script")]
+    data = None
+    script = ""
+    duplicate_score = 0.0
+    for attempt in range(3):
+        attempt_prompt = prompt
+        if attempt:
+            attempt_prompt += (
+                "\n\nREWRITE REQUIRED: the previous answer was too similar to an earlier generation. "
+                "Choose a different central claim, different hook construction, different physical examples, "
+                "and a different order. Do not merely paraphrase. "
+                f"Rejected draft to avoid: {script[:500]}\n"
+                f"Retry nonce: {secrets.token_hex(8)}."
+            )
+        data = _post_llm_json(SCRIPT_CREATOR_MODEL,
+                              [{"role": "system", "content": system},
+                               {"role": "user", "content": attempt_prompt}], 4000,
+                              min(1.15, temperature + attempt * 0.08))
+        if not isinstance(data, dict) or not str(data.get("script") or "").strip():
+            continue
+        candidate = clean_text(str(data.get("script") or "")).strip()
+        duplicate_score = max((_script_text_similarity(candidate, old) for old in prior_scripts), default=0.0)
+        candidate_hook = candidate.split(".", 1)[0].strip().casefold()
+        repeated_hook = any(candidate_hook and candidate_hook == old.split(".", 1)[0].strip().casefold()
+                            for old in prior_scripts)
+        script = candidate
+        if duplicate_score < 0.68 and not repeated_hook:
+            break
+        log(status_cb, f"Script creator: duplicate-like result ({duplicate_score:.0%}); requesting a new angle...")
+    if not script:
         raise RuntimeError("Script creator returned no usable script - try again.")
-    script = clean_text(str(data.get("script") or "")).strip()
     kws = [str(k).strip() for k in (data.get("hook_keywords") or []) if str(k).strip()]
     out_topic = str(data.get("topic") or topic or "").strip()
     # ALWAYS record the generated script (user-topic runs too) so past outputs can be
     # reviewed/fact-checked later - previously only the topic label survived.
     try:
-        if topic:
-            recent = json.loads(_SCRIPT_TOPIC_HISTORY.read_text(encoding="utf-8"))[-12:]
-    except Exception:
-        recent = []
-    try:
-        recent.append({"angle": (angle if not topic else "user-topic"), "topic": out_topic,
+        recent.append({"angle": (angle if not topic else lens), "topic": out_topic,
+                       "requested_topic": topic,
+                       "instructions": instructions,
                        "at": time.strftime("%Y-%m-%d %H:%M"), "script": script})
         _SCRIPT_TOPIC_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        _SCRIPT_TOPIC_HISTORY.write_text(json.dumps(recent[-12:], ensure_ascii=False, indent=1),
+        _SCRIPT_TOPIC_HISTORY.write_text(json.dumps(recent[-24:], ensure_ascii=False, indent=1),
                                          encoding="utf-8")
     except Exception:
         pass
     return {"topic": out_topic, "script": script, "hook_keywords": kws[:14]}
+
+
+def regenerate_script_from_reference(original_script, instructions="", status_cb=None):
+    """Rebuild a narration while keeping the supplied project's script as the content anchor."""
+    original_script = clean_text(original_script or "").strip()
+    instructions = clean_text(instructions or "").strip()[:2000]
+    if not original_script:
+        raise ValueError("The original project script is empty.")
+    direction = instructions or "Improve clarity, pacing and spoken flow without changing the concept."
+    prompt = f"""ORIGINAL PROJECT SCRIPT — this is the binding topic and factual reference:
+{original_script}
+
+OPTIONAL USER DIRECTION:
+{direction}
+
+Rewrite the narration from scratch while following these rules:
+- Keep the SAME central topic, subject and factual direction as the original.
+- Do not switch to a related but different topic and do not introduce unrelated facts.
+- The user direction may change structure, tone, specificity, number of facts and pacing.
+- Use simple conversational language a 13-year-old understands. Avoid technical or formal wording.
+- Preserve important factual qualifications; never turn a norm into a law or invent a stronger claim.
+- Make it natural to speak aloud, with one idea per sentence.
+- Unless the user requests another format or length, stay close to the original word count.
+- Narration only: no headings, bullets, notes, camera directions, hashtags or explanations.
+
+Return STRICT JSON: {{"script":"<complete rewritten narration>"}}"""
+    log(status_cb, "Script rewriter: rebuilding the narration from the original project script...")
+    data = _post_llm_json(
+        SCRIPT_CREATOR_MODEL,
+        [{"role": "system", "content": (
+            "You rewrite short-form narration. The supplied original script is a binding content "
+            "reference, not a loose inspiration. Return JSON only.")},
+         {"role": "user", "content": prompt}],
+        4000, 0.82)
+    script = clean_text(str((data or {}).get("script") or "")).strip() if isinstance(data, dict) else ""
+    if not script:
+        raise RuntimeError("Script regeneration returned no usable narration.")
+    return {"script": script}
 
 
 def llm_generate_project_title(script, reasoning_model=None, status_cb=None):
@@ -1737,6 +1987,20 @@ def llm_generate_project_title(script, reasoning_model=None, status_cb=None):
     except Exception as exc:
         log(status_cb, f"Failed to generate title: {exc}")
     return ""
+
+
+def derive_project_title_from_script(script):
+    """Create a stable display title when the title LLM is unavailable or returns nothing."""
+    text = clean_text(script or "")
+    text = re.sub(r"^\s*(?:hook|intro|voiceover|narrator)\s*[:\-]\s*", "", text, flags=re.I)
+    first = re.split(r"(?<=[.!?])\s+|\n+", text, maxsplit=1)[0].strip(" \t\r\n.!?\"'")
+    words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)?", first)
+    while words and words[0].lower() in {"did", "do", "have", "imagine", "what", "why", "this", "here"}:
+        if len(words) <= 4:
+            break
+        words.pop(0)
+    title = " ".join(words[:7]).strip()
+    return title.title()[:60] if title else ""
 
 
 # ===== Collaborative reasoning: GPT-5.5 drafts, Opus 4.8 critiques & corrects =====
@@ -2948,9 +3212,9 @@ HOOK_PRESENTER_QUERIES = {
               "あざと可愛い ダンス 女子", "お姉さん ダンス 可愛い", "カメラ目線 可愛い仕草 女子",
               "日本 女の子 ダンス 笑顔", "ゆるめ ダンス 女子", "可愛い 踊ってみた おすすめ",
               "岸みゆ ダンス", "sakii_0405_ ダンス", "なえなの ダンス", "景井ひな ダンス"],
-    "social": ["アイドル ダンス TikTok", "女子 可愛いダンス", "日本人女子 踊ってみた",
+    "social": ["アイドル ダンス 女子", "女子 可愛いダンス", "日本人女子 踊ってみた",
                "あざと可愛い 女子", "カメラ目線 可愛い", "笑顔 ダンス 女子", "大人可愛い ダンス",
-               "TikToker 女子 ダンス"],
+               "インフルエンサー 女子 ダンス"],
     "hashtag": ["#踊ってみた", "#ダンス女子", "#あざと可愛い", "#可愛い", "#おすすめ",
                 "#日本人女性", "#ダンス好きな人と繋がりたい", "#女の子"],
     # Birth-year tags (user-provided 2026-07-11): young Japanese women tag their birth year
@@ -2958,9 +3222,9 @@ HOOK_PRESENTER_QUERIES = {
     # demographic on BOTH TikTok and Instagram, and doubles as generic Japanese-style fill
     # footage (the hook pool feeds the body/context-fallback pool too).
     "birthyear": ["#01 #女の子", "#02 #女の子", "#03 #女の子", "#04 #女の子", "#05 #女の子"],
-    "english": ["cute Japanese creator dancing", "Japanese idol playful TikTok dance",
-                "kawaii Japanese girl dance TikTok", "Japanese TikToker dance to camera",
-                "Miyu Kishi TikTok dance"],
+    "english": ["cute Japanese creator dancing", "Japanese idol playful dance",
+                "kawaii Japanese girl dance", "Japanese creator dance to camera",
+                "Miyu Kishi dance"],
 }
 HOOK_MIN_LIKES = 20_000
 MIN_CLIP_LIKES = 0          # body footage is quality/semantic ranked; only the hook keeps 20K+
@@ -6000,7 +6264,9 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
             except Exception as exc:  # noqa: BLE001
                 log(status_cb, f"Visual FX: vision pass failed for a batch ({exc.__class__.__name__}).")
 
-    CAPTION_BAND = (0.50, 0.72)
+    # Keep the actual central caption core clear. The previous 0.50-0.72 exclusion removed
+    # almost a quarter of the frame and rejected many valid face/object targets in normal Shorts.
+    CAPTION_BAND = (0.57, 0.68)
     SIZE_R = {"small": 0.085, "medium": 0.135, "large": 0.20}
 
     def _f(v, default=0.0):
@@ -6054,14 +6320,14 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
             "reason": reason or str(d.get("reason", "")), "has_target": has_target, "safe": safe,
         })
 
-    # cap callouts to ~55% of scenes (keep the most relevant). Up from 30%: the reference viral
-    # documentaries put an arrow on most concrete-subject beats, not just a third.
+    # Effect-heavy default: allow arrows on up to ~68% of scenes while still requiring a real,
+    # confident, voice-relevant target. This raises density without reintroducing random arrows.
     eligible = sorted([c for c in candidates if c["callout_ok"]], key=lambda c: -c["rel"])
-    cap = max(1, int(round(len(scenes) * 0.55)))
+    cap = max(1, int(round(len(scenes) * 0.68)))
     keep = set(c["scene_index"] for c in eligible[:cap])
     for c in eligible[cap:]:
         c["callout"] = "none"; c["callout_ok"] = False
-        c["reason"] = "callout budget reached (kept most relevant ~30%)"
+        c["reason"] = "callout budget reached (kept most relevant ~68%)"
         summary["skipped_callouts_overlap"] += 1
 
     # cap flashy transitions (flash/glitch) to ~12% of scenes so they stay special; the rest of
@@ -8513,34 +8779,53 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
 
     unmatched_idx = [index for index, match in enumerate(matches) if match is None]
     if unmatched_idx:
-        borrow = [Path(it["path"]) for it in got
-                  if it.get("path") and Path(it["path"]).exists()]
+        # A user explicitly marked these scenes for replacement. Keeping their old media makes
+        # the operation look successful while doing nothing. If the strict vision gate has no
+        # winner, use the best remaining freshly scraped candidate as a relevance fallback. The
+        # old clip is only retained when the scraper produced literally no alternative.
+        already_matched = {str(Path(match).resolve()) for match in matches if match is not None}
+        borrow = []
+        for item in got:
+            raw = item.get("path")
+            if not raw or not Path(raw).exists():
+                continue
+            candidate = Path(raw)
+            key = str(candidate.resolve())
+            if key in already_matched:
+                continue
+            borrow.append(candidate)
+            already_matched.add(key)
         kept = borrowed = still_blank = 0
         for index in unmatched_idx:
             scene_index, _scene = indexed_targets[index]
-            existing = _resolve_existing_clip(config["scenes"][scene_index])
-            if existing is not None:
-                matches[index] = existing               # keep the clip the scene already has
-                kept += 1
-            elif borrow:
+            if borrow:
                 matches[index] = borrow.pop(0)          # best-effort: closest scraped clip
                 borrowed += 1
             else:
-                still_blank += 1                        # truly nothing - leave the scene untouched
+                existing = _resolve_existing_clip(config["scenes"][scene_index])
+                if existing is not None:
+                    matches[index] = existing           # no new candidate exists at all
+                    kept += 1
+                else:
+                    still_blank += 1                    # truly nothing - leave the scene untouched
         log(status_cb,
             f"Timeline replacement: {len(unmatched_idx)} line(s) had no clean clip clear the semantic "
-            f"bar - kept {kept} existing clip(s)"
-            + (f", used {borrowed} closest scraped clip(s)" if borrowed else "")
+            f"bar - used {borrowed} closest fresh scraped clip(s)"
+            + (f", kept {kept} existing clip(s) because no alternative existed" if kept else "")
             + (f", left {still_blank} unchanged" if still_blank else "")
             + " (continuing instead of stopping).")
 
+    replaced_count = 0
+    unchanged_ids = []
     for local_index, ((scene_index, scene), source) in enumerate(zip(indexed_targets, matches)):
         if source is None:
+            unchanged_ids.append(str(scene.get("id", scene_index)))
             continue                                    # nothing available - leave this scene as-is
         sid = str(scene.get("id", scene_index))
         source = Path(source)
         current_clip = str((config["scenes"][scene_index] or {}).get("clip") or "").strip()
         if current_clip and source.name == current_clip:
+            unchanged_ids.append(sid)
             continue                                    # 'kept' fallback: scene already uses this clip
         suffix = source.suffix.lower() if source.suffix else ".mp4"
         key = hashlib.sha1(str(source.resolve()).encode("utf-8", "ignore")).hexdigest()[:10]
@@ -8558,6 +8843,7 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
         updated["scrape_clip_id"] = meta.get("clip_id") or str(source)
         updated["match_class"] = (decisions[local_index] or {}).get("match_class", "TIMELINE_REPLACEMENT")
         updated["script_match_score"] = (decisions[local_index] or {}).get("script_match_score")
+        replaced_count += 1
         log(status_cb, f"Timeline replacement: scene {sid} -> {source.name} "
                        f"({meta.get('platform', 'tiktok')}).")
 
@@ -8568,10 +8854,15 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     tmp = config_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(config_for_json(config), indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, config_path)
-    log(status_cb, "Rendering timeline with targeted TikTok/X replacements...")
+    if unchanged_ids:
+        log(status_cb, "Timeline replacement warning: no alternative media existed for scene(s) "
+                       + ", ".join(unchanged_ids) + ".")
+    log(status_cb, f"Timeline replacement complete: changed {replaced_count}/{len(indexed_targets)} "
+                   "marked clip(s). Rendering the updated timeline...")
     output = pipeline.render_video(config)
     return {"title": config.get("title", slug), "project_dir": str(project_dir),
-            "video": str(output), "replaced_scenes": len(matches)}
+            "video": str(output), "replaced_scenes": replaced_count,
+            "requested_replacements": len(indexed_targets), "unchanged_scene_ids": unchanged_ids}
 
 
 def _split_script_lines(script, density="medium"):
@@ -8908,7 +9199,8 @@ def run_project(form, status_cb=None):
 
     title = form.get("title", "").strip()
     if not title and script:
-        title = llm_generate_project_title(script, status_cb=status_cb)
+        title = (llm_generate_project_title(script, status_cb=status_cb)
+                 or derive_project_title_from_script(script))
     if not title:
         title = f"Short {int(time.time())}"
         
@@ -9077,17 +9369,25 @@ def run_project(form, status_cb=None):
     if not script:
         raise RuntimeError("Paste a text script or upload a speech audio file.")
 
-    if not title:
-        title = llm_generate_project_title(script, reasoning_model=reasoning_model, status_cb=status_cb)
+    if not title or re.fullmatch(r"Short\s+\d+", title, flags=re.I):
+        title = (llm_generate_project_title(script, reasoning_model=reasoning_model, status_cb=status_cb)
+                 or derive_project_title_from_script(script))
         if title:
             log(status_cb, f"Updating project title to: {title}")
         else:
             title = f"Short {int(time.time())}"
             
-        # Update config with new title if it was generated late
+        # The folder may already have a timestamp slug, but all UI-facing metadata uses this title.
         if title:
-            # We already created the directory, but the title in config should be accurate
-            pass
+            try:
+                run_form_path = project_dir / "input" / "run_form.json"
+                saved_form = json.loads(run_form_path.read_text(encoding="utf-8")) if run_form_path.exists() else {}
+                if not isinstance(saved_form, dict):
+                    saved_form = {}
+                saved_form["title"] = title
+                run_form_path.write_text(json.dumps(saved_form, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
 
     (project_dir / "input" / "script.txt").write_text(script, encoding="utf-8")
     if visual_script:

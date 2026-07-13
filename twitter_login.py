@@ -418,6 +418,22 @@ class Session:
             except Exception as exc:
                 _status(cb, f"X search: navigation failed for {query!r} ({exc.__class__.__name__}).")
             page.wait_for_timeout(2200)
+            # X intermittently renders its generic client-side "Something went wrong" shell
+            # instead of firing SearchTimeline. Detect that state visible in the live scraper and
+            # recover once; previously we merely scrolled the broken page for several seconds.
+            try:
+                page_text = (page.locator("body").inner_text(timeout=2500) or "").casefold()
+            except Exception:
+                page_text = ""
+            if any(marker in page_text for marker in (
+                    "something went wrong", "try reloading", "don’t fret", "don't fret")):
+                _status(cb, f"X search: transient error page for {query!r}; reloading once.")
+                try:
+                    page.reload(timeout=min(30000, nav_ms), wait_until="domcontentloaded")
+                    page.wait_for_timeout(2200)
+                except Exception as exc:
+                    _status(cb, f"X search: recovery reload failed for {query!r} "
+                                f"({exc.__class__.__name__}).")
             scrape_browser_preview.capture(page, "X", query, sort, force=True)
             scrolls, stagnant, last_n = 0, 0, len(collected)
             while (len(collected) < want and scrolls < max_scrolls and stagnant < 3

@@ -491,7 +491,10 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             if status_cb:
                 _status(status_cb, f"Sort {_mode}: +{added} new clip(s) ({len(merged)} total) for {query!r}.")
         return merged
+    global _X_ZERO_STREAK, _X_UNAVAILABLE
     selected = normalize_platforms(platforms)
+    if _X_UNAVAILABLE:
+        selected.discard("twitter")
     remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
     if remaining is not None and remaining <= 0:
         return []
@@ -534,10 +537,31 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             _status(status_cb, f"X search failed ({exc.__class__.__name__}: {exc}).")
             x_items = []
         if x_items:
+            _X_ZERO_STREAK = 0
             ck = _merge_backend_cookies(selected)
             if ck:
                 set_cookies(ck)    # make sure yt-dlp has x.com cookies for these downloads
             items.extend(x_items)
+        else:
+            _X_ZERO_STREAK += 1
+            if _X_ZERO_STREAK >= 3 and twitter_login is not None:
+                # Learn during the run instead of repeating dozens of visibly empty X Media
+                # searches. One independent health probe distinguishes a bad term from a broken,
+                # logged-out or challenge-gated X session.
+                try:
+                    health = twitter_login.health_check(timeout_s=35)
+                except Exception:
+                    health = {"ok": False}
+                if not health.get("ok"):
+                    _X_UNAVAILABLE = True
+                    _status(status_cb,
+                            "Search Controller: X returned no videos repeatedly and failed its "
+                            "live health check; disabling X for the rest of this run.")
+                else:
+                    _X_ZERO_STREAK = 0
+                    _status(status_cb,
+                            "Search Controller: X is healthy but this query strategy returned "
+                            "nothing; switching terms instead of repeating it.")
     if ig_future is not None:
         try:
             wait_s = 90.0 if deadline is None else max(0.1, deadline - time.monotonic())

@@ -4,8 +4,8 @@ Upload a rendered vertical video and this module:
   1. detects visual cuts + transcribes the speech with timing (reuses sfx_agent),
   2. samples one frame per punchy moment and asks an Opus 4.8 VISION agent to DIRECT the edit:
      for each moment it decides whether a thick red ARROW should point at the concrete subject
-     the line is about, plus (optionally) a kawaii pixel NEKO reaction matching the mood.
-     ARROWS AND NEKOS ONLY - no text stamps, no circles.
+     the line is about, plus (optionally) either a kawaii pixel NEKO or categorized MEME
+     reaction matching the mood. ARROWS AND REACTIONS ONLY - no text stamps, no circles.
   3. renders every effect as an ANIMATED transparent overlay: arrows FLY IN straight from their
      side with an overshoot and then nudge-point at the target; nekos bounce in with a springy
      overshoot,
@@ -32,6 +32,8 @@ import sfx_agent
 ROOT = Path(__file__).resolve().parent
 VISUAL_OUTPUT_DIR = ROOT / "projects" / "_visual_enhanced"
 EMOTION_DIR = ROOT / "static" / "emotions"
+MEME_DIR = ROOT / "assets" / "meme_stickers"
+MEME_CATALOG_PATH = MEME_DIR / "catalog.json"
 
 ARROW_RED = (225, 32, 25)
 
@@ -51,6 +53,23 @@ def available_emotions():
         except Exception:
             pass
     return sorted(p.stem for p in EMOTION_DIR.glob("*.png")) if EMOTION_DIR.exists() else []
+
+
+def available_memes():
+    """Categorized transparent meme stickers whose assigned sound also exists locally."""
+    try:
+        raw = json.loads(MEME_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for meme_id, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue
+        image = MEME_DIR / f"{meme_id}.png"
+        sound = ROOT / "soundeffects" / str(rec.get("sound") or "")
+        if image.exists() and sound.exists():
+            out[meme_id] = {**rec, "image_path": str(image), "sound_path": str(sound)}
+    return out
 
 
 def log(status_cb, message):
@@ -97,12 +116,14 @@ VFX_AMOUNT_PROFILES = {
         "direct": "give MOST moments (roughly 2 out of 3) a red arrow when a concrete target "
                   "exists, and only skip a moment when there is genuinely nothing concrete on screen.",
         "neko": "Use it on the strongest ~1 in 3 moments, else 'none'.",
+        "meme": "Use a meme sparingly, only on the strongest ~1 in 4 emotionally obvious moments.",
     },
     "medium": {
         "min_gap": 1.2, "cap": 28,
         "direct": "give nearly every moment (roughly 3 out of 4) a red arrow when any concrete "
                   "target exists - skipping should be the exception, not the rule.",
         "neko": "Use it on the strongest ~1 in 2 moments, else 'none'.",
+        "meme": "Use a meme on roughly 1 in 3 emotionally obvious moments.",
     },
     "high": {
         "min_gap": 0.8, "cap": 42,
@@ -110,6 +131,7 @@ VFX_AMOUNT_PROFILES = {
                   "arrow whenever anything concrete is visible - a face, object, sign, detail, "
                   "anything. Only output 'none' when the frame is pure blur or empty background.",
         "neko": "Be generous: use it on ~2 in 3 emotionally coloured moments, else 'none'.",
+        "meme": "Use a meme generously on roughly 1 in 2 emotionally obvious moments.",
     },
 }
 
@@ -143,15 +165,16 @@ def _phrase_at(phrases, t):
 
 
 def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, status_cb=None,
-                    emotions=None, vfx_amount="low"):
+                    emotions=None, memes=None, vfx_amount="low"):
     """One frame per candidate moment -> contact sheet -> the vision agent DIRECTS the edit.
-    Returns (effect_events, char_events):
+    Returns (effect_events, char_events, meme_events):
       effects  = {time, type: arrow, cx, cy, from, target, confidence}
       characters = {time, emotion, cx, cy}."""
     emotions = list(emotions or [])
+    memes = dict(memes or {})
     profile = vfx_amount_profile(vfx_amount)
     if not os.environ.get("WAVESPEED_API_KEY") or not times:
-        return ([], [])
+        return ([], [], [])
     work = Path(video_path).parent / "_visual_frames"
     work.mkdir(parents=True, exist_ok=True)
     frames, kept_times = [], []
@@ -160,9 +183,11 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
         if pipeline.extract_poster_frame(video_path, fp, ffmpeg=ffmpeg, at=t):
             frames.append(fp); kept_times.append(t)
     if not frames:
-        return ([], [])
+        return ([], [], [])
 
-    effects, char_events = [], []
+    effects, char_events, meme_events = [], [], []
+    diagnostics = {"candidates": len(frames), "tiles_returned": 0, "arrow_requested": 0,
+                   "low_confidence": 0, "caption_conflict": 0, "accepted": 0}
     emo_line = ""
     if emotions:
         emo_line = (
@@ -172,6 +197,18 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             "sad->sad/crying, love/romance->love, confident->cool, creepy->scared, confusing->confused, "
             "opinionated->angry, curious->thinking). " + profile["neko"] + " Give char_cx, char_cy "
             "(0-1) in an EMPTY corner away from the subject and the caption band.\n")
+    meme_line = ""
+    if memes:
+        meme_options = "\n".join(
+            f"- {meme_id}: {rec.get('reaction')} | use for: {', '.join(rec.get('cues') or [])}"
+            for meme_id, rec in memes.items()
+        )
+        meme_line = (
+            "A moment may instead receive ONE transparent meme reaction. Pick 'meme' from the exact IDs "
+            "below only when its reaction meaning clearly matches the spoken phrase; otherwise use 'none'. "
+            f"{profile['meme']} A moment may have a neko OR a meme, never both. Give meme_cx and meme_cy "
+            "in an empty corner outside the caption band.\n"
+            f"MEME OPTIONS:\n{meme_options}\n")
     BATCH = 12
     for b0 in range(0, len(frames), BATCH):
         sub_f = frames[b0:b0 + BATCH]
@@ -195,12 +232,16 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             "'effect' = 'none' when nothing concrete is visible.\n"
             "NEVER aim an arrow at empty space, blur, generic background, or the caption band "
             "(cy roughly 0.50-0.72).\n"
-            + emo_line + "\n"
-            f"Moments:\n{lines}\n\n"
+            "ABSOLUTELY NO TEXT: never generate captions, subtitles, labels, words, stamps, numbers, "
+            "speech bubbles, or title cards. The only allowed visuals are arrows and the supplied "
+            "transparent neko/meme reaction images.\n"
+            + emo_line + meme_line + "\n"
+            f"Moments:\n{lines}\n\nReturn one entry for EVERY listed tile, including explicit 'none' entries.\n"
             'Return STRICT JSON: {"tiles": {"<tile_index>": {"effect": "arrow|none", '
             '"cx": 0-1, "cy": 0-1, "from": "left|right|top|bottom|top-left|top-right|bottom-left|bottom-right", '
             '"target": "short desc", "confidence": 0-10'
             + (', "emotion": "none|<from the list>", "char_cx": 0-1, "char_cy": 0-1' if emotions else '')
+            + (', "meme": "none|<exact meme ID>", "meme_cx": 0-1, "meme_cy": 0-1' if memes else '')
             + '}, ...}}')
         messages = [
             {"role": "system", "content": "You direct dense, punchy visual emphasis; every effect must aim at something concrete and visible. Return JSON only."},
@@ -219,6 +260,7 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             log(status_cb, f"Vision direction failed ({exc.__class__.__name__}); skipping this batch.")
             continue
         tiles = plan.get("tiles") if isinstance(plan.get("tiles"), dict) else {}
+        diagnostics["tiles_returned"] += len(tiles)
         for key, d in tiles.items():
             try:
                 j = int(key)
@@ -227,9 +269,23 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             if not (0 <= j < len(sub_t)) or not isinstance(d, dict):
                 continue
             t_here = round(float(sub_t[j]), 2)
-            # --- optional neko reaction ---
+            # --- optional meme/neko reaction (at most one per moment; meme wins if the model
+            # accidentally returned both because it has the more specific semantic mapping) ---
+            meme_id = str(d.get("meme", "none") or "none").strip()
+            if memes and meme_id in memes:
+                try:
+                    mcx = min(0.88, max(0.12, float(d.get("meme_cx", 0.80))))
+                    mcy = min(0.88, max(0.12, float(d.get("meme_cy", 0.20))))
+                except (TypeError, ValueError):
+                    mcx, mcy = 0.80, 0.20
+                if 0.50 <= mcy <= 0.72:
+                    mcy = 0.18
+                rec = memes[meme_id]
+                meme_events.append({"time": t_here, "meme": meme_id, "cx": mcx, "cy": mcy,
+                                    "reaction": rec.get("reaction", "reaction"),
+                                    "sound_path": rec.get("sound_path", "")})
             emo = str(d.get("emotion", "none") or "none").lower().strip()
-            if emotions and emo in emotions:
+            if meme_id not in memes and emotions and emo in emotions:
                 try:
                     ccx = min(0.9, max(0.1, float(d.get("char_cx", 0.82))))
                     ccy = min(0.9, max(0.1, float(d.get("char_cy", 0.20))))
@@ -242,15 +298,21 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             etype = str(d.get("effect", "none") or "none").lower().strip()
             if etype != "arrow":
                 continue
+            diagnostics["arrow_requested"] += 1
             try:
                 conf = float(d.get("confidence", 0))
                 cx = min(0.94, max(0.06, float(d.get("cx", 0.5))))
                 cy = min(0.94, max(0.06, float(d.get("cy", 0.5))))
             except (TypeError, ValueError):
                 continue
-            if conf < 6.0:
+            # Medium/high are explicitly dense modes. Confidence 5.5 still represents a visible
+            # concrete target; the old hard 6.0 threshold discarded many otherwise valid tiles.
+            min_conf = 6.0 if str(vfx_amount).lower() == "low" else 5.5
+            if conf < min_conf:
+                diagnostics["low_confidence"] += 1
                 continue
-            if 0.50 <= cy <= 0.72:                                    # target under captions -> skip
+            if 0.57 <= cy <= 0.67:                                    # only the central caption core
+                diagnostics["caption_conflict"] += 1
                 continue
             side = str(d.get("from", "")).lower().strip().replace("_", "-")
             if side not in _DIRS:
@@ -258,6 +320,7 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             effects.append({"time": t_here, "type": "arrow", "cx": cx, "cy": cy, "from": side,
                             "target": str(d.get("target", ""))[:80],
                             "confidence": round(conf, 1)})
+            diagnostics["accepted"] += 1
 
     def _space(evs, gap):
         evs.sort(key=lambda e: e["time"])
@@ -266,7 +329,13 @@ def analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model=None, st
             if not out or e["time"] - out[-1]["time"] >= gap:
                 out.append(e)
         return out
-    return (_space(effects, 1.15), _space(char_events, 2.0))
+    arrow_gap = max(0.72, float(profile["min_gap"]) * 0.92)
+    log(status_cb, "Visual density audit: "
+        f"{diagnostics['candidates']} candidates, {diagnostics['tiles_returned']} tiles returned, "
+        f"{diagnostics['arrow_requested']} arrows requested, {diagnostics['accepted']} accepted "
+        f"({diagnostics['low_confidence']} low-confidence, "
+        f"{diagnostics['caption_conflict']} caption conflicts).")
+    return (_space(effects, arrow_gap), _space(char_events, 2.0), _space(meme_events, 2.0))
 
 
 # --------------------------------------------------------------------- overlay renderers
@@ -402,6 +471,55 @@ def render_char_clip(event, w, h, fps, out_dir, idx, ffmpeg, hold=1.5):
     return clip, round(start, 3), round(start + n / fps, 3)
 
 
+def render_meme_clip(event, w, h, fps, out_dir, idx, ffmpeg, hold=1.55):
+    """A photographic/illustrated meme sticker: quick impact-pop, small rotational overshoot,
+    subtle float, then a fast shrink. Aspect ratio and smooth source detail are preserved."""
+    from PIL import Image
+    png = MEME_DIR / f"{event['meme']}.png"
+    if not png.exists():
+        return None
+    base = Image.open(png).convert("RGBA")
+    max_w, max_h = int(w * 0.38), int(h * 0.24)
+    ratio = min(max_w / max(1, base.width), max_h / max(1, base.height))
+    bw, bh = max(2, int(base.width * ratio)), max(2, int(base.height * ratio))
+    base = base.resize((bw, bh), Image.Resampling.LANCZOS)
+    frame_dir = out_dir / f"meme_{idx:02d}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    cx = int(min(w - bw * 0.52, max(bw * 0.52, event["cx"] * w)))
+    cy = int(min(h - bh * 0.52, max(bh * 0.52, event["cy"] * h)))
+    n = max(10, int(round(hold * fps)))
+    for i in range(n):
+        local = i / float(n - 1) if n > 1 else 1.0
+        if local < 0.25:
+            u = local / 0.25
+            scale = max(0.02, _ease_out_back(u, s=2.25))
+            alpha = min(1.0, u * 2.1)
+            angle = (1.0 - u) * -8.0
+        elif local > 0.88:
+            u = (local - 0.88) / 0.12
+            scale, alpha, angle = max(0.02, 1.0 - u), max(0.0, 1.0 - u), u * 4.0
+        else:
+            u = (local - 0.25) / 0.63
+            scale = 1.0 + math.sin(u * math.pi * 2) * 0.018
+            alpha = 1.0
+            angle = math.sin(u * math.pi * 2) * 1.2
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        if alpha > 0.03:
+            sw, sh = max(2, int(bw * scale)), max(2, int(bh * scale))
+            spr = base.resize((sw, sh), Image.Resampling.LANCZOS)
+            if abs(angle) > 0.15:
+                spr = spr.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+            if alpha < 0.999:
+                spr.putalpha(spr.getchannel("A").point(lambda p: int(p * alpha)))
+            canvas.alpha_composite(spr, (int(cx - spr.width / 2), int(cy - spr.height / 2)))
+        canvas.save(frame_dir / f"f_{i:03d}.png")
+    clip = _mov_from_frames(frame_dir, fps, out_dir / f"meme_{idx:02d}.mov", ffmpeg)
+    if not clip:
+        return None
+    start = max(0.0, float(event["time"]) - 0.05)
+    return clip, round(start, 3), round(start + n / fps, 3)
+
+
 def composite_overlays(video_path, overlay_clips, out_path, ffmpeg, status_cb=None):
     """Overlay each transparent clip onto the base video during its time window (audio copied)."""
     if not overlay_clips:
@@ -450,6 +568,14 @@ def _overlay_sfx_segments(events, ffprobe, status_cb=None):
     segs = []
     for k, e in enumerate(events):
         etype = e.get("type") or ("char" if e.get("emotion") else "arrow")
+        if e.get("meme") and e.get("sound_path"):
+            path = Path(e["sound_path"])
+            if path.exists():
+                dur = min(0.72, sfx_agent.media_duration(path, ffprobe) or 0.45)
+                segs.append({"path": path, "start": round(max(0.0, float(e["time"]) - 0.045), 3),
+                             "duration": round(max(0.12, dur), 3), "volume": 0.28,
+                             "category": "meme_reaction", "reason": f"meme_{e['meme']}_appear"})
+                continue
         prefs = by_type.get(etype, []) + [rotation[k % len(rotation)]]
         cat = next((c for c in prefs if lib.get(c)), None)
         if not cat:
@@ -468,7 +594,7 @@ def _overlay_sfx_segments(events, ffprobe, status_cb=None):
 
 
 def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, out_dir=None,
-                              add_characters=True, vfx_amount="low"):
+                              add_characters=True, add_memes=True, vfx_amount="low"):
     video_path = Path(video_path)
     if not video_path.exists():
         raise RuntimeError("Uploaded video not found.")
@@ -498,19 +624,26 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     log(status_cb, f"Directing {len(times)} punchy moment(s) (amount: {str(vfx_amount)})...")
 
     emotions = available_emotions() if add_characters else []
-    effects, char_events = analyze_effects(video_path, times, phrases, ffmpeg, reasoning_model,
-                                           status_cb=status_cb, emotions=emotions,
-                                           vfx_amount=vfx_amount)
+    memes = available_memes() if add_memes else {}
+    log(status_cb, f"Reaction library: {len(emotions)} neko emotion(s), {len(memes)} categorized meme(s).")
+    effects, char_events, meme_events = analyze_effects(
+        video_path, times, phrases, ffmpeg, reasoning_model,
+        status_cb=status_cb, emotions=emotions, memes=memes, vfx_amount=vfx_amount)
     n_arrow = len(effects)
     log(status_cb, f"Direction: {n_arrow} arrow(s)"
-                   + (f", {len(char_events)} neko(s)." if emotions else "."))
-    if not effects and not char_events:
+                   + f", {len(char_events)} neko(s), {len(meme_events)} meme reaction(s).")
+    if not effects and not char_events and not meme_events:
         raise RuntimeError("The director found nothing concrete to emphasise in this video. "
                            "Try a video with visible subjects/objects.")
 
     tmp = out_dir / f"_visualtmp_{stamp}"
     tmp.mkdir(parents=True, exist_ok=True)
     overlay_clips = []
+    for i, me in enumerate(meme_events):
+        clip = render_meme_clip(me, w, h, fps, tmp, i, ffmpeg)
+        if clip:
+            overlay_clips.append(clip)
+            log(status_cb, f"Meme '{me['meme']}' ({me.get('reaction')}) at {me['time']:.1f}s")
     for i, ce in enumerate(char_events):          # nekos first (effects layer on top)
         clip = render_char_clip(ce, w, h, fps, tmp, i, ffmpeg)
         if clip:
@@ -527,7 +660,7 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     overlaid = out_dir / f"_overlaid_{stamp}.mp4"
     composite_overlays(video_path, overlay_clips, overlaid, ffmpeg, status_cb=status_cb)
 
-    segments = _overlay_sfx_segments(effects + char_events, ffprobe, status_cb=status_cb)
+    segments = _overlay_sfx_segments(effects + char_events + meme_events, ffprobe, status_cb=status_cb)
     if segments:
         log(status_cb, f"Adding {len(segments)} click/ding/impact(s)...")
         sfx_agent.mix_into_video(overlaid, segments, out_path, ffmpeg, ffprobe, duration, status_cb=status_cb)
@@ -542,13 +675,16 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     plan_path = out_path.with_name(out_path.stem + "_plan.json")
     plan_path.write_text(json.dumps({
         "source_video": str(video_path), "duration": round(duration, 2),
-        "effect_counts": {"arrow": n_arrow, "neko": len(char_events)},
+        "effect_counts": {"arrow": n_arrow, "neko": len(char_events), "meme": len(meme_events)},
         "arrows": [{"time": e["time"], "cx": e["cx"], "cy": e["cy"],
                     "from": e.get("from"), "target": e.get("target", ""),
                     "confidence": e.get("confidence")}
                    for e in effects],
         "characters": [{"time": c["time"], "emotion": c["emotion"], "cx": c["cx"], "cy": c["cy"]}
                        for c in char_events],
+        "memes": [{"time": m["time"], "meme": m["meme"], "reaction": m.get("reaction"),
+                    "cx": m["cx"], "cy": m["cy"], "sound": Path(m.get("sound_path", "")).name}
+                   for m in meme_events],
     }, indent=2), encoding="utf-8")
 
     # Editable project: split the CLEAN original into scene clips and store every arrow/neko as an
@@ -556,17 +692,18 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     project_dir = None
     try:
         project_dir = _write_visual_timeline_project(
-            video_path, effects, char_events, cuts, phrases, duration, ffmpeg, out_path,
+            video_path, effects, char_events, meme_events, cuts, phrases, duration, ffmpeg, out_path,
             status_cb=status_cb)
     except Exception as exc:  # noqa: BLE001
         log(status_cb, f"Timeline project not written ({exc}); the enhanced video is still saved.")
 
     return {"video": str(out_path), "original_video": str(video_path), "visual_plan": str(plan_path),
-            "arrow_count": n_arrow, "character_count": len(char_events), "plan_source": "opus_vision",
+            "arrow_count": n_arrow, "character_count": len(char_events),
+            "meme_count": len(meme_events), "plan_source": "opus_vision",
             "project_dir": (str(agent_core.PROJECTS_DIR / project_dir) if project_dir else None)}
 
 
-def _write_visual_timeline_project(video_path, effects, char_events, cuts, phrases, duration,
+def _write_visual_timeline_project(video_path, effects, char_events, meme_events, cuts, phrases, duration,
                                    ffmpeg, enhanced_out, status_cb=None):
     """Create a REAL project for the VFX-master output: the CLEAN original video is split at the
     detected cuts into per-scene clips (original audio -> voice track), and every arrow/neko lands
@@ -607,7 +744,7 @@ def _write_visual_timeline_project(video_path, effects, char_events, cuts, phras
 
     ffprobe = pipeline.find_ffprobe(ffmpeg)
     try:
-        _snd_segs = _overlay_sfx_segments(effects + char_events, ffprobe, status_cb=None)
+        _snd_segs = _overlay_sfx_segments(effects + char_events + meme_events, ffprobe, status_cb=None)
     except Exception:
         _snd_segs = []
     sfx_by_time = {round(float(s.get("start", 0.0)), 2): s for s in _snd_segs}
@@ -643,6 +780,7 @@ def _write_visual_timeline_project(video_path, effects, char_events, cuts, phras
         "project_slug": slug, "title": f"Visual Master - {video_path.stem}"[:70],
         "duration": round(float(duration), 3), "scenes": cfg_scenes,
         "sfx_enabled": False, "render_captions": False, "animated_captions": False,
+        "caption_mode": "off", "captions_enabled": False,
         "use_seedance_clips": True, "seedance_clip_start_trim": 0.0,
         "background_music_choice": "none", "audio_master_gain": 1.0,
         "visual_master_source": str(video_path),
@@ -653,6 +791,6 @@ def _write_visual_timeline_project(video_path, effects, char_events, cuts, phras
         shutil.copy2(enhanced_out, pdir / "renders" / Path(enhanced_out).name)
     except Exception:
         pass
-    log(status_cb, f"Timeline project ready: {slug} (open it in the timeline editor to move / "
-                   "restyle / delete the arrows and nekos).")
+    log(status_cb, f"Timeline project ready: {slug} (arrows remain editable; rendered neko/meme "
+                   "reactions remain baked into the enhanced preview).")
     return slug

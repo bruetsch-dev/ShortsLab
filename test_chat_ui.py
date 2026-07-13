@@ -117,6 +117,12 @@ def test_shell_renders():
     leg = app.form_page().decode("utf-8", "replace")   # legacy form still renders
     check("legacy form route still available", 'id="short-form"' in leg)
     check("shell is standalone document", html.startswith("<!DOCTYPE html>"))
+    check("main sidebar uses centered panel collapse icon",
+          'id="sb-collapse"' in html and '<rect x="3.5" y="4" width="17" height="16"' in html)
+    js = (chat_ui.ROOT / "static" / "chat-shell.js").read_text(encoding="utf-8")
+    nav = re.search(r"const NAV = \[(.*?)\];", js, re.S)
+    check("main sidebar has no timeline-editor navigation button",
+          bool(nav) and "nav_timeline" not in nav.group(1))
 
 
 def test_chat_state_roundtrip():
@@ -137,10 +143,46 @@ def test_projects_jobs_payloads():
     if d["projects"]:
         p = d["projects"][0]
         for k in ("slug", "title", "edited", "failed", "has_video", "counters",
-                  "results_url", "has_timeline"):
+                  "results_url", "has_timeline", "running"):
             check(f"project item has {k}", k in p)
     j = chat_ui.jobs_list_payload()
     check("jobs-list payload shape", isinstance(j.get("jobs"), list))
+
+
+def test_running_project_never_looks_failed():
+    rows = chat_ui.projects_list_payload().get("projects") or []
+    candidate = next((p for p in rows if p.get("failed")), rows[0] if rows else None)
+    if not candidate:
+        check("running project suppresses failed preview", True, "no projects available")
+        return
+    jid = "_ui_running_state_test"
+    with app.JOB_LOCK:
+        app.JOBS[jid] = {
+            "status": "running", "project_dir": str(agent_core.PROJECTS_DIR / candidate["slug"]),
+            "logs": ["Working"], "created_at": 0,
+        }
+    try:
+        updated = next(p for p in chat_ui.projects_list_payload()["projects"]
+                       if p["slug"] == candidate["slug"])
+        check("running project suppresses failed preview",
+              updated.get("running") is True and updated.get("failed") is False, str(updated))
+    finally:
+        with app.JOB_LOCK:
+            app.JOBS.pop(jid, None)
+
+
+def test_timeline_exit_and_sidebar_guards():
+    candidate = next((p for p in chat_ui.projects_list_payload()["projects"]
+                      if p.get("has_timeline")), None)
+    if not candidate:
+        check("timeline hover sidebar + save-before-leave guard", True, "no timeline project")
+        return
+    html = app.timeline_page(candidate["slug"]).decode("utf-8", "replace")
+    check("timeline removes back button", 'class="back-arrow"' not in html)
+    check("timeline has no duplicate sidebar or edge hover overlay",
+          'id="tlsb"' not in html and 'id="tlsb-edge"' not in html and "tlsb-peek" not in html)
+    check("timeline asks to save before explicit navigation",
+          "Save before leaving?" in html and 'data-leave="save"' in html and "/timeline-save" in html)
 
 
 GERMAN_MARKERS = [
@@ -200,7 +242,9 @@ def test_legacy_routes_still_render():
 
 if __name__ == "__main__":
     for t in (test_payload_parity, test_option_extraction, test_shell_renders,
-              test_chat_state_roundtrip, test_projects_jobs_payloads, test_english_only,
+              test_chat_state_roundtrip, test_projects_jobs_payloads,
+              test_running_project_never_looks_failed, test_timeline_exit_and_sidebar_guards,
+              test_english_only,
               test_no_ai_in_chat, test_paid_guard, test_legacy_routes_still_render):
         print(f"\n== {t.__name__} ==")
         t()

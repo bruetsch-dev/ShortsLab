@@ -19,6 +19,52 @@ import app  # defines Handler + QuietServer and installs crash logging at import
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+def _cancel_active_jobs():
+    """Tell in-process workers to stop before the native window disappears."""
+    try:
+        with app.JOB_LOCK:
+            jobs = list(app.JOBS.values())
+        for job in jobs:
+            event = job.get("cancel_event") if isinstance(job, dict) else None
+            if event:
+                event.set()
+    except Exception:
+        pass
+
+
+def _close_scraper_sessions():
+    """Close Playwright contexts so their Chromium child processes do not survive Shortslab."""
+    closers = []
+    for module_name in ("tiktok_login", "twitter_login", "instagram_login"):
+        try:
+            module = __import__(module_name)
+            close = getattr(module, "close_session", None)
+            if callable(close):
+                worker = threading.Thread(target=close, daemon=True,
+                                          name=f"close-{module_name}")
+                worker.start()
+                closers.append(worker)
+        except Exception:
+            pass
+    # Do not let a wedged browser/session keep an already-closed app window alive invisibly.
+    deadline = time.monotonic() + 4.0
+    for worker in closers:
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _shutdown_everything(server):
+    _cancel_active_jobs()
+    _close_scraper_sessions()
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
+
+
 def _app_icon():
     """The app's .ico for the window + taskbar (falls back to png / None)."""
     for name in ("app_icon.ico", "start_icon.ico", "app_icon.png"):
@@ -117,8 +163,24 @@ def main():
             except Exception as exc:  # pragma: no cover - GUI dialog path
                 return {"ok": False, "error": str(exc)}
 
-    webview.create_window("Shortslab", url, js_api=_NativeApi(),
-                          width=1440, height=920, min_size=(1024, 680))
+    window = webview.create_window("Shortslab", url, js_api=_NativeApi(),
+                                   width=1440, height=920, min_size=(1024, 680))
+    closed = threading.Event()
+
+    def _on_window_closed(*_args):
+        # Keep the GUI callback non-blocking. Session cleanup can wait on Playwright worker
+        # threads, so perform it outside WebView2's event thread.
+        if closed.is_set():
+            return
+        closed.set()
+        threading.Thread(target=_shutdown_everything, args=(server,), daemon=True).start()
+
+    try:
+        window.events.closed += _on_window_closed
+    except Exception:
+        # Older pywebview versions still make webview.start() return after the last window closes;
+        # the unconditional cleanup below remains the fallback.
+        pass
     # edgechromium = the WebView2 engine (already installed); pywebview auto-falls-back otherwise.
     # icon = the Shortslab icon for the window + taskbar (so it's not the python.exe logo).
     start_kwargs = {"gui": "edgechromium"}
@@ -134,10 +196,11 @@ def main():
             webview.start()
     except Exception:
         webview.start()
-    try:
-        server.shutdown()
-    except Exception:
-        pass
+    _shutdown_everything(server)
+    # ThreadPoolExecutors created by scraper integrations use non-daemon worker threads. Even
+    # after their browser context is closed they can keep python.exe alive invisibly. At this
+    # point the only native window is gone and cleanup has run, so guarantee process termination.
+    os._exit(0)
 
 
 if __name__ == "__main__":
