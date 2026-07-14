@@ -126,25 +126,28 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         self.assertAlmostEqual(source_duration, 2.8)
         self.assertAlmostEqual(source_duration / rate, 3.0)
 
-        segments = sfx_agent.resolve_vision_segments(
-            [{"timestamp": 0.0, "end_timestamp": 3.0, "sfx_type": "hook_riser",
-              "trigger_detail": "hook climax", "reasoning": ""}],
-            {"library": {}, "hook_risers": pool, "reactions": {}},
-            duration=20.0, ffprobe=None)
-        riser = segments[0]
-        self.assertEqual(riser["start"], 0.0)
-        self.assertEqual(riser["duration"], 3.0)
-        self.assertEqual(str(riser["path"]), "near.wav")
-        self.assertAlmostEqual(riser["source_duration"] / riser["playback_rate"], 3.0, places=4)
+        # resolve_vision_segments trusts the SCANNED library first, so mock it to the fake pool.
+        # The fake .wav files don't exist on disk, so build_progressive_riser returns None and the
+        # riser keeps the plain uniform-rate path (source_duration / playback_rate == target).
+        fake_lib = {"library": {}, "hook_risers": pool, "reactions": {}}
+        with mock.patch.object(sfx_library, "build_library", return_value=fake_lib):
+            segments = sfx_agent.resolve_vision_segments(
+                [{"timestamp": 0.0, "end_timestamp": 3.0, "sfx_type": "hook_riser",
+                  "trigger_detail": "hook climax", "reasoning": ""}],
+                fake_lib, duration=20.0, ffprobe=None)
+            riser = segments[0]
+            self.assertEqual(riser["start"], 0.0)
+            self.assertEqual(riser["duration"], 3.0)
+            self.assertEqual(str(riser["path"]), "near.wav")
+            self.assertAlmostEqual(riser["source_duration"] / riser["playback_rate"], 3.0, places=4)
 
-        late = sfx_agent.resolve_vision_segments(
-            [{"timestamp": 0.0, "end_timestamp": 9.0, "sfx_type": "hook_riser",
-              "trigger_detail": "late hook climax", "reasoning": ""}],
-            {"library": {}, "hook_risers": pool, "reactions": {}},
-            duration=20.0, ffprobe=None)[0]
-        self.assertEqual(late["start"], 0.0)
-        self.assertEqual(late["duration"], 9.0)  # explicit timestamp remains authoritative
-        self.assertEqual(str(late["path"]), "longest.wav")
+            late = sfx_agent.resolve_vision_segments(
+                [{"timestamp": 0.0, "end_timestamp": 9.0, "sfx_type": "hook_riser",
+                  "trigger_detail": "late hook climax", "reasoning": ""}],
+                fake_lib, duration=20.0, ffprobe=None)[0]
+            self.assertEqual(late["start"], 0.0)
+            self.assertEqual(late["duration"], 9.0)  # explicit timestamp remains authoritative
+            self.assertEqual(str(late["path"]), "longest.wav")
 
     def test_atempo_chain_supports_stretching_and_speeding_up(self):
         self.assertEqual(pipeline.atempo_filter_chain(1.0), "")

@@ -11,6 +11,7 @@ Trimmed working copies live in generated_assets/sfx_trimmed/ - originals are nev
 The classification is cached to that folder so the scan only re-runs when files change.
 """
 
+import hashlib
 import json
 import math
 import subprocess
@@ -107,6 +108,95 @@ def choose_riser_for_target(pool, target_duration, duration_getter=None):
         return None, 0.0, 1.0
     _score, _index, item, source_duration, rate = min(candidates, key=lambda row: (row[0], row[1]))
     return item, source_duration, rate
+
+
+_STRETCHED_RISER_DIR = ROOT / "_stretched_risers"
+
+
+def build_progressive_riser(src_path, target_duration, source_duration,
+                            ffmpeg=None, keep_head=0.5):
+    """Time-stretch a hook riser so its climax lands EXACTLY on ``target_duration`` while keeping
+    the attack crisp.
+
+    The first ``keep_head`` (0.5s) of the SOURCE plays at 1.0x; every following ``keep_head``-second
+    chunk plays progressively slower (a geometric slowdown, rate_j = f**j with the head at j=0), so
+    a far-away impact word is reached without slowing the punchy opening. Pitch is preserved
+    (atempo). The result is a cached WAV whose total length == target_duration, meant to be placed
+    at playback_rate 1.0.
+
+    Returns the cached WAV Path, or None when a progressive stretch isn't needed/possible
+    (target <= source, or the source is too short to chunk) - the caller then keeps the plain
+    uniform-rate riser behaviour.
+    """
+    try:
+        target = float(target_duration)
+        rlen = float(source_duration)
+    except (TypeError, ValueError):
+        return None
+    src = Path(src_path)
+    if not src.exists() or target <= 0 or rlen <= 0:
+        return None
+    # Only stretch when the impact word sits meaningfully FARTHER than the riser is long (the
+    # "eigentlich zu weit weg" case). Shorter/equal targets keep the existing uniform-rate handling.
+    if rlen <= keep_head + 0.05 or target <= rlen + 0.12:
+        return None
+    # split the source into keep_head-second chunks (last one is the remainder)
+    chunks, t0 = [], 0.0
+    while t0 < rlen - 1e-3:
+        chunks.append((round(t0, 4), round(min(keep_head, rlen - t0), 4)))
+        t0 += keep_head
+    n = len(chunks)
+    if n < 2:
+        return None
+
+    # rate_j = f**j (head j=0 -> 1.0x). output(f) = sum(chunk_j / f**j) is monotonically DECREASING
+    # in f, output(1)=rlen < target, so a unique f in (0,1) yields output(f)=target. Bisect for it.
+    def _output(f):
+        return sum(s / (f ** j) for j, (_, s) in enumerate(chunks))
+    lo, hi = 0.05, 1.0
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        if _output(mid) > target:
+            lo = mid       # too slow / too long -> raise f
+        else:
+            hi = mid
+    f = 0.5 * (lo + hi)
+
+    key = hashlib.sha1(
+        f"{src.resolve()}|{rlen:.3f}|{target:.3f}|{keep_head:.3f}".encode("utf-8", "ignore")
+    ).hexdigest()[:16]
+    try:
+        _STRETCHED_RISER_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    out = _STRETCHED_RISER_DIR / f"riser_{key}.wav"
+    if out.exists() and out.stat().st_size > 2048:
+        return out
+
+    ffmpeg = ffmpeg or pipeline.find_ffmpeg()
+    split_labels = "".join(f"[s{j}]" for j in range(n))
+    parts = [f"[0:a]asplit={n}{split_labels}"]
+    for j, (start, s) in enumerate(chunks):
+        tempo = pipeline.atempo_filter_chain(f ** j)
+        tp = f",{tempo}" if tempo else ""
+        parts.append(f"[s{j}]atrim={start:.4f}:{round(start + s, 4):.4f},"
+                     f"asetpts=PTS-STARTPTS{tp}[c{j}]")
+    concat_in = "".join(f"[c{j}]" for j in range(n))
+    fc = ";".join(parts) + f";{concat_in}concat=n={n}:v=0:a=1[out]"
+    try:
+        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+                        "-filter_complex", fc, "-map", "[out]",
+                        "-ar", "48000", "-ac", "2", str(out)],
+                       capture_output=True, timeout=120)
+    except Exception:
+        return None
+    if out.exists() and out.stat().st_size > 2048:
+        return out
+    try:
+        out.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
 
 
 def load_active_labels():

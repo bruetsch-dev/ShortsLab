@@ -95,3 +95,6 @@ push_to_github.bat
 
 # large demo preview videos (regenerable, not needed to run the app)
 static/previews/*.mp4
+
+# generated: progressively time-stretched hook risers (regenerable cache)
+_stretched_risers/

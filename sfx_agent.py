@@ -798,16 +798,53 @@ def resolve_vision_segments(events, data, duration, existing_onsets=None, sfx_am
         item, rlen, playback_rate = sfx_library.choose_riser_for_target(
             hook_pool, end, duration_getter=fdur)
         if item:
-            segments.append({"path": Path(item["path"]), "start": 0.0,
+            # When the impact word sits farther away than the riser is long, DON'T uniformly slow
+            # the whole thing (that dulls the punchy attack). Keep the first 0.5s at full speed,
+            # then progressively slow each following 0.5s so the climax lands EXACTLY on the impact
+            # word. build_progressive_riser bakes that variable stretch into a cached WAV played at
+            # 1.0x; it returns None (uniform fallback) when the target is <= the source length.
+            riser_path = Path(item["path"])
+            src_dur = round(rlen, 3)
+            rate = round(playback_rate, 6)
+            stretched = None
+            try:
+                stretched = sfx_library.build_progressive_riser(item["path"], end, rlen)
+            except Exception:
+                stretched = None
+            if stretched:
+                riser_path = Path(stretched)
+                # Per-chunk atempo latency makes the baked WAV land a hair SHORT of the target, and
+                # the render can't extend a short file (the riser would end BEFORE the impact word).
+                # Measure the real length and let a tiny uniform playback_rate correction stretch it
+                # to land the climax EXACTLY on the impact word, keeping the progressive character.
+                actual = 0.0
+                try:
+                    actual = float(fdur(str(stretched)) or 0.0)
+                except Exception:
+                    actual = 0.0
+                if actual > 0.05:
+                    src_dur = round(actual, 3)
+                    # Overshoot by ~0.1s so the render's own atempo latency can't leave it short;
+                    # the render then atrim=0:end back to exactly the impact word.
+                    rate = round(min(1.0, actual / (end + 0.10)), 6)   # <1 slows the file out past `end`
+                else:
+                    src_dur = round(end, 3)
+                    rate = 1.0
+            segments.append({"path": riser_path, "start": 0.0,
                          "duration": round(end, 3), "source_trim": 0.0,
-                         "source_duration": round(rlen, 3),
-                         "playback_rate": round(playback_rate, 6),
+                         "source_duration": src_dur,
+                         "playback_rate": rate,
                          "volume": round(min(0.85, sfx_library.db_to_gain(-6)), 3),
                          "category": "hook_riser",
                          "reason": ev.get("trigger_detail") or "hook build-up"})
             hook_done = True
-            log(status_cb, f"Hook riser: selected {Path(item['path']).name} ({rlen:.2f}s) "
-                           f"for 0.00->{end:.2f}s at {playback_rate:.3f}x.")
+            if stretched:
+                log(status_cb, f"Hook riser: selected {Path(item['path']).name} ({rlen:.2f}s), "
+                               f"progressively stretched (first 0.5s kept, then slower each 0.5s) "
+                               f"to end on the impact word at {end:.2f}s.")
+            else:
+                log(status_cb, f"Hook riser: selected {Path(item['path']).name} ({rlen:.2f}s) "
+                               f"for 0.00->{end:.2f}s at {playback_rate:.3f}x.")
         # guaranteed climax: an impact at the riser end unless the director already put one there
         if impact_pool and not any(abs(e["timestamp"] - end) <= 0.10 for e in rest
                                    if e["sfx_type"] in ("impact",) or e["sfx_type"].startswith("reaction")):
