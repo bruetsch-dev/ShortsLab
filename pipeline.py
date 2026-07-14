@@ -2793,7 +2793,13 @@ def build_sfx_segments(config, has_speech=False):
     result = transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other]
     if content_on:
         content_segments = ai_content_sfx_segments(config)
-        if config.get("clip_source") == "scrape" or config.get("allow_ambient_sfx") is False:
+        # The ~2s cap keeps a FRESH scrape render from picking up a stale generated room tone/drone.
+        # It must NOT apply to a timeline-editor render: there every ai_content_sfx event is
+        # user-curated (shown, kept, moved and tuned in the editor), so capping it silently drops a
+        # sound the timeline clearly displays (e.g. a 2.6s riser) - the render no longer matched the
+        # editor. Respect the editor's SFX exactly when rendering from it.
+        if ((config.get("clip_source") == "scrape" or config.get("allow_ambient_sfx") is False)
+                and not config.get("timeline_editor_render")):
             # Found-footage edits get the discrete local SFX hits only (any classified category);
             # never a stale generated room tone/drone. Cap each at ~2s so nothing long sneaks in.
             content_segments = [

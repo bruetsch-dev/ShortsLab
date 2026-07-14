@@ -7965,6 +7965,19 @@ def apply_timeline_edits_to_config(config, edits, slug):
             dur = float(scene.get("end", 0)) - float(scene.get("start", 0))
         dur = max(0.5, min(20.0, dur or 1.0))
         scene = dict(scene)
+        # Normalize a clip stored as an editor preview URL ('file?path=<encoded>') to a bare
+        # basename. Older added scenes were saved with the raw URL; left as-is it breaks the
+        # speed/caption-blur pre-passes below (their startswith('speed_'/'capblur_') checks never
+        # match a 'file?path=...' string) AND is fragile to resolve, so a scene could render the
+        # wrong clip. The file lives in seedance 2.0/, so the basename IS the clip reference.
+        _clipval = str(scene.get("clip") or "")
+        if _clipval and ("path=" in _clipval or _clipval.startswith("file?")):
+            _bn = pipeline._clip_ref_basename(_clipval)
+            if _bn:
+                scene["clip"] = _bn
+                _assetval = str(scene.get("asset") or "")
+                if (not _assetval) or ("path=" in _assetval) or _assetval.startswith("file?"):
+                    scene["asset"] = _bn
         if sid in trim_by_id:
             try:
                 scene["seedance_start_trim"] = max(0.0, round(float(trim_by_id[sid]), 3))
