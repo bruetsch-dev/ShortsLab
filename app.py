@@ -9667,12 +9667,69 @@ def _timeline_media(project_dir, scene, config, index, manifest_clips=None):
 
 
 _CLIP_DUR_CACHE = {}
+_CLIP_DUR_CACHE_LOADED = False
+_CLIP_DUR_CACHE_DIRTY = False
+_CLIP_DUR_LOCK = threading.Lock()
+# dedup keys for the library payload, cached by (path, mtime, size) so the 128KB head-read
+# behind cross-source de-duplication runs once per file version instead of on every load.
+_LIB_KEYS_CACHE = {}
+
+
+def _clip_dur_cache_file():
+    try:
+        d = agent_core.PROJECTS_DIR / "_cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "clip_durations.json"
+    except Exception:
+        return None
+
+
+def _load_clip_dur_cache():
+    """Warm the in-process duration cache from disk once per process. This is what makes the
+    FIRST timeline-library load of a session fast - without it every app restart re-ffprobes
+    every clip (~48s for a big library)."""
+    global _CLIP_DUR_CACHE_LOADED
+    if _CLIP_DUR_CACHE_LOADED:
+        return
+    _CLIP_DUR_CACHE_LOADED = True
+    f = _clip_dur_cache_file()
+    if not f or not f.exists():
+        return
+    try:
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        for k, v in raw.items():
+            path, mt, sz = k.rsplit("|", 2)
+            _CLIP_DUR_CACHE[(path, int(mt), int(sz))] = float(v)
+    except Exception:
+        pass
+
+
+def _save_clip_dur_cache():
+    global _CLIP_DUR_CACHE_DIRTY
+    if not _CLIP_DUR_CACHE_DIRTY:
+        return
+    f = _clip_dur_cache_file()
+    if not f:
+        return
+    try:
+        out = {"%s|%d|%d" % (k[0], k[1], k[2]): v for k, v in _CLIP_DUR_CACHE.items()}
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out), encoding="utf-8")
+        tmp.replace(f)
+        _CLIP_DUR_CACHE_DIRTY = False
+    except Exception:
+        pass
+
+
 def _clip_source_seconds(clip_path):
-    """Full playable length (seconds) of a clip file, cached in-process by (path, mtime, size).
-    Used to cap timeline stretching so a clip can never be dragged past its own footage (which
-    would freeze the last frame). Returns 0.0 when unknown (-> the editor applies no extra cap)."""
+    """Full playable length (seconds) of a clip file, cached by (path, mtime, size) both in-process
+    and on disk (projects/_cache/clip_durations.json). Used to cap timeline stretching so a clip
+    can never be dragged past its own footage (which would freeze the last frame). Returns 0.0 when
+    unknown (-> the editor applies no extra cap)."""
+    global _CLIP_DUR_CACHE_DIRTY
     if not clip_path:
         return 0.0
+    _load_clip_dur_cache()
     try:
         p = Path(clip_path)
         st = p.stat()
@@ -9689,7 +9746,34 @@ def _clip_source_seconds(clip_path):
     except Exception:
         dur = 0.0
     _CLIP_DUR_CACHE[key] = dur
+    _CLIP_DUR_CACHE_DIRTY = True
     return dur
+
+
+def _prewarm_clip_durations(paths):
+    """Probe many clip durations CONCURRENTLY (ffprobe is subprocess-bound, so threads scale well)
+    to fill the cache before the library is built serially. Turns the cold first-load from ~48s
+    (359 serial ffprobes) into a couple of seconds, then persists the result for next session."""
+    _load_clip_dur_cache()
+    todo = []
+    for p in paths:
+        try:
+            st = p.stat()
+            key = (str(p), int(st.st_mtime), int(st.st_size))
+        except Exception:
+            continue
+        if key not in _CLIP_DUR_CACHE:
+            todo.append(p)
+    if not todo:
+        return
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(16, len(todo))) as ex:
+            list(ex.map(_clip_source_seconds, todo))
+    except Exception:
+        for p in todo:
+            _clip_source_seconds(p)
+    _save_clip_dur_cache()
 
 
 def project_has_render(slug):
@@ -9929,6 +10013,19 @@ def timeline_library_payload(slug):
     media = []
     seen = set()
     if project_dir:
+        # PERF: ffprobe (one subprocess per clip) is the dominant cost of this endpoint. Pre-warm
+        # every current-project clip's duration CONCURRENTLY (and from the on-disk cache) up front,
+        # so the serial builders below hit a warm cache instead of blocking ~48s on first load.
+        _pre = []
+        for _k, _p in project_media_files(project_dir):
+            if _k not in {"render", "review"} and is_video_path(_p):
+                _pre.append(_p)
+        _cr = project_dir / "seedance 2.0" / "_candidates"
+        if _cr.exists():
+            for _p in _cr.rglob("*"):
+                if _p.is_file() and is_video_path(_p) and "_raw" not in {x.lower() for x in _p.parts}:
+                    _pre.append(_p)
+        _prewarm_clip_durations(_pre)
         for kind, path in project_media_files(project_dir):
             if kind in {"render", "review"}:
                 continue
@@ -9992,10 +10089,20 @@ def timeline_library_payload(slug):
     def _keys_for(path_str):
         # content key = 128KB head WITHOUT the file size: re-cuts of the same source (longer
         # scene windows) share the head but differ in size, and they ARE the same TikTok.
+        # Cached by (path, mtime, size) in _LIB_KEYS_CACHE so the 128KB head-read happens once per
+        # file version, not on every library load (this is what made warm reloads ~1.7s).
         import hashlib
-        keys = []
         try:
             p = Path(path_str)
+            st = p.stat()
+            ck = (str(p), int(st.st_mtime), int(st.st_size))
+        except Exception:
+            return [("path", str(path_str))]
+        cached = _LIB_KEYS_CACHE.get(ck)
+        if cached is not None:
+            return cached
+        keys = []
+        try:
             sk = _clip_dedup_key(p)
             if sk[0] != "sha":
                 keys.append(sk)
@@ -10005,6 +10112,7 @@ def timeline_library_payload(slug):
             keys.append(("head", h.hexdigest()))
         except Exception:
             keys.append(("path", str(path_str)))
+        _LIB_KEYS_CACHE[ck] = keys
         return keys
 
     content_keys = set()
