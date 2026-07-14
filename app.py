@@ -6321,7 +6321,7 @@ TIMELINE_SKELETON = """
                   <option value="MOST_RECENT">Most recent</option>
                 </select>
               </label>
-              <label class="tl-msearch-jp" title="The AI agent translates your search into a native Japanese phrase and searches that instead"><input type="checkbox" id="tl-msearch-jp"> Search in Japanese</label>
+              <label class="tl-msearch-jp" title="The AI agent translates your search into a native Japanese phrase and searches that instead"><input type="checkbox" id="tl-msearch-jp"><span class="tl-sw" aria-hidden="true"></span> Search in Japanese</label>
             </div>
             <div class="tl-msearch-results" id="tl-msearch-results"></div>
             <details class="tl-manual-adv">
@@ -6714,10 +6714,24 @@ TIMELINE_ASSETS = """
   .tl-manual-panel .tl-msearch-opts #tl-msearch-sort { width:auto; margin:0; padding:3px 6px; height:26px;
     font-size:11px; box-sizing:border-box; background:var(--bg-raised); border:1px solid var(--line-strong);
     color:var(--text); border-radius:7px; cursor:pointer; text-transform:none; }
-  .tl-manual-panel .tl-msearch-opts .tl-msearch-jp { display:flex; align-items:center; gap:5px;
+  .tl-manual-panel .tl-msearch-opts .tl-msearch-jp { display:flex; align-items:center; gap:8px;
     cursor:pointer; font-weight:600; }
-  .tl-manual-panel .tl-msearch-opts .tl-msearch-jp input { width:auto; height:auto; margin:0;
-    accent-color:var(--accent); cursor:pointer; }
+  /* iOS-style on/off switch built from a <span> track (spans style reliably everywhere; a styled
+     appearance:none checkbox rendered inconsistently). The real checkbox is visually hidden but
+     still toggled by the label; a JS-managed .on class on the label drives the visual. */
+  #timeline-root .tl-manual-panel .tl-msearch-opts .tl-msearch-jp input[type="checkbox"] {
+    position:absolute; opacity:0; width:1px; height:1px; margin:0; padding:0; pointer-events:none; }
+  #timeline-root .tl-manual-panel .tl-msearch-opts .tl-msearch-jp .tl-sw {
+    flex:0 0 auto; display:inline-block; position:relative; width:38px; height:22px;
+    border-radius:999px; background:var(--bg-input); border:1px solid var(--line-strong);
+    transition:background .16s ease, border-color .16s ease; }
+  #timeline-root .tl-manual-panel .tl-msearch-opts .tl-msearch-jp .tl-sw::before {
+    content:""; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:999px;
+    background:var(--muted); transition:transform .16s ease, background .16s ease; }
+  #timeline-root .tl-manual-panel .tl-msearch-opts .tl-msearch-jp.on .tl-sw {
+    background:var(--accent); border-color:var(--accent); }
+  #timeline-root .tl-manual-panel .tl-msearch-opts .tl-msearch-jp.on .tl-sw::before {
+    transform:translateX(16px); background:#06210a; }
   .tl-manual-panel .tl-msres-jpnote { grid-column:1/-1; font-size:11px; color:var(--muted); padding:2px 2px 6px; }
   .tl-manual-panel .tl-msres-jpnote b { color:var(--text); }
   .tl-msearch-results { display:grid; grid-template-columns:repeat(auto-fill,minmax(84px,1fr)); gap:7px; max-height:290px; overflow-y:auto; }
@@ -8981,6 +8995,11 @@ TIMELINE_ASSETS = """
     }
     if(msGo) msGo.addEventListener('click', doManualSearch);
     if(msInput) msInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); doManualSearch(); } });
+    // mirror the checkbox state onto a .on class on the label so the iOS-switch styling is class-
+    // driven (robust against the timeline's ID-level input reset, and works in every engine).
+    if(msJp){ var _jpLbl=msJp.closest('.tl-msearch-jp');
+      var _syncJp=function(){ if(_jpLbl) _jpLbl.classList.toggle('on', msJp.checked); };
+      msJp.addEventListener('change', _syncJp); _syncJp(); }
   }
   // one shared audio player so previewing a sound stops the previous one
   var libAudio=null;
