@@ -8634,6 +8634,7 @@ TIMELINE_ASSETS = """
         var vfxBody=document.getElementById('tl-lib-vfx'); if(vfxBody) vfxBody.hidden = which!=='vfx';
         // the floating fetch card only makes sense while browsing project media
         var fbar=document.getElementById('tl-fetch-float'); if(fbar) fbar.hidden = (which!=='media');
+        if(which==='media' && window.__tlSyncFetchPad) window.__tlSyncFetchPad();
         if(which==='vfx') loadVfxLibrary();
       });
     });
@@ -8766,6 +8767,22 @@ TIMELINE_ASSETS = """
         amt=document.getElementById('tl-agent-amount'), amtVal=document.getElementById('tl-agent-amount-val');
     if(!input||!btn||!status) return;
     var pollT=null, hideT=null, manualDoneCb=null;
+    // Keep the media list's top padding synced to the floating fetch card's ACTUAL height. When the
+    // fetch status appears/grows while processing (or the manual panel opens) the card gets taller;
+    // without this it would cover the category tabs and you couldn't switch category mid-fetch.
+    (function(){
+      var floatEl=document.getElementById('tl-fetch-float'),
+          mediaEl=document.getElementById('tl-lib-media');
+      if(!floatEl||!mediaEl) return;
+      function syncPad(){
+        if(floatEl.hidden) return;
+        var h=floatEl.offsetHeight;
+        if(h>0) mediaEl.style.paddingTop=(h+12)+'px';
+      }
+      if(window.ResizeObserver){ try{ new ResizeObserver(syncPad).observe(floatEl); }catch(e){} }
+      window.__tlSyncFetchPad=syncPad;   // callable after tab-switch un-hides the float
+      syncPad();
+    })();
     if(amt&&amtVal){ var updAmt=function(){ amtVal.textContent=amt.value; }; amt.addEventListener('input', updAmt); updAmt(); }
     // status box = a message line + a slim progress bar (indeterminate until we get a %)
     function ensureUI(){
@@ -8778,11 +8795,16 @@ TIMELINE_ASSETS = """
       status.className='tl-agent-status'+(cls?(' '+cls):'');
       status.querySelector('.tl-agent-msg').textContent=msg;
       var bar=status.querySelector('.tl-agent-prog'), fill=bar.querySelector('i');
-      if(prog===-1){ bar.style.display='none'; return; }
-      bar.style.display='';
-      if(prog==null){ bar.classList.add('indet'); fill.style.width=''; }
-      else { bar.classList.remove('indet'); fill.style.width=Math.round(Math.max(0,Math.min(1,prog))*100)+'%'; }
+      if(prog===-1){ bar.style.display='none'; }
+      else {
+        bar.style.display='';
+        if(prog==null){ bar.classList.add('indet'); fill.style.width=''; }
+        else { bar.classList.remove('indet'); fill.style.width=Math.round(Math.max(0,Math.min(1,prog))*100)+'%'; }
+      }
+      // the status just grew the floating card -> push the category tabs down so they stay usable
+      if(window.__tlSyncFetchPad) window.__tlSyncFetchPad();
     }
+    function hideStatus(){ status.hidden=true; if(window.__tlSyncFetchPad) window.__tlSyncFetchPad(); }
     function poll(){
       fetch('/timeline-agent-fetch-status?slug='+encodeURIComponent(slug))
         .then(function(r){return r.json();}).then(function(d){
@@ -8801,7 +8823,7 @@ TIMELINE_ASSETS = """
           if(n>0) playFetchChime();     // audible cue that matching media landed
           // #169 - the confirmation is only temporary; fade the whole status away after a moment
           if(hideT) clearTimeout(hideT);
-          hideT=setTimeout(function(){ status.hidden=true; }, 3500);
+          hideT=setTimeout(hideStatus, 3500);
           loadLibraryData().then(function(){
             var t=document.querySelector('.tl-sublib-tab[data-k="agent"]');
             if(t) t.click();   // jump straight to the new AI-fetch category
@@ -8845,6 +8867,7 @@ TIMELINE_ASSETS = """
       mToggle.addEventListener('click', function(){
         var show=mPanel.hidden; mPanel.hidden=!show; mToggle.classList.toggle('on', show);
         mToggle.setAttribute('aria-expanded', show?'true':'false');
+        if(window.__tlSyncFetchPad) window.__tlSyncFetchPad();   // panel changed the card height
       });
     }
     if(mOpen){
@@ -8881,7 +8904,7 @@ TIMELINE_ASSETS = """
       if(n>=1e3) return (n/1e3).toFixed(1).replace(/\\.0$/,'')+'K'; return ''+n; }
     function renderManualResults(list){
       if(!msBox) return;
-      if(!list.length){ msBox.innerHTML='<div class="tl-msres-empty">No results. Try another search, and make sure you\\u2019re connected to TikTok / Instagram.</div>'; return; }
+      if(!list.length){ msBox.innerHTML='<div class="tl-msres-empty">No results. Try another search, and make sure you\\u2019re connected to TikTok / Instagram.</div>'; if(window.__tlSyncFetchPad) window.__tlSyncFetchPad(); return; }
       msBox.innerHTML='';
       list.forEach(function(r){
         var card=document.createElement('div'); card.className='tl-msres';
@@ -8897,6 +8920,7 @@ TIMELINE_ASSETS = """
         card.addEventListener('click', function(){ manualDownloadOne(r, card); });
         msBox.appendChild(card);
       });
+      if(window.__tlSyncFetchPad) window.__tlSyncFetchPad();
     }
     function manualDownloadOne(r, card){
       if(card.classList.contains('downloading')||card.classList.contains('done')) return;
