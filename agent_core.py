@@ -7996,10 +7996,18 @@ def apply_timeline_edits_to_config(config, edits, slug):
                     is_video = (str(replaced_by_id[sid].get("type")) == "video"
                                 or src.suffix.lower() in VIDEO_EXTS)
                     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", src.stem)[:18]
+                    # Content key from the SOURCE path. Library clips from different projects share
+                    # generic names (scraped_10.mp4, agent_NN.mp4), so a name-only dest collided:
+                    # replacing a scene twice (or with a clip whose basename matched an earlier
+                    # replacement) hit the existing 'replaced_<sid>_<safe>' file and 'if not
+                    # dest.exists()' silently kept the OLD content -> the render used the old clip.
+                    # The key (placed EARLY so the speed_/capblur_ pre-pass stem[:24] truncation can't
+                    # cut it off) makes each distinct source its own file, like the imported path.
+                    key = hashlib.sha1(str(src.resolve()).encode("utf-8", "ignore")).hexdigest()[:8]
                     if is_video:
                         dest_dir = project_dir / "seedance 2.0"
                         dest_dir.mkdir(parents=True, exist_ok=True)
-                        dest = dest_dir / f"replaced_{sid}_{safe}{src.suffix.lower()}"
+                        dest = dest_dir / f"replaced_{sid}_{key}_{safe}{src.suffix.lower()}"
                         if not dest.exists():
                             shutil.copy2(src, dest)
                         scene["clip"] = dest.name      # scene_clip_path resolves clip_dir/<name>
@@ -8011,7 +8019,7 @@ def apply_timeline_edits_to_config(config, edits, slug):
                     else:
                         dest_dir = project_dir / "web images"
                         dest_dir.mkdir(parents=True, exist_ok=True)
-                        dest = dest_dir / f"replaced_{sid}_{safe}{src.suffix.lower()}"
+                        dest = dest_dir / f"replaced_{sid}_{key}_{safe}{src.suffix.lower()}"
                         if not dest.exists():
                             shutil.copy2(src, dest)
                         scene["asset"] = str(dest.resolve())   # resolve_media_path handles absolute
@@ -8031,7 +8039,12 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 clip_dir = project_dir / "seedance 2.0"
                 base = str(scene.get("caption_blur_src") or scene.get("timeline_speed_src") or scene["clip"])
                 if want_blur and not base.startswith(("speed_", "capblur_")) and (clip_dir / base).exists():
-                    dest = clip_dir / f"capblur_{sid}_{Path(base).stem[:24]}.mp4"
+                    # Hash the SOURCE name (not a truncated stem): for long scene ids the old
+                    # '{sid}_{stem[:24]}' cut off the source-identifying part, so two different
+                    # replaced sources produced the SAME capblur name and 'if not dest.exists()'
+                    # reused the stale (old-clip) blur -> the render showed the old clip.
+                    _bk = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:10]
+                    dest = clip_dir / f"capblur_{sid}_{_bk}.mp4"
                     if not dest.exists():
                         shutil.copy2(clip_dir / base, dest)
                         found = 0
@@ -8082,7 +8095,11 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 src = clip_dir / src_name
                 if src.exists() and not src_name.startswith("speed_"):
                     tag = str(round(speed, 2)).replace(".", "p")
-                    dest = clip_dir / f"speed_{sid}_{tag}_{src.stem[:24]}.mp4"
+                    # Hash the SOURCE name (see the capblur note): a truncated stem collided across
+                    # different replaced sources for long scene ids, so a re-speed reused the stale
+                    # (old-clip) speed file. The tag keeps distinct speeds distinct.
+                    _sk = hashlib.sha1(src_name.encode("utf-8", "ignore")).hexdigest()[:10]
+                    dest = clip_dir / f"speed_{sid}_{tag}_{_sk}.mp4"
                     if not dest.exists():
                         ffm = pipeline.find_ffmpeg()
                         subprocess.run([ffm, "-y", "-hide_banner", "-loglevel", "error",
