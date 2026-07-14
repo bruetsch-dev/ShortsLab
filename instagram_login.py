@@ -57,7 +57,11 @@ _LOCALE = os.environ.get("INSTAGRAM_LOCALE", "ja-JP").strip() or "ja-JP"
 
 # XHR endpoints the Instagram web app uses for keyword search / reels feeds. The schema
 # drifts, so extraction walks the whole JSON tree instead of hard-coding paths.
-_SEARCH_XHR_MARKERS = ("fbsearch", "top_serp", "/api/v1/clips/", "sections/")
+# Instagram moved hashtag/search results to the GraphQL endpoint (2026-07); the old REST
+# markers (fbsearch/top_serp/sections/clips) no longer fire for a tag page, so `graphql` MUST
+# be listened for or every IG search returns 0 items and Instagram gets auto-disabled.
+_SEARCH_XHR_MARKERS = ("fbsearch", "top_serp", "/api/v1/clips/", "sections/", "hashtag",
+                       "graphql", "web_info", "tags/web_info")
 
 _SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0, "captcha": 0,
                  "timeline_responses": 0, "health_checks": 0, "unavailable": 0,
@@ -254,6 +258,16 @@ def logout():
 _HASHTAG_RE = re.compile(r"#([^\s#]{1,60})")
 
 
+def instagram_search_url(query):
+    """Route native hashtags to Instagram's tag surface instead of its keyword box."""
+    from urllib.parse import quote
+    value = str(query or "").strip()
+    if value.startswith("#"):
+        tag = value.lstrip("#").strip().split()[0] if value.lstrip("#").strip() else ""
+        return f"https://www.instagram.com/explore/tags/{quote(tag, safe='')}/"
+    return f"https://www.instagram.com/explore/search/keyword/?q={quote(value, safe='')}"
+
+
 def _extract_reels(payload):
     """Recursively pull Reels (media_type == 2 videos with a shortcode) out of any
     Instagram web-API response. The schema drifts across endpoints (fbsearch top_serp,
@@ -383,7 +397,7 @@ class Session:
         except Exception:
             return []
 
-    def search(self, query, want=12, status_cb=None, max_scrolls=6, timeout_s=None,
+    def search(self, query, want=12, status_cb=None, max_scrolls=12, timeout_s=None,
                sort="MOST_LIKED"):
         cb = status_cb or self._status_cb
         query = str(query or "").strip()
@@ -416,8 +430,7 @@ class Session:
 
         page.on("response", _on_response)
         try:
-            from urllib.parse import quote
-            url = f"https://www.instagram.com/explore/search/keyword/?q={quote(query, safe='')}"
+            url = instagram_search_url(query)
             try:
                 nav_ms = 45000 if deadline is None else max(
                     1000, min(45000, int((deadline - time.monotonic()) * 1000)))
@@ -429,7 +442,7 @@ class Session:
             page.wait_for_timeout(2600)
             scrape_browser_preview.capture(page, "Instagram", query, sort, force=True)
             scrolls, stagnant, last_n = 0, 0, len(collected)
-            while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
+            while (len(collected) < want and scrolls < max_scrolls and stagnant < 4
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1200)
@@ -442,12 +455,57 @@ class Session:
                 else:
                     stagnant = 0
                 last_n = len(collected)
+            # Hashtag grids sometimes hydrate without firing one of the currently known JSON
+            # endpoints. Parse embedded JSON first, then retain visible Reel links as a minimal
+            # fallback so a dense tag grid is never reported as a false zero-result search.
             if not collected:
                 try:
-                    low = (page.content() or "").lower()
-                    if "log in" in low and "sign up" in low:
+                    for script in page.locator('script[type="application/json"]').all():
+                        raw = script.text_content() or ""
+                        if raw and len(raw) < 25_000_000:
+                            try:
+                                _absorb(json.loads(raw))
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            if not collected:
+                try:
+                    for anchor in page.locator('a[href*="/reel/"]').all()[:max(1, int(want))]:
+                        href = str(anchor.get_attribute("href") or "")
+                        match = re.search(r"/reel/([^/?#]+)/?", href)
+                        if not match or match.group(1) in seen:
+                            continue
+                        code = match.group(1)
+                        seen.add(code)
+                        try:
+                            desc = str(anchor.locator("img").first.get_attribute("alt") or "")
+                        except Exception:
+                            desc = ""
+                        if NSFW_RE.search(desc):
+                            _SEARCH_STATS["nsfw_skipped"] += 1
+                            continue
+                        collected.append({
+                            "id": code, "desc": desc,
+                            "webVideoUrl": f"https://www.instagram.com/reel/{code}/",
+                            "_source": "instagram_login", "_platform": "instagram",
+                            "video": {"width": 0, "height": 0, "duration": 0},
+                            "stats": {"diggCount": 0, "playCount": 0}, "createTime": 0,
+                            "author": {"uniqueId": "", "nickname": ""},
+                            "hashtags": [{"name": t} for t in _HASHTAG_RE.findall(desc)[:12]],
+                        })
+                except Exception:
+                    pass
+            if not collected:
+                try:
+                    # Detect a REAL block by the REDIRECT URL, never by substring in the page
+                    # HTML: Instagram's inline JS bundle contains the literals "captcha" and
+                    # "challenge" on EVERY page, so matching page.content() flagged a captcha on
+                    # a perfectly healthy #japan grid and disabled Instagram for the whole run.
+                    url = (page.url or "").lower()
+                    if "/accounts/login" in url or "/accounts/suspended" in url:
                         _SEARCH_STATS["login_wall"] += 1
-                    if "captcha" in low or "challenge" in low or "confirm it's you" in low:
+                    if "/challenge" in url or "/checkpoint" in url:
                         _SEARCH_STATS["captcha"] += 1
                 except Exception:
                     pass
@@ -556,7 +614,7 @@ def health_check(timeout_s=45):
     _SEARCH_STATS["health_checks"] += 1
     before = search_stats()
     try:
-        items = search_async("japan viral", want=3, status_cb=lambda _m: None,
+        items = search_async("#japan", want=3, status_cb=lambda _m: None,
                              timeout_s=timeout_s, sort="MOST_RECENT").result(
                                  timeout=max(5, timeout_s + 5)) or []
     except Exception:

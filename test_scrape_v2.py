@@ -95,14 +95,15 @@ def test_architect_raw_queries_and_multi_sort():
     finally:
         v.clip_scraper.backend_search = original
     q0 = queries[0].query
-    check("each raw term searches relevance + likes + views",
-          calls[:3] == [(q0, "RELEVANCE"), (q0, "MOST_LIKED"), (q0, "MOST_VIEWED")])
-    # zero results everywhere -> ONE extra broadened pass with just the first token
-    check("0-result query is auto-broadened to its first token",
-          len(calls) == 4 and calls[3] == (q0.split()[0], "RELEVANCE"))
-    check("broadening is counted", state.get("broadened_queries") == 1)
-    check("sort passes are reported", state.get("sort_pass_counts") == {
-          "RELEVANCE": 2, "MOST_LIKED": 1, "MOST_VIEWED": 1})
+    # All three backends collect the same platform result neighbourhood and sort it locally.
+    # Re-running the same navigation for likes/views wastes time and returns duplicates.
+    check("each raw term fetches each result neighbourhood once",
+          calls == [(q0, "RELEVANCE"), (" ".join(q0.split()[:-1]), "RELEVANCE")])
+    # A 3-token failure may shed only its final disambiguator; it must retain two anchor tokens.
+    check("zero-result retry preserves a 2-token anchor",
+          len(calls) == 2 and len(calls[-1][0].split()) == 2)
+    check("anchor-preserving retry is counted", state.get("broadened_queries", 0) == 1)
+    check("single sort mode is reported", state.get("sort_pass_counts") == {"RELEVANCE": 2})
 
     calls = []
     try:

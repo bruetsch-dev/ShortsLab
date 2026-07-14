@@ -594,7 +594,11 @@ def _overlay_sfx_segments(events, ffprobe, status_cb=None):
 
 
 def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, out_dir=None,
-                              add_characters=True, add_memes=True, vfx_amount="low"):
+                              add_characters=True, add_memes=True, vfx_amount="low",
+                              add_arrows=True, write_project=True):
+    # add_arrows=False -> detect but do NOT render the arrow layer (used when the clip run already
+    # drew its own in-render arrows and only wants the neko/meme reaction layers composited on top).
+    # write_project=False -> skip creating a standalone visualmaster_* timeline project.
     video_path = Path(video_path)
     if not video_path.exists():
         raise RuntimeError("Uploaded video not found.")
@@ -629,6 +633,8 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     effects, char_events, meme_events = analyze_effects(
         video_path, times, phrases, ffmpeg, reasoning_model,
         status_cb=status_cb, emotions=emotions, memes=memes, vfx_amount=vfx_amount)
+    if not add_arrows:
+        effects = []                          # detected but not rendered (arrows already baked in)
     n_arrow = len(effects)
     log(status_cb, f"Direction: {n_arrow} arrow(s)"
                    + f", {len(char_events)} neko(s), {len(meme_events)} meme reaction(s).")
@@ -690,12 +696,13 @@ def enhance_video_with_arrows(video_path, reasoning_model=None, status_cb=None, 
     # Editable project: split the CLEAN original into scene clips and store every arrow/neko as an
     # editable overlay so the timeline editor can move/restyle/delete each one and re-render.
     project_dir = None
-    try:
-        project_dir = _write_visual_timeline_project(
-            video_path, effects, char_events, meme_events, cuts, phrases, duration, ffmpeg, out_path,
-            status_cb=status_cb)
-    except Exception as exc:  # noqa: BLE001
-        log(status_cb, f"Timeline project not written ({exc}); the enhanced video is still saved.")
+    if write_project:
+        try:
+            project_dir = _write_visual_timeline_project(
+                video_path, effects, char_events, meme_events, cuts, phrases, duration, ffmpeg, out_path,
+                status_cb=status_cb)
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Timeline project not written ({exc}); the enhanced video is still saved.")
 
     return {"video": str(out_path), "original_video": str(video_path), "visual_plan": str(plan_path),
             "arrow_count": n_arrow, "character_count": len(char_events),

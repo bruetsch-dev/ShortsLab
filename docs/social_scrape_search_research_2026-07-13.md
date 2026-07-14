@@ -139,3 +139,142 @@ This script disproves the current blanket rule “never search lifeless objects.
 4. Object footage is valid for proof/demonstration beats. The “never lifeless objects” rule should apply only to emotion/vibe fillers, not globally.
 5. Search adaptation must consume structured evidence: platform, query, sort/filter, result count, rejection distribution and visible-result descriptions.
 6. A session/login/server failure must stop that platform immediately and must not count as a zero-result query.
+
+## Authenticated direct-platform tests
+
+The user completed sign-in in the visible research browser on TikTok, Instagram and X. The tests below use those live platform sessions directly; no app scraper and no WaveSpeed/LLM API generated the queries or evaluated the media.
+
+### TikTok T1 — named entity: Nagoro scarecrow village
+
+Query: `名頃 かかし`
+
+- The first result page contained roughly seven clearly on-topic posts among the first ten inspected results. Exact matches included `@souloftribes.global`, `@alfrenava17`, `@tes_yagi`, `@sei0007` and `@nostalgic_japan`.
+- This validates the compact native pattern **entity + visible object** for TikTok.
+- Control query `かかし` was heavily polluted by AI fake-news videos, movies, Naruto cosplay, restaurants/cafés named Kakashi, festivals and a different scarecrow village. A named-entity search must therefore never auto-broaden to a single generic token.
+
+Candidate reviews:
+
+| Candidate | Visible review | Score / decision |
+|---|---|---|
+| `@tes_yagi/video/7275721311312268562` | Authentic row of human-sized dolls and an exact Nagoro caption, but a large burned-in Japanese question covers the center of the frame. | Relevance 4, legibility 2, authenticity 2, editability 0. **Reject**: the caption overlay is a hard editing failure despite topical relevance. |
+| `@sei0007/video/7608570015238999303` | Clean vertical snowy Nagoro shot with the local sign and partially snow-covered dolls; no burned captions. The post explicitly describes Nagoro and its roughly 300 dolls. | Relevance 3–4, legibility 1.5, authenticity 2, editability 2. **Accept conditionally**: use a segment where several dolls are visible; the opening sign/snow frame alone does not prove “hundreds.” |
+
+### TikTok T2 — abstract social rule translated into a physical situation
+
+Voiceover concept: leaving home barefaced, even for a convenience-store errand, is treated as sloppy.
+
+Query: `すっぴん コンビニ`
+
+- The page returned multiple exact situation posts, including “メイクしないとコンビニにもいけない”, “すっぴんでコンビニ来ちゃう人”, a late-night convenience-store trip and an awkward encounter while barefaced.
+- The native situation phrase is substantially better than generic queries such as “Japan beauty standards”: it names what a phone camera can actually show.
+
+Candidate reviews:
+
+| Candidate | Visible review | Score / decision |
+|---|---|---|
+| `@__lv118/video/7605048680445529362` | Two casually dressed people outside at night with convenience-store bags; the woman’s face is masked/motion-blurred. No captions, but the visual itself does not communicate the bare-face pressure. | Visual relevance about 2.5. **Reject as primary**; caption-dependent thematic fallback only. |
+| `@tamukun_36/video/7145028436690603265` | Clean close-up of a woman’s bare face, no burned captions; exact post caption states she cannot even go to a convenience store without makeup. | Relevance 3, legibility 1.5, authenticity 2, editability 2. **Accept conditionally** as a human-consequence shot if the usable segment shows the makeup/preparation action. |
+
+### Instagram I1 — keyword route versus hashtag route
+
+- Keyword URL `explore/search/keyword/?q=名頃 かかし` returned “No results.”
+- Direct hashtag URL `explore/tags/名頃かかしの里/` loaded a dense, highly relevant grid of Nagoro posts, including multiple photos/carousels and Reels.
+- This exposes a concrete backend bug: the current Instagram module always builds the keyword-search URL. A leading hashtag must route to `/explore/tags/<tag>/`; otherwise a strong native hashtag is incorrectly reported as zero results.
+- Opened Reel `instagram.com/p/DZuI9t6TqPK/`: verified creator, recent post, exact location caption `Nagoro “Scarecrow” Village / 天空の村 かかしの里`, and comments consistent with the real location. It remains **unrated pending frame-level visual inspection**; metadata alone is not enough to accept media.
+
+## Interim empirical changes required
+
+1. Preserve named-entity anchors during query recovery; never reduce `名頃 かかし` to `かかし` merely because a round is weak.
+2. Give each intent platform-specific strings and routing. TikTok compact phrases, Instagram hashtags, and X event/proof phrases are not interchangeable.
+3. Treat burned-in captions as a hard rejection when they materially cover the subject, even if semantic relevance is perfect.
+4. Require visible evidence, not post-caption evidence alone. The `@__lv118` result demonstrates why caption-only matching accepts misleading filler.
+5. Instagram hashtag navigation must be implemented before judging hashtag search quality.
+
+### X X1 — named location and proof-event queries
+
+Query `名頃 かかし 徳島` in X's Media tab returned more than thirty media post links, but the loaded set was photo-dominant; no native-video link appeared in the inspected first set. This makes X useful as a secondary proof/image source for this entity, not the first source for moving Nagoro footage.
+
+Query `女性 土俵 救命` was much more effective for the sumo hook than the generic `女性 土俵` family:
+
+- The result set exposed several native-video links immediately.
+- Opened candidate `@females_db_park/status/1913409167127417080`: 27-second native video, 1.9M views, 16.1K likes, 2.4K reposts and an exact post description of women administering aid while an official orders them off the ring.
+- The poster visibly shows the real arena, ring and crowd with no burned-in caption. The wide opening frame does not yet make the women legible, so this is **accepted conditionally** only for the incident segment where the women enter/provide aid. Metadata + opening frame alone cannot justify using the whole clip.
+
+Control query `名頃 かかし tiktok` returned only five visible photo links in the inspected set, compared with a substantially denser result set for the location-disambiguated native query. Appending the word `tiktok` while already searching X is counterproductive: it narrows toward cross-platform mentions rather than native footage and must be stripped from generated X/TikTok/Instagram terms.
+
+### Instagram I1 candidate frame review completed
+
+The opened Nagoro Reel `instagram.com/p/DZuI9t6TqPK/` reports 80K likes and 476 comments. Its cover clearly shows a fisheye view of a room filled with dolls, but it also carries a large centered Korean/English/Japanese title. Decision: **do not use the intro/cover segment**. The Reel may be accepted only if a later segment is clean and shows the dolls without the title overlay; the scraper must analyze/select a clean subclip rather than rejecting or accepting an entire post from its cover.
+
+This adds a required distinction to media review: caption detection must be **time-local**. A captioned intro does not necessarily invalidate a 40-second source, but the chosen cut interval must be caption-free and visually relevant.
+
+## Implemented V2 corrections (first code pass)
+
+- The Architect now outputs explicit TikTok, Instagram and X query plans per intent and alternative instead of broadcasting the same strings to all backends.
+- Each intent carries `communication_role`, `story_subject` and `local_claim`. This prevents a hook example such as sumo from becoming the assumed subject of the whole women/restrictions story.
+- Fixed shock logic: no deterministic “every fifth scene” mutation. Pattern interrupts are now allowed only when locally meaningful.
+- Restored objects for proof/demonstration roles. The blanket “never lifeless objects” instruction no longer controls factual beats such as four sweets, five cups or a ribbon being tied.
+- Platform names (`tiktok`, `instagram`, `x.com`, `reels`, `shorts`, etc.) are stripped at the final execution boundary as well as during plan cleanup.
+- X may retain up to four tokens, so a proof phrase such as `女性 土俵 救命` is no longer truncated to `女性 土俵`.
+- Query execution now respects each query's platform scope.
+- Removed three redundant navigations per query. The login modules fetched the same result neighbourhood and only sorted it locally; V2 now fetches once and combines semantic/engagement ranking afterward.
+- Zero-result recovery no longer collapses two-token entity anchors to one token. A 3+ token term may drop only its last disambiguator; two-token failures go to the live adaptive controller.
+- The adaptive controller now receives the failed query's platform, communication role, story subject, local claim and visual observations, and returns platform-scoped corrective queries.
+- Coverage prioritizes X for proof roles and TikTok/Instagram for action/emotion roles, with at most two platform lanes per scene before secondary terms.
+- Instagram now routes `#hashtag` to `/explore/tags/<tag>/`, listens for hashtag responses, parses embedded JSON and retains visible Reel links as a fallback instead of reporting a populated grid as zero results.
+- Global lateral filler is TikTok-scoped, preventing generic TikTok-style phrases from causing repeated empty X searches.
+
+Verification:
+
+- `python -m py_compile scrape_v2.py instagram_login.py tests/test_tiktok_scrape_logic.py` passed.
+- Three new focused regression tests passed: platform-scoped plan preservation, Instagram hashtag routing, and single-fetch/no-single-token broadening.
+- The standalone offline V2 suite `python test_scrape_v2.py` passed in full.
+
+### Additional live controls
+
+TikTok query `パンプス 痛い` (human consequence of painful required footwear):
+
+- Returned a dozen visible results, including exact foot-pain/shoe-rub demonstrations and creators explaining painful pumps.
+- Most first-page Japanese results were product/tutorial content rather than a woman visibly suffering during a commute. One Spanish “heels hurt while walking” result was visually promising but loses Japanese authenticity.
+- Decision: the query is productive for the **physical consequence**, but it cannot prove the workplace rule. Use it for a close foot-pain/removing-shoes cut, while the rule itself needs a separate proof/news shot or narration support. Do not pretend a shoe product demo proves forced office policy.
+
+X query `女性 メガネ禁止 接客`:
+
+- Returned eight inspected media links, all photos and no native video.
+- Decision: X can provide still/news proof for this obscure rule but is a weak footage source for the beat. After this result pattern, the corrective strategy should switch platform and observable action (uniformed sales worker removing glasses/putting in contacts) rather than generating many more X synonyms.
+
+Instagram hashtag controls:
+
+- `#お見舞いマナー` and broader `#お見舞い` both loaded empty tag surfaces in the authenticated direct session.
+- This is a valid zero-result strategy outcome, not a login failure: the same session successfully loaded the dense Nagoro tag grid.
+- The correct recovery is a changed physical demonstration query on TikTok, not stripping to one generic token or repeating Instagram keyword variants.
+
+Runtime health handling was extended to Instagram: after three consecutive empty searches, one independent `#japan` health probe distinguishes a healthy-but-bad strategy from a broken/login/challenge session. A failed probe disables Instagram for the rest of the run. The corresponding regression test passes.
+
+## Visual-script mapping defect and correction
+
+`apply_visual_script_to_scenes` called `parse_timed_script` even when the visual script contained no timestamps. That parser invents uniform time blocks for ordinary prose, so the later semantic mapping branch was effectively unreachable. Uneven narration scenes could therefore receive the wrong direction, and an early hook noun could bleed into later beats.
+
+Correction:
+
+- The overlap mapper now runs only when the user actually supplied `mm:ss` timestamps.
+- Untimed notes are anchored by real scene midpoint/duration, then concrete shared subject/action terms override the temporal guess.
+- Generic directions retain chronological order, while specific notes such as “sumo ring”, “painful heels” and “remove glasses” follow their matching local narration claims even when the note list is not perfectly ordered.
+- Added regression coverage for both semantic untimed mapping and preserved explicit-timestamp overlap behavior; both pass.
+
+### TikTok T3 — proof/demonstration object beat: retieable gift bow
+
+Query `蝶結び ラッピング` returned twelve highly relevant visible demonstrations in the first inspected result set. This is strong evidence against the old blanket “never search objects” rule: hands tying a bow communicate this narration beat more clearly than generic Japanese people or a reaction face.
+
+Critical candidate reviews:
+
+| Candidate | Visible review | Decision |
+|---|---|---|
+| `@kurastyle1855/video/7250332628115524865` | 32-second vertical hands-on ribbon demonstration, but the cover/intro has a huge white caption box covering much of the hands and lower frame. | **Reject intro**; later interval may be usable only if segment OCR confirms the box disappears. |
+| `@ting_livegood/video/7144159659430186286` | Exact bow demonstration, but the cover has large Chinese headline text and thick horizontal black bars. | **Reject** for caption obstruction and framing/letterbox quality. |
+
+Learning: the query is semantically excellent, yet tutorial neighbourhoods are caption-heavy. Search success and usable-segment success must stay separate. The controller should retain the physical concept but try changed UGC phrasing (`gift opening`, hands untying/retieing) after repeated caption rejections, rather than declaring the concept itself bad.
+
+The live controller now receives cumulative rejection counts (`burned_captions`, `black_bars`, `rapid_edits`, `low_quality`, download failures) in addition to visual descriptions. Its prompt explicitly changes away from tutorial/news-repost neighbourhoods when caption or framing rejection dominates, and changes the visible subject/action when semantic mismatch dominates.
+
+Popularity ranking was also completed: V2 source candidates now retain both likes and views. Relevance remains dominant, but the engagement component blends log-normalized likes and views, so a million-view exact match ranks above an otherwise identical low-view result without allowing a viral off-topic clip to beat a relevant one. Regression coverage passes.

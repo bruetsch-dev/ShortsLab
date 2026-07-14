@@ -281,6 +281,8 @@ def backend_name(platforms=None):
 _SEEN_QUERIES = set()
 _X_ZERO_STREAK = 0
 _X_UNAVAILABLE = False
+_IG_ZERO_STREAK = 0
+_IG_UNAVAILABLE = False
 X_QUERY_STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "for", "to", "of", "in", "on", "at",
     "with", "from", "will", "would", "could", "first", "next", "then", "many",
@@ -402,10 +404,12 @@ def backend_search_health(platforms=None):
 
 
 def reset_backend_search_health():
-    global _X_ZERO_STREAK, _X_UNAVAILABLE
+    global _X_ZERO_STREAK, _X_UNAVAILABLE, _IG_ZERO_STREAK, _IG_UNAVAILABLE
     _SEEN_QUERIES.clear()               # fresh run -> allow every query once again
     _X_ZERO_STREAK = 0
     _X_UNAVAILABLE = False
+    _IG_ZERO_STREAK = 0
+    _IG_UNAVAILABLE = False
     for mod in (tiktok_login, twitter_login, instagram_login):
         if mod is not None:
             try:
@@ -491,10 +495,12 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             if status_cb:
                 _status(status_cb, f"Sort {_mode}: +{added} new clip(s) ({len(merged)} total) for {query!r}.")
         return merged
-    global _X_ZERO_STREAK, _X_UNAVAILABLE
+    global _X_ZERO_STREAK, _X_UNAVAILABLE, _IG_ZERO_STREAK, _IG_UNAVAILABLE
     selected = normalize_platforms(platforms)
     if _X_UNAVAILABLE:
         selected.discard("twitter")
+    if _IG_UNAVAILABLE:
+        selected.discard("instagram")
     remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
     if remaining is not None and remaining <= 0:
         return []
@@ -574,10 +580,28 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             _status(status_cb, f"Instagram search failed ({exc.__class__.__name__}: {exc}).")
             ig_items = []
         if ig_items:
+            _IG_ZERO_STREAK = 0
             ck = _merge_backend_cookies(selected)
             if ck:
                 set_cookies(ck)    # instagram.com cookies for the yt-dlp reel downloads
             items.extend(ig_items)
+        else:
+            _IG_ZERO_STREAK += 1
+            if _IG_ZERO_STREAK >= 3 and instagram_login is not None:
+                try:
+                    health = instagram_login.health_check(timeout_s=35)
+                except Exception:
+                    health = {"ok": False}
+                if not health.get("ok"):
+                    _IG_UNAVAILABLE = True
+                    _status(status_cb,
+                            "Search Controller: Instagram returned no Reels repeatedly and failed "
+                            "its live health check; disabling Instagram for the rest of this run.")
+                else:
+                    _IG_ZERO_STREAK = 0
+                    _status(status_cb,
+                            "Search Controller: Instagram is healthy but this hashtag/keyword "
+                            "strategy returned nothing; switching terms instead of repeating it.")
     sort_mode = str(sort or "MOST_LIKED").upper()
     metric = {"MOST_VIEWED": "views", "MOST_RECENT": "created_at"}.get(sort_mode, "likes")
     if sort_mode in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"}:

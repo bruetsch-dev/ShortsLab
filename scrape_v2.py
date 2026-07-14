@@ -74,7 +74,9 @@ SCRAPE_V2_CONFIG = {
     "max_queries_per_bucket": 30,
     "max_queries_per_scene_retry": 8,
     "max_bucket_time_seconds": 300,
-    "max_total_scrape_time_seconds": 1200,
+    # STRICT no-reuse needs one UNIQUE source per scene, so the search must keep trying more
+    # terms/queries - the user explicitly allowed longer runs to avoid ever reusing a clip.
+    "max_total_scrape_time_seconds": 1800,
     "vision_batch_size": 8,
     "max_segments_per_source": 3,
     "target_segment_seconds": 2.3,
@@ -87,7 +89,10 @@ SCRAPE_V2_CONFIG = {
     "max_clips_per_creator": 2,
     "max_clips_per_query": 3,
     "max_near_duplicates_per_visual": 2,
-    "max_segments_per_source_final": 2,
+    # STRICT (user rule 2026-07-13): the SAME source TikTok/video may appear AT MOST ONCE in the
+    # final render - never a second window/excerpt of it. Everything else (more searching, more
+    # query terms) must be tried before a source would be reused. 1 = one clip per source.
+    "max_segments_per_source_final": 1,
     "max_near_duplicate_similarity": 0.92,
 }
 
@@ -142,6 +147,11 @@ class AlternativeVisualIntent:
     jp_location: str = ""
     english_queries: list = field(default_factory=list)
     japanese_queries: list = field(default_factory=list)
+    # Explicit executable terms by platform. Shape:
+    # {"tiktok": {"japanese": [], "english": []},
+    #  "instagram": {"keywords": [], "hashtags": []},
+    #  "twitter": {"japanese": [], "english": []}}
+    platform_queries: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -166,6 +176,12 @@ class VisualIntent:
     match_category: str = "vibe"       # literal | vibe | shock
     english_queries: list = field(default_factory=list)
     japanese_queries: list = field(default_factory=list)
+    # What the picture contributes to comprehension. This prevents a blanket "never objects"
+    # rule from rejecting indispensable proof/demonstration shots such as four sweets or a bow.
+    communication_role: str = "human_consequence"  # proof|demonstration|human_consequence|emotion|pattern_interrupt
+    story_subject: str = ""       # recurring subject of the WHOLE script
+    local_claim: str = ""         # what this exact narration beat says about that subject
+    platform_queries: dict = field(default_factory=dict)
 
     @property
     def intent_id(self) -> str:
@@ -182,6 +198,14 @@ class SearchQueryV2:
     expected_action: str = ""
     expected_location: str = ""
     negative_terms: list = field(default_factory=list)
+    # Empty = legacy query may run everywhere. Otherwise execute only on these backends.
+    platforms: list = field(default_factory=list)
+
+
+def _query_identity(query):
+    """Dedupe the same text per backend, not globally across incompatible search surfaces."""
+    scoped = tuple(sorted({_canonical_platform(value) for value in (query.platforms or [])}))
+    return (scoped or ("*",), sanitize_platform_query(query.query).casefold())
 
 
 @dataclass
@@ -193,6 +217,7 @@ class SourceVideoCandidate:
     caption: str = ""
     hashtags: list = field(default_factory=list)
     likes: int = 0
+    views: int = 0
     duration: float = 0.0
     width: int = 0
     height: int = 0
@@ -305,6 +330,27 @@ def _slog_thumbs(seg, project_dir, ffmpeg, n=3):
     except Exception:
         pass
     return out
+
+
+def _accepted_poster(seg, project_dir, ffmpeg, start=0.0):
+    """One browser-safe JPEG frame of an accepted clip for the live 'last accepted' preview.
+    The raw proxies are often HEVC (won't play in Chromium/WebView2), so the UI shows this."""
+    try:
+        src = seg.final_path or seg.source_path
+        if not src or not ffmpeg or not Path(src).exists():
+            return ""
+        pdir = Path(project_dir) / "review" / "_accepted"
+        pdir.mkdir(parents=True, exist_ok=True)
+        base = hashlib.sha1(str(seg.segment_id).encode("utf-8", "ignore")).hexdigest()[:10]
+        dst = pdir / f"{base}.jpg"
+        at = max(0.0, float(start)) + max(0.3, float(seg.duration or 2.0) * 0.4)
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{at:.2f}",
+                        "-i", str(src), "-frames:v", "1",
+                        "-vf", "scale=360:-2,format=yuvj420p", "-q:v", "5", str(dst)],
+                       capture_output=True, timeout=30)
+        return str(dst) if dst.exists() else ""
+    except Exception:
+        return ""
 
 
 def _llm_json(messages, max_tokens=4000, temperature=0.3, reasoning_model=None,
@@ -430,32 +476,58 @@ def queries_for_intent(intent: VisualIntent):
     real TikTok search finds nothing with an 8-word phrase. English phrases are kept only as a low
     backup tier. Every block is length-capped and the relevance-`expected_*` carry the Japanese
     tokens so metadata ranking matches the (Japanese) captions. Diversified per tier."""
-    # New Architect plans already contain exact raw strings. Preserve them byte-for-byte after
-    # validation; do not recombine/translate them in the Scraper Agent.
+    # New Architect plans contain platform-native strings. TikTok, Instagram and X do not index
+    # content the same way, so never broadcast an Instagram hashtag or an X proof phrase to every
+    # backend. Legacy plans without platform_queries still use the shared arrays below.
     direct = []
     primary_tier = "exact_action" if intent.match_category == "literal" else (
         "semantic_action" if intent.match_category == "vibe" else "creator_style")
 
-    def add_direct(values, language, tier, subject, action, location):
+    def add_direct(values, language, tier, subject, action, location, platforms=None):
         for raw in values or []:
             direct.append(SearchQueryV2(
                 query=raw, language=language, tier=tier, visual_intent_id=intent.intent_id,
                 expected_subject=subject, expected_action=action, expected_location=location,
-                negative_terms=list(intent.avoid_elements or [])))
+                negative_terms=list(intent.avoid_elements or []), platforms=list(platforms or [])))
 
-    add_direct(_clean_english_queries(intent.english_queries), "en", primary_tier,
-               intent.subject, intent.action, intent.location)
-    add_direct(_clean_japanese_queries(intent.japanese_queries), "ja", primary_tier,
-               intent.subject, intent.action, intent.location)
+    def add_platform_plan(plan, subject, action, location, tier):
+        if not isinstance(plan, dict):
+            return
+        for raw_platform, values in plan.items():
+            platform = _canonical_platform(raw_platform)
+            if platform not in ("tiktok", "instagram", "twitter") or not isinstance(values, dict):
+                continue
+            for language, key in (("ja", "japanese"), ("en", "english")):
+                cleaned = _clean_queries_for_platform(platform, values.get(key), language, limit=4)
+                add_direct(cleaned, language, tier, subject, action, location, [platform])
+            # Instagram exposes keyword/tag discovery rather than a useful TikTok-style phrase
+            # ranking. Keep those two result neighbourhoods explicit.
+            if platform == "instagram":
+                cleaned = _clean_queries_for_platform(platform, values.get("keywords"), "auto", limit=4)
+                add_direct(cleaned, "auto", tier, subject, action, location, [platform])
+                tags = _clean_queries_for_platform(platform, values.get("hashtags"), "hashtag", limit=4)
+                add_direct(tags, "ja", "hashtag", subject, action, location, [platform])
+
+    add_platform_plan(intent.platform_queries, intent.subject, intent.action, intent.location,
+                      primary_tier)
     for alt in (intent.alternative_visuals or [])[:3]:
-        add_direct(_clean_english_queries(alt.english_queries, 2), "en", "semantic_action",
-                   alt.subject, alt.action, alt.location)
-        add_direct(_clean_japanese_queries(alt.japanese_queries, 2), "ja", "semantic_action",
-                   alt.subject, alt.action, alt.location)
+        add_platform_plan(alt.platform_queries, alt.subject, alt.action, alt.location,
+                          "semantic_action")
+
+    if not direct:
+        add_direct(_clean_english_queries(intent.english_queries), "en", primary_tier,
+                   intent.subject, intent.action, intent.location)
+        add_direct(_clean_japanese_queries(intent.japanese_queries), "ja", primary_tier,
+                   intent.subject, intent.action, intent.location)
+        for alt in (intent.alternative_visuals or [])[:3]:
+            add_direct(_clean_english_queries(alt.english_queries, 2), "en", "semantic_action",
+                       alt.subject, alt.action, alt.location)
+            add_direct(_clean_japanese_queries(alt.japanese_queries, 2), "ja", "semantic_action",
+                       alt.subject, alt.action, alt.location)
     if direct:
         out, seen = [], set()
         for query in direct:
-            key = (query.language, query.query.casefold())
+            key = (tuple(query.platforms), query.language, query.query.casefold())
             if key not in seen:
                 seen.add(key)
                 out.append(query)
@@ -597,7 +669,7 @@ def _dynamic_like_floor_v2(tier, platform):
 
 def rank_metadata_candidates_v2(candidates, query: SearchQueryV2, platform_counts=None,
                                 creator_counts=None):
-    """Score + sort SourceVideoCandidate list by RELEVANCE first (likes are ~7% of the score).
+    """Score + sort candidates by relevance first; likes and views share ~7% of the score.
     Applies the tier-aware dynamic like floor. Returns the surviving list sorted best-first.
 
     rank = relevance*0.45 + specificity*0.15 + raw_footage_prob*0.15 + resolution*0.08
@@ -621,7 +693,9 @@ def rank_metadata_candidates_v2(candidates, query: SearchQueryV2, platform_count
             res = max(0.0, min(10.0, (long_side - 400) / 160.0)) if long_side else 0.0
             if c.height < c.width:               # landscape source -> weak
                 res *= 0.4
-        eng = min(10.0, math.log10(int(c.likes or 0) + 1) * 1.7)   # log-normalised, capped
+        like_eng = min(10.0, math.log10(int(c.likes or 0) + 1) * 1.7)
+        view_eng = min(10.0, math.log10(int(c.views or 0) + 1) * 1.35)
+        eng = like_eng * 0.65 + view_eng * 0.35
         blob = (c.caption + " " + " ".join(c.hashtags)).lower()
         risk = 2.5 if any(t in blob for t in _RISK_TERMS) else 0.0
         # 9:16 output - landscape sources (X is ~all landscape) must never outrank an available
@@ -810,6 +884,75 @@ def _clean_japanese_queries(values, limit=4):
     return out
 
 
+def _canonical_platform(value):
+    key = str(value or "").strip().lower()
+    if key in ("x", "twitter", "x.com"):
+        return "twitter"
+    if key in ("ig", "insta", "instagram", "reels"):
+        return "instagram"
+    return "tiktok" if key in ("tt", "tiktok") else key
+
+
+def _clean_queries_for_platform(platform, values, language="auto", limit=4):
+    """Validate an Architect query without destroying the platform-specific search grammar.
+
+    The old universal 2-token trim erased X disambiguators (``女性 土俵 救命`` became
+    ``女性 土俵``) and broadcast Instagram tags to all sites. TikTok remains compact, X may keep
+    one proof disambiguator, and Instagram may use a single native hashtag.
+    """
+    platform = _canonical_platform(platform)
+    out, seen = [], set()
+    rows = values if isinstance(values, list) else []
+    for value in rows:
+        query = sanitize_platform_query(value)
+        if not query or len(query) > 120 or any(ch in query for ch in "()[]{}:/"):
+            continue
+        if language == "hashtag":
+            # Exactly one tag. Multiple tags in the keyword box are a weak neighbourhood and the
+            # backend already routes a leading # to the platform's tag surface where supported.
+            tag = query.split()[0].lstrip("#")
+            tag = re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", "", tag)
+            query = "#" + tag if tag else ""
+        else:
+            has_japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", query))
+            if language == "ja" and (not has_japanese or not _JP_QUERY_ALLOWED_RE.fullmatch(query)
+                                      or _JP_LATIN_WORD_RE.search(query)):
+                continue
+            if language == "en" and len(re.findall(r"[A-Za-z0-9]+", query)) < 2:
+                continue
+            toks = query.split()
+            max_tokens = 2 if platform == "tiktok" else (3 if platform == "instagram" else 4)
+            if language == "en" or (language == "auto" and not has_japanese):
+                useful = [token for token in toks if token.casefold() not in _EN_QUERY_FILLER]
+                if len(useful) >= 2:
+                    toks = useful
+            query = " ".join(toks[:max_tokens])
+        key = query.casefold()
+        if query and key not in seen:
+            seen.add(key); out.append(query)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _normalize_platform_query_plan(raw):
+    plan = {}
+    for raw_platform, values in (raw.items() if isinstance(raw, dict) else []):
+        platform = _canonical_platform(raw_platform)
+        if platform not in ("tiktok", "instagram", "twitter") or not isinstance(values, dict):
+            continue
+        row = {}
+        if platform == "instagram":
+            row["keywords"] = _clean_queries_for_platform(platform, values.get("keywords"), "auto", 4)
+            row["hashtags"] = _clean_queries_for_platform(platform, values.get("hashtags"), "hashtag", 4)
+        else:
+            row["japanese"] = _clean_queries_for_platform(platform, values.get("japanese"), "ja", 4)
+            row["english"] = _clean_queries_for_platform(platform, values.get("english"), "en", 3)
+        if any(row.values()):
+            plan[platform] = row
+    return plan
+
+
 def build_viral_search_plan_v2(title, script, scenes, understanding=None, reasoning_model=None,
                                 status_cb=None):
     """Architect Agent: tangible viral B-roll concepts + raw EN/JA platform search strings."""
@@ -818,7 +961,7 @@ def build_viral_search_plan_v2(title, script, scenes, understanding=None, reason
         return []
     system = (
         "You are the Architect Agent for fast viral B-roll in the 'Wildest School Rules' style. "
-        "Your JSON is executed autonomously by a TikTok/X Scraper Agent. Never make a boring "
+        "Your JSON is executed autonomously by TikTok, Instagram and X Scraper Agents. Never make a boring "
         "sentence translation. Extract the underlying object, action, emotion, awkwardness or shock, "
         "then describe what it physically looks like in authentic phone footage. JSON only.")
     prompt = ac.understanding_brief(understanding) + f"""
@@ -832,6 +975,15 @@ Examples: "no free time" -> student asleep at desk or massive textbook pile. "st
 Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
 visible subject, visible action and plausible location.
 
+Also choose one communication_role:
+- proof: a named place, event, sign, rule or factual object must be visibly proven.
+- demonstration: hands/person demonstrates the concrete object or procedure.
+- human_consequence: show what the rule causes a person to do or endure.
+- emotion: a physical expression/action communicates an abstract feeling.
+- pattern_interrupt: a surprising but still locally meaningful visual punchline.
+Objects are REQUIRED when they are the clearest proof or demonstration (four sweets, five cups,
+a warning gate, a ribbon being tied). The "prefer humans" rule applies only to emotion/filler.
+
 STORY-THESIS GUARD: First infer the recurring human subject and overall claim from the FULL script.
 The opening hook is often only one example, not the overall topic. A hook noun may influence only
 the scenes that explicitly mention it. Do not carry it into later intents, alternatives, queries or
@@ -839,14 +991,18 @@ global context unless the later narration repeats it. Example: if sumo appears o
 story about restrictions on women, sumo is valid only for that hook block; the recurring subject is
 women experiencing different restrictions. Each later scene must follow its own local claim.
 
-QUERIES ARE BROAD DISCOVERY SEARCHES, NOT SCENE DESCRIPTIONS. Real TikTok/X search returns ZERO
-results for a specific phrase - a downstream vision agent watches every found video and picks the
-exact matching seconds, so a query only needs to land in the right content NEIGHBOURHOOD.
-japanese_queries: 1-2 words a real Japanese user actually types (満員電車 / 日本 学校 / あるある /
-東京 夜). english_queries: 2-3 words max (japan school / tokyo train / japan rules). NEVER stack
-adjectives, NEVER put a whole situation into one query, NEVER exceed these word counts.
-For the primary concept return 2-3 japanese_queries and 1-2 english_queries. For each alternative
-return 1 of each. These arrays are exact raw strings sent directly to TikTok and X.
+QUERIES ARE DISCOVERY SEARCHES, NOT TRANSLATED SCENE DESCRIPTIONS. Generate a separate executable
+plan for every platform because their discovery grammars differ:
+- TikTok: 1-2 compact native words describing a phone-filmable situation. Preserve a named-entity
+  anchor when one exists (名頃 かかし), and never append TikTok, Instagram, X, reels or shorts.
+- Instagram: 1-2 keyword phrases plus 1-2 single native hashtags. A hashtag is ONE raw string that
+  begins with #; no spaces, annotations, translations or multiple tags in one string.
+- X/Twitter: 2-4 words. Prefer event/proof phrases with one disambiguator (女性 土俵 救命), because
+  generic nouns are noisy and X is strongest for recorded incidents. Never include filter:media;
+  the backend selects Media itself. Never append TikTok, Instagram or X to a query.
+English is a secondary discovery lane: 2-3 targeted words, only when local-language results may be
+insufficient. The downstream vision agent finds the exact seconds, but the query must still land in
+the correct subject/action neighbourhood.
 VIBE scenes: ONE query may add a single emotion word (疲れた / awkward japan). SHOCK scenes: ONE
 query may chase the punchline with a single meme word (ハプニング / japan fail).
 INTELLIGENT TERMS: you MAY invent platform-native terms that PROVE the scene's feeling even when
@@ -859,9 +1015,8 @@ NEVER search for measuring OBJECTS (scale/体重計, tape measure, calculator, m
 search measurable numbers ("40kg", "150cm") or platform action trends (ボディチェック / body
 check, 骨格診断, outfit try on, GRWM) so results show HUMANS, not props. Searching the object
 filled half a video with store shelves and suitcases - retention death.
-PLACEMENT RULE: scene 0 and roughly every 5th scene (the end of
-each thought block, every 10-15 seconds) MUST be visual_match_category "shock" - the dopamine
-reset. All other scenes are literal or vibe.
+Use shock/pattern_interrupt only when it strengthens the local narration beat. Never impose a fixed
+cadence and never replace factual proof with an unrelated meme merely because several scenes passed.
 Japanese strings must be what local users write, including useful native slang such as あるある or
 厳しい. ABSOLUTE RULE: every japanese_queries string contains ONLY Kanji, Hiragana, Katakana, spaces,
 digits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.
@@ -872,12 +1027,18 @@ Scenes:
 
 Return exactly:
 {{"intents":[{{"scene_id":0,"visual_type":"concrete|context|abstract",
-"visual_match_category":"literal|vibe|shock","subject":"...","action":"...","location":"...",
+"visual_match_category":"literal|vibe|shock","communication_role":"proof|demonstration|human_consequence|emotion|pattern_interrupt",
+"story_subject":"recurring subject of full script","local_claim":"claim of this scene",
+"subject":"...","action":"...","location":"...",
 "camera_style":"pov|handheld|vlog|static|walking","mood":"...",
 "required_elements":["..."],"optional_elements":["..."],"avoid_elements":["..."],
-"english_queries":["raw phrase"],"japanese_queries":["日本語検索"],
+"platform_queries":{{"tiktok":{{"japanese":["日本語検索"],"english":["raw phrase"]}},
+"instagram":{{"keywords":["日本語検索"],"hashtags":["#日本語タグ"]}},
+"twitter":{{"japanese":["日本語 検索 証拠"],"english":["raw phrase"]}}}},
 "alternatives":[{{"subject":"...","action":"...","location":"...","camera_style":"...",
-"mood":"...","english_queries":["raw phrase"],"japanese_queries":["日本語検索"]}}]}}]}}
+"mood":"...","platform_queries":{{"tiktok":{{"japanese":["日本語検索"],"english":[]}},
+"instagram":{{"keywords":["日本語検索"],"hashtags":["#日本語タグ"]}},
+"twitter":{{"japanese":["日本語 検索 証拠"],"english":[]}}}}}}]}}]}}
 """
 
     # BATCHED (2026-07-11): one call for ALL scenes truncated on longer scripts - ~400 output
@@ -924,6 +1085,10 @@ Return exactly:
         visual_type = str(row.get("visual_type") or "context").strip().lower()
         if visual_type not in ("concrete", "context", "abstract"):
             visual_type = "context"
+        communication_role = str(row.get("communication_role") or "human_consequence").strip().lower()
+        if communication_role not in ("proof", "demonstration", "human_consequence", "emotion",
+                                      "pattern_interrupt"):
+            communication_role = "human_consequence"
         alternatives = []
         for alt in (row.get("alternatives") or [])[:3]:
             if isinstance(alt, dict):
@@ -932,17 +1097,21 @@ Return exactly:
                     location=str(alt.get("location") or ""),
                     camera_style=str(alt.get("camera_style") or ""), mood=str(alt.get("mood") or ""),
                     english_queries=_clean_english_queries(alt.get("english_queries"), 2),
-                    japanese_queries=_clean_japanese_queries(alt.get("japanese_queries"), 2)))
+                    japanese_queries=_clean_japanese_queries(alt.get("japanese_queries"), 2),
+                    platform_queries=_normalize_platform_query_plan(alt.get("platform_queries"))))
         intents.append(VisualIntent(
             scene_id=sid, scene_text=(ac.scene_text_for_planning(scenes[sid]) or "")[:200],
-            visual_type=visual_type, match_category=category,
+            visual_type=visual_type, match_category=category, communication_role=communication_role,
+            story_subject=str(row.get("story_subject") or ""),
+            local_claim=str(row.get("local_claim") or ""),
             subject=str(row.get("subject") or ""), action=str(row.get("action") or ""),
             location=str(row.get("location") or ""), camera_style=str(row.get("camera_style") or ""),
             mood=str(row.get("mood") or ""), required_elements=list(row.get("required_elements") or []),
             optional_elements=list(row.get("optional_elements") or []),
             avoid_elements=list(row.get("avoid_elements") or []), alternative_visuals=alternatives,
             english_queries=_clean_english_queries(row.get("english_queries")),
-            japanese_queries=_clean_japanese_queries(row.get("japanese_queries"))))
+            japanese_queries=_clean_japanese_queries(row.get("japanese_queries")),
+            platform_queries=_normalize_platform_query_plan(row.get("platform_queries"))))
     missing = [sid for sid in range(len(scenes)) if sid not in seen]
     if missing:
         _log(status_cb, f"Scrape V2 Architect omitted {len(missing)} scene(s); using the legacy visual "
@@ -956,19 +1125,13 @@ Return exactly:
             if sid in legacy_by_id:
                 intents.append(legacy_by_id[sid])
     intents.sort(key=lambda item: item.scene_id)
-    # SHOCK CADENCE (deterministic backstop for the prompt rule): the dopamine reset needs a
-    # shock/meme punchline every 10-15s. Scenes run ~2s, so enforce >=1 shock per 5-scene
-    # window - if the LLM tagged none in a window, flip the window's last scene to shock.
     if intents:
-        for w0 in range(0, len(intents), 5):
-            win = intents[w0:w0 + 5]
-            if win and not any(getattr(x, "match_category", "") == "shock" for x in win):
-                win[-1].match_category = "shock"
         _n_shock = sum(1 for x in intents if getattr(x, "match_category", "") == "shock")
-        _log(status_cb, f"Scrape V2 Architect: shock cadence enforced - {_n_shock} shock "
-                        f"scene(s) across {len(intents)} (>=1 per ~10-15s).")
-    _log(status_cb, "Scrape V2 Architect: %d tangible visual intent(s), %d raw EN/JA queries." %
-         (len(intents), sum(len(i.english_queries) + len(i.japanese_queries) for i in intents)))
+        _log(status_cb, f"Scrape V2 Architect: {_n_shock} locally justified shock scene(s) "
+                        f"across {len(intents)}; no forced cadence.")
+    query_count = sum(len(queries_for_intent(item)) for item in intents)
+    _log(status_cb, "Scrape V2 Architect: %d tangible visual intent(s), %d executable "
+                    "platform-scoped queries." % (len(intents), query_count))
     if not intents or not any(queries_for_intent(item) for item in intents):
         raise RuntimeError("Scrape V2 Architect could not generate any valid visual search phrases after retry.")
     return intents
@@ -1604,12 +1767,12 @@ def assign_segments_globally_v2(intents, scene_candidates, cfg=None, status_cb=N
         return False
 
     def _caps_ok(seg, cand_class):
-        # ONE scene per segment (was 2): the same segment appearing twice reads as "the video
-        # repeats itself" (user complaint on run #5 - 4 segments were each used for 2 scenes).
-        # Different WINDOWS of the same source stay allowed via max_segments_per_source_final.
+        # ONE scene per segment AND (STRICT) one clip per SOURCE video: a second window/excerpt
+        # of a TikTok that is already in the render is forbidden - it reads as the video
+        # repeating itself. max_segments_per_source_final is 1.
         if seg_use.get(seg.segment_id, 0) >= 1:
             return False
-        if source_use.get(seg.source_id, 0) >= cfg["max_segments_per_source_final"]:
+        if source_use.get(seg.source_id, 0) >= max(1, int(cfg["max_segments_per_source_final"])):
             return False
         if creator_use.get(seg.creator_id, 0) >= cfg["max_clips_per_creator"]:
             return False
@@ -1731,7 +1894,8 @@ def _item_to_source(item, query: SearchQueryV2):
         platform=str(m.get("platform") or "tiktok"), source_id=str(sid),
         creator_id=str(m.get("author") or ""), url=str(m.get("url") or ""),
         caption=str(m.get("caption") or ""), hashtags=list(m.get("hashtags") or []),
-        likes=int(m.get("likes") or 0), duration=float(m.get("duration") or 0.0),
+        likes=int(m.get("likes") or 0), views=int(m.get("views") or 0),
+        duration=float(m.get("duration") or 0.0),
         width=int(m.get("w") or 0), height=int(m.get("h") or 0),
         query=query.query, query_tier=query.tier, raw_item=item)
 
@@ -1742,9 +1906,9 @@ def _hook_presenter_queries_v2():
     Reuses the same query pool as the V1 hook finder (agent_core.HOOK_PRESENTER_QUERIES)."""
     pools = getattr(_ac(), "HOOK_PRESENTER_QUERIES", {}) or {}
     out = []
-    # A handful of strong terms is enough. Each is searched under relevance/likes/views, so the
-    # old 18-term pool caused ~54 serial browser searches and could spend 15 minutes on the hook
-    # alone. Birth-year tags ("#0X #女の子", user-provided) go FIRST: they surface exactly the
+    # A handful of strong terms is enough. The old pool repeatedly navigated the same query for
+    # local relevance/likes/views sorts and could spend 15 minutes on the hook alone. Birth-year
+    # tags ("#0X #女の子", user-provided) go FIRST: they surface exactly the
     # young-Japanese-creator demographic on TikTok AND Instagram, and their surplus segments
     # double as generic Japanese-style fill for the body/context-fallback pool. Rotate through
     # the years so consecutive runs don't hammer the same two tags.
@@ -1818,7 +1982,7 @@ Return exactly: {{"global_filler_queries": ["...", "..."]}}"""
         # that echo the theme term (filler has no per-scene expectations).
         out.append(SearchQueryV2(query=text, language=lang, tier="global_filler",
                                  visual_intent_id="global_filler", expected_subject=text,
-                                 expected_action="", expected_location=""))
+                                 expected_action="", expected_location="", platforms=["tiktok"]))
     return out[:25]
 
 
@@ -1826,29 +1990,32 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
                     sort="RELEVANCE", coverage_pass=False):
     """Run a batch of SearchQueryV2 through the dual backend, dedupe by source_id, relevance-rank.
 
-    Every raw Architect query is executed through multiple result orders. This combines topical
-    relevance with the most-liked/most-viewed pools instead of betting a scene on one ranking."""
+    TikTok, Instagram and X currently expose the same fetched result neighbourhood for every
+    requested sort; their login modules sort that one collected pool locally. Re-navigating three
+    times therefore wastes minutes and usually returns duplicates. Fetch once, then combine
+    semantic rank with likes/views in ``rank_metadata_candidates_v2``."""
     ranked_all = []
     plat_counts, creator_counts = {}, {}
     preferred = str(sort or "RELEVANCE").upper()
-    if preferred == "ALL":
-        preferred = "RELEVANCE"
-    # The first coverage wave must touch every narration concept before spending minutes
-    # re-running one early query under popularity sorts. Later waves still execute each term
-    # under relevance/likes/views as requested.
-    sort_passes = (["RELEVANCE"] if coverage_pass else list(dict.fromkeys(
-        [preferred, "RELEVANCE", "MOST_LIKED", "MOST_VIEWED"])))
-    sort_passes = [mode for mode in sort_passes
-                   if mode in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT")]
-    def _run_pass(q, text, sort_mode):
+    if preferred not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "ALL"):
+        preferred = "MOST_LIKED"
+    # "ALL" -> backend_search runs every sort order and merges the unique clips (clip_scraper
+    # handles it). The coverage/escalation pass stays on RELEVANCE for speed.
+    sort_passes = ["RELEVANCE" if coverage_pass else preferred]
+    selected_platforms = clip_scraper.normalize_platforms(platforms)
+
+    def _run_pass(q, text, sort_mode, target_platforms):
         """One backend search for one text under one sort order. Returns raw item count."""
         if status_cb:
             _log(status_cb, f'Scrape V2 query [{sort_mode}]: "{text}"')
         text = sanitize_platform_query(text)
         if not text:
             return 0
-        items = clip_scraper.backend_search(text, 10, status_cb=status_cb, sort=sort_mode,
-                                            platforms=platforms, deadline=deadline) or []
+        # DEEP SCROLL (user rule 2026-07-13): pull ~18 (page 2-3), not the top-10. The first
+        # page is caption-heavy tutorials; the organic POV clips live deeper, and strict
+        # no-reuse needs a wide pool of DISTINCT sources per term.
+        items = clip_scraper.backend_search(text, 18, status_cb=status_cb, sort=sort_mode,
+                                            platforms=target_platforms, deadline=deadline) or []
         state["queries_executed"] = state.get("queries_executed", 0) + 1
         qt = state.setdefault("query_texts", [])
         if text not in qt:
@@ -1874,21 +2041,27 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
     for q in queries:
         if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
             break
+        scoped = {_canonical_platform(value) for value in (q.platforms or [])}
+        target_platforms = sorted(selected_platforms & scoped) if scoped else sorted(selected_platforms)
+        if not target_platforms:
+            continue
         raw_total = 0
         for sort_mode in sort_passes:
             if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
                 break
-            raw_total += _run_pass(q, q.query, sort_mode)
-        # ZERO-RESULT AUTO-BROADENING (2026-07-12): a query that finds NOTHING under every sort
-        # order was too specific for real platform search - retry ONCE with just its first token
-        # before moving on, so the run keeps gathering material instead of burning the queue.
+            raw_total += _run_pass(q, q.query, sort_mode, target_platforms)
+        # Preserve named-entity anchors. The previous first-token fallback changed ``名頃 かかし``
+        # into generic ``名頃``/``かかし`` neighbourhoods and flooded the pool with unrelated media.
+        # Only a 3+ token query may shed its final disambiguator here; two-token failures are left
+        # for the live adaptive controller, which can change the physical situation intelligently.
         toks = q.query.split()
-        if (raw_total == 0 and len(toks) >= 2
+        if (raw_total == 0 and len(toks) >= 3
                 and not (cancel_check and cancel_check())
                 and not (deadline and time.monotonic() >= deadline)):
-            _log(status_cb, f'Scrape V2: 0 results for "{q.query}" -> broadened to "{toks[0]}"')
+            broader = " ".join(toks[:-1])
+            _log(status_cb, f'Scrape V2: 0 results for "{q.query}" -> preserved anchor and retried "{broader}"')
             state["broadened_queries"] = state.get("broadened_queries", 0) + 1
-            _run_pass(q, toks[0], sort_passes[0] if sort_passes else "RELEVANCE")
+            _run_pass(q, broader, sort_passes[0], target_platforms)
     ranked_all.sort(key=lambda s: s.rank_score, reverse=True)
     return ranked_all
 
@@ -2043,17 +2216,22 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
         state["scene_retries"] = state.get("scene_retries", 0) + 1
     # CREATIVE LATERAL RETRY (user rule): the literal approach already failed for these
     # scenes - ask for lateral queries that PROVE each scene's point visually WITHOUT its
-    # literal words (numbers, human actions, platform slang; never lifeless objects).
+    # literal words. ROLE-AWARE (research 2026-07-13, gift-taboo finding): for proof/
+    # demonstration beats the factual OBJECT is the proof (4個 和菓子, 蝶結び ラッピング) and
+    # must NOT be banned; only emotion/vibe beats avoid lifeless objects.
     try:
-        lines = "\n".join(f'scene {it.scene_id}: "{(it.scene_text or "")[:120]}"'
-                          for it in weak_intents[:8])
+        lines = "\n".join(
+            f'scene {it.scene_id} [{getattr(it, "communication_role", "human_consequence")}]: '
+            f'"{(it.scene_text or "")[:120]}"' for it in weak_intents[:8])
         data = _llm_json([
             {"role": "system", "content":
              "You are the Lateral Search Architect. Previous LITERAL searches for these scenes "
-             "returned boring, static or irrelevant footage. Abandon the literal approach "
-             "completely: translate each scene into the numbers users flex with, the human "
-             "behavior it causes, or native platform slang - queries that prove the point "
-             "visually without the scene's own words. Never lifeless objects. JSON only."},
+             "returned boring, static or irrelevant footage. Abandon the literal approach: "
+             "translate each scene into the numbers users flex with, the human behavior it "
+             "causes, or native platform slang. OBJECT RULE by the [role] tag: proof/"
+             "demonstration beats SHOULD search the factual object itself (hands counting four "
+             "sweets, tying a bow); emotion/human_consequence/pattern_interrupt beats must "
+             "avoid lifeless objects and show a person instead. JSON only."},
             {"role": "user", "content":
              f"FAILED SCENES:\n{lines}\n\nFor EACH scene return 3-5 lateral native queries "
              "(1-2 Japanese words each; latin unit tokens like 40kg allowed).\n"
@@ -2062,7 +2240,7 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
             status_cb=status_cb, label="lateral retry")
         by_id = {it.scene_id: it for it in weak_intents}
         lat_added = 0
-        seen_q = {q.query.casefold() for q in new_queries}
+        seen_q = {_query_identity(q) for q in new_queries}
         for sid_str, qs_raw in ((data.get("scenes") or {}) if isinstance(data, dict) else {}).items():
             try:
                 sid = int(re.sub(r"[^0-9-]", "", str(sid_str)) or "x")
@@ -2073,13 +2251,14 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
                 continue
             for text, lang in ([(q, "ja") for q in _clean_japanese_queries(qs_raw, limit=5)]
                                + [(q, "en") for q in _clean_english_queries(qs_raw, limit=2)]):
-                if text.casefold() in seen_q:
-                    continue
-                seen_q.add(text.casefold())
-                new_queries.append(SearchQueryV2(
+                candidate = SearchQueryV2(
                     query=text, language=lang, tier="semantic_action",
                     visual_intent_id=it.intent_id, expected_subject=text,
-                    expected_action=it.action, expected_location=""))
+                    expected_action=it.action, expected_location="", platforms=["tiktok"])
+                if _query_identity(candidate) in seen_q:
+                    continue
+                seen_q.add(_query_identity(candidate))
+                new_queries.append(candidate)
                 lat_added += 1
         if lat_added:
             _log(status_cb, f"Scrape V2: +{lat_added} lateral retry queries for the failed scene(s).")
@@ -2094,8 +2273,37 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
                                        status_cb=status_cb)
 
 
+def escalate_platform_pivot_v2(uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check,
+                               deadline, state, seen_source_ids, reasoning_model=None, status_cb=None):
+    """ESCALATION STAGE 1 - cross-platform pivot: re-send each uncovered scene's OWN terms to
+    ALL connected platforms. X's Media tab is strong for proof/news, Instagram for hashtag reach,
+    so a term that only ran on TikTok now also hits X and IG. Returns new scene->candidate map."""
+    import copy as _c
+    qs, seen = [], set()
+    for it in uncovered:
+        for q in queries_for_intent(it)[:6]:
+            q2 = _c.copy(q)
+            q2.platforms = list(platforms)          # force the full connected set
+            key = (q2.query.casefold(), q2.visual_intent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            qs.append(q2)
+    if not qs:
+        return {}
+    state["escalation_stage1"] = state.get("escalation_stage1", 0) + 1
+    sources = _search_sources(qs, platforms, cancel_check, deadline, seen_source_ids, state, status_cb)
+    segs = _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
+                                 status_cb, download_budget=SCRAPE_V2_CONFIG["max_downloaded_analysis_videos"])
+    if not segs:
+        return {}
+    describe_segments_v2(segs, project_dir, ffmpeg, reasoning_model=reasoning_model, status_cb=status_cb)
+    return match_segments_to_scenes_v2(uncovered, segs, reasoning_model=reasoning_model, status_cb=status_cb)
+
+
 def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segments,
-                                     reasoning_model=None, status_cb=None, limit=8):
+                                     reasoning_model=None, status_cb=None, limit=8,
+                                     rejection_summary=None):
     """Inspect one completed search round and create a small corrective query set.
 
     This is deliberately called *between* rounds, while the run is active.  It gives the Search
@@ -2117,20 +2325,34 @@ def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segm
         })
     failed = [{"scene_id": it.scene_id, "line": it.scene_text,
                "wanted_subject": it.subject, "wanted_action": it.action,
-               "wanted_location": it.location}
+               "wanted_location": it.location, "communication_role": it.communication_role,
+               "story_subject": it.story_subject, "local_claim": it.local_claim}
               for it in weak_intents[:8]]
+    searched_rows = []
+    for searched in searched_queries or []:
+        if isinstance(searched, SearchQueryV2):
+            searched_rows.append({"query": searched.query, "platforms": searched.platforms or ["all"]})
+        else:
+            searched_rows.append({"query": str(searched or ""), "platforms": ["all"]})
     prompt = (
-        "You are the live Search Controller for a TikTok/X footage scraper. A search round just "
+        "You are the live Search Controller for a TikTok/Instagram/X footage scraper. A search round just "
         "finished and the listed scenes STILL have no semantic match. Inspect the searched terms "
         "and what vision actually saw. Diagnose the failure pattern, then change strategy: choose "
         "a different observable human action, native synonym, location/context, or literal proof. "
+        "Use rejection counts: repeated captions/black bars means leave tutorial/news-repost "
+        "neighbourhoods for clean UGC actions; repeated semantic mismatch means change the visible "
+        "subject/action, not merely a synonym. "
         "Do not repeat or lightly reword a failed query. Do not add platform names such as TikTok, "
-        "X, Twitter or Instagram. Japanese terms are raw native characters, 1-2 words; English "
-        "terms are 2-3 words. Return at most two new terms per scene. JSON only.\n\n"
+        "X, Twitter or Instagram. Create platform-specific terms: TikTok uses 1-2 compact words; "
+        "Instagram uses one keyword phrase or one #hashtag; X uses 2-4 event/proof words and may "
+        "retain a disambiguator. Preserve named-entity anchors. Return at most two new terms per "
+        "scene total. JSON only.\n\n"
         f"UNMATCHED SCENES:\n{json.dumps(failed, ensure_ascii=False)}\n\n"
-        f"SEARCHED THIS ROUND:\n{json.dumps(list(searched_queries), ensure_ascii=False)}\n\n"
+        f"SEARCHED THIS ROUND:\n{json.dumps(searched_rows, ensure_ascii=False)}\n\n"
         f"VISION OBSERVATIONS / LIVE LOG:\n{json.dumps(observations, ensure_ascii=False)}\n\n"
-        'Return {"diagnosis":"short reason","queries":{"<scene_id>":["raw query"]}}')
+        f"CUMULATIVE REJECTION COUNTS:\n{json.dumps(rejection_summary or {}, ensure_ascii=False)}\n\n"
+        'Return {"diagnosis":"short reason","queries":{"<scene_id>":'
+        '{"tiktok":["raw query"],"instagram":["#rawtag"],"twitter":["raw proof query"]}}}')
     try:
         data = _llm_json([
             {"role": "system", "content": "Diagnose live search failures and return executable corrective queries."},
@@ -2143,7 +2365,8 @@ def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segm
     if diagnosis:
         _log(status_cb, "Search Controller: " + diagnosis[:300])
     by_id = {it.scene_id: it for it in weak_intents}
-    out, seen = [], {sanitize_platform_query(q).casefold() for q in searched_queries}
+    out, seen = [], {(tuple(sorted(row["platforms"])), sanitize_platform_query(row["query"]).casefold())
+                     for row in searched_rows}
     rows = data.get("queries") if isinstance(data, dict) else {}
     for sid_raw, values in (rows.items() if isinstance(rows, dict) else []):
         try:
@@ -2151,21 +2374,27 @@ def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segm
         except (TypeError, ValueError):
             continue
         it = by_id.get(sid)
-        if it is None or not isinstance(values, list):
+        if it is None or not isinstance(values, dict):
             continue
-        cleaned = _clean_japanese_queries(values, limit=2) + _clean_english_queries(values, limit=2)
-        for text in cleaned[:2]:
-            key = text.casefold()
-            if not text or key in seen:
+        for raw_platform, raw_queries in values.items():
+            platform = _canonical_platform(raw_platform)
+            if platform not in ("tiktok", "instagram", "twitter"):
                 continue
-            seen.add(key)
-            lang = "ja" if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text) else "en"
-            out.append(SearchQueryV2(
-                query=text, language=lang, tier="semantic_action",
-                visual_intent_id=it.intent_id, expected_subject=it.subject,
-                expected_action=it.action, expected_location=it.location))
-            if len(out) >= max(1, int(limit)):
-                return out
+            language = "hashtag" if (platform == "instagram" and any(
+                str(v or "").strip().startswith("#") for v in (raw_queries or []))) else "auto"
+            cleaned = _clean_queries_for_platform(platform, raw_queries, language, limit=2)
+            for text in cleaned:
+                key = ((platform,), text.casefold())
+                if not text or key in seen:
+                    continue
+                seen.add(key)
+                lang = "ja" if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text) else "en"
+                out.append(SearchQueryV2(
+                    query=text, language=lang, tier="semantic_action", platforms=[platform],
+                    visual_intent_id=it.intent_id, expected_subject=it.subject,
+                    expected_action=it.action, expected_location=it.location))
+                if len(out) >= max(1, int(limit)):
+                    return out
     return out
 
 
@@ -2240,14 +2469,29 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
 
     query_queue = []
     coverage_queries = []
-    # Round zero is deliberately scene-fair: reserve one strongest query for every scene.
+    # Round zero is deliberately scene-fair: reserve up to two platform-appropriate queries for
+    # every scene. Proof beats prefer X (recorded incidents) then TikTok; human/action beats prefer
+    # TikTok then Instagram. The remaining platform variants stay in the normal queue.
     # Previously tier sorting put all sumo variants first, so the 25-minute deadline expired
     # before heels, glasses, Mount Omine or the royal-family searches were even attempted.
     for it in body_intents:
         intent_queries = queries_for_intent(it)
         if intent_queries:
-            coverage_queries.append(intent_queries[0])
-            query_queue.extend(intent_queries[1:])
+            order = (["twitter", "tiktok", "instagram"] if it.communication_role == "proof"
+                     else ["tiktok", "instagram", "twitter"])
+            chosen = []
+            for platform in order:
+                candidate = next((q for q in intent_queries
+                                  if platform in {_canonical_platform(p) for p in (q.platforms or [])}
+                                  and q not in chosen), None)
+                if candidate is not None:
+                    chosen.append(candidate)
+                if len(chosen) >= 2:
+                    break
+            if not chosen:
+                chosen = intent_queries[:1]
+            coverage_queries.extend(chosen)
+            query_queue.extend(q for q in intent_queries if q not in chosen)
     query_queue.sort(key=lambda q: V2_QUERY_TIERS.index(q.tier) if q.tier in V2_QUERY_TIERS else 9)
     # BROAD-DISCOVERY DEDUPE (2026-07-12): after the 2/3-token trim many intents collapse onto
     # the same broad query (東京 / 日本 学校 ...). Search each text ONCE globally - the vision
@@ -2256,7 +2500,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     _seen_qtext = set()
     _dq = []
     for q in query_queue:
-        key = q.query.casefold()
+        key = _query_identity(q)
         if key in _seen_qtext:
             continue
         _seen_qtext.add(key)
@@ -2275,8 +2519,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         _filler = []
     _fill_added = 0
     for q in _filler:
-        if q.query.casefold() not in _seen_qtext:
-            _seen_qtext.add(q.query.casefold())
+        if _query_identity(q) not in _seen_qtext:
+            _seen_qtext.add(_query_identity(q))
             query_queue.append(q)
             _fill_added += 1
     if _fill_added:
@@ -2342,8 +2586,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                     scene_candidates[sid].sort(key=lambda r: r["overall_match"], reverse=True)
                     scene_candidates[sid] = scene_candidates[sid][:6]
                 state["segments_semantic_passed"] = sum(len(v) for v in scene_candidates.values())
-            batch_intents = [intent_by_key[q.visual_intent_id] for q in cov_batch
-                             if q.visual_intent_id in intent_by_key]
+            batch_intents, _batch_seen = [], set()
+            for q in cov_batch:
+                if q.visual_intent_id in intent_by_key and q.visual_intent_id not in _batch_seen:
+                    _batch_seen.add(q.visual_intent_id)
+                    batch_intents.append(intent_by_key[q.visual_intent_id])
             weak_now = [it for it in batch_intents if not scene_candidates.get(it.scene_id)]
             raw_delta = int(state.get("raw_results", 0) or 0) - before_raw
             quality_delta = int(state.get("segments_quality_passed", 0) or 0) - before_quality
@@ -2356,11 +2603,12 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             adaptations = int(state.get("live_adaptation_rounds", 0) or 0)
             if weak_now and adaptations < 2 and time.monotonic() < deadline:
                 adaptive = adapt_queries_from_live_round_v2(
-                    weak_now, [q.query for q in cov_batch], coverage_segments,
-                    reasoning_model=reasoning_model, status_cb=status_cb, limit=8)
+                    weak_now, cov_batch, coverage_segments,
+                    reasoning_model=reasoning_model, status_cb=status_cb, limit=8,
+                    rejection_summary=state.get("rejections") or {})
                 fresh_adaptive = []
                 for q in adaptive:
-                    key = q.query.casefold()
+                    key = _query_identity(q)
                     if key in _seen_qtext:
                         continue
                     _seen_qtext.add(key)
@@ -2399,7 +2647,13 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         if (cancel_check and cancel_check()) or time.monotonic() >= deadline:
             break
         matched_scenes = sum(1 for sid, c in scene_candidates.items() if c)
-        if matched_scenes >= len(body_intents) and len(all_segments) >= len(body_intents) * 2:
+        # STRICT no-reuse: every scene needs its OWN source, so keep searching until the pool
+        # holds at least as many DISTINCT sources as there are scenes (many candidates share
+        # the same TikTok). Only then is it possible to fill the render without reusing a source.
+        distinct_sources = len({c["segment"].source_id
+                                for cands in scene_candidates.values() for c in cands})
+        if (matched_scenes >= len(body_intents) and distinct_sources >= len(body_intents)
+                and len(all_segments) >= len(body_intents) * 2):
             break
         if state.get("downloaded_sources", 0) >= cfg["max_downloaded_analysis_videos"]:
             break
@@ -2458,10 +2712,12 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             if scored_scenes:
                 try:
                     import scrape_browser_preview
+                    _pstart = 0.0 if seg.final_path else float(seg.start_time or 0.0)
+                    _poster = _accepted_poster(seg, project_dir, ffmpeg, _pstart)
                     scrape_browser_preview.mark_accepted(
                         seg.final_path or seg.source_path,
                         platform=seg.platform, query=seg.query or "", clip_id=seg.source_id,
-                        start=0.0 if seg.final_path else float(seg.start_time or 0.0))
+                        start=_pstart, poster=_poster)
                 except Exception:
                     pass
         for sid, cands in new_matches.items():
@@ -2491,14 +2747,58 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 scene_candidates[sid] = scene_candidates[sid][:6]
             state["segments_semantic_passed"] = sum(len(v) for v in scene_candidates.values())
 
-    weak = [it for it in body_intents if not scene_candidates.get(it.scene_id)]
-    if weak and time.monotonic() < deadline:
-        retry_matches = retry_unmatched_scenes_v2(weak, platforms, project_dir, ffmpeg, ffprobe,
-                                                  cancel_check, deadline, state, seen_source_ids,
-                                                  reasoning_model=reasoning_model, status_cb=status_cb)
-        for sid, cands in retry_matches.items():
+    # ---- STRICT 3-STAGE ESCALATION (user rule 2026-07-13) ----
+    # A scene may only drop to a filler/fallback clip AFTER it has bled through, in order:
+    #   1) cross-platform pivot (its terms re-sent to X Media + Instagram),
+    #   2) a fresh lateral-agent query set (numbers / cringe / trend terms),
+    #   3) the global thematic filler pool.
+    # Re-assign after every stage: a scene that lands a UNIQUE clip drops out of the escalation,
+    # so later stages only work the scenes that are still genuinely uncovered.
+    def _merge_matches(new_matches):
+        for sid, cands in (new_matches or {}).items():
             scene_candidates.setdefault(sid, []).extend(cands)
             scene_candidates[sid].sort(key=lambda r: r["overall_match"], reverse=True)
+            scene_candidates[sid] = scene_candidates[sid][:6]
+
+    def _uncovered_intents():
+        # a scene is "covered" only if the strict-source assigner can give it its OWN clip
+        asg = assign_segments_globally_v2(body_intents, scene_candidates, cfg)
+        return [it for it in body_intents
+                if not (asg.get(it.scene_id) and asg[it.scene_id].segment_id)]
+
+    uncovered = _uncovered_intents()
+    if uncovered and time.monotonic() < deadline:
+        _log(status_cb, "Escalation 1/3 (cross-platform pivot): %d scene(s) still without a "
+                        "unique clip - re-sending their terms to X + Instagram..." % len(uncovered))
+        _merge_matches(escalate_platform_pivot_v2(
+            uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
+            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb))
+        uncovered = _uncovered_intents()
+
+    if uncovered and time.monotonic() < deadline:
+        _log(status_cb, "Escalation 2/3 (lateral-agent): %d scene(s) still uncovered - generating "
+                        "fresh creative queries (numbers / cringe / trends)..." % len(uncovered))
+        _merge_matches(retry_unmatched_scenes_v2(
+            uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
+            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb))
+        uncovered = _uncovered_intents()
+
+    if uncovered and time.monotonic() < deadline:
+        # STAGE 3 - global thematic filler pool: match the still-uncovered scenes against the
+        # broad on-theme B-roll already gathered (lateral filler + surplus hook clips), relaxed.
+        described_pool = sorted((s for s in all_segments if s.visual_description),
+                                key=lambda s: s.quality_score, reverse=True)[:60]
+        if described_pool:
+            _log(status_cb, "Escalation 3/3 (global filler bucket): %d scene(s) - matching the "
+                            "thematic B-roll pool..." % len(uncovered))
+            state["escalation_stage3"] = state.get("escalation_stage3", 0) + 1
+            _merge_matches(match_segments_to_scenes_v2(
+                uncovered, described_pool, reasoning_model=reasoning_model, status_cb=status_cb))
+            uncovered = _uncovered_intents()
+    if uncovered:
+        _log(status_cb, "Escalation exhausted: %d scene(s) still have no unique clip after all 3 "
+                        "stages - the context/relevancy fallback handles them (never a reused source)."
+             % len(uncovered))
 
     # TOTAL-COLLAPSE GUARD: still zero semantic candidates for every scene although segments
     # were described -> DO NOT render a video out of random clips. Fail loudly instead; the
@@ -2562,7 +2862,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         seg0 = getattr(a, "_seg", None)
         if a.segment_id and seg0 is not None:
             _src_use[seg0.source_id] = _src_use.get(seg0.source_id, 0) + 1
-    _src_cap = int(cfg.get("max_segments_per_source_final", 2) or 2)
+    _src_cap = max(1, int(cfg.get("max_segments_per_source_final", 1) or 1))
 
     for it in body_intents:
         a = assignments.get(it.scene_id)

@@ -7,7 +7,8 @@ _STATE = {"jpeg": b"", "version": 0, "captured_at": 0.0, "platform": "",
           "query": "", "sort": "", "accepted_version": 0,
           "last_accepted_path": "", "last_accepted_platform": "",
           "last_accepted_query": "", "last_accepted_clip_id": "",
-          "last_accepted_at": 0.0, "last_accepted_start": 0.0}
+          "last_accepted_at": 0.0, "last_accepted_start": 0.0,
+          "last_accepted_poster": ""}
 
 
 def capture(page, platform, query="", sort="", force=False):
@@ -38,8 +39,12 @@ def status():
             "available": bool(_STATE["jpeg"])}
 
 
-def mark_accepted(path, platform="", query="", clip_id="", start=0.0):
-    """Publish the latest clip that passed semantic matching for at least one scene."""
+def mark_accepted(path, platform="", query="", clip_id="", start=0.0, poster=""):
+    """Publish the latest clip that passed semantic matching for at least one scene.
+
+    `poster` is a browser-playable JPEG frame of the clip: the raw proxy is often HEVC/H.265,
+    which Chromium/WebView2 refuse to render, so the preview shows the poster (always renders)
+    with the video only as a best-effort enhancement."""
     with _LOCK:
         _STATE.update(
             accepted_version=int(_STATE["accepted_version"]) + 1,
@@ -49,6 +54,7 @@ def mark_accepted(path, platform="", query="", clip_id="", start=0.0):
             last_accepted_clip_id=str(clip_id or ""),
             last_accepted_at=time.time(),
             last_accepted_start=max(0.0, float(start or 0.0)),
+            last_accepted_poster=str(poster or ""),
         )
 
 
@@ -59,4 +65,5 @@ def clear():
                       accepted_version=int(_STATE["accepted_version"]) + 1,
                       last_accepted_path="", last_accepted_platform="",
                       last_accepted_query="", last_accepted_clip_id="",
-                      last_accepted_at=0.0, last_accepted_start=0.0)
+                      last_accepted_at=0.0, last_accepted_start=0.0,
+                      last_accepted_poster="")

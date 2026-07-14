@@ -175,6 +175,11 @@ def main():
         closed.set()
         threading.Thread(target=_shutdown_everything, args=(server,), daemon=True).start()
 
+    # NOTE: we deliberately do NOT hook window.events.closing. Calling window.evaluate_js() (or a
+    # modal dialog / time.sleep) from inside WebView2's closing event runs on the UI thread and
+    # deadlocks against it, so the window would hang and never close. The unsaved-changes guard
+    # lives in the page itself (beforeunload) for the browser; the native window just closes cleanly.
+
     try:
         window.events.closed += _on_window_closed
     except Exception:

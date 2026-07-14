@@ -10,11 +10,64 @@ import agent_core
 import app
 import clip_scraper
 import pipeline
+import scrape_v2
 import sfx_agent
 import sfx_library
+import instagram_login
 
 
 class TikTokScrapeLogicTests(unittest.TestCase):
+    def test_v2_queries_are_platform_scoped_and_preserve_x_disambiguator(self):
+        intent = scrape_v2.VisualIntent(
+            scene_id=3, scene_text="Women were ordered off the sumo ring.",
+            subject="women", action="providing emergency aid", location="sumo ring",
+            platform_queries={
+                "tiktok": {"japanese": ["女性 土俵 tiktok"], "english": []},
+                "instagram": {"keywords": ["女性 土俵"], "hashtags": ["#女人禁制"]},
+                "twitter": {"japanese": ["女性 土俵 救命"], "english": []},
+            })
+        rows = scrape_v2.queries_for_intent(intent)
+        self.assertTrue(any(row.query == "女性 土俵" and row.platforms == ["tiktok"] for row in rows))
+        self.assertTrue(any(row.query == "女性 土俵 救命" and row.platforms == ["twitter"] for row in rows))
+        self.assertNotIn("tiktok", " ".join(row.query for row in rows).casefold())
+        tag = next(row for row in rows if row.query == "#女人禁制")
+        self.assertEqual(tag.platforms, ["instagram"])
+
+    def test_instagram_hashtag_uses_tag_surface(self):
+        self.assertEqual(
+            instagram_login.instagram_search_url("#名頃かかしの里"),
+            "https://www.instagram.com/explore/tags/%E5%90%8D%E9%A0%83%E3%81%8B%E3%81%8B%E3%81%97%E3%81%AE%E9%87%8C/",
+        )
+        self.assertIn("/explore/search/keyword/?q=", instagram_login.instagram_search_url("名頃 かかし"))
+
+    def test_v2_search_executes_scoped_backend_once_and_does_not_single_token_broaden(self):
+        query = scrape_v2.SearchQueryV2(
+            query="名頃 かかし", language="ja", tier="exact_action", visual_intent_id="scene_1",
+            platforms=["tiktok"])
+        state = {}
+        with mock.patch.object(scrape_v2.clip_scraper, "backend_search", return_value=[]) as search:
+            rows = scrape_v2._search_sources(
+                [query], ["tiktok", "twitter", "instagram"], None, time.monotonic() + 20,
+                set(), state, None, sort="ALL")
+        self.assertEqual(rows, [])
+        self.assertEqual(search.call_count, 1)
+        self.assertEqual(search.call_args.kwargs["platforms"], ["tiktok"])
+        self.assertEqual(search.call_args.kwargs["sort"], "MOST_LIKED")
+        self.assertEqual(state.get("broadened_queries", 0), 0)
+
+    def test_v2_metadata_rank_uses_views_as_well_as_likes(self):
+        query = scrape_v2.SearchQueryV2(
+            query="名頃 かかし", language="ja", tier="exact_action", visual_intent_id="scene_1",
+            expected_subject="名頃 かかし")
+        low = scrape_v2.SourceVideoCandidate(
+            platform="tiktok", source_id="low", creator_id="a", url="", caption="名頃 かかし",
+            likes=100, views=1_000, width=720, height=1280)
+        viral = scrape_v2.SourceVideoCandidate(
+            platform="tiktok", source_id="viral", creator_id="b", url="", caption="名頃 かかし",
+            likes=100, views=1_000_000, width=720, height=1280)
+        ranked = scrape_v2.rank_metadata_candidates_v2([low, viral], query)
+        self.assertEqual(ranked[0].source_id, "viral")
+
     def test_sidebar_has_subtle_dev_entry_and_dev_page_lists_real_trainers(self):
         shell = app.chat_ui.chat_shell_page({}).decode("utf-8")
         self.assertIn('id="sb-dev"', shell)
@@ -25,11 +78,20 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         self.assertIn("/dev-trainer-open", dev_page)
 
     def test_transition_add_hitbox_cannot_cover_timeline_sfx(self):
+        # Transitions moved OFF the SFX track entirely: the "+" hover slot and the transition marker
+        # both render on the CLIP row (tl-trans-on-clip), and a transition sound added via the "+"
+        # is flagged is_transition so it is drawn as a clip-boundary diamond, never as an SFX note.
         source = Path(app.__file__).read_text(encoding="utf-8")
         self.assertIn(".tl-trans-slot { position:absolute; top:50%; width:26px; height:26px", source)
-        self.assertIn("z-index:2", source)
         self.assertIn("pointer-events:none", source)
-        self.assertIn(".tl-fx { position:absolute; top:6px; bottom:6px; z-index:8", source)
+        self.assertIn(".tl-trans.tl-trans-on-clip, .tl-trans-slot.tl-trans-on-clip", source)
+        # the "+" slot and the transition marker are appended to the clip track, not the SFX track
+        self.assertIn("slot.className='tl-trans-slot tl-trans-on-clip'", source)
+        self.assertIn("clipsEl.appendChild(slot);", source)
+        self.assertIn("clipsEl.appendChild(node);", source)
+        # transition sounds added via the "+" carry the is_transition flag and route off the SFX lane
+        self.assertIn("is_transition:!!opts.transition", source)
+        self.assertIn("if(fx.is_transition){", source)
         self.assertIn("button.addEventListener('click'", source)
 
     def test_dev_scrape_trainer_rejects_unknown_run_before_starting_server(self):
@@ -185,6 +247,31 @@ class TikTokScrapeLogicTests(unittest.TestCase):
             agent_core.scene_text_for_planning(scene),
             "This is the spoken line. show a train",
         )
+
+    def test_untimed_visual_notes_follow_local_claim_not_uniform_scene_index(self):
+        scenes = [
+            {"start": 0.0, "end": 2.0, "script": "Women are banned from entering the sumo ring."},
+            {"start": 2.0, "end": 10.0, "script": "Office workers endure painful heels all day."},
+            {"start": 10.0, "end": 12.0, "script": "Some sales staff were forbidden to wear glasses."},
+        ]
+        # Deliberately not ordered like the narration: semantic anchors must beat uniform spreading.
+        visual_notes = """Woman stopped beside a sumo ring.
+Sales worker removes her glasses before serving a customer.
+Office worker rubs painful feet after taking off heels."""
+        mapped = agent_core.apply_visual_script_to_scenes(scenes, visual_notes, 12.0)
+        self.assertIn("sumo ring", mapped[0]["visual_script"])
+        self.assertIn("painful feet", mapped[1]["visual_script"])
+        self.assertIn("glasses", mapped[2]["visual_script"])
+
+    def test_explicit_visual_timestamps_still_map_by_overlap(self):
+        scenes = [
+            {"start": 0.0, "end": 5.0, "script": "first"},
+            {"start": 5.0, "end": 10.0, "script": "second"},
+        ]
+        mapped = agent_core.apply_visual_script_to_scenes(
+            scenes, "00:00 - 00:05 show red apples\n00:05 - 00:10 show yellow bananas", 10.0)
+        self.assertIn("apples", mapped[0]["visual_script"])
+        self.assertIn("bananas", mapped[1]["visual_script"])
 
     def test_semantic_threshold_relaxes_after_each_failed_round(self):
         # At 80% relevancy the first pass starts moderately strict (6.0/10) and relaxes toward the
@@ -389,6 +476,28 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         )
 
     def test_five_valid_x_zero_searches_trigger_one_health_check_across_buckets(self):
+        clip_scraper.reset_backend_search_health()
+
+    def test_three_empty_instagram_searches_trigger_health_check_and_disable_backend(self):
+        import concurrent.futures
+        clip_scraper.reset_backend_search_health()
+
+        def empty_future(*_args, **_kwargs):
+            future = concurrent.futures.Future()
+            future.set_result([])
+            return future
+
+        with mock.patch.object(clip_scraper, "instagram_backend_ready", return_value=True), \
+             mock.patch.object(clip_scraper, "tiktok_backend_ready", return_value=False), \
+             mock.patch.object(clip_scraper, "twitter_backend_ready", return_value=False), \
+             mock.patch.object(clip_scraper.instagram_login, "search_async", side_effect=empty_future) as search, \
+             mock.patch.object(clip_scraper.instagram_login, "health_check",
+                               return_value={"ok": False}) as health:
+            for query in ("#名頃かかしの里", "#お見舞いマナー", "#すっぴんメイク"):
+                self.assertEqual(clip_scraper.backend_search(query, 5, platforms=["instagram"]), [])
+            self.assertEqual(clip_scraper.backend_search("#japan", 5, platforms=["instagram"]), [])
+        self.assertEqual(search.call_count, 3)
+        health.assert_called_once()
         clip_scraper.reset_backend_search_health()
         health = mock.Mock(return_value={"ok": False})
         common = (
@@ -960,7 +1069,7 @@ class TikTokScrapeLogicTests(unittest.TestCase):
             with mock.patch.object(agent_core, "PROJECTS_DIR", projects), \
                  mock.patch.object(app.agent_core, "PROJECTS_DIR", projects), \
                  mock.patch.object(app, "_timeline_media",
-                                   return_value=("/poster.jpg", "/clip.mp4", None)):
+                                   return_value=("/poster.jpg", "/clip.mp4", None, None)):
                 model = app.timeline_model("synced-preview")
             self.assertEqual(model["scenes"][0]["source_trim"], 0.75)
             self.assertEqual(model["scenes"][0]["source_speed"], 1.5)

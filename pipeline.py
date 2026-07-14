@@ -1264,6 +1264,74 @@ def draw_counter(draw, text, x, y, width, height, alpha=235):
     draw_wrapped(draw, text, (x + 20, y + 12, x + width - 20, y + height - 10), font, (255, 244, 220, alpha), (0, 0, 0, alpha), 4)
 
 
+_STICKER_CACHE = {}
+
+
+def _load_sticker_image(path):
+    """Load + cache a transparent PNG/WEBP sticker (meme / neko / custom VFX)."""
+    key = str(path)
+    img = _STICKER_CACHE.get(key)
+    if img is None:
+        try:
+            img = Image.open(path).convert("RGBA")
+        except Exception:
+            img = False
+        _STICKER_CACHE[key] = img
+    return img or None
+
+
+def render_image_sticker(spec, width, height, local, hit):
+    """Composite a transparent image sticker (meme / neko / custom) added in the timeline VFX
+    library. Positioned by editor_x/editor_y (normalized centre), sized by editor_scale, rotated
+    by editor_rotation, with a fade/pop/slide/bounce entrance. Returns (RGBA tile, (x, y)) or None."""
+    asset = str(spec.get("asset") or spec.get("path") or "")
+    if not asset:
+        return None
+    base = _load_sticker_image(asset)
+    if base is None:
+        return None
+    try:
+        scale = max(0.2, min(3.0, float(spec.get("editor_scale", 1.0) or 1.0)))
+    except (TypeError, ValueError):
+        scale = 1.0
+    try:
+        rotation = max(-180.0, min(180.0, float(spec.get("editor_rotation", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        rotation = 0.0
+    animation = str(spec.get("animation") or "pop").lower()
+    a_in = 1.0 if animation == "none" else hit         # hit eases 0->1 over the first quarter
+    a_out = clamp((1.0 - local) / 0.16, 0.0, 1.0)      # quick fade-out at the tail
+    alpha = clamp(a_in * a_out, 0.0, 1.0)
+    if alpha <= 0.02:
+        return None
+    if animation == "bounce":
+        pop = 0.40 + 0.60 * a_in + 0.22 * math.sin(a_in * math.pi)
+    elif animation == "pop":
+        pop = 0.62 + 0.38 * (1.0 - (1.0 - a_in) ** 2) + 0.06 * math.sin(a_in * math.pi)
+    else:                                              # fade / slide / none keep authored size
+        pop = 1.0
+    target_h = max(24.0, height * 0.30 * scale * max(0.2, pop))   # base sticker ~30% of frame height
+    ratio = target_h / max(1, base.height)
+    tw, th = max(1, int(base.width * ratio)), max(1, int(target_h))
+    try:
+        tile = base.resize((tw, th), Image.Resampling.LANCZOS)
+    except Exception:
+        tile = base.resize((tw, th))
+    if abs(rotation) > 0.5:
+        tile = tile.rotate(-rotation, resample=Image.Resampling.BICUBIC, expand=True)
+    if alpha < 0.999:
+        r, g, b, a = tile.split()
+        tile = Image.merge("RGBA", (r, g, b, a.point(lambda v: int(v * alpha))))
+    cx = width * clamp(float(spec.get("editor_x", 0.78) or 0.78), 0.0, 1.0)
+    cy = height * clamp(float(spec.get("editor_y", 0.24) or 0.24), 0.0, 1.0)
+    x = int(cx - tile.width / 2)
+    y = int(cy - tile.height / 2)
+    if animation == "slide":
+        direction = -1 if spec.get("from", "left") == "left" else 1
+        x += int(direction * (1.0 - a_in) * width * 0.22)
+    return tile, (x, y)
+
+
 def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
     if not bool(config.get("smart_overlays", True)):
         return img
@@ -1370,6 +1438,11 @@ def draw_smart_overlays(img, scene, shot, p, frame_no, width, height, config):
                     direction = -1 if spec.get("from", "left") == "left" else 1
                     pos = (pos[0] + int(direction * (1.0 - a_in) * width * 0.22), pos[1])
                 overlay.alpha_composite(tile[0], pos)
+        elif kind == "image":
+            # Transparent meme / neko / custom sticker added from the timeline VFX library.
+            built = render_image_sticker(spec, width, height, local, hit)
+            if built is not None:
+                overlay.alpha_composite(built[0], built[1])
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -1831,11 +1904,26 @@ def generate_assets(config, force=False, status_cb=None):
     return manifest_path
 
 
+def _clip_ref_basename(ref):
+    """The real file basename from a scene's clip/asset reference. The reference may be a bare
+    filename, an absolute path, OR the timeline editor's preview URL 'file?path=<url-encoded-path>'
+    (that's what a dragged / replaced clip is saved as). Without decoding it, Path(ref).name returns
+    the whole mangled URL, scene_clip_path finds no file, and the renderer wrongly falls back to
+    opening the .mp4 as an image ("cannot identify image file")."""
+    s = str(ref or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"[?&]path=([^&]+)", s)           # file?path=<encoded> -> take + decode the param
+    s = urllib.parse.unquote(m.group(1) if m else s)
+    s = s.replace("\\", "/")
+    return s.rsplit("/", 1)[-1]
+
+
 def clip_filename(scene, index):
-    clip = scene.get("clip")
+    clip = _clip_ref_basename(scene.get("clip"))
     if clip:
-        return Path(clip).name
-    asset = scene.get("asset")
+        return clip
+    asset = _clip_ref_basename(scene.get("asset"))
     if asset:
         return f"{Path(asset).stem}.mp4"
     return f"scene_{index:02d}.mp4"
@@ -2003,10 +2091,28 @@ def make_placeholder(scene, width, height):
     return img
 
 
+_SCENE_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v", ".avi", ".ts"}
+
+
 def scene_image(config, scene, asset_dir, width, height):
     path = resolve_media_path(config, asset_dir, scene.get("asset") or f"scene_{int(scene.get('id', 0)):02d}.png")
+    # A clip scene's "asset" can point at a VIDEO file (a clip dragged / replaced in the timeline).
+    # This still image is only a fallback base - the scene's real pixels come from its clip track -
+    # so NEVER Image.open a video (that raised "cannot identify image file" and killed the render).
+    # Use the clip's poster still if one exists, else a placeholder.
+    if path.suffix.lower() in _SCENE_VIDEO_SUFFIXES:
+        for poster in (path.with_suffix(".poster.jpg"), path.with_suffix(".jpg"), path.with_suffix(".png")):
+            if poster.exists():
+                try:
+                    return Image.open(poster).convert("RGB")
+                except Exception:
+                    break
+        return make_placeholder(scene, width, height)
     if path.exists():
-        return Image.open(path).convert("RGB")
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception:
+            return make_placeholder(scene, width, height)
     return make_placeholder(scene, width, height)
 
 

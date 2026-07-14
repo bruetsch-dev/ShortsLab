@@ -35,7 +35,12 @@ def _asset_ver():
     try:
         css = (ROOT / "static" / "chat-shell.css").stat().st_mtime
         js = (ROOT / "static" / "chat-shell.js").stat().st_mtime
-        return str(int(max(css, js)))
+        mtimes = [css, js]
+        try:
+            mtimes.append((ROOT / "static" / "timeline-theme.css").stat().st_mtime)
+        except Exception:
+            pass
+        return str(int(max(mtimes)))
     except Exception:
         return str(int(time.time()))
 
@@ -135,16 +140,20 @@ UI_STRINGS = {
     "not_connected": "Not connected",
     "busy": "Busy...",
     "reasoning_q": "Choose your reasoning model.",
-    "voice_q": "Choose the voice for your Short.",
+    "voice_q": "Choose the narrator for your Short.",
     "tts_voice": "TTS voice",
     "tts_model": "TTS model",
     "fresh_take": "Fresh voice take (keep saved scrape)",
     "speaker_video": "Speaker video (talking-head hook)",
     "speaker_image": "Speaker image",
     "upload_image": "Upload image",
-    "outputs_q": "Select the outputs you want to include.",
+    "outputs_q": "Select the final layers to include.",
     "halt_after_speech": "Halt after speech generation",
     "sfx_amount": "SFX amount",
+    "vfx_amount": "Visual FX amount",
+    "add_visual_effects": "Add visual effects (arrows)",
+    "add_meme_reactions": "Add meme reactions",
+    "add_neko_reactions": "Add neko reactions",
     "presets": "Presets",
     "load_preset": "Load preset",
     "save_preset": "Save preset",
@@ -260,7 +269,6 @@ RUN_MANIFEST = {
     # constant hidden fields the legacy form always posts
     "always": {
         "ui_form": "1",
-        "scrape_platforms": "tiktok,x,instagram",
         "influencer_hook": "on",
         "mix_voice_in_final": "on",
         "use_visual_direction": "on",
@@ -276,7 +284,8 @@ RUN_MANIFEST = {
         "loaded_project_source", "loaded_project_mode", "reasoning_model", "reasoning_mode",
         "pipeline_version",
         "clip_source", "video_model", "image_model", "scraping_engine",
-        "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "script",
+        "scrape_platforms",
+        "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
         "tts_voice", "tts_model", "speaker_image_path",
     ],
@@ -285,6 +294,7 @@ RUN_MANIFEST = {
         "out_web_images", "out_wikimedia", "out_gpt_images", "out_video_clips",
         "out_sfx", "out_transition_sfx", "out_background_music", "out_captions",
         "halt_after_speech", "force_regenerate", "enable_speaker_hook",
+        "add_visual_effects", "add_meme_reactions", "add_neko_reactions",
     ],
     # file fields
     "file": ["speaker_image_file"],
@@ -564,11 +574,6 @@ def chat_shell_page(initial=None):
         <input type="checkbox" id="prototype-toggle" role="switch" aria-label="Creator Launchpad prototype">
         <span class="sb-proto-track" aria-hidden="true"><i></i></span>
         <span class="sb-proto-label">prototype</span>
-      </label>
-      <label class="sb-proto-switch sb-theme-switch" for="theme-toggle" title="Switch between dark and light mode">
-        <input type="checkbox" id="theme-toggle" role="switch" aria-label="Dark mode">
-        <span class="sb-proto-track" aria-hidden="true"><i></i></span>
-        <span class="sb-proto-label" id="theme-toggle-label">dark</span>
       </label>
       <span class="sb-version">{CHAT_UI_VERSION}</span>
     </div>

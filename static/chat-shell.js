@@ -26,7 +26,9 @@ function appendReasoningField(card, modelId, holder) {
   const rm = reasoningOptions(modelId, holder.reasoning_mode);
   if (!rm.options.length) { holder.reasoning_mode = ""; return; }
   holder.reasoning_mode = rm.value;
-  card.appendChild(selectField("Reasoning mode", rm.options, rm.value, v => holder.reasoning_mode = v));
+  const f = selectField("Reasoning mode", rm.options, rm.value, v => holder.reasoning_mode = v);
+  f.style.marginTop = "22px";     // breathing room below the model choice buttons
+  card.appendChild(f);
 }
 
 /* ------------------------------------------------------------------ tiny dom helpers */
@@ -74,7 +76,11 @@ const DEFAULT_VALUES = () => {
   if (!v.scraping_engine) v.scraping_engine = "v2";
   if (!v.script_relevancy) v.script_relevancy = "70";
   if (!v.scrape_sort) v.scrape_sort = "ALL";
+  if (!v.scrape_platforms) v.scrape_platforms = "tiktok,x,instagram";
   if (!v.sfx_amount) v.sfx_amount = "medium";
+  if (!v.vfx_amount) v.vfx_amount = "medium";
+  if (st.add_visual_effects === undefined) v.add_visual_effects = true;   // arrows on by default
+  if (!v.pipeline_version) v.pipeline_version = "v0.2";   // version chooser removed; always v0.2
   if (!v.speaker_name) v.speaker_name = "Narrator";
   v.loaded_project_mode = v.loaded_project_mode || "normal";
   v.loaded_project_source = "";
@@ -113,7 +119,7 @@ function persist() {
 
 /* ------------------------------------------------------------------ flow definitions */
 const FLOW_STEPS = {
-  script: ["script", "hook", "version", "source", "reasoning", "voice", "outputs", "review"],
+  script: ["script", "source", "reasoning", "outputs", "review"],
   viraltrans: ["topic", "review"],
   reddit: ["discover", "pick"],
   longform: ["script", "settings"],
@@ -227,49 +233,195 @@ function renderAll() {
   scrollDown();
 }
 
+// Short chip labels for the step carousel (one per known step id)
+const STEP_SHORT = {
+  script: "Story", voice: "Voice", source: "Footage", reasoning: "Director",
+  outputs: "Finish", review: "Review", topic: "Topic", discover: "Discover",
+  pick: "Select", upload: "Source", settings: "Settings", choose: "Upgrade",
+  summary: "Project", hook: "Opening", version: "Edit",
+};
+let _lastStepperOffset = null; // px offset of the previous bar, so the next slides from it
+let _stepperRO = null;
+// A horizontal, auto-centering step carousel: done steps sit to the left
+// (clickable to jump back), the active step is centered, upcoming steps trail
+// off to the right (dimmed). buildStepper only builds the DOM — centering is
+// done by centerActiveStepper against the LIVE DOM so re-render races can't
+// leave a stale element un-positioned.
+function buildStepper(flowSteps, activeStep) {
+  if (!flowSteps || flowSteps.length < 2) return null;
+  const wrap = el("nav", "proto-stepper"); wrap.setAttribute("aria-label", "Steps");
+  const track = el("div", "proto-stepper-track");
+  const activeIdx = Math.max(0, flowSteps.indexOf(activeStep));
+  flowSteps.forEach((st, i) => {
+    const chip = el("button", "proto-step-chip"); chip.type = "button";
+    chip.innerHTML = `<span class="psc-dot"></span><span class="psc-label">${esc(STEP_SHORT[st] || st)}</span>`;
+    chip.classList.add(i < activeIdx ? "done" : (i === activeIdx ? "active" : "upcoming"));
+    chip.setAttribute("aria-current", i === activeIdx ? "step" : "false");
+    if (i < activeIdx) chip.addEventListener("click", () => editStep(st));
+    else chip.disabled = true; // active + upcoming are not jump targets
+    track.appendChild(chip);
+  });
+  wrap.appendChild(track);
+  return wrap;
+}
+// Center the active chip of whatever stepper is currently in the DOM. The final
+// transform is set synchronously (so it is correct even in a background tab where
+// rAF is paused); the slide from the previous bar's offset is layered on via the
+// Web Animations API when `animate` is set and we have a previous position.
+function centerActiveStepper(animate) {
+  const wrap = document.querySelector(".proto-active-card .proto-stepper");
+  if (!wrap) return true; // nothing to place (single-step flow) — stop retrying
+  const track = wrap.querySelector(".proto-stepper-track");
+  const active = track && track.querySelector(".proto-step-chip.active");
+  if (!track || !active || !wrap.clientWidth) return false; // not laid out yet
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const target = wrap.clientWidth / 2 - (active.offsetLeft + active.offsetWidth / 2);
+  track.style.transition = "none";
+  track.style.transform = `translateX(${target}px)`; // authoritative final state
+  if (animate && !reduce && _lastStepperOffset != null && _lastStepperOffset !== target && track.animate) {
+    try {
+      track.animate(
+        [{ transform: `translateX(${_lastStepperOffset}px)` }, { transform: `translateX(${target}px)` }],
+        { duration: 420, easing: "cubic-bezier(.16,1,.3,1)" });
+    } catch (e) {}
+  }
+  _lastStepperOffset = target;
+  return true;
+}
+// Kick off placement after layout; retry with timers (which, unlike rAF, still
+// fire in a hidden tab) until the wrap has a width, then keep it centered on resize.
+function activateStepper() {
+  let tries = 0;
+  const kick = () => { if (!centerActiveStepper(true) && tries++ < 40) setTimeout(kick, 16); };
+  kick();
+  if (window.ResizeObserver) {
+    if (_stepperRO) _stepperRO.disconnect();
+    const wrap = document.querySelector(".proto-active-card .proto-stepper");
+    if (wrap) {
+      _stepperRO = new ResizeObserver(() => {
+        if (!wrap.isConnected) { _stepperRO.disconnect(); _stepperRO = null; return; }
+        centerActiveStepper(false);
+      });
+      _stepperRO.observe(wrap);
+    }
+  }
+}
+// Per-step header copy [KICKER, TITLE, SUBTITLE], keyed by step id.
+function stepCopy(step) {
+  return ({
+    script:["STORY", "Add your script", "Paste it or generate a fresh one."],
+    hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
+    version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
+    source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
+            isCultureFacts() ? "Set relevance, ranking and optional search terms." : "Pick how the visuals should be generated."],
+    reasoning:["DIRECTOR", "Choose the AI director", "Select the model that plans the production."],
+    voice:["VOICE", "Choose the narrator", "Pick a voice and preview the delivery."],
+    outputs:["FINISH", "Select the final layers", "Choose sound, captions and approval behavior."],
+    review:["REVIEW", "Ready to create", "Check the essentials and start the production."],
+    topic:["TOPIC", "Define the idea", "Give the agent one clear direction."],
+    discover:["DISCOVER", "Find the story", "Choose where the search should begin."],
+    pick:["SELECT", "Choose the strongest story", "Pick the version worth producing."],
+    upload:["SOURCE", "Add your video", "Drop in the cut you want to enhance."],
+    settings:["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
+    choose:["UPGRADE", "Choose an enhancement", "Pick one production pass."],
+    summary:["PROJECT", "Project overview", "Choose the next action."],
+  }[step] || ["SETTINGS", "Configure this step", "Make your choices and continue."]);
+}
+let _lastStepIdx = null;   // for slide direction between steps
 function decoratePrototypeFlow() {
   chat.querySelectorAll(":scope > .msg").forEach(m => m.classList.add("proto-flow-context"));
   const cards = chat.querySelectorAll(":scope > .chat-card");
-  if (cards.length) {
-    const active = cards[cards.length - 1];
-    active.classList.add("proto-active-card", "proto-step-surface", `proto-step-${S.step || "default"}`);
-    active.dataset.step = S.step || "default";
-    const copy = {
-      script:["STORY", "Add your script", "Paste it or generate a fresh one."],
-      hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
-      version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
-      source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
-              isCultureFacts() ? "Set relevance, ranking and optional search terms." : "Pick how the visuals should be generated."],
-      reasoning:["DIRECTOR", "Choose the AI director", "Select the model that plans the production."],
-      voice:["VOICE", "Choose the narrator", "Pick a voice and preview the delivery."],
-      outputs:["FINISH", "Select the final layers", "Choose sound, captions and approval behavior."],
-      review:["REVIEW", "Ready to create", "Check the essentials and start the production."],
-      topic:["TOPIC", "Define the idea", "Give the agent one clear direction."],
-      discover:["DISCOVER", "Find the story", "Choose where the search should begin."],
-      pick:["SELECT", "Choose the strongest story", "Pick the version worth producing."],
-      upload:["SOURCE", "Add your video", "Drop in the cut you want to enhance."],
-      settings:["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
-      choose:["UPGRADE", "Choose an enhancement", "Pick one production pass."],
-      summary:["PROJECT", "Project overview", "Choose the next action."],
-    }[S.step] || ["SETTINGS", "Configure this step", "Make your choices and continue."];
-    const flowSteps = stepsFor(S.flow);
-    const stepIndex = Math.max(0, flowSteps.indexOf(S.step));
-    const prev = stepIndex > 0 ? flowSteps[stepIndex - 1] : null;
-    const head = el("header", "proto-config-head");
-    const back = el("button", "proto-config-back", `${protoIcon("arrow")}<span>${prev ? "Back" : "All modes"}</span>`);
+  if (!cards.length) return;
+  const active = cards[cards.length - 1];
+  active.classList.add("proto-active-card", "proto-step-surface", `proto-step-${S.step || "default"}`);
+  active.dataset.step = S.step || "default";
+  const copy = stepCopy(S.step);
+  const flowSteps = stepsFor(S.flow);
+  const stepIndex = Math.max(0, flowSteps.indexOf(S.step));
+  const prev = stepIndex > 0 ? flowSteps[stepIndex - 1] : null;
+  const next = stepIndex < flowSteps.length - 1 ? flowSteps[stepIndex + 1] : null;
+  // header: title only (no back button, no step chips) + a quiet progress count
+  const head = el("header", "proto-config-head");
+  head.innerHTML = `<div class="proto-config-title"><small>${esc(copy[0])}</small>` +
+    `<span class="proto-config-count">${String(stepIndex + 1).padStart(2,"0")} / ${String(flowSteps.length).padStart(2,"0")}</span>` +
+    `<h1>${esc(copy[1])}</h1><p>${esc(copy[2])}</p></div>`;
+  active.insertBefore(head, active.firstChild);
+  // Unified Back button lives in the FOOTER, on the LEFT, level with Continue on the right.
+  // `margin-right:auto` on it pushes every other footer control to the right regardless of
+  // how that step laid its footer out, which also fixes steps whose Continue sat on the left.
+  const foots = active.querySelectorAll(".card-foot");
+  let foot = foots[foots.length - 1];
+  // every step gets a footer with a Back button (create one for steps that had none, e.g. Story Flow)
+  if (!foot) { foot = el("div", "card-foot"); active.appendChild(foot); }
+  {
+    foot.querySelectorAll(".spacer").forEach(s => s.remove());
+    foot.querySelectorAll(".btn").forEach(b => {
+      if (b.textContent.trim().toLowerCase() === String(T.back || "Back").trim().toLowerCase()) b.remove();
+    });
+    const back = el("button", "btn proto-foot-back", `${protoIcon("arrow")}<span>${prev ? (T.back || "Back") : "All modes"}</span>`);
     back.type = "button";
     back.addEventListener("click", () => prev ? editStep(prev) : resetToMode());
-    head.innerHTML = `<div class="proto-config-nav"></div><div class="proto-config-title"><small>${esc(copy[0])}</small><h1>${esc(copy[1])}</h1><p>${esc(copy[2])}</p></div>`;
-    head.querySelector(".proto-config-nav").appendChild(back);
-    head.querySelector(".proto-config-nav").appendChild(el("span", "proto-config-count",
-      `${String(stepIndex + 1).padStart(2,"0")} / ${String(flowSteps.length).padStart(2,"0")}`));
-    active.insertBefore(head, active.firstChild);
-    active.querySelectorAll(".card-foot .btn").forEach(button => {
-      if (button.textContent.trim().toLowerCase() === String(T.back || "Back").trim().toLowerCase())
-        button.classList.add("proto-redundant-back");
-    });
+    foot.insertBefore(back, foot.firstChild);
+  }
+  // Whole-box transition: on a step change the ENTIRE menu card slides in from the side it
+  // came from (forward = from the right, back = from the left), with faint neighbour peeks.
+  const dir = (_lastStepIdx == null) ? 0 : Math.sign(stepIndex - _lastStepIdx);
+  _lastStepIdx = stepIndex;
+  active.classList.toggle("has-prev", !!prev);
+  active.classList.toggle("has-next", !!next);
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!reduce && dir !== 0 && active.animate) {
+    try {
+      active.animate(
+        [{ transform: `translateX(${dir * 46}px)`, opacity: 0 }, { transform: "translateX(0)", opacity: 1 }],
+        { duration: 380, easing: "cubic-bezier(.16,1,.3,1)" });   // slow-out settle
+    } catch (e) {}
+  }
+  renderStepGhosts(active, prev, next);
+}
+// #177 - carousel coverflow: the previous/next step menus are rendered smaller + dimmed, peeking
+// on the left/right of the active card. Lightweight (title only) so they never run a step's real
+// logic; gated to wide windows so they can't cause horizontal scroll.
+function renderStepGhosts(active, prev, next) {
+  const col = active.parentElement;
+  if (!col) return;
+  col.querySelectorAll(".proto-ghost").forEach(g => g.remove());
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduce || (!prev && !next)) return;
+  try {
+    if (getComputedStyle(col).position === "static") col.style.position = "relative";
+    col.style.overflowX = "clip";   // ghosts extend far off-card; never let them add horizontal scroll
+  } catch (e) {}
+  const mk = (step, side) => {
+    if (!step) return null;
+    const cp = stepCopy(step);
+    const g = el("div", "proto-ghost proto-ghost-" + side);
+    g.setAttribute("aria-hidden", "true");
+    g.innerHTML = `<span class="pg-kicker">${esc(cp[0])}</span><span class="pg-title">${esc(cp[1])}</span><span class="pg-sub">${esc(cp[2])}</span>`;
+    col.appendChild(g);
+    return g;
+  };
+  const gp = mk(prev, "prev"), gn = mk(next, "next");
+  const place = () => {
+    const cardW = active.offsetWidth, cardH = active.offsetHeight;
+    if (!cardW) return false;
+    // only show the flanking menus when there's real room beside the card (else no peek)
+    if (col.clientWidth < cardW + 150) { if (gp) gp.style.display = "none"; if (gn) gn.style.display = "none"; return true; }
+    const cardLeft = active.offsetLeft, cardTop = active.offsetTop;
+    const gw = Math.round(cardW * 0.84), gh = Math.round(cardH * 0.9), peek = 46;
+    [gp, gn].forEach(g => { if (!g) return; g.style.display = ""; g.style.width = gw + "px"; g.style.height = gh + "px"; g.style.top = (cardTop + (cardH - gh) / 2) + "px"; });
+    if (gp) gp.style.left = (cardLeft - gw + peek) + "px";
+    if (gn) gn.style.left = (cardLeft + cardW - peek) + "px";
+    return true;
+  };
+  if (!place()) { let n = 0; const t = () => { if (!place() && n++ < 40) setTimeout(t, 16); }; setTimeout(t, 16); }
+  if (window.ResizeObserver) {
+    if (_ghostRO) _ghostRO.disconnect();
+    _ghostRO = new ResizeObserver(() => { if (!active.isConnected) { _ghostRO.disconnect(); _ghostRO = null; return; } place(); });
+    _ghostRO.observe(col);
   }
 }
+let _ghostRO = null;
 
 /* ------------------------------------------------------------------ topbar */
 function renderTopbar() {
@@ -344,7 +496,6 @@ function renderPrototypeHome() {
   const home = el("div", "proto-launchpad");
   home.innerHTML = `
     <header class="proto-hero">
-      <div class="proto-kicker"><span></span> CREATOR WORKSPACE</div>
       <h1>Pick the format.<br><em>Shape the story.</em></h1>
       <p>Choose a starting point, configure your production, and let AI handle the rest.</p>
     </header>
@@ -435,7 +586,7 @@ function renderPrototypeHome() {
     if (upgradeSection) {
       upgradeSection.className = "proto-upgrade-section";
       const upgradeHead = el("header", "proto-section-heading");
-      upgradeHead.innerHTML = `<div class="proto-kicker"><span></span> FINISHING STUDIO</div><h2>Upgrade your video</h2>`;
+      upgradeHead.innerHTML = `<h2>Upgrade your video</h2>`;
       upgradeSection.insertBefore(upgradeHead, enhance);
     }
     enhance.className = "proto-enhance-showcase";
@@ -449,6 +600,20 @@ function renderPrototypeHome() {
       </span>
       <span class="proto-enhance-copy"><small>POLISH AN EXISTING CUT</small><strong>Enhance video</strong>
       <em>Add cinematic sound effects, animated captions and attention-guiding visual effects to an existing video.</em><span>Enhance a video ${protoIcon("arrow")}</span></span>`;
+    // Timeline Editor entry — sits right next to "Enhance video" with an animated editor preview.
+    if (upgradeSection) {
+      const tl = document.createElement("button");
+      tl.type = "button";
+      tl.className = "proto-enhance-showcase proto-timeline-showcase";
+      tl.innerHTML = `<span class="proto-enhance-preview proto-tl-preview" aria-hidden="true">
+        <span class="tl-demo-track tl-demo-clips"><i class="tl-demo-clip"></i><i class="tl-demo-clip"></i><i class="tl-demo-clip"></i><i class="tl-demo-clip"></i></span>
+        <span class="tl-demo-track tl-demo-fx"><i class="tl-demo-fxdot"></i><i class="tl-demo-fxdot"></i><i class="tl-demo-fxdot"></i></span>
+        <i class="tl-demo-playhead"></i></span>
+        <span class="proto-enhance-copy"><small>FRAME-ACCURATE EDITOR</small><strong>Timeline Editor</strong>
+        <em>Fine-tune clips, sound effects and visuals on a CapCut-style timeline.</em><span>Open editor ${protoIcon("arrow")}</span></span>`;
+      tl.addEventListener("click", () => openTimelineNav());
+      upgradeSection.appendChild(tl);
+    }
   }
   home.querySelectorAll(".proto-primary-tools .proto-tool-icon").forEach(icon => icon.remove());
   home.querySelectorAll(".proto-tool-copy small,.proto-enhance-copy small").forEach(label => label.remove());
@@ -496,33 +661,36 @@ function enterModeFromCard(source, mode) {
   // Clip Short begins revealing its first configuration surface during the final 160ms of
   // the card expansion. The expanding preview remains above it and fades away, producing one
   // continuous spatial transition instead of zoom -> blank beat -> sudden wizard.
-  const revealAt = mode === "culture" ? 455 : 620;
+  // Start revealing the config surface WHILE the preview is still zooming (not after it fully
+  // stops), so the blur-dissolve exit flows into the incoming content instead of popping.
+  // #7 - slower zoom, and the config menu flies in LATER (reveal delayed to match the 1000ms zoom)
+  const revealAt = mode === "culture" ? 660 : 700;
   setTimeout(() => {
     selectMode(mode);
     document.body.classList.add("mode-arriving");
     if (mode === "culture") {
       document.body.classList.add("mode-arriving-clip");
-      // Start audio on the same painted frame as the 820ms card flight. Starting it directly
+      // Start audio on the same painted frame as the card flight. Starting it directly
       // after the DOM class change made the sound lead the visible motion by one frame.
       requestAnimationFrame(() => playUiWhoosh());
       // Keep the expanded footage visibly layered over the already-arriving script box. Only
       // after the overlap has registered does the preview complete its fade.
       requestAnimationFrame(() => clone.classList.add("ui-visible"));
-      setTimeout(() => clone.classList.add("finish"), 480);
+      setTimeout(() => clone.classList.add("finish"), 640);
       // Pin the rendered card to the animation's exact end state before mode-arriving-clip is
       // removed. Without this handoff Chromium briefly rebuilt the layer on the CPU and flashed
       // the underlying unanimated card for one frame.
       setTimeout(() => {
         const card = chat.querySelector(":scope > .proto-active-card");
         if (card) card.classList.add("proto-flight-landed");
-      }, 835);
+      }, 1120);
     } else {
       requestAnimationFrame(() => clone.classList.add("finish"));
     }
     setTimeout(() => {
       clone.remove(); source.style.opacity = "";
       document.body.classList.remove("mode-entering", "mode-arriving", "mode-arriving-clip");
-    }, mode === "culture" ? 1020 : 480);
+    }, mode === "culture" ? 1380 : 900);
   }, revealAt);
 }
 async function refreshPrototypeHomeData() {
@@ -594,15 +762,53 @@ function renderScriptFlow() {
     c.appendChild(ta);
     const sizeScriptBox = () => {
       ta.style.height = "auto";
-      ta.style.height = Math.min(Math.max(360, ta.scrollHeight + 2), Math.round(window.innerHeight * .72)) + "px";
+      // compact: grows with content but starts small and never dominates the card
+      ta.style.height = Math.min(Math.max(150, ta.scrollHeight + 2), Math.round(window.innerHeight * .42)) + "px";
     };
     ta.addEventListener("input", sizeScriptBox);
     requestAnimationFrame(sizeScriptBox);
+    // Hook + impact-word are marked RIGHT HERE on the same script field (no separate step, so the
+    // text can never desync). Select text in the box above, then Mark hook / Mark impact.
+    {
+      let selRange = null;
+      const capture = () => {
+        if (ta.selectionStart != null && ta.selectionEnd > ta.selectionStart)
+          selRange = [ta.selectionStart, ta.selectionEnd];
+      };
+      ["mouseup", "keyup", "select"].forEach(ev => ta.addEventListener(ev, capture));
+      const selText = () => selRange ? ta.value.substring(selRange[0], selRange[1]).trim() : "";
+      const status = el("span", "script-hookstatus");
+      const paint = () => {
+        const parts = [];
+        parts.push(S.values.hook_text ? "★ " + T.hook_marked + ": " + S.values.hook_text.slice(0, 70) : T.no_hook);
+        if (S.values.impact_word) parts.push("⚡ " + S.values.impact_word);
+        status.textContent = parts.join("   ·   ");
+        status.className = "script-hookstatus" + (S.values.hook_text ? " on" : "");
+      };
+      const bar = el("div", "script-hookbar");
+      bar.appendChild(btn("★ " + T.mark_hook, () => {
+        const s = selText(); if (s) { S.values.hook_text = s; persist(); paint(); } else ta.focus();
+      }, "ghost small"));
+      bar.appendChild(btn(T.use_first_line, () => {
+        const first = (ta.value || "").split(/(?<=[.!?])\s+|\n/)[0] || "";
+        S.values.hook_text = first.trim(); persist(); paint();
+      }, "ghost small"));
+      bar.appendChild(btn("⚡ " + T.mark_impact, () => {
+        const w = (selText().split(/\s+/)[0] || "").replace(/[^\p{L}\p{N}'-]/gu, "");
+        if (w) { S.values.impact_word = w; persist(); paint(); } else ta.focus();
+      }, "ghost small"));
+      bar.appendChild(btn(T.clear_hook, () => {
+        S.values.hook_text = ""; S.values.impact_word = ""; persist(); paint();
+      }, "ghost small"));
+      bar.appendChild(status);
+      c.appendChild(bar);
+      paint();
+    }
     // Script Creator: topic -> gemini writes a reference-style script into the field
     // (empty topic = the model picks its own viral topic). The generated script always stays
     // here for review/edit - the run never starts from this step, so a halt toggle is noise.
     {
-      const row = el("div", "card-foot");
+      const row = el("div", "script-gen-row");
       const ti = document.createElement("input");
       ti.type = "text"; ti.placeholder = T.gen_topic_ph; ti.style.flex = "1";
       ti.value = S.values.gen_topic || "";
@@ -632,6 +838,7 @@ function renderScriptFlow() {
           if (!d.ok) throw new Error(d.error || "no script");
           ta.value = d.script; S.values.script = d.script;
           S.values.hook_keywords = JSON.stringify(d.hook_keywords || []);
+          S.values.hook_text = ""; S.values.impact_word = "";   // a new script invalidates the old marks
           persist();
           msgA(esc(T.gen_script_done)); renderAll();
         } catch (e) { errorCard(T.gen_script_err, String(e)); }
@@ -663,71 +870,93 @@ function renderScriptFlow() {
         addGroup(T.recent_generated, d.generated, true);
         addGroup(T.recent_used, d.used, false);
         if (!box.children.length) box.appendChild(el("div", "card-note", "No scripts yet."));
-        const foots = c.querySelectorAll(".card-foot");
-        c.insertBefore(box, foots[foots.length - 1]);   // between the generate row and the foot
+        const genCol = c.querySelector(".script-gen-col");
+        if (genCol) genCol.appendChild(box);
+        else c.insertBefore(box, c.querySelector(".card-foot"));
       }, "ghost"));
       c.appendChild(row);
       c.appendChild(instructionWrap);
     }
+    // narrator is picked RIGHT HERE (no separate voice step): voice + preview + TTS model on one row
+    if (isCultureFacts()) applyCultureFactsPreset();
+    {
+      const nrow = el("div", "script-narrator");
+      nrow.appendChild(el("span", "sn-lbl", esc(T.tts_voice || "Narrator")));
+      const vsel = el("select");
+      (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+      if (S.values.tts_voice && [...vsel.options].some(o => o.value === S.values.tts_voice)) vsel.value = S.values.tts_voice;
+      S.values.tts_voice = vsel.value;
+      vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
+      nrow.appendChild(vsel);
+      nrow.appendChild(btn("▶", () => {
+        const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.values.tts_voice || "");
+        a.play().catch(() => {});
+      }, "ghost small"));
+      const msel = el("select");
+      (OPT.tts_model || []).forEach(o => msel.appendChild(new Option(o.label, o.value)));
+      if (S.values.tts_model && [...msel.options].some(o => o.value === S.values.tts_model)) msel.value = S.values.tts_model;
+      S.values.tts_model = msel.value;
+      msel.addEventListener("change", () => { S.values.tts_model = msel.value; persist(); });
+      nrow.appendChild(msel);
+      c.appendChild(nrow);
+      // optional talking-head speaker hook (non-scrape only) - a compact toggle; gallery on demand
+      if (!isCultureFacts()) {
+        const tog = toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {
+          S.values.enable_speaker_hook = v; renderAll(); persist();
+        });
+        tog.classList.add("script-spk-toggle");
+        c.appendChild(tog);
+        if (S.values.enable_speaker_hook) {
+          const grid = el("div", "spk-grid"); grid.id = "spk-grid"; c.appendChild(grid);
+          loadSpeakerGallery(grid);
+          const up = btn("⬆ " + T.upload_image, () => pickFile("image/*", f => {
+            FILES.speaker_image_file = f; S.values.speaker_image_path = "";
+            const note = el("div", "upl-file"); note.innerHTML = `<span class="nm">${esc(f.name)}</span>`;
+            grid.parentElement.insertBefore(note, grid.nextSibling);
+          }), "ghost small");
+          up.style.marginTop = "8px"; c.appendChild(up);
+        }
+      }
+    }
     const foot = el("div", "card-foot");
-    foot.appendChild(btn(T.upload_txt, () => pickFile(".txt,text/plain", f => {
-      f.text().then(txt => { ta.value = txt; });
-    }), "ghost"));
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
       if (!v) { ta.focus(); return; }
       S.values.script = v;
       if (S.values.hook_text && !v.includes(S.values.hook_text)) S.values.hook_text = "";
-      completeStep("script", "hook");
+      if (S.values.impact_word && !v.toLowerCase().includes(S.values.impact_word.toLowerCase())) S.values.impact_word = "";
+      completeStep("script", "source");
     }, "primary"));
     c.appendChild(foot);
+    // Structure the 2-column card explicitly: LEFT = script editing (box, hook bar, narrator,
+    // speaker toggle); RIGHT = the Script Creator generator. Without this the grid auto-placed the
+    // loose children into a scattered, "buggy"-looking arrangement.
+    (function structureScriptCols() {
+      const head = c.querySelector(".proto-config-head");
+      const genRow = c.querySelector(".script-gen-row");
+      const genInstr = c.querySelector(".generator-instructions");
+      const editCol = el("div", "script-edit-col");
+      const genCol = el("div", "script-gen-col");
+      if (genRow) genCol.appendChild(genRow);
+      if (genInstr) genCol.appendChild(genInstr);
+      [...c.children].forEach(ch => {
+        if (ch === head || ch === foot || ch === editCol || ch === genCol) return;
+        editCol.appendChild(ch);          // everything else = the left editing column
+      });
+      c.insertBefore(editCol, foot);
+      c.insertBefore(genCol, foot);
+    })();
     setComposer("off");
     return;
   }
 
-  // step: hook
+  // (narrator now lives in the script step; no separate voice step. hook + impact too.)
+
+  // step: visual source (edit-pipeline chooser removed - every run is v0.2)
+  // NOTE: gated on the SCRIPT step now that the separate voice step is gone (was done("voice"),
+  // which never becomes true anymore -> the whole flow rendered blank after the first Continue).
   if (done("script")) {
-    msgA(esc(T.mark_hook_q));
-    if (done("hook")) {
-      msgU(S.values.hook_text
-        ? `${esc(T.hook_marked)}: <i>${esc(S.values.hook_text.slice(0, 90))}</i>` : esc(T.no_hook), "hook");
-    } else if (S.step === "hook") {
-      renderHookCard(); setComposer("off"); return;
-    }
-  }
-
-  // step: edit pipeline version (v0.2 reference edit rules vs v0.1 classic)
-  if (done("hook")) {
-    msgA(esc(T.pipeline_q));
-    if (done("version")) {
-      msgU(S.values.pipeline_version === "v0.1" ? esc(T.pipeline_v01) : esc(T.pipeline_v02), "version");
-    } else if (S.step === "version") {
-      const c = card();
-      const seg = el("div", "choices");
-      [["v0.2", T.pipeline_v02, T.pipeline_v02_d],
-       ["v0.1", T.pipeline_v01, T.pipeline_v01_d]].forEach(([v, t, d]) => {
-        const b = el("button", "choice" + ((S.values.pipeline_version || "v0.2") === v ? " sel" : ""),
-          `${esc(t)}<small>${esc(d)}</small>`);
-        b.addEventListener("click", () => { S.values.pipeline_version = v; renderAll(); persist(); });
-        seg.appendChild(b);
-      });
-      c.appendChild(seg);
-      const foot = el("div", "card-foot");
-      foot.appendChild(btn(T.back, () => editStep("hook"), "ghost"));
-      foot.appendChild(el("span", "spacer"));
-      foot.appendChild(btn(T.continue, () => {
-        if (!S.values.pipeline_version) S.values.pipeline_version = "v0.2";
-        if (isCultureFacts()) applyCultureFactsPreset();
-        completeStep("version", "source");
-      }, "primary"));
-      c.appendChild(foot);
-      setComposer("off"); return;
-    }
-  }
-
-  // step: visual source
-  if (done("version")) {
     msgA(esc(T.visual_source_q));
     if (done("source")) {
       msgU(S.values.clip_source === "scrape"
@@ -753,34 +982,23 @@ function renderScriptFlow() {
       const rm = reasoningOptions(S.values.reasoning_model, S.values.reasoning_mode);
       if (rm.options.length) {
         S.values.reasoning_mode = rm.value;
-        c.appendChild(selectField("Reasoning mode", rm.options, rm.value, v => S.values.reasoning_mode = v));
+        const rmField = selectField("Reasoning mode", rm.options, rm.value, v => S.values.reasoning_mode = v);
+        rmField.style.marginTop = "26px";     // keep "Reasoning mode" clear of the model buttons above
+        c.appendChild(rmField);
         c.appendChild(el("div", "hint", "Higher reasoning can improve difficult tasks but may increase response time and cost."));
       }
       const foot = el("div", "card-foot");
       foot.appendChild(btn(T.back, () => editStep("source"), "ghost"));
-      foot.appendChild(btn("Continue", () => completeStep("reasoning", "voice"), "primary"));
+      foot.appendChild(btn("Continue", () => completeStep("reasoning", "outputs"), "primary"));
       c.appendChild(foot);
       setComposer("off"); return;
     }
   }
 
-  // step: voice + speaker
+  // step: outputs (the outputs summary chip is intentionally not echoed anymore)
   if (done("reasoning")) {
-    msgA(esc(T.voice_q));
-    if (done("voice")) {
-      msgU(`${esc(S.values.tts_voice)} · ${esc(labelFor(OPT.tts_model, S.values.tts_model))}` +
-        (S.values.enable_speaker_hook ? " · " + esc(T.speaker_video) : ""), "voice");
-    } else if (S.step === "voice") {
-      renderVoiceCard(); setComposer("off"); return;
-    }
-  }
-
-  // step: outputs
-  if (done("voice")) {
     msgA(esc(T.outputs_q));
-    if (done("outputs")) {
-      msgU(esc(outputsSummary()), "outputs");
-    } else if (S.step === "outputs") {
+    if (!done("outputs") && S.step === "outputs") {
       renderOutputsCard(); setComposer("off"); return;
     }
   }
@@ -822,7 +1040,7 @@ function renderHookCard() {
     ist.innerHTML = S.values.impact_word ? (esc(T.impact_marked) + ": <b>" + esc(S.values.impact_word) + "</b>") : esc(T.no_impact);
   };
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("script"), "ghost"));
+  foot.appendChild(btn(T.back, () => editStep("voice"), "ghost"));
   foot.appendChild(btn("★ " + T.mark_hook, () => {
     grab();
     if (lastSel && (S.values.script || "").includes(lastSel)) S.values.hook_text = lastSel;
@@ -845,7 +1063,7 @@ function renderHookCard() {
     st.className = "hook-status off"; st.textContent = T.no_hook; paintImpactStatus();
   }, "ghost"));
   foot.appendChild(el("span", "spacer"));
-  foot.appendChild(btn(T.continue, () => completeStep("hook", "version"), "primary"));
+  foot.appendChild(btn(T.continue, () => completeStep("hook", "source"), "primary"));
   c.appendChild(foot);
 }
 function paintHook(view) {
@@ -893,11 +1111,9 @@ function renderSourceCard() {
     const rv = el("span", "range-val", (S.values.script_relevancy || "70") + "%");
     rg.addEventListener("input", () => { S.values.script_relevancy = rg.value; rv.textContent = rg.value + "%"; persist(); });
     rr.appendChild(rg); rr.appendChild(rv); wrap.appendChild(rr);
-    wrap.appendChild(selectField(T.scrape_sort || "Sort results by", OPT.scrape_sort || [
-      {value:"RELEVANCE",label:"Relevance (best for on-topic clips)"},
-      {value:"MOST_LIKED",label:"Most liked"}, {value:"MOST_VIEWED",label:"Most viewed"},
-      {value:"MOST_RECENT",label:"Most recent"}
-    ], S.values.scrape_sort || "RELEVANCE", v => S.values.scrape_sort = v));
+    // Sort dropdown removed - the scrape now ALWAYS runs every sort order (liked/relevance/
+    // viewed/recent) and merges the unique clips, so there is nothing to choose.
+    S.values.scrape_sort = "ALL";
     // custom terms chips
     wrap.appendChild(el("div", "card-cap", esc(T.custom_terms)));
     const chips = el("div", "chips"); chips.style.marginBottom = "8px";
@@ -921,37 +1137,17 @@ function renderSourceCard() {
     inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); plus.click(); } });
     add.appendChild(inp); add.appendChild(plus);
     wrap.appendChild(chips); wrap.appendChild(add);
-    // connections
+    // connections + per-platform "search this platform" toggle (the slider sits next to Reconnect)
+    if (!S.values.scrape_platforms) S.values.scrape_platforms = "tiktok,x,instagram";
     wrap.appendChild(el("div", "card-cap", esc(T.connections)));
-    wrap.appendChild(connectionRow("tiktok", T.connect_tiktok, "/tiktok-status", "/tiktok-login"));
-    wrap.appendChild(connectionRow("x", T.connect_x, "/twitter-status", "/twitter-login"));
-    wrap.appendChild(connectionRow("instagram", T.connect_instagram || "Connect Instagram", "/instagram-status", "/instagram-login"));
-    // background music
-    wrap.appendChild(el("div", "card-cap", esc(T.background_music)));
-    const mrow = el("div", "chip-add");
-    const msel = el("select");
-    msel.appendChild(new Option(T.bgm_none, "none"));
-    const play = btn("▶ " + T.preview, () => {
-      const url = msel.selectedOptions[0] && msel.selectedOptions[0].dataset.url;
-      if (url) { const a = ensureAudio(); a.src = url; a.play().catch(() => {}); }
-    }, "ghost");
-    jget("/music-list").then(d => {
-      (d.tracks || []).forEach(t => {
-        const o = new Option(t.name, t.file); o.dataset.url = t.url; msel.appendChild(o);
-      });
-      msel.value = S.values.background_music_choice || "none";
-    }).catch(() => {});
-    msel.addEventListener("change", () => {
-      S.values.background_music_choice = msel.value;
-      S.values.background_music_enabled = msel.value !== "none";
-      S.values.out_background_music = msel.value !== "none" ? S.values.out_background_music : S.values.out_background_music;
-      persist();
-    });
-    mrow.appendChild(msel); mrow.appendChild(play); wrap.appendChild(mrow);
+    wrap.appendChild(connectionRow("tiktok", T.connect_tiktok, "/tiktok-status", "/tiktok-login", true));
+    wrap.appendChild(connectionRow("x", T.connect_x, "/twitter-status", "/twitter-login", true));
+    wrap.appendChild(connectionRow("instagram", T.connect_instagram || "Connect Instagram", "/instagram-status", "/instagram-login", true));
+    // (Background music picker removed by request - runs never add background music.)
   }
 
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("version"), "ghost"));
+  foot.appendChild(btn(T.back, () => editStep("voice"), "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => {
     // scrape disables the AI-image outputs exactly like the legacy form did
@@ -971,16 +1167,26 @@ function renderSourceCard() {
 function renderVoiceCard() {
   const c = card();
   if (isCultureFacts()) applyCultureFactsPreset();
-  const row = el("div", "fld-row");
-  row.appendChild(selectField(T.tts_voice, OPT.tts_voice, S.values.tts_voice, v => S.values.tts_voice = v));
-  row.appendChild(selectField(T.tts_model, OPT.tts_model, S.values.tts_model, v => S.values.tts_model = v));
-  c.appendChild(row);
+  // narrator field: dropdown + Preview button side-by-side (preview sits to the RIGHT of the voice select)
+  const voiceFld = el("div", "fld voice-fld");
+  voiceFld.appendChild(el("label", "", esc(T.tts_voice)));
+  const voiceInline = el("div", "voice-inline");
+  const vsel = el("select");
+  (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+  if (S.values.tts_voice && [...vsel.options].some(o => o.value === S.values.tts_voice)) vsel.value = S.values.tts_voice;
+  S.values.tts_voice = vsel.value;
+  vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
   const prev = btn("▶ " + T.preview, () => {
     const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.values.tts_voice || "");
     a.play().catch(() => {});
   }, "ghost small");
-  c.appendChild(prev);
-  c.appendChild(toggleField(T.fresh_take, S.values.force_regenerate, v => S.values.force_regenerate = v));
+  voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
+  voiceFld.appendChild(voiceInline);
+  const row = el("div", "fld-row");
+  row.appendChild(voiceFld);
+  row.appendChild(selectField(T.tts_model, OPT.tts_model, S.values.tts_model, v => S.values.tts_model = v));
+  c.appendChild(row);
+  // "fresh voice take" slider hidden by request (force_regenerate still defaults false in state)
   if (!isCultureFacts()) c.appendChild(toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {
     S.values.enable_speaker_hook = v; renderAll(); persist();
   }));
@@ -999,9 +1205,9 @@ function renderVoiceCard() {
     up.style.marginTop = "8px"; c.appendChild(up);
   }
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("reasoning"), "ghost"));
+  foot.appendChild(btn(T.back, () => editStep("script"), "ghost"));
   foot.appendChild(el("span", "spacer"));
-  foot.appendChild(btn(T.continue, () => completeStep("voice", "outputs"), "primary"));
+  foot.appendChild(btn(T.continue, () => completeStep("voice", "source"), "primary"));
   c.appendChild(foot);
 }
 function loadSpeakerGallery(grid) {
@@ -1029,26 +1235,61 @@ const OUTPUT_FIELDS = [
   ["out_web_images", "Web images"], ["out_wikimedia", "Wikimedia images"],
   ["out_gpt_images", "Generated images"], ["out_video_clips", "Video clips"],
   ["out_sfx", "Sound effects"], ["out_transition_sfx", "Transition SFX"],
-  ["out_background_music", "Background music"], ["out_captions", "Captions"],
+  ["out_captions", "Captions"],
 ];
+// low/medium/high amount as a 3-stop SLIDER (reused for SFX + VFX amount, in the flow and masters)
+function amountSliderField(label, current, onChange) {
+  const levels = ["low", "medium", "high"];
+  const wrap = el("div", "fld");
+  wrap.appendChild(el("label", "", esc(label)));
+  const row = el("div", "range-row");
+  const rg = el("input"); rg.type = "range"; rg.min = 0; rg.max = 2; rg.step = 1;
+  rg.value = Math.max(0, levels.indexOf(current || "medium"));
+  const val = el("span", "range-val", levels[+rg.value]);
+  rg.addEventListener("input", () => { val.textContent = levels[+rg.value]; onChange(levels[+rg.value]); persist(); });
+  row.appendChild(rg); row.appendChild(val); wrap.appendChild(row);
+  return wrap;
+}
 function renderOutputsCard() {
-  const c = card();
+  const c = card("layers-card");
   if (isCultureFacts()) applyCultureFactsPreset();
-  const grid = el("div", "tgl-grid");
   const scrape = S.values.clip_source === "scrape";
-  visibleOutputFields().forEach(([k, label]) => {
-    const dis = scrape && ["out_web_images", "out_wikimedia", "out_gpt_images"].includes(k);
-    const t = toggleField(label, S.values[k], v => S.values[k] = v, dis);
-    grid.appendChild(t);
-  });
-  c.appendChild(grid);
-  c.appendChild(el("div", "card-cap", "Run"));
-  c.appendChild(toggleField(T.halt_after_speech, S.values.halt_after_speech, v => S.values.halt_after_speech = v));
-  c.appendChild(el("div", "card-note", "A marked hook is always cut from the body and joined with exactly 0.5 seconds of silence before voice approval."));
-  c.appendChild(selectField(T.sfx_amount, OPT.sfx_amount, S.values.sfx_amount, v => S.values.sfx_amount = v));
+  // one clean section = a compact header + a body of controls, evenly spaced.
+  const section = (title, ...nodes) => {
+    const sec = el("div", "out-sec");
+    sec.appendChild(el("div", "out-sec-cap", esc(title)));
+    const body = el("div", "out-sec-body");
+    nodes.forEach(n => n && body.appendChild(n));
+    sec.appendChild(body); c.appendChild(sec);
+  };
+  const grid = (fields) => {
+    const g = el("div", "tgl-grid");
+    fields.forEach(([k, label]) => g.appendChild(toggleField(label, S.values[k], v => S.values[k] = v)));
+    return g;
+  };
+  // Media layer — only for AI Short (generate). Clip Short always uses the scraped footage.
+  if (!scrape) {
+    section("Media", grid([
+      ["out_video_clips", "Video clips"], ["out_gpt_images", "AI images"],
+      ["out_web_images", "Web images"], ["out_wikimedia", "Wikimedia"],
+    ]));
+  }
+  // Visual effects (arrows/callouts baked in-render + optional meme & neko reaction layers)
+  const vg = el("div", "tgl-grid");
+  vg.appendChild(toggleField("Arrows & callouts", S.values.add_visual_effects !== false, v => S.values.add_visual_effects = v));
+  vg.appendChild(toggleField("Meme reactions", !!S.values.add_meme_reactions, v => S.values.add_meme_reactions = v));
+  vg.appendChild(toggleField("Neko reactions", !!S.values.add_neko_reactions, v => S.values.add_neko_reactions = v));
+  section("Visual effects", vg, amountSliderField("Amount", S.values.vfx_amount || "medium", v => S.values.vfx_amount = v));
+  // Sound
+  section("Sound", grid([["out_sfx", "Sound effects"], ["out_transition_sfx", "Transition SFX"]]),
+    amountSliderField("Amount", S.values.sfx_amount, v => S.values.sfx_amount = v));
+  // Captions
+  section("Captions", grid([["out_captions", "Word-by-word captions"]]));
+  // Speech approval
+  const halt = toggleField(T.halt_after_speech, S.values.halt_after_speech, v => S.values.halt_after_speech = v);
+  section("Speech", halt, el("div", "out-sec-hint", "Pause to approve or re-do the voice before the run finishes."));
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("voice"), "ghost"));
-  foot.appendChild(btn(T.presets, openPresets, "ghost"));
+  foot.appendChild(btn(T.back, () => editStep("reasoning"), "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => completeStep("outputs", "review"), "primary"));
   c.appendChild(foot);
@@ -1074,7 +1315,7 @@ function renderEnhanceFlow() {
 }
 function visibleOutputFields() {
   return isCultureFacts()
-    ? OUTPUT_FIELDS.filter(([k]) => ["out_sfx", "out_transition_sfx", "out_background_music", "out_captions"].includes(k))
+    ? OUTPUT_FIELDS.filter(([k]) => ["out_sfx", "out_transition_sfx", "out_captions"].includes(k))
     : OUTPUT_FIELDS;
 }
 function outputsSummary() {
@@ -1086,51 +1327,48 @@ function outputsSummary() {
 }
 
 function renderReviewCard() {
-  const c = card();
-  c.appendChild(el("h3", "", esc(T.ready_create)));
-  const g = el("div", "sum-grid");
+  const c = card();   // the "REVIEW / Ready to create" title comes from the step header
   const rows = [
     ["Mode", isCultureFacts() ? "Clip Short" : isVisualsFromScript() ? "AI Short" : T.mode_script_t, null],
-    ["Edit pipeline", (S.values.pipeline_version === "v0.1" ? T.pipeline_v01 : T.pipeline_v02), "version"],
    ["Visual source", isCultureFacts() ? "TikTok, X & Instagram · Scrape V2" : (S.values.clip_source === "scrape" ? T.src_scrape : T.src_generate), isCultureFacts() ? null : "source"],
   ];
   if (S.values.clip_source === "scrape") {
     if (!isCultureFacts()) rows.push([T.scrape_engine, "Scrape V2", "source"]);
     rows.push([T.script_relevancy, (S.values.script_relevancy || "70") + "%", isCultureFacts() ? null : "source"]);
+    rows.push(["Search platforms", (S.values.scrape_platforms || "tiktok,x,instagram").split(",").map(p => p === "x" ? "X" : p.charAt(0).toUpperCase() + p.slice(1)).join(", "), "source"]);
     if (S.values.scrape_terms) rows.push(["Search terms", S.values.scrape_terms, isCultureFacts() ? null : "source"]);
   } else {
     rows.push([T.video_model, labelFor(OPT.video_model, S.values.video_model), "source"]);
     rows.push([T.image_model, labelFor(OPT.image_model, S.values.image_model), "source"]);
   }
   rows.push(["Reasoning model", labelFor(OPT.reasoning_model, S.values.reasoning_model), "reasoning"]);
-  rows.push(["Voice", S.values.tts_voice + " · " + labelFor(OPT.tts_model, S.values.tts_model), "voice"]);
-  if (!isCultureFacts()) rows.push(["Speaker video", S.values.enable_speaker_hook ? "On" : "Off", "voice"]);
-  rows.push(["Hook", S.values.hook_text ? T.hook_marked : T.no_hook, "hook"]);
-  if (S.values.impact_word) rows.push(["Impact word", S.values.impact_word, "hook"]);
-  rows.push([T.background_music, (S.values.background_music_choice && S.values.background_music_choice !== "none")
-      ? S.values.background_music_choice : "Off", "source"]);
+  rows.push(["Voice", S.values.tts_voice + " · " + labelFor(OPT.tts_model, S.values.tts_model), "script"]);
+  if (!isCultureFacts()) rows.push(["Speaker video", S.values.enable_speaker_hook ? "On" : "Off", "script"]);
+  rows.push(["Hook", S.values.hook_text ? T.hook_marked : T.no_hook, "script"]);
+  if (S.values.impact_word) rows.push(["Impact word", S.values.impact_word, "script"]);
+  var vfxLayers = [S.values.add_visual_effects !== false ? "arrows" : null,
+                   S.values.add_meme_reactions ? "memes" : null,
+                   S.values.add_neko_reactions ? "nekos" : null].filter(Boolean);
+  rows.push([T.vfx_amount, (vfxLayers.length ? vfxLayers.join(", ") + " · " : "off · ") + (S.values.vfx_amount || "medium"), "outputs"]);
   rows.push([T.sfx_amount, S.values.sfx_amount || "medium", "outputs"]);
+  // spec tiles - one card per setting, with an inline Edit that jumps to the step
+  const specs = el("div", "review-specs");
   rows.forEach(([k, v, editKey]) => {
-    g.appendChild(el("span", "k", esc(k)));
-    g.appendChild(el("span", "v", esc(v)));
-    const e = el("span");
-    if (editKey) { const b = el("button", "edit-link", T.edit); b.addEventListener("click", () => editStep(editKey)); e.appendChild(b); }
-    g.appendChild(e);
+    const tile = el("div", "review-spec");
+    tile.appendChild(el("span", "rs-k", esc(k)));
+    tile.appendChild(el("span", "rs-v", esc(v)));
+    if (editKey) { const b = el("button", "rs-edit", esc(T.edit)); b.addEventListener("click", () => editStep(editKey)); tile.appendChild(b); }
+    specs.appendChild(tile);
   });
-  c.appendChild(g);
-  c.appendChild(el("div", "card-cap", "Outputs"));
-  const ul = el("ul", "sum-list");
-  visibleOutputFields().filter(([k]) => S.values[k]).forEach(([, l]) => ul.appendChild(el("li", "", esc(l))));
-  c.appendChild(ul);
+  c.appendChild(specs);
+  // (no "Outputs" section here — the layers are already chosen in the Finish step)
   if (S.projectSlug) {
     c.appendChild(el("div", "card-note", esc(T.project_loaded) + ": " + esc(S.projectTitle || S.projectSlug)
       + " · " + esc(labelForRunMode(S.values.loaded_project_mode))));
   }
   const foot = el("div", "card-foot");
-  foot.appendChild(btn(T.back, () => editStep("outputs"), "ghost"));
-  foot.appendChild(btn(T.presets, openPresets, "ghost"));
   foot.appendChild(el("span", "spacer"));
-  foot.appendChild(btn("⚡ " + T.create_short, submitRun, "primary"));
+  foot.appendChild(btn("⚡ " + T.create_short, submitRun, "primary review-cta"));
   c.appendChild(foot);
 }
 
@@ -1200,14 +1438,12 @@ function renderMasterFlow(kind) {
       c.appendChild(selectField(T.planning_agent, OPT.master_reasoning, S.master.reasoning_model,
         v => { const changed=!!S.master.reasoning_model&&S.master.reasoning_model!==v; S.master.reasoning_model = v; S.master.reasoning_mode = reasoningOptions(v, S.master.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
       appendReasoningField(c, S.master.reasoning_model || firstVal(OPT.master_reasoning), S.master);
-      c.appendChild(selectField(T.sfx_amount, OPT.master_sfx_amount, S.master.sfx_amount || "medium",
-        v => S.master.sfx_amount = v));
+      c.appendChild(amountSliderField(T.sfx_amount, S.master.sfx_amount || "medium", v => S.master.sfx_amount = v));
     } else if (kind === "visual") {
       c.appendChild(selectField(T.analysis_agent, OPT.vfx_reasoning, S.master.reasoning_model,
         v => { const changed=!!S.master.reasoning_model&&S.master.reasoning_model!==v; S.master.reasoning_model = v; S.master.reasoning_mode = reasoningOptions(v, S.master.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
       appendReasoningField(c, S.master.reasoning_model || firstVal(OPT.vfx_reasoning), S.master);
-      c.appendChild(selectField(T.effect_amount, OPT.vfx_amount, S.master.vfx_amount || "medium",
-        v => S.master.vfx_amount = v));
+      c.appendChild(amountSliderField(T.effect_amount, S.master.vfx_amount || "medium", v => S.master.vfx_amount = v));
       c.appendChild(toggleField(T.neko_toggle, S.master.add_characters !== false,
         v => S.master.add_characters = v));
       c.appendChild(toggleField("Add meme reactions", S.master.add_memes !== false,
@@ -1435,7 +1671,7 @@ function renderProjectFlow() {
     S.values.loaded_project_mode = mode;
     S.values.loaded_project_source = S.projectSlug;
     S.flow = "script";
-    S.completed = ["script", "hook", "version", "source", "reasoning", "voice", "outputs"];
+    S.completed = ["script", "voice", "source", "reasoning", "outputs"];
     S.step = "review";
     renderAll(); persist();
   }, "small")));
@@ -1517,6 +1753,17 @@ function typedMsg(container, text) {
   return m;
 }
 
+// Recolor the run box by state: running=green, awaiting-approval(paused)=orange, error/cancel=red.
+function setJobBoxState(cardEl, status) {
+  if (!cardEl) return;
+  const st = String(status || "").toLowerCase();
+  let cls = "prog-state-running";
+  if (st === "awaiting_approval") cls = "prog-state-paused";
+  else if (["error", "failed", "cancelled", "canceled", "cancelling"].includes(st)) cls = "prog-state-error";
+  else if (["done", "complete", "completed"].includes(st)) cls = "prog-state-done";
+  cardEl.classList.remove("prog-state-running", "prog-state-paused", "prog-state-error", "prog-state-done");
+  cardEl.classList.add(cls);
+}
 function renderJobSection() {
   if (prototypeMode) {
     const hero = el("header", "production-head");
@@ -1529,24 +1776,24 @@ function renderJobSection() {
   const scrapeView=el("div","scrape-browser-card"); scrapeView.id="scrape-browser-card"; scrapeView.hidden=true;
   scrapeView.innerHTML='<div class="scrape-browser-head"><b>Live scrape browser</b><span id="scrape-browser-meta"></span></div><img id="scrape-browser-image" alt="Current TikTok or X scraper page">';
   const acceptedView=el("div","last-accepted-card"); acceptedView.id="last-accepted-card"; acceptedView.hidden=true;
-  acceptedView.innerHTML='<div class="last-accepted-head"><b>Last accepted:</b><span id="last-accepted-meta"></span></div><div class="last-accepted-media"><video id="last-accepted-video" muted loop playsinline preload="metadata"></video><span id="last-accepted-empty">Waiting for a matching clip...</span></div><div class="last-accepted-query" id="last-accepted-query"></div>';
+  acceptedView.innerHTML='<div class="last-accepted-head"><b>Last accepted:</b><span id="last-accepted-meta"></span></div><div class="last-accepted-media"><img id="last-accepted-poster" alt="Last accepted clip frame" hidden><video id="last-accepted-video" muted loop playsinline preload="metadata"></video><span id="last-accepted-empty">Waiting for a matching clip...</span></div><div class="last-accepted-query" id="last-accepted-query"></div>';
   scrapeMonitor.appendChild(scrapeView); scrapeMonitor.appendChild(acceptedView); chat.appendChild(scrapeMonitor);
-  // technical console (terminal-styled, collapsible)
-  const tcard = card("term-card"); tcard.id = "job-tech-card";
-  const thead = el("div", "term-head");
-  const tbtn = el("button", "term-toggle");
-  tbtn.innerHTML = `<span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
-    <span class="term-title">${esc(T.show_tech)}</span><span class="term-chev">▾</span>`;
-  tbtn.addEventListener("click", () => {
-    const lg = $("job-log");
-    const show = lg.hasAttribute("hidden");
-    if (show) { lg.removeAttribute("hidden"); tcard.classList.add("open"); lg.scrollTop = lg.scrollHeight; }
-    else { lg.setAttribute("hidden", ""); tcard.classList.remove("open"); }
-    tbtn.querySelector(".term-title").textContent = show ? T.hide_tech : T.show_tech;
-  });
-  thead.appendChild(tbtn); tcard.appendChild(thead);
-  const lg = el("pre", "tech-log"); lg.id = "job-log"; lg.setAttribute("hidden", "");
-  tcard.appendChild(lg);
+  // technical console -> opens as an OVERLAY POPUP (not inline). Its trigger button now lives in
+  // the run-box header, right next to Cancel (where the status badge used to be).
+  const overlay = el("div", "tech-modal-overlay"); overlay.id = "job-tech-overlay"; overlay.hidden = true;
+  const modal = el("div", "tech-modal");
+  const mhead = el("div", "tech-modal-head");
+  mhead.innerHTML = `<span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span><b>${esc(T.show_tech)}</b>`;
+  const closeB = el("button", "tech-modal-close"); closeB.innerHTML = "&times;"; closeB.setAttribute("aria-label", "Close");
+  mhead.appendChild(closeB); modal.appendChild(mhead);
+  const lg = el("pre", "tech-log"); lg.id = "job-log";
+  modal.appendChild(lg); overlay.appendChild(modal);
+  (document.querySelector(".app") || document.body).appendChild(overlay);
+  const openTech = () => { overlay.hidden = false; lg.scrollTop = lg.scrollHeight; };
+  const closeTech = () => { overlay.hidden = true; };
+  closeB.addEventListener("click", closeTech);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeTech(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !overlay.hidden) closeTech(); });
   // #111 - deterministic phase stats stack in this container, which sits directly ABOVE the run
   // box. Each new stat is appended to the bottom (right above the box), so the newest is always
   // closest to the box and older stats move up.
@@ -1560,11 +1807,15 @@ function renderJobSection() {
   head.appendChild(dot);
   head.appendChild(el("b", "", "Creating your Short"));
   head.appendChild(el("span", "spacer"));
-  const badge = el("span", "tb-badge run", esc(S.jobStatus || "running")); badge.id = "job-badge";
-  head.appendChild(badge);
+  // "Show technical details" button next to Cancel (replaces the status badge text)
+  const techBtn = el("button", "job-tech-btn"); techBtn.id = "job-tech-btn"; techBtn.type = "button";
+  techBtn.innerHTML = `<span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span><span class="term-title">${esc(T.show_tech)}</span>`;
+  techBtn.addEventListener("click", openTech);
+  head.appendChild(techBtn);
   const cancelB = btn(T.cancel_process, cancelJob, "danger small"); cancelB.id = "job-cancel";
   head.appendChild(cancelB);
   c.appendChild(head);
+  setJobBoxState(c, S.jobStatus || "running");
   const prog = el("div", "prog-embed"); prog.id = "job-progress"; c.appendChild(prog);
   // outputs / result container (appears below the box when the run completes)
   const owrap = el("div"); owrap.id = "job-out"; chat.appendChild(owrap);
@@ -1576,7 +1827,7 @@ function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = 
 
 async function pollScrapeBrowser(){
   const monitor=$("scrape-monitor"),card=$("scrape-browser-card"),image=$("scrape-browser-image"),meta=$("scrape-browser-meta");
-  const accepted=$("last-accepted-card"),video=$("last-accepted-video"),acceptedMeta=$("last-accepted-meta"),acceptedQuery=$("last-accepted-query"),empty=$("last-accepted-empty");
+  const accepted=$("last-accepted-card"),video=$("last-accepted-video"),acceptedMeta=$("last-accepted-meta"),acceptedQuery=$("last-accepted-query"),empty=$("last-accepted-empty"),poster=$("last-accepted-poster");
   if(!card||!image)return;
   try{
     const d=await jget('/scrape-browser-status');
@@ -1587,13 +1838,22 @@ async function pollScrapeBrowser(){
       image.dataset.version=String(d.version); image.src='/scrape-browser-preview?v='+encodeURIComponent(d.version);
     }
     if(accepted){
-      accepted.hidden=false;
+      // Only reveal the "Last accepted" card ONCE a clip has actually been accepted - it used to
+      // show (empty + stretched into the wide browser column) before scraping produced anything.
+      const has=!!(d.last_accepted_poster_url||d.last_accepted_url);
+      accepted.hidden=!has;
       acceptedMeta.textContent=d.last_accepted_platform||'';
       acceptedQuery.textContent=d.last_accepted_query?('Search: '+d.last_accepted_query):'';
-      empty.hidden=!!d.last_accepted_url; video.hidden=!d.last_accepted_url;
+      // POSTER FRAME is the reliable display (proxies are often HEVC and won't play inline);
+      // the <video> is a best-effort enhancement layered on top when the codec is supported.
+      if(empty)empty.hidden=has;
+      if(poster&&d.last_accepted_poster_url&&String(poster.dataset.version||'')!==String(d.accepted_version)){
+        poster.dataset.version=String(d.accepted_version); poster.src=d.last_accepted_poster_url; poster.hidden=false;
+      }
       if(d.last_accepted_url&&String(video.dataset.version||'')!==String(d.accepted_version)){
         video.dataset.version=String(d.accepted_version); video.dataset.start=String(d.last_accepted_start||0);
-        video.src=d.last_accepted_url;
+        if(d.last_accepted_poster_url)video.setAttribute('poster',d.last_accepted_poster_url);
+        video.src=d.last_accepted_url; video.hidden=false;
         video.onloadedmetadata=function(){try{video.currentTime=Math.min(Math.max(0,+video.dataset.start||0),Math.max(0,(video.duration||0)-.1));video.play().catch(function(){});}catch(e){}};
       }
     }
@@ -1697,8 +1957,7 @@ async function pollJob() {
   if (d.status !== S.jobStatus) {
     const prev = S.jobStatus;
     S.jobStatus = d.status; renderTopbar(); persist();
-    const badge = $("job-badge");
-    if (badge) { badge.textContent = d.status; badge.className = "tb-badge" + (d.status === "running" ? " run" : ""); }
+    setJobBoxState($("job-card"), d.status);   // recolor the run box: green / orange / red
     // notification chime: render finished, or voiceover ready for approval (halt-after-speech)
     if (prev && prev !== "missing") {
       if (d.status === "done") playNotification("done");
@@ -1751,41 +2010,48 @@ async function pollJob() {
   if (sp) {
     if (d.status === "awaiting_approval" && d.speech_audio_url && !sp.dataset.done) {
       sp.dataset.done = "1"; sp.innerHTML = "";
-      const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", esc(T.voiceover_ready))); sp.appendChild(m);
-      const c = el("div", "chat-card"); sp.appendChild(c);
-      const au = el("audio", "inline-audio"); au.controls = true; au.src = d.speech_audio_url; c.appendChild(au);
-      const foot = el("div", "card-foot");
-      // narration speed: the preview is already baked at `curSpeed`; picking a different one
-      // previews it live (audio playbackRate = chosen/current) and re-tempos the voice on approve.
+      const c = el("div", "chat-card speech-approve-card"); sp.appendChild(c);
+      c.appendChild(el("div", "sa-head",
+        `<span class="sa-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg></span>` +
+        `<div class="sa-title"><b>Your voiceover is ready</b><em>Listen, then approve — or redo it with a different voice.</em></div>`));
+      const au = el("audio", "sa-audio"); au.controls = true; au.src = d.speech_audio_url; c.appendChild(au);
+      // narration speed: the preview is baked at `curSpeed`; picking a different one previews it
+      // live (audio playbackRate = chosen/current) and re-tempos the voice on approve.
       const curSpeed = +(d.speech_speed || 0) || 1.15;
-      const ssel = el("select"); ssel.title = "Narration speed before the run continues";
-      [["", "Keep current speed (" + curSpeed.toFixed(2) + "x)"],
+      const speedRow = el("div", "sa-field");
+      speedRow.appendChild(el("label", "sa-lbl", "Narration speed"));
+      const ssel = el("select");
+      [["", "Keep current (" + curSpeed.toFixed(2) + "x)"],
        ["1.0", "1.00x"], ["1.15", "1.15x"], ["1.2", "1.20x"],
        ["1.3", "1.30x"], ["1.4", "1.40x"], ["1.5", "1.50x"], ["1.6", "1.60x"]]
         .forEach(([v, l]) => ssel.appendChild(new Option(l, v)));
-      // live preview of the selected speed relative to the baked one
       ssel.addEventListener("change", () => {
         const sel = +ssel.value || curSpeed;
         au.playbackRate = Math.max(0.5, Math.min(2.5, sel / curSpeed));
         try { au.currentTime = 0; au.play().catch(() => {}); } catch (e) {}
       });
-      foot.appendChild(ssel);
-      foot.appendChild(btn("✓ " + T.approve_continue, async () => {
+      speedRow.appendChild(ssel); c.appendChild(speedRow);
+      // primary action
+      const approveRow = el("div", "sa-actions");
+      approveRow.appendChild(btn("✓ " + T.approve_continue, async () => {
         const q = ssel.value ? "&speed=" + encodeURIComponent(ssel.value) : "";
         await fetch("/approve-speech?id=" + encodeURIComponent(S.jobId) + q, { method: "POST" });
         sp.innerHTML = ""; delete sp.dataset.done;
       }, "primary"));
+      c.appendChild(approveRow);
+      // redo section (voice + model + new take), visually subordinate
+      const redo = el("div", "sa-redo");
+      redo.appendChild(el("div", "sa-lbl", "Not happy? Redo with a different voice"));
+      const redoRow = el("div", "sa-redo-row");
       const vsel = el("select"); OPT.tts_voice.forEach(o => vsel.appendChild(new Option(o.label, o.value)));
       vsel.value = S.values.tts_voice || vsel.value;
       const msel = el("select"); OPT.tts_model.forEach(o => msel.appendChild(new Option(o.label, o.value)));
-      foot.appendChild(vsel); foot.appendChild(msel);
-      foot.appendChild(btn("↻ " + T.new_take, async (ev) => {
+      redoRow.appendChild(vsel); redoRow.appendChild(msel);
+      redoRow.appendChild(btn("↻ " + T.new_take, async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
         const body = new URLSearchParams({ speaker_name: S.values.speaker_name || "Narrator",
           tts_voice: vsel.value, tts_model: msel.value });
         // #127 - /replace-speech regenerates the voiceover as a follow-on run in the SAME project.
-        // The old job flips to "cancelled" the moment the gate releases; guard the poller so
-        // that race can never be rendered as an aborted run while we adopt the new job id.
         S.replacePending = true;
         try {
           const r = await fetch("/replace-speech?id=" + encodeURIComponent(S.jobId) + "&json=1",
@@ -1793,7 +2059,6 @@ async function pollJob() {
           const d = await r.json();
           if (d && d.id) { S.jobId = d.id; S.jobStatus = "running"; persist(); }
         } catch (e) {
-          // fallback: adopt the newest running job (the follow-on run) from the jobs list
           try {
             const jl = await (await fetch("/jobs-list")).json();
             const run = (jl.jobs || []).find(j => j.status === "running" || j.status === "awaiting_approval");
@@ -1803,8 +2068,8 @@ async function pollJob() {
         S.replacePending = false;
         sp.innerHTML = ""; delete sp.dataset.done;
         renderTopbar();
-      }, "danger"));
-      c.appendChild(foot);
+      }, "ghost"));
+      redo.appendChild(redoRow); c.appendChild(redo);
       scrollDown();
     } else if (d.status !== "awaiting_approval" && sp.dataset.done) {
       sp.innerHTML = ""; delete sp.dataset.done;
@@ -1825,8 +2090,16 @@ async function pollJob() {
     if (!$("job-final")) {
       const fin = el("div"); fin.id = "job-final"; chat.appendChild(fin);
       if (d.status === "done") {
-        const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", "✓ " + esc(T.your_short_ready))); fin.appendChild(m);
-        renderResultCard(fin, d);
+        // clip-short skips the final render and jumps straight into the timeline editor
+        if (d.open_timeline && d.project_slug) {
+          const m = el("div", "msg assistant");
+          m.appendChild(el("div", "bubble", "✓ Your edit is ready — opening the timeline editor…"));
+          fin.appendChild(m); scrollDown();
+          setTimeout(() => openTimelineWithLoading(d.project_slug, S.projectTitle || d.project_slug), 750);
+        } else {
+          const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", "✓ " + esc(T.your_short_ready))); fin.appendChild(m);
+          renderResultCard(fin, d);
+        }
       } else if (d.status === "error") {
         const c = el("div", "chat-card err-card"); fin.appendChild(c);
         c.appendChild(el("h3", "", esc(T.job_error)));
@@ -1836,10 +2109,14 @@ async function pollJob() {
         foot.appendChild(btn(T.new_chat, resetToMode, "ghost small"));
         c.appendChild(foot);
       } else {
-        const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", esc(T.job_cancelled))); fin.appendChild(m);
-        const c = el("div", "chat-card"); fin.appendChild(c);
+        // cancelled: one compact, intentional card (not a big empty box with a lone button)
+        const c = el("div", "chat-card end-card end-cancelled"); fin.appendChild(c);
+        c.appendChild(el("div", "end-body",
+          `<span class="end-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg></span>` +
+          `<div class="end-copy"><b>Run cancelled</b><em>The run was stopped before it finished.</em></div>`));
         const foot = el("div", "card-foot");
-        foot.appendChild(btn(T.new_chat, resetToMode, "small"));
+        foot.appendChild(el("span", "spacer"));
+        foot.appendChild(btn("＋ " + T.new_chat, resetToMode, "primary small"));
         c.appendChild(foot);
       }
       scrollDown();
@@ -2019,8 +2296,10 @@ function assetCard(p) {
   const act = el("div", "aact");
   if (p.failed) act.appendChild(btn("▶ " + T.continue, () => continueProject(p.slug), "primary small"));
   else if (p.results_url) act.appendChild(linkBtn("▶ " + T.check_results, p.results_url, "small"));
-  act.appendChild(btn("↺ Open", () => loadProject(p.slug), "small"));
-  if (p.has_timeline) act.appendChild(linkBtn("🎞 Edit", "/timeline?slug=" + encodeURIComponent(p.slug), "small"));
+  // Opening a finished project goes STRAIGHT into the timeline editor (its render exists);
+  // only projects without a render fall back to the project overview.
+  if (p.has_timeline) act.appendChild(btn("🎞 " + (T.open || "Open"), () => openTimelineWithLoading(p.slug, p.title), "small"));
+  else act.appendChild(btn("↺ " + (T.open || "Open"), () => loadProject(p.slug), "small"));
   c.appendChild(act);
   return c;
 }
@@ -2069,23 +2348,52 @@ async function openTimelineNav() {
     }
     alert(T.no_timeline_yet); return;
   }
-  // project picker filtered to timeline-capable projects
+  // no active project: a chat-shell modal (open an existing timeline OR upload your own video),
+  // rendered in the current design instead of an old server page.
   const d = await jget("/projects-list");
   const withTl = (d.projects || []).filter(p => p.has_timeline);
-  if (!withTl.length) { alert(T.no_timeline_yet); return; }
   const scrim = el("div", "modal-scrim"); document.body.appendChild(scrim);
   scrim.addEventListener("click", e => { if (e.target === scrim) scrim.remove(); });
-  const m = el("div", "modal"); scrim.appendChild(m);
-  m.appendChild(el("h3", "", esc(T.pick_project)));
-  const list = el("div", "list"); m.appendChild(list);
-  withTl.forEach(p => {
-    const b = el("button", "sb-proj");
-    b.innerHTML = `${projThumb(p, "th")}<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
-    b.addEventListener("click", () => {
-      openTimelineWithLoading(p.slug, p.title);
-    });
-    list.appendChild(b);
+  const m = el("div", "modal tl-open-modal"); scrim.appendChild(m);
+  m.appendChild(el("h3", "", esc(T.open_timeline || "Timeline Editor")));
+  const sub = el("p", "tl-open-sub", esc(T.timeline_open_sub ||
+    "Open a rendered project to fine-tune it, or drop in your own video to start editing from scratch."));
+  m.appendChild(sub);
+
+  // upload-your-own-video row
+  const up = el("div", "tl-open-upload");
+  const upBtn = el("button", "btn primary", "⬆ " + (T.upload_own_video || "Load your own video"));
+  const file = el("input"); file.type = "file"; file.accept = "video/mp4,.mp4"; file.hidden = true;
+  const status = el("div", "tl-open-status"); status.hidden = true;
+  up.appendChild(upBtn); up.appendChild(file); m.appendChild(up); m.appendChild(status);
+  upBtn.addEventListener("click", () => file.click());
+  file.addEventListener("change", async () => {
+    const f = file.files && file.files[0]; if (!f) return;
+    if (!/\.mp4$/i.test(f.name) && f.type !== "video/mp4") {
+      status.hidden = false; status.className = "tl-open-status error"; status.textContent = T.upload_mp4_only || "Please choose an .mp4 file."; return;
+    }
+    status.hidden = false; status.className = "tl-open-status"; status.textContent = (T.uploading || "Uploading") + " " + f.name + " …";
+    upBtn.disabled = true;
+    try {
+      const fd = new FormData(); fd.append("file", f, f.name);
+      const r = await fetch("/timeline-import", { method: "POST", body: fd });
+      const j = await r.json();
+      if (j && j.ok && j.slug) { scrim.remove(); openTimelineWithLoading(j.slug, f.name.replace(/\.mp4$/i, "")); }
+      else { status.className = "tl-open-status error"; status.textContent = (j && j.error) || (T.upload_failed || "Upload failed."); upBtn.disabled = false; }
+    } catch (e) { status.className = "tl-open-status error"; status.textContent = T.upload_failed || "Upload failed."; upBtn.disabled = false; }
   });
+
+  // existing timeline-capable projects
+  if (withTl.length) {
+    m.appendChild(el("div", "tl-open-divider", esc(T.or_open_project || "or open a project")));
+    const list = el("div", "list"); m.appendChild(list);
+    withTl.forEach(p => {
+      const b = el("button", "sb-proj");
+      b.innerHTML = `${projThumb(p, "th")}<span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>`;
+      b.addEventListener("click", () => { scrim.remove(); openTimelineWithLoading(p.slug, p.title); });
+      list.appendChild(b);
+    });
+  }
 }
 let sidebarProjects = [];
 async function refreshSidebar() {
@@ -2101,8 +2409,16 @@ async function refreshSidebar() {
     wrap.hidden = !active.length;
     box.innerHTML = "";
     active.forEach(j => {
-      const b = el("button", "sb-job");
-      b.innerHTML = `<b>${esc(j.project_slug || j.kind)}</b><span class="${j.status === "running" ? "run" : ""}">${esc(j.status)} · ${esc(j.last_log || "")}</span>`;
+      const st = j.status;
+      const label = st === "awaiting_approval" ? "Needs approval"
+        : st === "cancelling" ? "Cancelling…" : "Working…";
+      const title = prettyJobTitle(j.project_slug || j.kind || "Run");
+      const b = el("button", "sb-job sb-job-" + (st === "awaiting_approval" ? "wait" : st === "cancelling" ? "cancel" : "run"));
+      b.innerHTML =
+        `<span class="sb-job-dot"></span>` +
+        `<span class="sb-job-body"><b>${esc(title)}</b><em>${esc(label)}</em></span>` +
+        `<span class="sb-job-wave"><i></i><i></i><i></i></span>`;
+      b.title = title + " — " + (j.last_log || label);
       b.addEventListener("click", () => { startJob(j.id); closeDrawer(); });
       box.appendChild(b);
     });
@@ -2207,11 +2523,34 @@ async function paintConnections() {
   // Collapsed header shows just the count (e.g. "1/3"); the rows expand on hover/focus.
   const cnt = $("sb-conns-count"); if (cnt) cnt.textContent = ready + "/" + CONNS.length;
 }
-function connectionRow(key, label, statusUrl, loginUrl) {
+// platform key as stored in S.values.scrape_platforms (the backend splits this comma list)
+function platformSelected(key) {
+  return (S.values.scrape_platforms || "tiktok,x,instagram").split(",").map(s => s.trim()).includes(key);
+}
+function setPlatformSelected(key, on) {
+  const cur = (S.values.scrape_platforms || "tiktok,x,instagram").split(",").map(s => s.trim()).filter(Boolean);
+  const next = on ? Array.from(new Set(cur.concat([key]))) : cur.filter(p => p !== key);
+  // keep a stable order and never let the list go fully empty (a scrape needs >=1 source)
+  const order = ["tiktok", "x", "instagram"];
+  S.values.scrape_platforms = (next.length ? next : ["tiktok"]).sort((a, b) => order.indexOf(a) - order.indexOf(b)).join(",");
+}
+function connectionRow(key, label, statusUrl, loginUrl, selectable) {
   const row = el("div", "sb-conn");
   const dot = el("span", "dot"); row.appendChild(dot);
-  const txt = el("span", "", esc(label)); row.appendChild(txt);
-  const b = el("button", "", "🔗"); row.appendChild(b);
+  const txt = el("span", "conn-name", esc(label)); row.appendChild(txt);
+  // the actions group (slider + reconnect) is pushed to the right as one unit, so the
+  // "search this platform" slider sits directly next to the Reconnect button.
+  const actions = el("div", "conn-actions"); row.appendChild(actions);
+  if (selectable) {
+    const sw = el("label", "conn-use");
+    sw.title = "Use this platform when searching for clips";
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = platformSelected(key);
+    const track = el("span", "conn-use-track");
+    cb.addEventListener("change", () => { setPlatformSelected(key, cb.checked); persist(); });
+    sw.appendChild(cb); sw.appendChild(track); sw.appendChild(el("span", "conn-use-lbl", "search"));
+    actions.appendChild(sw);
+  }
+  const b = el("button", "", "🔗"); actions.appendChild(b);
   const paint = async () => {
     try {
       const st = await jget(statusUrl);
@@ -2305,6 +2644,12 @@ function choiceButtons(options, value, onPick) {
 function labelFor(options, value) {
   const o = (options || []).find(x => x.value === value);
   return o ? o.label : (value || "-");
+}
+// slug/kind -> a short, human title for the sidebar job chip (drops timestamps + underscores)
+function prettyJobTitle(s) {
+  let t = String(s || "Run").replace(/_\d{6,}.*$/, "").replace(/[_-]+/g, " ").trim();
+  t = t.replace(/\b\w/g, c => c.toUpperCase());
+  return t.length > 26 ? t.slice(0, 25) + "…" : (t || "Run");
 }
 function labelForRunMode(m) {
   return { normal: T.run_normal, recut_existing_only: T.run_recut, recut_new_web_images: T.run_new_web,
@@ -2508,8 +2853,8 @@ function applyPrototypeMode(on, rerender) {
   if (rerender) { renderNav(); renderAll(); }
 }
 function wireChrome() {
-  const saved = (() => { try { return localStorage.getItem("sl-chat-theme"); } catch (e) { return null; } })();
-  applyTheme(saved || "dark");
+  // Light mode removed for now - always dark, no toggle.
+  applyTheme("dark");
   const savedPrototype = (() => {
     try {
       const value = localStorage.getItem("sl-prototype-ui-v2");
@@ -2519,7 +2864,8 @@ function wireChrome() {
   applyPrototypeMode(savedPrototype, false);
   const prototypeToggle = $("prototype-toggle");
   if (prototypeToggle) prototypeToggle.addEventListener("change", () => applyPrototypeMode(prototypeToggle.checked, true));
-  $("theme-toggle").addEventListener("change", e => applyTheme(e.currentTarget.checked ? "dark" : "light"));
+  const themeToggle = $("theme-toggle");
+  if (themeToggle) themeToggle.addEventListener("change", e => applyTheme(e.currentTarget.checked ? "dark" : "light"));
   $("sb-collapse").addEventListener("click", () => $("app").classList.toggle("sb-collapsed"));
   $("tb-menu").addEventListener("click", () => {
     const app = $("app");

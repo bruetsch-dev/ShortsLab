@@ -1459,8 +1459,13 @@ def apply_visual_script_to_scenes(scenes, visual_script, target_duration):
     if not visual_script:
         return scenes
     enriched = [dict(scene) for scene in scenes]
+    # ``parse_timed_script`` also invents uniform timestamps for ordinary prose. Only use its
+    # overlap path when the author supplied real mm:ss markers; otherwise semantic note mapping
+    # below must see the original individual directions.
+    has_explicit_timestamps = bool(re.search(r"\b\d{1,2}:\d{2}\b", str(visual_script or "")))
     try:
-        visual_beats = parse_timed_script(visual_script, target_duration)
+        visual_beats = (parse_timed_script(visual_script, target_duration)
+                        if has_explicit_timestamps else [])
     except Exception:
         visual_beats = []
     if visual_beats:
@@ -1478,9 +1483,38 @@ def apply_visual_script_to_scenes(scenes, visual_script, target_duration):
     notes = split_visual_notes(visual_script)
     if not notes:
         return enriched
+    # Untimed notes used to be spread uniformly by scene INDEX. That shifts directions whenever
+    # narration scenes have unequal durations and can attach a hook noun (for example sumo) to
+    # unrelated later beats. Anchor by scene time, then let concrete shared nouns/actions override
+    # the temporal guess. This stays deterministic and preserves author order when notes are broad.
+    stop = {
+        "a", "an", "the", "and", "or", "of", "to", "in", "on", "at", "for", "with", "from",
+        "show", "shot", "video", "clip", "footage", "scene", "woman", "women", "person", "people",
+    }
+
+    def _note_terms(text):
+        return words(str(text or "")) - stop
+
+    note_terms = [_note_terms(note) for note in notes]
+    duration = max(float(target_duration or 0.0),
+                   max((float(scene.get("end") or 0.0) for scene in enriched), default=0.0), 0.1)
     for index, scene in enumerate(enriched):
-        note_index = min(len(notes) - 1, int(index * len(notes) / max(1, len(enriched))))
-        scene["visual_script"] = notes[note_index]
+        start = float(scene.get("start") or 0.0)
+        end = float(scene.get("end") or start)
+        midpoint = max(0.0, min(duration, (start + end) / 2.0))
+        expected = min(len(notes) - 1, int((midpoint / duration) * len(notes)))
+        scene_terms = _note_terms(" ".join(str(scene.get(key) or "") for key in (
+            "exact_voice_text", "voice_line", "script", "visual_direction")))
+        best_index, best_score = expected, -1.0
+        for note_index, terms in enumerate(note_terms):
+            overlap = len(scene_terms & terms)
+            semantic = (overlap / max(1.0, min(len(scene_terms), len(terms)))) * 8.0
+            proximity = max(0.0, 1.5 - abs(note_index - expected) * 0.45)
+            # A real shared content term beats temporal proximity; generic notes retain chronology.
+            score = semantic + proximity
+            if score > best_score:
+                best_index, best_score = note_index, score
+        scene["visual_script"] = notes[best_index]
     return enriched
 
 
@@ -1697,7 +1731,7 @@ def normalize_micro_beat_plan(raw_beats, title, script, target_duration):
         last = normalized[-1]["end"]
     return normalized
 
-SCRIPT_CREATOR_MODEL = "google/gemini-3.1-pro-preview"
+SCRIPT_CREATOR_MODEL = "google/gemini-3.5-flash"
 
 # Curated JAPAN angles for the no-topic case. The model alone converges on the same 1-2
 # topics every call ("schools banned brown hair"); rotating through this pool with a
@@ -4769,13 +4803,13 @@ def assign_clips_to_scenes_by_vision(scenes, clip_paths, project_dir, reasoning_
                     merged_log[i] = d
                 if c:
                     accepted_edges.append((s, i, c, d))
-        # Global greedy assignment across batches.  This retains second-best batch options when
-        # two scenes want the same clip instead of simply blanking the later scene. A source
-        # clip may serve up to TWO scenes (cleanup keeps duplicates off adjacent cuts).
+        # Global greedy assignment across batches.  STRICT no-reuse (user rule 2026-07-13): a
+        # source clip serves AT MOST ONE scene - never a second scene, even a different excerpt.
+        # A scene left without a unique clip goes back to the search/retry path instead.
         assigned_scenes, used_clips = set(), {}
         for _score, i, c, d in sorted(accepted_edges, key=lambda row: row[0], reverse=True):
             clip_key = str(Path(c).resolve())
-            if i in assigned_scenes or used_clips.get(clip_key, 0) >= 2:
+            if i in assigned_scenes or used_clips.get(clip_key, 0) >= 1:
                 continue
             merged_clips[i] = c
             merged_log[i] = d
@@ -6165,7 +6199,7 @@ def plan_visual_emphasis(config, reasoning_model=None, status_cb=None):
     return added
 
 
-def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, collaborate=False):
+def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, collaborate=False, vfx_amount="medium"):
     """TARGET-BASED visual effects (replaces the text-only emphasis guesser). For every scene that
     has a real clip we look at the ACTUAL middle frame, find the concrete on-screen target that
     proves the narration line (face / object / sign / money / food / vehicle / crowd / screen),
@@ -6323,7 +6357,8 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
     # Effect-heavy default: allow arrows on up to ~68% of scenes while still requiring a real,
     # confident, voice-relevant target. This raises density without reintroducing random arrows.
     eligible = sorted([c for c in candidates if c["callout_ok"]], key=lambda c: -c["rel"])
-    cap = max(1, int(round(len(scenes) * 0.68)))
+    _cap_frac = {"low": 0.35, "medium": 0.55, "high": 0.80}.get(str(vfx_amount or "medium").lower(), 0.55)
+    cap = max(1, int(round(len(scenes) * _cap_frac)))
     keep = set(c["scene_index"] for c in eligible[:cap])
     for c in eligible[cap:]:
         c["callout"] = "none"; c["callout_ok"] = False
@@ -7788,7 +7823,12 @@ def apply_timeline_edits_to_config(config, edits, slug):
             continue
         asset = a.get("path") or ""
         is_clip = (a.get("kind") == "clip")
-        clip_name = Path(a["clip"]).name if a.get("clip") else None
+        # a["clip"] is the editor preview URL ('file?path=<url-encoded>'), NOT a bare filename;
+        # decode it to the real basename so the renderer can resolve the clip (else it opened the
+        # .mp4 as an image -> "cannot identify image file"). Fall back to the asset path's basename.
+        clip_name = pipeline._clip_ref_basename(a.get("clip")) or None
+        if is_clip and not clip_name and asset:
+            clip_name = pipeline._clip_ref_basename(asset) or None
         # A clip dragged from the "All projects" tab (or any external path) lives in ANOTHER
         # project's folder - copy it into THIS project so the render resolves it and it can't
         # break if the source project is deleted. Video clips resolve by basename in
@@ -7837,6 +7877,10 @@ def apply_timeline_edits_to_config(config, edits, slug):
     # seedance_clip_start_trim(config, scene) = scene["seedance_start_trim"].
     trim_by_id = {str(d.get("id")): d.get("source_trim") for d in (edits.get("scenes") or [])
                   if d.get("source_trim") is not None}
+    # user's manual green/red flip of the intended-subject label (display only)
+    subject_override_by_id = {str(d.get("id")): str(d.get("subject_override"))
+                              for d in (edits.get("scenes") or [])
+                              if d.get("subject_override") in ("good", "bad")}
     overlays_by_id = {}
     for row in (edits.get("overlays") or []):
         sid = str(row.get("scene_id") or "") if isinstance(row, dict) else ""
@@ -7881,6 +7925,27 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 except Exception:
                     item.pop("appear_sfx_path", None)
                     item.pop("appear_sfx_name", None)
+            # Timeline VFX library image stickers (meme / neko / custom): the asset must be a real
+            # image under an allowed root, else the overlay is dropped (render can't resolve it and
+            # we won't let the editor point the renderer at arbitrary files).
+            if str(item.get("type")) == "image":
+                ap = str(item.get("asset") or item.get("path") or "")
+                ok = False
+                if ap:
+                    try:
+                        rp = Path(ap).resolve()
+                        roots = [(ROOT / "assets" / "meme_stickers").resolve(),
+                                 (ROOT / "static" / "emotions").resolve(),
+                                 (project_dir).resolve()]
+                        if (rp.is_file() and rp.suffix.lower() in {".png", ".webp", ".gif"}
+                                and any(str(rp).startswith(str(r)) for r in roots)):
+                            item["asset"] = str(rp)
+                            item.pop("path", None)
+                            ok = True
+                    except Exception:
+                        ok = False
+                if not ok:
+                    continue
             cleaned.append(item)
         overlays_by_id[sid] = cleaned
     order = edits.get("order")
@@ -7907,6 +7972,8 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 pass
         if sid in overlays_by_id:
             scene["overlays"] = overlays_by_id[sid]
+        if sid in subject_override_by_id:
+            scene["subject_override"] = subject_override_by_id[sid]
         # apply an in-editor media replacement for this scene (copy the chosen file into the project
         # so the renderer resolves it; keep the scene duration -> new clip is trimmed to that length)
         if sid in replaced_by_id:
@@ -8086,6 +8153,7 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 "playback_rate": max(0.01, float(item.get("playback_rate") or 1.0)),
                 "enabled": item.get("enabled") is not False,
                 "label": item.get("label") or "Sound",
+                "is_transition": bool(item.get("is_transition")),
             })
             continue
         entry = {}
@@ -8539,9 +8607,13 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
     log(status_cb, f"Speech retime complete: {old_duration:.2f}s -> {duration:.2f}s; "
                    f"{len(config['scenes'])} clips and {len(caption_track)} caption phrases updated.")
     if not render:
+        try:
+            log(status_cb, "PROJECT_DIR|" + str(project_dir))
+        except Exception:
+            pass
         return {"title": config.get("title", slug), "project_dir": str(project_dir),
-                "video": None, "retimed_scenes": len(config["scenes"]),
-                "audio": str(audio_path)}
+                "project_slug": slug, "video": None, "open_timeline": True, "no_render": True,
+                "retimed_scenes": len(config["scenes"]), "audio": str(audio_path)}
 
     config["output_basename"] = f"{slug}_timeline_revoice_{stamp}"
     attach_cancel_event(config, {"_cancel_event": cancel_event} if cancel_event else {})
@@ -8559,7 +8631,7 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
 
 def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event=None,
                                    include_project_pool=False, output_tag="timeline_social_replace",
-                                   reasoning_model_override=None, media_source="scrape"):
+                                   reasoning_model_override=None, media_source="scrape", render=True):
     """Search fresh TikTok/X footage for only the marked timeline scenes, then render.
 
     This is deliberately separate from a full same-script rerun: unmarked media remains intact,
@@ -8857,6 +8929,17 @@ def replace_timeline_scrape_scenes(slug, scene_ids, status_cb=None, cancel_event
     if unchanged_ids:
         log(status_cb, "Timeline replacement warning: no alternative media existed for scene(s) "
                        + ", ".join(unchanged_ids) + ".")
+    if not render:
+        log(status_cb, f"Timeline replacement complete: changed {replaced_count}/{len(indexed_targets)} "
+                       "marked clip(s). Opening the timeline editor (no render).")
+        try:
+            log(status_cb, "PROJECT_DIR|" + str(project_dir))
+        except Exception:
+            pass
+        return {"title": config.get("title", slug), "project_dir": str(project_dir),
+                "project_slug": slug, "video": None, "open_timeline": True, "no_render": True,
+                "replaced_scenes": replaced_count, "requested_replacements": len(indexed_targets),
+                "unchanged_scene_ids": unchanged_ids}
     log(status_cb, f"Timeline replacement complete: changed {replaced_count}/{len(indexed_targets)} "
                    "marked clip(s). Rendering the updated timeline...")
     output = pipeline.render_video(config)
@@ -9620,9 +9703,9 @@ def run_project(form, status_cb=None):
         if p.strip()
     ] or ["tiktok", "x"]
     scrape_terms = str(form.get("scrape_terms", "") or "").strip()
-    scrape_sort = str(form.get("scrape_sort", "MOST_LIKED") or "MOST_LIKED").strip().upper()
-    if scrape_sort not in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "RELEVANCE"}:
-        scrape_sort = "MOST_LIKED"
+    scrape_sort = str(form.get("scrape_sort", "ALL") or "ALL").strip().upper()
+    if scrape_sort not in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "RELEVANCE", "ALL"}:
+        scrape_sort = "ALL"
     try:
         script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 70)))))
     except (TypeError, ValueError):
@@ -10306,6 +10389,48 @@ def run_project(form, status_cb=None):
                     continue
                 _seen_raw.add(_rk)
                 clean_raw_fallback.append(_p)
+            # BROADEN THE POOL to EVERY distinct clip the scrape actually downloaded. A run can
+            # download ~100 distinct clips (most sit in seedance 2.0/_candidates as "declined" but
+            # are real vertical footage) yet body_pool exposed only a handful - so the finalize was
+            # forced to reuse. Pull the whole downloaded set (content-deduped so the same TikTok is
+            # never added twice; skip the hook-presenter pool + _raw working files) so unmatched
+            # scenes get FRESH distinct footage instead of a replay.
+            try:
+                import hashlib as _pool_hl
+
+                def _pool_ck(_p):
+                    try:
+                        with open(_p, "rb") as _f:
+                            return _pool_hl.sha1(_f.read(131072)).hexdigest()
+                    except Exception:
+                        return None
+
+                _pool_ident = set()
+                for _p in (fallback_pool + clean_raw_fallback):
+                    _k = _pool_ck(_p)
+                    if _k:
+                        _pool_ident.add(_k)
+                _extra_downloaded = []
+                if seedance_target_dir.exists():
+                    for _mp4 in sorted(seedance_target_dir.rglob("*.mp4")):
+                        _low = {x.lower() for x in _mp4.parts}
+                        if "_raw" in _low or "hook_influencer" in _low:
+                            continue
+                        _rk = str(_mp4.resolve())
+                        if _rk in _seen_raw or not _download_clean(_mp4):
+                            continue
+                        _k = _pool_ck(_mp4)
+                        if not _k or _k in _pool_ident:
+                            continue
+                        _pool_ident.add(_k)
+                        _seen_raw.add(_rk)
+                        _extra_downloaded.append(str(_mp4))
+                if _extra_downloaded:
+                    clean_raw_fallback.extend(_extra_downloaded)
+                    log(status_cb, f"Distinct-clip pool broadened with {len(_extra_downloaded)} more "
+                                   "downloaded clip(s); unmatched scenes get fresh footage, not a repeat.")
+            except Exception as _pool_exc:  # noqa: BLE001
+                log(status_cb, f"Pool broadening skipped ({_pool_exc.__class__.__name__}).")
             usage_counts = {}
             for _, _assigned in accepted_body:
                 _key = str(Path(_assigned).resolve())
@@ -10320,38 +10445,52 @@ def run_project(form, status_cb=None):
                     ),
                 ) if candidates else None
 
+            # STRICT NO-REUSE (user rule, absolute): a source that already appears ANYWHERE in the
+            # video may NEVER fill another scene - not even a different excerpt. Identity is the
+            # clip's content head-hash, so two files that are the same TikTok collide even with
+            # different filenames/trims. When the pool of still-UNUSED distinct clips is exhausted
+            # we HOLD the previous shot (one contiguous clip spanning the gap) instead of replaying
+            # an earlier clip elsewhere in the timeline - a hold is a continuation, a replay is the
+            # jarring duplicate the user keeps hitting.
+            import hashlib as _dedup_hl
+
+            def _content_key(_p):
+                try:
+                    with open(_p, "rb") as _fh:
+                        return "h:" + _dedup_hl.sha1(_fh.read(131072)).hexdigest()
+                except Exception:
+                    return "p:" + str(Path(_p).resolve())
+
+            used_identity = set()
+            for _sc in scene_clips:
+                if _sc:
+                    used_identity.add(_content_key(_sc))
+
             for scene_index in range(1, scene_total):
                 if scene_clips[scene_index] is not None:
                     continue
                 wanted_bucket = scene_bucket.get(scene_index)
-                # All clean footage we can borrow for an unmatched scene: accepted semantic matches
-                # first (best), then CLEAN RAW download clips (looser but real - the safety net for
-                # "accepts no clips at 80%"). DISTRIBUTE by least-used so one clip is not replayed
-                # across the whole video (the "same clip reused" complaint), and prefer the scene's
-                # own search bucket for topical continuity.
+                # Accepted semantic matches first, then CLEAN RAW downloads - but ONLY clips whose
+                # source is not already used anywhere in the video (incl. V2 matches + the hook).
                 combined_fallback = fallback_pool + clean_raw_fallback
-                if combined_fallback:
+                unused = [p for p in combined_fallback if _content_key(p) not in used_identity]
+                if unused:
                     same_bucket_pool = [
-                        p for p in combined_fallback
+                        p for p in unused
                         if wanted_bucket and (clip_meta.get(str(p)) or {}).get("bucket_id") == wanted_bucket
                     ]
-                    fallback_clip = _least_used(same_bucket_pool) or _least_used(combined_fallback)
-                    # Anti-repeat: never replay an already-used clip while a fresher one exists
-                    # anywhere - variety wins over staying in-bucket.
-                    _use = usage_counts.get(str(Path(fallback_clip).resolve()), 0)
-                    if _use > 0:
-                        _fresh = _least_used(combined_fallback)
-                        if _fresh is not None and usage_counts.get(str(Path(_fresh).resolve()), 0) < _use:
-                            fallback_clip = _fresh
+                    # deterministic pick from the unused pool, preferring the scene's own bucket
+                    fallback_clip = min(same_bucket_pool or unused, key=lambda c: str(Path(c).name))
                     _is_accepted = fallback_clip in fallback_pool
                     _in_bucket = (wanted_bucket and (clip_meta.get(str(fallback_clip)) or {}).get("bucket_id") == wanted_bucket)
-                    reason = ("adaptive least-used " + ("accepted" if _is_accepted else "clean-raw")
-                              + " clip" + (f" from bucket {wanted_bucket}" if _in_bucket else " (variety over repeat)"))
+                    reason = ("distinct " + ("accepted" if _is_accepted else "clean-raw")
+                              + " clip" + (f" from bucket {wanted_bucket}" if _in_bucket else " (no source reused)"))
+                    used_identity.add(_content_key(fallback_clip))
                 elif scene_index > 1 and scene_clips[scene_index - 1] is not None:
-                    # Truly nothing to borrow - hold the previous visual instead of jumping away and
-                    # later cutting back. The renderer continues the clip's source time across the hold.
+                    # No distinct clip left -> HOLD the previous shot (contiguous continuation, the
+                    # renderer continues the source time across the hold). Never replay an earlier clip.
                     fallback_clip = scene_clips[scene_index - 1]
-                    reason = f"adaptive adjacent visual hold from scene {scene_index - 1}"
+                    reason = f"no distinct clip left - held previous shot from scene {scene_index - 1}"
                 else:
                     continue
                 scene_clips[scene_index] = fallback_clip
@@ -10833,7 +10972,10 @@ def run_project(form, status_cb=None):
     else:
         config["output_basename"] = f"{slug}_{recut_mode}_{recut_stamp}"
         config["recut_stamp"] = recut_stamp
-        config["recut_uses_existing_media_only"] = recut_mode == "recut_existing_only"
+        # Timeline "reorder & recut": recut_existing_only reuses the project's own clips, UNLESS the
+        # user explicitly chose "find more clips" (recut_allow_scrape) in the media-source popup.
+        config["recut_uses_existing_media_only"] = (recut_mode == "recut_existing_only"
+                                                    and not form_flag(form, "recut_allow_scrape", False))
         config["recut_generates_new_web_images_only"] = recut_mode == "recut_new_web_images"
         config["recut_regenerates_seedance"] = recut_mode == "recut_regenerate_seedance"
         config["recut_recreates_speaker_clip_only"] = recut_mode == "recut_recreate_speaker_clip"
@@ -11023,7 +11165,18 @@ def run_project(form, status_cb=None):
     # for scrape mode we now run the TARGET-BASED planner (plan_visual_fx): it looks at the actual
     # clip frame, only adds a red callout when a concrete relevant subject exists, and sets the
     # per-scene punch-in/reframe/shake/freeze/transition. A user can hard-disable all of it.
-    _fx_off = form_flag(form, "disable_visual_fx", False) if isinstance(form, dict) else False
+    # VFX layers chosen at "select the final layers": arrows (in-render), meme + neko reactions
+    # (composited after the render). vfx_amount scales all of them.
+    _ui_form = bool(str(form.get("ui_form", "")).strip()) if isinstance(form, dict) else False
+    _add_visual_effects = form_flag(form, "add_visual_effects", False if _ui_form else True)
+    _add_meme_reactions = form_flag(form, "add_meme_reactions", False)
+    _add_neko_reactions = form_flag(form, "add_neko_reactions", False)
+    _vfx_amount = str((form.get("vfx_amount") if isinstance(form, dict) else "") or "medium").strip().lower()
+    if _vfx_amount not in ("low", "medium", "high"):
+        _vfx_amount = "medium"
+    config["vfx_amount"] = _vfx_amount
+    _disable_visual_fx = form_flag(form, "disable_visual_fx", False) if isinstance(form, dict) else False
+    _fx_off = _disable_visual_fx or not _add_visual_effects   # arrows/punch-in only when chosen
     for _sc in config.get("scenes", []):
         _sc.pop("overlays", None)                 # clear any stale/legacy overlay specs first
     if _fx_off:
@@ -11035,7 +11188,7 @@ def run_project(form, status_cb=None):
     elif config.get("clip_source") == "scrape":
         try:
             plan_visual_fx(config, project_dir, reasoning_model=reasoning_model,
-                           status_cb=status_cb, collaborate=collaborate_reasoning)
+                           status_cb=status_cb, collaborate=collaborate_reasoning, vfx_amount=_vfx_amount)
             config["visual_emphasis_enabled"] = bool((config.get("visual_fx_report") or {})
                                                      .get("visual_fx_summary", {}).get("callout_count"))
         except Exception as exc:  # noqa: BLE001
@@ -11123,8 +11276,51 @@ def run_project(form, status_cb=None):
             log(status_cb, f"Caption keywords (rule-based): {', '.join(_found[:8])}...")
 
     check_cancel(form)
+    # CLIP-SHORT (scrape) hands off to the timeline editor instead of baking a final MP4 here. All
+    # the pipeline's edits (scene clips, cut/reaction SFX, arrows, captions, timings) are already
+    # written to project.json above, and scrape mode runs NO post-render Audio-Director pass
+    # (sfx_semantic_vision is False for scrape) - so nothing is lost by skipping the encode. The
+    # user opens the timeline with everything as edited and renders from there when happy.
+    _skip_render_open_timeline = (
+        clip_source == "scrape" and form_flag(form, "open_timeline_no_render", True))
+    if _skip_render_open_timeline:
+        log(status_cb, "Skipping the final render - opening the timeline editor with the "
+                       "pipeline's edit. Render from the timeline when you're happy with it.")
+        try:
+            log(status_cb, "PROJECT_DIR|" + str(project_dir))
+        except Exception:
+            pass
+        return {
+            "project_dir": str(project_dir),
+            "project_slug": project_dir.name,
+            "title": title,
+            "video": None,
+            "open_timeline": True,
+            "no_render": True,
+        }
     log(status_cb, "Rendering final 9:16 MP4...")
     output = pipeline.render_video(config)
+
+    # VFX Master reaction layers (memes / nekos) composited onto the finished render. Arrows are
+    # already baked in-render by plan_visual_fx, so add_arrows=False avoids drawing them twice.
+    if (_add_meme_reactions or _add_neko_reactions) and output and Path(output).exists():
+        _layers = [name for name, on in (("meme reactions", _add_meme_reactions),
+                                         ("neko reactions", _add_neko_reactions)) if on]
+        try:
+            check_cancel(form)
+            import visual_agent
+            log(status_cb, "Adding %s (amount: %s)..." % (" + ".join(_layers), _vfx_amount))
+            _vfx_res = visual_agent.enhance_video_with_arrows(
+                output, reasoning_model=reasoning_model, status_cb=status_cb,
+                out_dir=(project_dir / "renders"),
+                add_characters=_add_neko_reactions, add_memes=_add_meme_reactions,
+                vfx_amount=_vfx_amount, add_arrows=False, write_project=False)
+            _enhanced = _vfx_res.get("video") if isinstance(_vfx_res, dict) else None
+            if _enhanced and Path(_enhanced).exists():
+                output = Path(_enhanced)
+                log(status_cb, "Reaction layers added to the render.")
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Reaction layers skipped ({exc.__class__.__name__}: {exc}).")
     check_cancel(form)
 
     # SEMANTIC SFX PASS (Script-to-Visuals): the multimodal Audio Director watches + hears the

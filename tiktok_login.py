@@ -220,6 +220,57 @@ def login(status_cb=None, timeout_s=300):
                 pass
 
 
+def open_manual_browser(status_cb=None, timeout_s=3600):
+    """Open ONE headed Chromium on the TikTok persistent profile with a TikTok tab AND an Instagram
+    tab, so the user can browse both (already logged in to TikTok; Instagram is remembered in the
+    same profile after signing in once) and copy the links of clips they want. Downloading those
+    links is handled by the app's 'Add to manual' action (yt-dlp + the saved login cookies).
+    Blocks on its own thread until the user closes the window. #159."""
+    if not available():
+        _status(status_cb, "Manual browser: Playwright is not installed (pip install playwright "
+                           "&& playwright install chromium).")
+        return False
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # Same profile the scrape uses - kill any zombie holder first so this window actually opens
+    # on-screen instead of delegating to an off-screen scrape process.
+    _kill_stale_profile_processes()
+    _status(status_cb, "Opening TikTok + Instagram in a logged-in window - find clips, copy their "
+                       "links, then paste them into 'Add to manual' back in the editor.")
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
+            viewport={"width": 1320, "height": 900},
+            args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                  "--no-default-browser-check", "--window-position=120,60"])
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _place_window_visible(ctx, 120, 60)      # force ON-SCREEN even if a scrape saved it off-screen
+            try:
+                page.goto("https://www.tiktok.com/", timeout=60000)
+            except Exception:
+                pass
+            try:
+                ig = ctx.new_page()
+                ig.goto("https://www.instagram.com/", timeout=60000)
+            except Exception:
+                pass
+            deadline = time.time() + max(60, int(timeout_s))
+            while time.time() < deadline:
+                try:
+                    if not ctx.pages:               # user closed every tab -> done
+                        break
+                except Exception:
+                    break
+                time.sleep(1.2)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    _status(status_cb, "Manual browser closed.")
+    return True
+
+
 def logout():
     """Forget the saved session (delete profile + cookies)."""
     import shutil
@@ -554,7 +605,7 @@ class Session:
     def logged_in(self):
         return _has_session_cookie(self.cookies())
 
-    def search(self, query, want=12, status_cb=None, sort="MOST_LIKED", max_scrolls=8,
+    def search(self, query, want=12, status_cb=None, sort="MOST_LIKED", max_scrolls=14,
                timeout_s=None):
         """Run a logged-in keyword search and return up to ~want native TikTok item dicts."""
         cb = status_cb or self._status_cb
@@ -621,7 +672,7 @@ class Session:
             scrolls = 0
             stagnant = 0
             last_n = len(collected)
-            while (len(collected) < want and scrolls < max_scrolls and stagnant < 2
+            while (len(collected) < want and scrolls < max_scrolls and stagnant < 4
                    and (deadline is None or time.monotonic() < deadline)):
                 page.mouse.wheel(0, 2600)
                 page.wait_for_timeout(1100)

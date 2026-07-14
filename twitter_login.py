@@ -372,7 +372,7 @@ class Session:
         except Exception:
             return []
 
-    def search(self, query, want=12, status_cb=None, max_scrolls=6, timeout_s=None,
+    def search(self, query, want=12, status_cb=None, max_scrolls=12, timeout_s=None,
                sort="MOST_LIKED"):
         cb = status_cb or self._status_cb
         query = str(query or "").strip()
