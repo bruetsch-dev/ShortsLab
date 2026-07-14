@@ -1208,7 +1208,10 @@ def _item_meta(item):
     m["has_text_stickers"] = bool(item.get("stickersOnItem") or item.get("stickers"))
     m["id"] = str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
     m["url"] = str(item.get("webVideoUrl") or item.get("shareUrl") or item.get("url") or "")
-    m["cover"] = str(v.get("cover") or v.get("originCover") or vm.get("coverUrl") or "")
+    # Instagram (instagram_login backend) carries the thumbnail at the item's top-level "cover",
+    # not inside a TikTok-shaped video/videoMeta dict - fall back to it so IG previews resolve.
+    m["cover"] = str(v.get("cover") or v.get("originCover") or vm.get("coverUrl")
+                     or item.get("cover") or item.get("thumbnail") or "")
     stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
         item.get("stats") if isinstance(item.get("stats"), dict) else {})
     try:

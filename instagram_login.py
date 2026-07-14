@@ -318,6 +318,16 @@ def _extract_reels(payload):
             created = int(m.get("taken_at") or 0)
         except (TypeError, ValueError):
             created = 0
+        # thumbnail (cover) for the manual-browser preview - IG media JSON keeps it under
+        # image_versions2.candidates[].url (highest-res first), with a couple of legacy fallbacks.
+        cover = ""
+        iv2 = m.get("image_versions2") if isinstance(m.get("image_versions2"), dict) else {}
+        for _c in (iv2.get("candidates") if isinstance(iv2.get("candidates"), list) else []):
+            if isinstance(_c, dict) and _c.get("url"):
+                cover = str(_c["url"])
+                break
+        if not cover:
+            cover = str(m.get("thumbnail_url") or m.get("display_uri") or m.get("display_url") or "")
         width = height = 0
         try:
             width = int(m.get("original_width") or 0)
@@ -336,6 +346,7 @@ def _extract_reels(payload):
             "webVideoUrl": f"https://www.instagram.com/reel/{code}/",
             "_source": "instagram_login",     # backend_download -> yt-dlp
             "_platform": "instagram",         # scaled like-gate + reporting
+            "cover": cover,
             "video": {"width": width, "height": height, "duration": dur_ms},
             "stats": {"diggCount": likes, "playCount": views},
             "createTime": created,

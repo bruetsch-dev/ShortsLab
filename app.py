@@ -6312,6 +6312,17 @@ TIMELINE_SKELETON = """
               </select>
               <button type="button" id="tl-msearch-go" title="Search (nothing downloads until you click a result)">🔍 Search</button>
             </div>
+            <div class="tl-msearch-opts">
+              <label class="tl-msearch-sortwrap" title="Order the results">Sort
+                <select id="tl-msearch-sort">
+                  <option value="MOST_LIKED">Most liked</option>
+                  <option value="RELEVANCE">Relevance</option>
+                  <option value="MOST_VIEWED">Most viewed</option>
+                  <option value="MOST_RECENT">Most recent</option>
+                </select>
+              </label>
+              <label class="tl-msearch-jp" title="The AI agent translates your search into a native Japanese phrase and searches that instead"><input type="checkbox" id="tl-msearch-jp"> Search in Japanese</label>
+            </div>
             <div class="tl-msearch-results" id="tl-msearch-results"></div>
             <details class="tl-manual-adv">
               <summary>Browse logged-in, or paste links manually</summary>
@@ -6695,6 +6706,20 @@ TIMELINE_ASSETS = """
   .tl-manual-panel .tl-msearch-row #tl-msearch-go::after { display:none; }
   .tl-manual-panel .tl-msearch-row #tl-msearch-go:hover { filter:brightness(1.08); }
   .tl-manual-panel .tl-msearch-row #tl-msearch-go:disabled { opacity:.6; cursor:default; }
+  /* second controls row: sort order + "search in Japanese" (AI-translated) */
+  .tl-manual-panel .tl-msearch-opts { display:flex; align-items:center; gap:12px; margin-top:6px;
+    font-size:11px; color:var(--muted); flex-wrap:wrap; }
+  .tl-manual-panel .tl-msearch-opts .tl-msearch-sortwrap { display:flex; align-items:center; gap:5px;
+    font-weight:700; letter-spacing:.02em; text-transform:uppercase; }
+  .tl-manual-panel .tl-msearch-opts #tl-msearch-sort { width:auto; margin:0; padding:3px 6px; height:26px;
+    font-size:11px; box-sizing:border-box; background:var(--bg-raised); border:1px solid var(--line-strong);
+    color:var(--text); border-radius:7px; cursor:pointer; text-transform:none; }
+  .tl-manual-panel .tl-msearch-opts .tl-msearch-jp { display:flex; align-items:center; gap:5px;
+    cursor:pointer; font-weight:600; }
+  .tl-manual-panel .tl-msearch-opts .tl-msearch-jp input { width:auto; height:auto; margin:0;
+    accent-color:var(--accent); cursor:pointer; }
+  .tl-manual-panel .tl-msres-jpnote { grid-column:1/-1; font-size:11px; color:var(--muted); padding:2px 2px 6px; }
+  .tl-manual-panel .tl-msres-jpnote b { color:var(--text); }
   .tl-msearch-results { display:grid; grid-template-columns:repeat(auto-fill,minmax(84px,1fr)); gap:7px; max-height:290px; overflow-y:auto; }
   .tl-msres-empty, .tl-msres-loading { grid-column:1/-1; padding:12px 4px; font-size:12px; color:var(--faint); text-align:center; }
   .tl-msres { position:relative; border:1px solid var(--line); border-radius:9px; overflow:hidden; background:var(--bg-base); cursor:pointer; transition:border-color .12s ease, transform .12s ease; }
@@ -8899,13 +8924,15 @@ TIMELINE_ASSETS = """
     // ---- manual SEARCH: type a query -> see results (cover + likes) WITHOUT downloading ----
     // -> click a result to download just that one clip into the Manual library.
     var msInput=document.getElementById('tl-msearch-input'), msGo=document.getElementById('tl-msearch-go'),
-        msPlat=document.getElementById('tl-msearch-plat'), msBox=document.getElementById('tl-msearch-results');
+        msPlat=document.getElementById('tl-msearch-plat'), msBox=document.getElementById('tl-msearch-results'),
+        msSort=document.getElementById('tl-msearch-sort'), msJp=document.getElementById('tl-msearch-jp');
     function fmtCount(n){ n=+n||0; if(n>=1e6) return (n/1e6).toFixed(1).replace(/\\.0$/,'')+'M';
       if(n>=1e3) return (n/1e3).toFixed(1).replace(/\\.0$/,'')+'K'; return ''+n; }
-    function renderManualResults(list){
+    function renderManualResults(list, jpTerm){
       if(!msBox) return;
-      if(!list.length){ msBox.innerHTML='<div class="tl-msres-empty">No results. Try another search, and make sure you\\u2019re connected to TikTok / Instagram.</div>'; if(window.__tlSyncFetchPad) window.__tlSyncFetchPad(); return; }
-      msBox.innerHTML='';
+      var jpNote = jpTerm ? ('<div class="tl-msres-jpnote">Searched in Japanese: <b>'+esc(jpTerm)+'</b></div>') : '';
+      if(!list.length){ msBox.innerHTML=jpNote+'<div class="tl-msres-empty">No results. Try another search, and make sure you\\u2019re connected to TikTok / Instagram.</div>'; if(window.__tlSyncFetchPad) window.__tlSyncFetchPad(); return; }
+      msBox.innerHTML=jpNote;
       list.forEach(function(r){
         var card=document.createElement('div'); card.className='tl-msres';
         var glyph=(r.platform==='instagram')?'\\uD83D\\uDCF7':(r.platform==='twitter')?'\\uD835\\uDD4F':'\\uD83C\\uDFB5';
@@ -8940,14 +8967,16 @@ TIMELINE_ASSETS = """
     function doManualSearch(){
       if(!msInput||!msBox) return;
       var q=(msInput.value||'').trim(); if(!q) return;
+      var jp=!!(msJp&&msJp.checked);
       if(msGo) msGo.disabled=true;
-      msBox.innerHTML='<div class="tl-msres-loading">Searching \\u201c'+esc(q)+'\\u201d\\u2026</div>';
+      msBox.innerHTML='<div class="tl-msres-loading">'+(jp?'Translating to Japanese &amp; searching':'Searching')+' \\u201c'+esc(q)+'\\u201d\\u2026</div>';
       fetch('/timeline-manual-search', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({slug:slug, query:q, platforms:[msPlat?msPlat.value:'tiktok']})})
+        body: JSON.stringify({slug:slug, query:q, platforms:[msPlat?msPlat.value:'tiktok'],
+                              sort:(msSort?msSort.value:'MOST_LIKED'), japanese:jp})})
         .then(function(r){return r.json();}).then(function(d){
           if(msGo) msGo.disabled=false;
           if(!d.ok){ msBox.innerHTML='<div class="tl-msres-empty">'+esc(d.error||'Search failed.')+'</div>'; return; }
-          renderManualResults(d.results||[]);
+          renderManualResults(d.results||[], d.japanese_term||'');
         }).catch(function(){ if(msGo) msGo.disabled=false; msBox.innerHTML='<div class="tl-msres-empty">Search request failed.</div>'; });
     }
     if(msGo) msGo.addEventListener('click', doManualSearch);
@@ -10677,17 +10706,49 @@ def _platform_from_url(url):
     return "tiktok"
 
 
-def timeline_manual_search(query, platforms=None, count=24):
+_MANUAL_SORTS = ("MOST_LIKED", "RELEVANCE", "MOST_VIEWED", "MOST_RECENT")
+
+
+def _translate_query_to_japanese(query):
+    """Ask the reasoning model for the NATURAL 1-3 word Japanese (kanji/kana) phrase a real Japanese
+    user would type on TikTok/Instagram for this search. Returns '' if unavailable."""
+    try:
+        import scrape_v2 as _s2
+        data = _s2._llm_json([
+            {"role": "system", "content":
+             "You translate a short footage search into the NATURAL Japanese (kanji/kana) search "
+             "phrase a real Japanese person types on TikTok/Instagram. Keep it 1-3 words - platform "
+             "search returns nothing for long phrases. JSON only."},
+            {"role": "user", "content":
+             'Search: "' + str(query) + '"\nReturn exactly {"japanese":"<1-3 word japanese search>"}'}],
+            max_tokens=120, temperature=0.2)
+        return " ".join(str((data or {}).get("japanese") or "").split()[:4]).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def timeline_manual_search(query, platforms=None, count=24, sort="MOST_LIKED", japanese=False):
     """Manual browse: search TikTok/Instagram and RETURN the results (cover thumbnail + metadata)
-    WITHOUT downloading anything. The user clicks a result to download just that one clip."""
+    WITHOUT downloading anything. The user clicks a result to download just that one clip.
+    `sort` = one of MOST_LIKED / RELEVANCE / MOST_VIEWED / MOST_RECENT. `japanese` = translate the
+    query to a native Japanese search phrase (via the AI agent) before searching."""
     query = str(query or "").strip()
     if not query:
         return {"ok": False, "error": "Type something to search."}
+    sort_mode = str(sort or "MOST_LIKED").upper()
+    if sort_mode not in _MANUAL_SORTS:
+        sort_mode = "MOST_LIKED"
+    used_query = query
+    japanese_term = ""
+    if japanese:
+        japanese_term = _translate_query_to_japanese(query)
+        if japanese_term:
+            used_query = japanese_term
     try:
         import clip_scraper
         plats = [str(p).strip().lower() for p in (platforms or ["tiktok"]) if str(p).strip()] or ["tiktok"]
-        got = clip_scraper.backend_search(query, int(count), status_cb=None,
-                                          sort="MOST_LIKED", platforms=plats) or []
+        got = clip_scraper.backend_search(used_query, int(count), status_cb=None,
+                                          sort=sort_mode, platforms=plats) or []
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"Search failed ({exc.__class__.__name__}). Are you connected to TikTok/Instagram?"}
     results, seen = [], set()
@@ -10712,7 +10773,8 @@ def timeline_manual_search(query, platforms=None, count=24):
             "author": str(m.get("author") or ""),
             "platform": _platform_from_url(url),
         })
-    return {"ok": True, "results": results, "query": query}
+    return {"ok": True, "results": results, "query": used_query,
+            "sort": sort_mode, "japanese_term": japanese_term}
 
 
 _MANUAL_COVER_CACHE = {}   # cover-url -> (content_type, bytes); small in-memory LRU-ish cache
@@ -10729,10 +10791,17 @@ def fetch_manual_cover(url):
         return cached
     try:
         import urllib.request
+        # Instagram/Facebook CDNs (cdninstagram / fbcdn) 403 a TikTok referer; send the matching
+        # origin so IG covers load too. (This was why the IG manual-browser previews were blank.)
+        low = url.lower()
+        if "cdninstagram" in low or "fbcdn" in low or "instagram" in low:
+            referer = "https://www.instagram.com/"
+        else:
+            referer = "https://www.tiktok.com/"
         req = urllib.request.Request(url, headers={
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"),
-            "Referer": "https://www.tiktok.com/",
+            "Referer": referer,
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         })
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -13634,7 +13703,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = {}
             res = timeline_manual_search(str(data.get("query", "")),
                                          platforms=data.get("platforms"),
-                                         count=int(data.get("count") or 24))
+                                         count=int(data.get("count") or 24),
+                                         sort=str(data.get("sort") or "MOST_LIKED"),
+                                         japanese=bool(data.get("japanese")))
             self.send_bytes(json.dumps(res).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/timeline-manual-download":
