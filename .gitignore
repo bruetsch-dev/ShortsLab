@@ -93,8 +93,9 @@ instagram-profile/
 # local push helper (not source)
 push_to_github.bat
 
-# large demo preview videos (regenerable, not needed to run the app)
-static/previews/*.mp4
+# NOTE: static/previews/*.mp4 are intentionally TRACKED - the new-creation mode
+# menu buttons play them as previews, so a fresh clone/pull needs them (without
+# them the buttons only show the static poster JPGs).
 
 # generated: progressively time-stretched hook risers (regenerable cache)
 _stretched_risers/
