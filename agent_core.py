@@ -33,6 +33,18 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 SPEAKER_DIR.mkdir(exist_ok=True)
 
 
+def is_project_dir(path):
+    """True for a REAL project folder under projects/.
+
+    A leading underscore marks a container, not a project: _longform, _sfx_enhanced,
+    _visual_enhanced and _captioned hold the output of the other modes, _cache is scratch. Listing
+    one as a project lets the UI "open" something that has no config and no run form, and it then
+    renders whatever the defaults happen to be.
+    """
+    p = Path(path)
+    return p.is_dir() and not p.name.startswith("_")
+
+
 def load_env_file():
     env_path = ROOT / ".env"
     if not env_path.exists():

@@ -497,7 +497,7 @@ def list_previous_projects(limit=80):
     projects_root = agent_core.PROJECTS_DIR
     if not projects_root.exists():
         return []
-    projects = [path for path in projects_root.iterdir() if path.is_dir()]
+    projects = [path for path in projects_root.iterdir() if agent_core.is_project_dir(path)]
     projects.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return projects[:limit]
 
@@ -5973,7 +5973,8 @@ def set_project_hidden(slug, hidden):
 
 def assets_page(show_hidden=False):
     projects_dir = agent_core.PROJECTS_DIR
-    all_projects = [p for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.exists() else []
+    all_projects = ([p for p in projects_dir.iterdir() if agent_core.is_project_dir(p)]
+                    if projects_dir.exists() else [])
     all_projects.sort(key=project_edited_mtime, reverse=True)   # most recently EDITED first
     hidden_projects = [p for p in all_projects if is_project_hidden(p)]
     visible_projects = [p for p in all_projects if not is_project_hidden(p)]

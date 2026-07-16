@@ -450,7 +450,7 @@ def projects_list_payload(show_hidden=False, limit=200):
                 active_project_slugs.add(Path(project_dir).name)
     items = []
     if projects_dir.exists():
-        dirs = [p for p in projects_dir.iterdir() if p.is_dir()]
+        dirs = [p for p in projects_dir.iterdir() if agent_core.is_project_dir(p)]
         dirs.sort(key=app.project_edited_mtime, reverse=True)
         for p in dirs[:limit]:
             try:
@@ -490,7 +490,7 @@ def projects_list_payload(show_hidden=False, limit=200):
     hidden_count = 0
     try:
         hidden_count = sum(1 for p in projects_dir.iterdir()
-                           if p.is_dir() and app.is_project_hidden(p)) if projects_dir.exists() else 0
+                           if agent_core.is_project_dir(p) and app.is_project_hidden(p))             if projects_dir.exists() else 0
     except Exception:
         pass
     return {"projects": items, "hidden_count": hidden_count, "showing_hidden": bool(show_hidden)}
