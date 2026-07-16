@@ -8102,8 +8102,14 @@ def apply_timeline_edits_to_config(config, edits, slug):
                     dest = clip_dir / f"speed_{sid}_{tag}_{_sk}.mp4"
                     if not dest.exists():
                         ffm = pipeline.find_ffmpeg()
+                        # setpts alone only rewrites timestamps, so the output inherits a SCALED
+                        # framerate (0.9x on 30fps -> 27fps, 1.1x on 29.97 -> 32.97...). The
+                        # renderer then samples every clip at a fixed 30fps, which duplicates the
+                        # frames of a non-30 source in an uneven pattern. fps=30 resamples to
+                        # constant 30 here, where the speed is known.
                         subprocess.run([ffm, "-y", "-hide_banner", "-loglevel", "error",
-                                        "-i", str(src), "-vf", f"setpts=PTS/{speed:.4f}",
+                                        "-i", str(src), "-vf", f"setpts=PTS/{speed:.4f},fps=30",
+                                        "-r", "30",
                                         "-an", "-c:v", "libx264", "-crf", "19",
                                         "-preset", "veryfast", str(dest)],
                                        capture_output=True, timeout=300)
