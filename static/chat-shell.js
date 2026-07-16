@@ -45,12 +45,18 @@ const fmtDate = (s) => s || "";
 
 async function jget(url) { const r = await fetch(url); return r.json(); }
 
+// What a project's `kind` is CALLED on screen. The raw key doubles as a CSS class, so it stays
+// lowercase; only the badge text lives here. An ordinary generated/scraped project has no kind
+// and so no badge.
+const KIND_LABEL = { running: "running", failed: "failed", sfx: "SFX", vfx: "VFX",
+                     longform: "Sketch" };
+function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
 /* single-frame project thumbnail (hook/opening) + a master-tool badge overlay */
 function projThumb(p, cls) {
-  // Overlay label + colored border: failed (red) wins, else an SFX/VFX-Master upload gets its
-  // own colored tag; an ordinary generated/scraped project gets no overlay.
+  // Overlay label + colored border: failed (red) wins, else an SFX/VFX-Master upload or a Sketch
+  // explainer gets its own colored tag.
   const kind = p.running ? "running" : p.failed ? "failed" : (p.kind || p.preview_kind || "");
-  const txt = kind === "running" ? "running" : kind === "failed" ? "failed" : kind === "sfx" ? "SFX" : kind === "vfx" ? "VFX" : "";
+  const txt = kindLabel(kind);
   const tag = txt ? `<span class="pv-tag pv-tag-${kind}">${txt}</span>` : "";
   const inner = p.thumb_url
     ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">`
@@ -717,7 +723,7 @@ async function refreshPrototypeHomeData() {
       const fallback = `<span class="proto-poster-fallback proto-poster-${idx + 1}">${protoIcon("folder")}</span>`;
       const preview = p.thumb_url ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">` : fallback;
       const status = p.running ? "Run in progress" : p.failed ? "Needs attention" : p.has_timeline ? "Ready to edit" : "In progress";
-      b.innerHTML = `<span class="proto-project-poster">${preview}${p.kind ? `<i>${esc(p.kind)}</i>` : ""}</span>
+      b.innerHTML = `<span class="proto-project-poster">${preview}${kindLabel(p.kind) ? `<i>${esc(kindLabel(p.kind))}</i>` : ""}</span>
         <span class="proto-project-copy"><b>${esc(p.title || p.slug)}</b><small>${esc(status)} · ${esc(fmtDate(p.edited))}</small></span>${protoIcon("more")}`;
       b.addEventListener("click", () => loadProject(p.slug));
         grid.appendChild(b);

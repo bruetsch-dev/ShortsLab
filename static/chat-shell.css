@@ -164,6 +164,7 @@ body.sb-resizing .sidebar { transition: none; }
   box-shadow: 0 1px 3px rgba(0,0,0,.5); }
 .pv-tag-sfx { background: #7c5cff; }      /* SFX Master = violet */
 .pv-tag-vfx { background: #f0912b; }      /* VFX Master = orange */
+.pv-tag-longform { background: #38bdf8; }  /* Sketch explainer = cyan */
 .pv-tag-failed { background: var(--danger); }
 .pv-tag-running { background:var(--warning); color:#171208; }
 .pv-wrap.pv-sfx { border: 2px solid #7c5cff !important; box-shadow: 0 0 0 1px rgba(124,92,255,.22); box-sizing:border-box; }
@@ -175,6 +176,10 @@ body.sb-resizing .sidebar { transition: none; }
 .asset-card2 .pv-wrap.ath { width: 100%; aspect-ratio: 9/12; display: block; }
 .asset-card2.project-kind-sfx { border-color:#7c5cff; }
 .asset-card2.project-kind-vfx { border-color:#f0912b; }
+/* NOTE: these four are dead in the prototype theme - `.prototype-ui .asset-card2` has the same
+   specificity and comes later, so it wins. The badge (.pv-tag-*) carries the meaning. Kept for
+   the classic shell; do not add more here expecting a coloured card. */
+.asset-card2.project-kind-longform { border-color:#38bdf8; }
 .asset-card2.project-kind-failed { border-color:var(--danger); }
 .asset-card2.project-kind-running { border-color:var(--warning); }
 .asset-card2 .pv-wrap.ath .pv-badge { width: 26px; height: 26px; font-size: 15px; right: 6px; bottom: 6px; border-radius: 7px; }
