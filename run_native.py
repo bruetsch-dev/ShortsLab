@@ -19,6 +19,52 @@ import app  # defines Handler + QuietServer and installs crash logging at import
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+def _enable_context_menus():
+    """Give the native window its right-click menu back (copy/paste in the script box).
+
+    pywebview's WebView2 backend ties FOUR unrelated things to debug mode in one line each:
+
+        settings.AreBrowserAcceleratorKeysEnabled = _state['debug']
+        settings.AreDefaultContextMenusEnabled    = _state['debug']   # <- the one we want
+        settings.AreDevToolsEnabled              = _state['debug']
+        settings.IsStatusBarEnabled              = _state['debug']
+
+    So a release window has no context menu ANYWHERE - you cannot right-click-paste a script.
+    (webview.settings['SHOW_DEFAULT_MENUS'] looks like the knob for this but is read only by the
+    macOS backend.) Starting with debug=True would fix it and drag in devtools, browser hotkeys
+    and a hover status bar; instead we re-enable the single setting right after pywebview has
+    applied its own, inside ITS handler - which is the UI thread, the only thread allowed to
+    touch CoreWebView2.Settings.
+
+    Best effort: on any pywebview version where this no longer fits, the app runs exactly as
+    before, just without the context menu.
+    """
+    try:
+        from webview.platforms import edgechromium
+    except Exception:
+        return False
+    original = getattr(edgechromium.EdgeChrome, "on_webview_ready", None)
+    if original is None or getattr(original, "_shortslab_ctxmenu", False):
+        return False
+
+    def on_webview_ready(self, sender, args):
+        # finally, not a plain sequence: pywebview applies the settings and THEN navigates, so an
+        # exception out of its load_url would leave the context menu switched off behind us.
+        try:
+            original(self, sender, args)
+        finally:
+            try:
+                core = getattr(sender, "CoreWebView2", None)
+                if core is not None:        # None when init failed and pywebview bailed out early
+                    core.Settings.AreDefaultContextMenusEnabled = True
+            except Exception as exc:                               # pragma: no cover - GUI path
+                print("[native] could not enable context menus:", exc)
+
+    on_webview_ready._shortslab_ctxmenu = True
+    edgechromium.EdgeChrome.on_webview_ready = on_webview_ready
+    return True
+
+
 def _cancel_active_jobs():
     """Tell in-process workers to stop before the native window disappears."""
     try:
@@ -163,6 +209,7 @@ def main():
             except Exception as exc:  # pragma: no cover - GUI dialog path
                 return {"ok": False, "error": str(exc)}
 
+    _enable_context_menus()     # must run before start(): it patches the backend's ready handler
     window = webview.create_window("Shortslab", url, js_api=_NativeApi(),
                                    width=1440, height=920, min_size=(1024, 680))
     closed = threading.Event()
