@@ -40,8 +40,56 @@ IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra t
 VIDEO_W, VIDEO_H, VIDEO_FPS = 1920, 1080, 30
 
 
+STATE_FILE = "state.json"           # resume state: script + timings + prompts of the last run
+MIN_IMAGE_BYTES = 1024              # smaller than this = a truncated/failed write, regenerate
+
+
 class LongformError(RuntimeError):
     pass
+
+
+def _image_done(path):
+    """True when an image is already on disk and is not a truncated stub."""
+    try:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size >= MIN_IMAGE_BYTES
+    except OSError:
+        return False
+
+
+def load_state(out_dir, script):
+    """Resume state for THIS script, or None.
+
+    Keyed on the exact script: if a single word changed, the line split, the timings and the
+    prompts all change, so nothing from the old run may be reused (the images would land on the
+    wrong lines). Returning None simply means "run every stage again".
+    """
+    try:
+        data = json.loads((Path(out_dir) / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or str(data.get("script") or "") != str(script or ""):
+        return None
+    return data
+
+
+def save_state(out_dir, **fields):
+    """Persist the resume state atomically (never leave a half-written state behind)."""
+    path = Path(out_dir) / STATE_FILE
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except Exception:
+        existing = {}
+    existing.update(fields)
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(existing, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+    return existing
 
 
 def _log(cb, msg):
@@ -427,21 +475,35 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # character reference FIRST (consistency anchor; also proves the session works)
-    _log(status_cb, "Generating the character reference frame first...")
-    ref = higgsfield_login.generate_sync(CHARACTER_REFERENCE_PROMPT,
-                                         out_dir / "character_reference.png",
-                                         aspect="16:9", model="FLUX.2 Pro",
-                                         timeout_s=300, status_cb=status_cb)
-    if ref:
-        _log(status_cb, "Character reference saved (used as the style anchor).")
+    ref_path = out_dir / "character_reference.png"
+    if _image_done(ref_path):
+        _log(status_cb, "Character reference already there - reusing it.")
     else:
-        _log(status_cb, "Character reference failed - continuing without it.")
+        _log(status_cb, "Generating the character reference frame first...")
+        ref = higgsfield_login.generate_sync(CHARACTER_REFERENCE_PROMPT, ref_path,
+                                             aspect="16:9", model="FLUX.2 Pro",
+                                             timeout_s=300, status_cb=status_cb)
+        if ref:
+            _log(status_cb, "Character reference saved (used as the style anchor).")
+        else:
+            _log(status_cb, "Character reference failed - continuing without it.")
 
     total = len(prompts)
     results = {}
     attempts = {}
     lock = threading.Lock()
-    queue = list(range(total))
+    # RESUME: every image whose file is already on disk is reused, so a re-run only generates
+    # what is actually missing. The filename (index + timestamp + duration) identifies the line,
+    # so a reused file always belongs to the line it is mapped onto - if the script or its timing
+    # changed, the key changes and the image is regenerated instead of silently mismatched.
+    for idx in range(total):
+        existing = out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png"
+        if _image_done(existing):
+            results[idx] = str(existing)
+    if results:
+        _log(status_cb, f"Resume: {len(results)}/{total} image(s) already generated - "
+                        f"only the missing {total - len(results)} will be generated.")
+    queue = [i for i in range(total) if i not in results]
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY)
     inflight = {}
 
@@ -568,8 +630,14 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
 # ------------------------------------------------------------------ ORCHESTRATOR
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
-                       status_cb=None, cancel_event=None, speech_gate=None):
-    """The whole pipeline. Returns a result dict for the job UI."""
+                       status_cb=None, cancel_event=None, speech_gate=None, resume=True):
+    """The whole pipeline. Returns a result dict for the job UI.
+
+    RESUME (default on): re-running the SAME script continues the existing project instead of
+    starting over - the voiceover, timings and prompts are reloaded from state.json and only the
+    images that are actually missing get generated. The state is keyed on the exact script, so
+    editing the script starts a clean run (old images would otherwise land on shifted lines).
+    """
     script = str(script or "").strip()
     if len(script) < 40:
         raise LongformError("Please paste the full script (at least a few sentences).")
@@ -578,25 +646,47 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "script.txt").write_text(script, encoding="utf-8")
 
-    voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
-                                               status_cb=status_cb, cancel_event=cancel_event,
-                                               speech_gate=speech_gate)
+    state = load_state(out_dir, script) if resume else None
+    voice_path = out_dir / "voiceover.wav"
     ffprobe = pipeline.find_ffprobe(pipeline.find_ffmpeg())
-    audio_duration = 0.0
-    try:
-        out = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
-                              "-of", "default=nokey=1:noprint_wrappers=1", str(voice_path)],
-                             capture_output=True, text=True, timeout=30)
-        audio_duration = float((out.stdout or "0").strip() or 0.0)
-    except Exception:
-        pass
 
-    lines = transcribe_lines(script, voice_path, status_cb=status_cb)
+    def _probe_duration(path):
+        try:
+            out = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                                  "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
+                                 capture_output=True, text=True, timeout=30)
+            return float((out.stdout or "0").strip() or 0.0)
+        except Exception:
+            return 0.0
+
+    reusable = bool(state and state.get("lines") and voice_path.exists())
+    if reusable:
+        # Reusing the voiceover is what makes resume work at all: fresh TTS would shift every
+        # timestamp, which changes every image key and would orphan the images already generated.
+        tts_parts = int(state.get("tts_parts") or 0)
+        audio_duration = float(state.get("audio_duration") or 0.0) or _probe_duration(voice_path)
+        lines = state["lines"]
+        _log(status_cb, f"Resume: reusing the existing voiceover + {len(lines)} timed line(s) "
+                        "(no TTS, no transcription re-run).")
+    else:
+        voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
+                                                   status_cb=status_cb, cancel_event=cancel_event,
+                                                   speech_gate=speech_gate)
+        audio_duration = _probe_duration(voice_path)
+        lines = transcribe_lines(script, voice_path, status_cb=status_cb)
+        save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts,
+                   audio_duration=round(audio_duration, 3))
     transcript_path = write_transcript(lines, out_dir / "transcript.txt")
     _log(status_cb, f"Transcript written: {transcript_path.name}")
 
-    prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
-                                     status_cb=status_cb, cancel_event=cancel_event)
+    prompts = (state or {}).get("prompts") if reusable else None
+    if prompts and len(prompts) == len(lines):
+        _log(status_cb, f"Resume: reusing the {len(prompts)} saved image prompt(s).")
+    else:
+        prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
+                                         status_cb=status_cb, cancel_event=cancel_event)
+        save_state(out_dir, script=script, lines=lines, prompts=prompts, tts_parts=tts_parts,
+                   audio_duration=round(audio_duration, 3))
     prompts_path = write_prompts_file(prompts, out_dir / f"image_prompts_{slug}.txt")
     _log(status_cb, f"Prompt file written: {prompts_path.name}")
 
