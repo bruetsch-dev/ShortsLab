@@ -619,7 +619,12 @@ def generate_sync(prompt, out_path, aspect=None, model=None, timeout_s=300, stat
     """Generate ONE image on the worker thread and block for the result path (or None)."""
     if not is_ready():
         return None
-    wait = max(30.0, float(timeout_s) + 60.0)
+    # Session.generate's own deadline only covers WAITING for the image. After it comes the
+    # download (page.request.get, 60s), plus up to ~2.5s of loop overshoot - so the worst case is
+    # timeout_s + ~62.5s. Waiting only timeout_s + 60 lost that race by two seconds: we would give
+    # up while the worker was still writing a perfectly good file, and the caller would re-generate
+    # an image that had in fact just landed. The margin has to clear the download.
+    wait = max(30.0, float(timeout_s) + 90.0)
     try:
         return (_executor().submit(_generate_on_worker, prompt, str(out_path), aspect, model,
                                    timeout_s, status_cb).result(timeout=wait))

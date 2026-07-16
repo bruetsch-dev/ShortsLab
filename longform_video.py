@@ -37,6 +37,7 @@ OUT_ROOT = agent_core.PROJECTS_DIR / "_longform"
 TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
 IMAGE_CONCURRENCY = 4               # max Higgsfield generations in flight
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
+MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
 VIDEO_W, VIDEO_H, VIDEO_FPS = 1920, 1080, 30
 
 
@@ -624,6 +625,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     queue = [i for i in range(total) if i not in results]
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY)
     inflight = {}
+    dead = 0                            # failed generation attempts so far
 
     def submit(idx):
         prompt = prompts[idx]["prompt"]
@@ -658,6 +660,18 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                     _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
                                     f"#{idx + 1} done")
                 else:
+                    dead += 1
+                    # Counting failed ATTEMPTS, not dead images: with 4 in flight every image runs
+                    # attempt 1 before any runs attempt 3, so no image exhausts its retries until
+                    # nearly all of them have been tried twice - waiting for that burnt ~2.5 of the
+                    # 3 hours we are trying to save. And "no image has EVER worked" is what makes
+                    # this safe: a run that is producing images can never trip it, however many
+                    # single prompts fail.
+                    if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not any(results.values()):
+                        raise LongformError(
+                            f"The first {dead} image generations all failed - Higgsfield looks "
+                            "down or logged out. Stopping instead of spending hours filling the "
+                            "video with black frames; reconnect and resume (nothing is lost).")
                     attempts[idx] = attempts.get(idx, 0) + 1
                     if attempts[idx] <= IMAGE_RETRIES:
                         _log(status_cb, f"image #{idx + 1} failed - regenerating "
