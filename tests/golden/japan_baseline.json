@@ -1,0 +1,89 @@
+{
+ "prompts": {
+  "architect": [
+   [
+    {
+     "role": "system",
+     "content": "You are the Architect Agent for fast viral B-roll in the 'Wildest School Rules' style. Your JSON is executed autonomously by TikTok, Instagram and X Scraper Agents. Never make a boring sentence translation. Extract the underlying object, action, emotion, awkwardness or shock, then describe what it physically looks like in authentic phone footage. JSON only."
+    },
+    {
+     "role": "user",
+     "content": "\nFor every scene choose exactly one visual_match_category:\n- literal: direct visual proof is important.\n- vibe: turn an abstract feeling into a concrete scannable action.\n- shock: use exaggeration, awkwardness, surprise or meme humor as a retention hook.\n\nExamples: \"no free time\" -> student asleep at desk or massive textbook pile. \"strict discipline\"\n-> perfectly synchronized drill. \"romance banned\" -> awkward teenage couple or teacher intervening.\nCreate one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a\nvisible subject, visible action and plausible location.\n\nAlso choose one communication_role:\n- proof: a named place, event, sign, rule or factual object must be visibly proven.\n- demonstration: hands/person demonstrates the concrete object or procedure.\n- human_consequence: show what the rule causes a person to do or endure.\n- emotion: a physical expression/action communicates an abstract feeling.\n- pattern_interrupt: a surprising but still locally meaningful visual punchline.\nObjects are REQUIRED when they are the clearest proof or demonstration (four sweets, five cups,\na warning gate, a ribbon being tied). The \"prefer humans\" rule applies only to emotion/filler.\n\nSTORY-THESIS GUARD: First infer the recurring human subject and overall claim from the FULL script.\nThe opening hook is often only one example, not the overall topic. A hook noun may influence only\nthe scenes that explicitly mention it. Do not carry it into later intents, alternatives, queries or\nglobal context unless the later narration repeats it. Example: if sumo appears only in the hook of a\nstory about restrictions on women, sumo is valid only for that hook block; the recurring subject is\nwomen experiencing different restrictions. Each later scene must follow its own local claim.\n\nQUERIES ARE DISCOVERY SEARCHES, NOT TRANSLATED SCENE DESCRIPTIONS. Generate a separate executable\nplan for every platform because their discovery grammars differ:\n- TikTok: 1-2 compact native words describing a phone-filmable situation. Preserve a named-entity\n  anchor when one exists (名頃 かかし), and never append TikTok, Instagram, X, reels or shorts.\n- Instagram: 1-2 keyword phrases plus 1-2 single native hashtags. A hashtag is ONE raw string that\n  begins with #; no spaces, annotations, translations or multiple tags in one string.\n- X/Twitter: 2-4 words. Prefer event/proof phrases with one disambiguator (女性 土俵 救命), because\n  generic nouns are noisy and X is strongest for recorded incidents. Never include filter:media;\n  the backend selects Media itself. Never append TikTok, Instagram or X to a query.\nEnglish is a secondary discovery lane: 2-3 targeted words, only when local-language results may be\ninsufficient. The downstream vision agent finds the exact seconds, but the query must still land in\nthe correct subject/action neighbourhood.\nVIBE scenes: ONE query may add a single emotion word (疲れた / awkward japan). SHOCK scenes: ONE\nquery may chase the punchline with a single meme word (ハプニング / japan fail).\nINTELLIGENT TERMS: you MAY invent platform-native terms that PROVE the scene's feeling even when\nthose words never appear in the script - three levers beat literal translation: (1) the NUMBERS\nusers flex/complain with (\"40kg ダイエット\" / \"シンデレラ体重\", never 体重計), (2) the HUMAN\nACTION the topic causes (泣いた / ボディチェック / 失敗), (3) native slang (あるある / 限界 /\n密着 / ルーティン).\nHARD RULE - PHYSICAL ATTRIBUTES: when a scene is about weight, body shape, height or looks,\nNEVER search for measuring OBJECTS (scale/体重計, tape measure, calculator, mirror). ALWAYS\nsearch measurable numbers (\"40kg\", \"150cm\") or platform action trends (ボディチェック / body\ncheck, 骨格診断, outfit try on, GRWM) so results show HUMANS, not props. Searching the object\nfilled half a video with store shelves and suitcases - retention death.\nUse shock/pattern_interrupt only when it strengthens the local narration beat. Never impose a fixed\ncadence and never replace factual proof with an unrelated meme merely because several scenes passed.\nJapanese strings must be what local users write, including useful native slang such as あるある or\n厳しい. ABSOLUTE RULE: every japanese_queries string contains ONLY Kanji, Hiragana, Katakana, spaces,\ndigits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.\nNever translate the full narration sentence. Arrays contain strings only.\n\nScenes:\nscene 0: Japanese vending machines have three secret features.\nscene 1: First, they give free drinks in an emergency.\nscene 2: Second, they double as wifi hotspots.\n\nReturn exactly:\n{\"intents\":[{\"scene_id\":0,\"visual_type\":\"concrete|context|abstract\",\n\"visual_match_category\":\"literal|vibe|shock\",\"communication_role\":\"proof|demonstration|human_consequence|emotion|pattern_interrupt\",\n\"story_subject\":\"recurring subject of full script\",\"local_claim\":\"claim of this scene\",\n\"subject\":\"...\",\"action\":\"...\",\"location\":\"...\",\n\"camera_style\":\"pov|handheld|vlog|static|walking\",\"mood\":\"...\",\n\"required_elements\":[\"...\"],\"optional_elements\":[\"...\"],\"avoid_elements\":[\"...\"],\n\"platform_queries\":{\"tiktok\":{\"japanese\":[\"日本語検索\"],\"english\":[\"raw phrase\"]},\n\"instagram\":{\"keywords\":[\"日本語検索\"],\"hashtags\":[\"#日本語タグ\"]},\n\"twitter\":{\"japanese\":[\"日本語 検索 証拠\"],\"english\":[\"raw phrase\"]}},\n\"alternatives\":[{\"subject\":\"...\",\"action\":\"...\",\"location\":\"...\",\"camera_style\":\"...\",\n\"mood\":\"...\",\"platform_queries\":{\"tiktok\":{\"japanese\":[\"日本語検索\"],\"english\":[]},\n\"instagram\":{\"keywords\":[\"日本語検索\"],\"hashtags\":[\"#日本語タグ\"]},\n\"twitter\":{\"japanese\":[\"日本語 検索 証拠\"],\"english\":[]}}}]}]}\n"
+    }
+   ],
+   [
+    {
+     "role": "system",
+     "content": "You are the Architect Agent for fast viral B-roll in the 'Wildest School Rules' style. Your JSON is executed autonomously by TikTok, Instagram and X Scraper Agents. Never make a boring sentence translation. Extract the underlying object, action, emotion, awkwardness or shock, then describe what it physically looks like in authentic phone footage. JSON only."
+    },
+    {
+     "role": "user",
+     "content": "\nFor every scene choose exactly one visual_match_category:\n- literal: direct visual proof is important.\n- vibe: turn an abstract feeling into a concrete scannable action.\n- shock: use exaggeration, awkwardness, surprise or meme humor as a retention hook.\n\nExamples: \"no free time\" -> student asleep at desk or massive textbook pile. \"strict discipline\"\n-> perfectly synchronized drill. \"romance banned\" -> awkward teenage couple or teacher intervening.\nCreate one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a\nvisible subject, visible action and plausible location.\n\nAlso choose one communication_role:\n- proof: a named place, event, sign, rule or factual object must be visibly proven.\n- demonstration: hands/person demonstrates the concrete object or procedure.\n- human_consequence: show what the rule causes a person to do or endure.\n- emotion: a physical expression/action communicates an abstract feeling.\n- pattern_interrupt: a surprising but still locally meaningful visual punchline.\nObjects are REQUIRED when they are the clearest proof or demonstration (four sweets, five cups,\na warning gate, a ribbon being tied). The \"prefer humans\" rule applies only to emotion/filler.\n\nSTORY-THESIS GUARD: First infer the recurring human subject and overall claim from the FULL script.\nThe opening hook is often only one example, not the overall topic. A hook noun may influence only\nthe scenes that explicitly mention it. Do not carry it into later intents, alternatives, queries or\nglobal context unless the later narration repeats it. Example: if sumo appears only in the hook of a\nstory about restrictions on women, sumo is valid only for that hook block; the recurring subject is\nwomen experiencing different restrictions. Each later scene must follow its own local claim.\n\nQUERIES ARE DISCOVERY SEARCHES, NOT TRANSLATED SCENE DESCRIPTIONS. Generate a separate executable\nplan for every platform because their discovery grammars differ:\n- TikTok: 1-2 compact native words describing a phone-filmable situation. Preserve a named-entity\n  anchor when one exists (名頃 かかし), and never append TikTok, Instagram, X, reels or shorts.\n- Instagram: 1-2 keyword phrases plus 1-2 single native hashtags. A hashtag is ONE raw string that\n  begins with #; no spaces, annotations, translations or multiple tags in one string.\n- X/Twitter: 2-4 words. Prefer event/proof phrases with one disambiguator (女性 土俵 救命), because\n  generic nouns are noisy and X is strongest for recorded incidents. Never include filter:media;\n  the backend selects Media itself. Never append TikTok, Instagram or X to a query.\nEnglish is a secondary discovery lane: 2-3 targeted words, only when local-language results may be\ninsufficient. The downstream vision agent finds the exact seconds, but the query must still land in\nthe correct subject/action neighbourhood.\nVIBE scenes: ONE query may add a single emotion word (疲れた / awkward japan). SHOCK scenes: ONE\nquery may chase the punchline with a single meme word (ハプニング / japan fail).\nINTELLIGENT TERMS: you MAY invent platform-native terms that PROVE the scene's feeling even when\nthose words never appear in the script - three levers beat literal translation: (1) the NUMBERS\nusers flex/complain with (\"40kg ダイエット\" / \"シンデレラ体重\", never 体重計), (2) the HUMAN\nACTION the topic causes (泣いた / ボディチェック / 失敗), (3) native slang (あるある / 限界 /\n密着 / ルーティン).\nHARD RULE - PHYSICAL ATTRIBUTES: when a scene is about weight, body shape, height or looks,\nNEVER search for measuring OBJECTS (scale/体重計, tape measure, calculator, mirror). ALWAYS\nsearch measurable numbers (\"40kg\", \"150cm\") or platform action trends (ボディチェック / body\ncheck, 骨格診断, outfit try on, GRWM) so results show HUMANS, not props. Searching the object\nfilled half a video with store shelves and suitcases - retention death.\nUse shock/pattern_interrupt only when it strengthens the local narration beat. Never impose a fixed\ncadence and never replace factual proof with an unrelated meme merely because several scenes passed.\nJapanese strings must be what local users write, including useful native slang such as あるある or\n厳しい. ABSOLUTE RULE: every japanese_queries string contains ONLY Kanji, Hiragana, Katakana, spaces,\ndigits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.\nNever translate the full narration sentence. Arrays contain strings only.\n\nScenes:\nscene 0: Japanese vending machines have three secret features.\nscene 1: First, they give free drinks in an emergency.\nscene 2: Second, they double as wifi hotspots.\n\nReturn exactly:\n{\"intents\":[{\"scene_id\":0,\"visual_type\":\"concrete|context|abstract\",\n\"visual_match_category\":\"literal|vibe|shock\",\"communication_role\":\"proof|demonstration|human_consequence|emotion|pattern_interrupt\",\n\"story_subject\":\"recurring subject of full script\",\"local_claim\":\"claim of this scene\",\n\"subject\":\"...\",\"action\":\"...\",\"location\":\"...\",\n\"camera_style\":\"pov|handheld|vlog|static|walking\",\"mood\":\"...\",\n\"required_elements\":[\"...\"],\"optional_elements\":[\"...\"],\"avoid_elements\":[\"...\"],\n\"platform_queries\":{\"tiktok\":{\"japanese\":[\"日本語検索\"],\"english\":[\"raw phrase\"]},\n\"instagram\":{\"keywords\":[\"日本語検索\"],\"hashtags\":[\"#日本語タグ\"]},\n\"twitter\":{\"japanese\":[\"日本語 検索 証拠\"],\"english\":[\"raw phrase\"]}},\n\"alternatives\":[{\"subject\":\"...\",\"action\":\"...\",\"location\":\"...\",\"camera_style\":\"...\",\n\"mood\":\"...\",\"platform_queries\":{\"tiktok\":{\"japanese\":[\"日本語検索\"],\"english\":[]},\n\"instagram\":{\"keywords\":[\"日本語検索\"],\"hashtags\":[\"#日本語タグ\"]},\n\"twitter\":{\"japanese\":[\"日本語 検索 証拠\"],\"english\":[]}}}]}]}\n"
+    }
+   ]
+  ],
+  "main": [
+   [
+    {
+     "role": "system",
+     "content": "You are a visual researcher for Japanese social-topic shorts made of REAL found footage. You translate each narration line into a concrete, camera-observable situation that a phone could have filmed. You NEVER output abstract themes as the search target. Return JSON only."
+    },
+    {
+     "role": "user",
+     "content": "For EACH scene, output a PRIMARY visible situation plus at least TWO ALTERNATIVE visible situations for the same idea. A situation MUST have a visible subject + visible action + a plausible location. FORBIDDEN as an intent: feelings/claims like 'people feel lonely', 'work culture is strict', 'dating is hard'. REQUIRED style: 'office worker asleep on late train', 'woman eating alone at a ramen counter', 'salaryman leaving office at night', 'customer checking a price tag in a supermarket', 'small Tokyo apartment interior'.\nClassify each scene visual_type: 'concrete' (shows a specific object/action), 'context' (a place/social setting), or 'abstract' (a fragment/feeling/transition).\n\nCRITICAL - also give SHORT Japanese SEARCH KEYWORDS for each situation (jp_subject, jp_action, jp_location). These are how a real person searches TikTok, NOT a translation of the sentence. Keep each ONE short term (jp_action may be 1-2 words). Use the single most iconic, commonly-searched Japanese word for the thing on screen. Examples: subject 'office worker asleep on late train' -> jp_subject 'サラリーマン', jp_action '電車 寝る', jp_location '電車'. NEVER a full sentence, NEVER 5+ words, NEVER multiple objects in one field. Give the SAME short jp_* keywords for each alternative.\n\nScenes:\nscene 0: Japanese vending machines have three secret features.\nscene 1: First, they give free drinks in an emergency.\nscene 2: Second, they double as wifi hotspots.\n\nReturn STRICT JSON: {\"intents\":[{\"scene_id\":int,\"visual_type\":\"concrete|context|abstract\",\"subject\":\"...\",\"action\":\"...\",\"location\":\"...\",\"jp_subject\":\"1 word\",\"jp_action\":\"1-2 words\",\"jp_location\":\"1 word\",\"camera_style\":\"pov|handheld|vlog|static|walking\",\"mood\":\"...\",\"required_elements\":[\"..\"],\"optional_elements\":[\"..\"],\"avoid_elements\":[\"..\"],\"alternatives\":[{\"subject\":\"..\",\"action\":\"..\",\"location\":\"..\",\"jp_subject\":\"..\",\"jp_action\":\"..\",\"jp_location\":\"..\",\"camera_style\":\"..\",\"mood\":\"..\"},{\"subject\":\"..\",\"action\":\"..\",\"location\":\"..\",\"jp_subject\":\"..\",\"jp_action\":\"..\",\"jp_location\":\"..\",\"camera_style\":\"..\",\"mood\":\"..\"}]}]}"
+    }
+   ]
+  ],
+  "lateral filler": [
+   [
+    {
+     "role": "system",
+     "content": "You are the Lateral Search Architect for a high-retention short-form scraping pipeline. You translate a script's THEME into native TikTok search queries that guarantee AUTHENTIC HUMAN footage. CORE PHILOSOPHY - intelligent tangibles over literal objects: NEVER search lifeless objects; translate every concept into (1) the specific numbers/extremes users post to flex or complain (40kg, 3時間睡眠, 月3万円), (2) the human behavior the topic causes (crying, struggling, routine, body check, fail), (3) native platform slang (あるある, 限界, 失敗, ルーティン, 密着). JSON only."
+    },
+    {
+     "role": "user",
+     "content": "\nTOPIC: Japanese vending machines have three secret features\nSCRIPT:\nJapanese vending machines have three secret features.\nFirst, they give free drinks in an emergency.\nSecond, they double as wifi hotspots.\n\n\nGenerate 15-25 broad, DIVERSE, lateral search queries for a GLOBAL thematic B-roll pool.\nRules: mostly 1-2-word native Japanese (latin unit tokens like 40kg / 150cm are fine), plus at\nmost 4 English queries of 2-3 words; every query must promise visible PEOPLE in motion or an\nextreme platform trend tied to the theme; no two queries covering the same angle. Infer the global\ntheme from the FULL script, not its first hook example. Do not include a hook-specific object/place\nin this pool unless it recurs later in the script.\nReturn exactly: {\"global_filler_queries\": [\"...\", \"...\"]}"
+    }
+   ]
+  ]
+ },
+ "hook": {
+  "DEFAULT_WOMAN_LEAD": "beautiful japanese woman, tokyo street style, fashionable, candid",
+  "WOMAN_TAGS": [
+   "japanesegirl",
+   "tokyofashion",
+   "ootdjapan",
+   "japanstyle",
+   "tokyostreetstyle",
+   "fyp"
+  ],
+  "_X_PROOF_TERMS": [
+   "classroom",
+   "cleaning",
+   "commuter",
+   "convenience store",
+   "delay",
+   "disruption",
+   "event",
+   "incident",
+   "law",
+   "machine",
+   "passenger",
+   "product",
+   "proof",
+   "reaction",
+   "restocking",
+   "rule",
+   "salaryman",
+   "self checkout",
+   "service",
+   "station",
+   "students",
+   "train",
+   "transport",
+   "vending",
+   "viral",
+   "worker"
+  ]
+ }
+}
