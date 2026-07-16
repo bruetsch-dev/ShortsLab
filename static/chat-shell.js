@@ -341,8 +341,12 @@ function decoratePrototypeFlow() {
   const cards = chat.querySelectorAll(":scope > .chat-card");
   if (!cards.length) return;
   const active = cards[cards.length - 1];
-  active.classList.add("proto-active-card", "proto-step-surface", `proto-step-${S.step || "default"}`);
+  // the step class alone is ambiguous: `script` and `settings` are shared by several flows whose
+  // steps hold different things, so the surface carries its flow too and CSS can tell them apart
+  active.classList.add("proto-active-card", "proto-step-surface", `proto-step-${S.step || "default"}`,
+                       `proto-mode-${S.flow || "default"}`);
   active.dataset.step = S.step || "default";
+  active.dataset.mode = S.flow || "default";
   const copy = stepCopy(S.step);
   const flowSteps = stepsFor(S.flow);
   const stepIndex = Math.max(0, flowSteps.indexOf(S.step));

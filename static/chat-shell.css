@@ -1747,6 +1747,14 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .prototype-ui .app.proto-flow .proto-step-script { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr); column-gap:18px; }
 .prototype-ui .app.proto-flow .proto-step-script > .proto-config-head { grid-column:1/-1; }
 .prototype-ui .app.proto-flow .proto-step-script .script-box { grid-column:1; grid-row:2/4; width:auto; min-height:390px; height:clamp(390px,52vh,570px)!important; margin:22px 0 0 28px; }
+/* Longform's script step has no second column - no narrator panel, no generator - so the two-column
+   grid does not apply to it. Left as-is, its bare textarea inherited the `grid-row:2/4` above
+   (written to let the script flow's box run tall BESIDE that panel), occupied the footer's row, and
+   the auto-placed footer landed in the same cell: the box painted over the Back button. One column,
+   one row, and a height that fits the card's 72vh budget instead of a fixed 390px. */
+.prototype-ui .app.proto-flow .proto-mode-longform.proto-step-script { grid-template-columns:minmax(0,1fr); }
+.prototype-ui .app.proto-flow .proto-mode-longform.proto-step-script .script-box {
+  grid-row:2; margin:22px 28px 0; height:clamp(260px,42vh,520px)!important; min-height:260px; }
 .prototype-ui .app.proto-flow .proto-step-script > .card-foot:not(:last-child) { grid-column:2; align-self:start; display:flex; flex-direction:column; align-items:stretch; min-height:0; margin:22px 28px 0 0!important; padding:13px; }
 .prototype-ui .app.proto-flow .proto-step-script > .card-foot:not(:last-child) input { width:100%; min-width:0; }
 .prototype-ui .app.proto-flow .proto-step-script > .card-foot:not(:last-child) .btn { width:100%; justify-content:center; }
