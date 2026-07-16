@@ -44,6 +44,7 @@ TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
 IMAGE_CONCURRENCY = 1               # max Higgsfield generations in flight
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
 MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
+MAX_CONSECUTIVE_FAILURES_MIDRUN = 10    # unbroken failure streak while fresh work remains = died mid-run
 VIDEO_W, VIDEO_H, VIDEO_FPS = 1920, 1080, 30
 
 
@@ -644,6 +645,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
     #                                     judging the provider by yesterday's images would disable
     #                                     the dead-provider stop exactly when a login has expired
+    consec = 0                          # failures since the last success (mid-run death signal)
 
     def submit(idx):
         prompt = prompts[idx]["prompt"]
@@ -676,6 +678,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                 if path:
                     results[idx] = str(path)
                     fresh_ok += 1
+                    consec = 0
                     _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
                                     f"#{idx + 1} done")
                 else:
@@ -693,6 +696,20 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                             f"The first {dead} image generations all failed - Higgsfield looks "
                             "down or logged out. Stopping instead of spending hours filling the "
                             "video with black frames; reconnect and resume (nothing is lost).")
+                    consec += 1
+                    # Mid-run death (the rule above is blind once anything succeeded): retries go
+                    # to the BACK of the queue, so mid-run a failure streak is interleaved with
+                    # fresh successes unless the provider actually stopped working. Only trip
+                    # while UNTRIED images remain - at the tail the queue holds nothing but the
+                    # retries of a few hopeless prompts (content-filter rejects and the like),
+                    # and those should become black frames as designed, not kill a run that has
+                    # already produced almost everything.
+                    if (consec >= MAX_CONSECUTIVE_FAILURES_MIDRUN
+                            and any(attempts.get(i, 0) == 0 for i in queue)):
+                        raise LongformError(
+                            f"{consec} generations in a row have failed with untried images "
+                            "still queued - Higgsfield looks like it died mid-run. Stopping; "
+                            "reconnect and resume (the finished images are kept).")
                     attempts[idx] = attempts.get(idx, 0) + 1
                     if attempts[idx] <= IMAGE_RETRIES:
                         _log(status_cb, f"image #{idx + 1} failed - regenerating "
@@ -817,6 +834,14 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     # it the timings), otherwise resume would silently keep the old narrator forever.
     if state and voice and str(state.get("voice") or "") != str(voice):
         _log(status_cb, "Narrator changed - regenerating the voiceover (timings will be redone).")
+        state = None
+    # The delivery directive is as much part of the performance as the narrator: a voiceover
+    # stitched under a different directive is the wrong read, and keeping it would silently undo
+    # an edit to TTS_STYLE_LONGFORM forever. (generate_voiceover guards its own reuse the same
+    # way; this closes the outer path that skips generate_voiceover entirely.)
+    if state and str(state.get("tts_style") or "") != str(pipeline.TTS_STYLE_LONGFORM or ""):
+        _log(status_cb, "Delivery directive changed - regenerating the voiceover "
+                        "(timings will be redone).")
         state = None
     reusable = bool(state and state.get("lines") and voice_path.exists())
     if reusable:
