@@ -2020,6 +2020,31 @@ async function pollJob() {
         }
         c.appendChild(row);
       });
+      // bulk actions: a long script splits into many parts, so deciding each one by hand is
+      // tedious. Both act on the PENDING parts only (already-approved ones stay untouched) and
+      // fire sequentially so the TTS backend isn't hammered with parallel regenerations.
+      const pending = (d.lf_parts || []).filter(p => p.state === "pending");
+      if (pending.length > 1) {
+        const bulk = el("div", "card-foot lf-bulk");
+        const runAll = async (action, btnEl) => {
+          const all = [...bulk.querySelectorAll("button")];
+          all.forEach(b => b.disabled = true);
+          btnEl.textContent = "…";
+          for (const p of pending) {
+            await fetch("/longform-speech-decide?id=" + encodeURIComponent(S.jobId) +
+              "&part=" + encodeURIComponent(p.index) + "&action=" + action, { method: "POST" });
+          }
+          setTimeout(pollJob, 700);
+        };
+        bulk.appendChild(el("span", "lf-bulk-lbl",
+          (T.lf_bulk_hint || "All %n remaining parts:").replace("%n", pending.length)));
+        bulk.appendChild(el("span", "spacer"));
+        bulk.appendChild(btn("✓ " + (T.lf_approve_all || "Approve all"),
+          ev => runAll("approve", ev.currentTarget), "primary"));
+        bulk.appendChild(btn("↻ " + (T.lf_decline_all || "Decline & regenerate all"),
+          ev => runAll("decline", ev.currentTarget), "danger"));
+        c.appendChild(bulk);
+      }
       scrollDown();
     }
   } else if (lfp && lfp.dataset.lfSig && d.status !== "awaiting_approval") {

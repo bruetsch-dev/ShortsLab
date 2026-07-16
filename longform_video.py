@@ -42,6 +42,7 @@ VIDEO_W, VIDEO_H, VIDEO_FPS = 1920, 1080, 30
 
 STATE_FILE = "state.json"           # resume state: script + timings + prompts of the last run
 MIN_IMAGE_BYTES = 1024              # smaller than this = a truncated/failed write, regenerate
+MIN_AUDIO_BYTES = 8192              # 24kHz/16bit mono: <0.2s of audio, so a truncated part
 
 
 class LongformError(RuntimeError):
@@ -53,6 +54,15 @@ def _image_done(path):
     try:
         p = Path(path)
         return p.is_file() and p.stat().st_size >= MIN_IMAGE_BYTES
+    except OSError:
+        return False
+
+
+def _audio_done(path):
+    """True when a TTS part is already on disk and is not a truncated stub."""
+    try:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size >= MIN_AUDIO_BYTES
     except OSError:
         return False
 
@@ -168,7 +178,7 @@ def concat_audio_parts(part_paths, out_path, ffmpeg):
 
 
 def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
-                       speech_gate=None, voice=None, speaker=None):
+                       speech_gate=None, voice=None, speaker=None, resume=True):
     """Script -> voiceover.wav (parts stitched). Returns (path, parts_count).
 
     `voice` / `speaker` pick the Gemini TTS narrator (None = pipeline defaults), so longform uses
@@ -179,6 +189,12 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     {"index", "text", "path"}; `regen_part(i)` re-generates part i with a fresh TTS take and
     returns the new path. The gate blocks until the user has approved every part (declines
     trigger regen through the callback); it raises to cancel the run.
+
+    RESUME: the parts are only stitched (and deleted) once the gate has approved them all, so a
+    run that is cancelled or lost in the approval gate leaves every `vo_part*.wav` behind while
+    `voiceover.wav` never appears - the outer resume check misses it and used to pay for the whole
+    TTS again. The part paths are therefore recorded in state.json as they are produced (takes
+    included) and reused here, which drops you straight back into the approval screen.
     """
     parts = split_script_for_tts(script)
     if not parts:
@@ -194,10 +210,41 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         tts_kw["voice"] = voice
     if speaker:
         tts_kw["speaker"] = speaker
+
+    # Reusable parts must belong to THIS script and narrator: the state is keyed on the script
+    # (load_state) and the split it was recorded under must still produce the same part count,
+    # else part 3 of the old split would be spoken over part 3 of the new one. The saved list is
+    # an index-aligned PREFIX - a run that died on part 3 of 8 saved 2 paths, and those 2 are
+    # still worth reusing - so it is the recorded total that is compared, not the list length.
+    saved = load_state(out_dir, script) if resume else None
+    saved_files = (saved or {}).get("tts_part_files") or []
+    if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
+            or str((saved or {}).get("voice") or "") != str(voice or "")):
+        saved_files = []
+
     part_files = []
+
+    def _remember():
+        """Record the parts after every TTS call, so a run killed halfway keeps what it paid for.
+
+        The timings, prompts and duration in the state describe the PREVIOUS voiceover, so they
+        are dropped in the same write: this is the point where the new script enters the state,
+        and a resume that found the new script next to the old lines would happily pair the new
+        audio with the old script's timings.
+        """
+        save_state(out_dir, script=script, voice=voice or "",
+                   tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
+                   lines=None, prompts=None, audio_duration=0.0)
+
     for i, part in enumerate(parts):
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Cancelled.")
+        existing = saved_files[i] if i < len(saved_files) else ""
+        if existing and _audio_done(existing):
+            _log(status_cb, f"Resume: reusing voiceover part {i + 1}/{len(parts)} "
+                            f"({Path(existing).name}) - no new TTS.")
+            part_files.append(Path(existing))
+            continue
         _log(status_cb, f"Voiceover part {i + 1}/{len(parts)} ({len(part)} chars) "
                         f"with Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS"
                         f"{(' - narrator ' + str(voice)) if voice else ''}...")
@@ -205,6 +252,10 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
                                             model=tts_model, cancel_event=cancel_event,
                                             status_cb=status_cb, **tts_kw)
         part_files.append(p)
+        _remember()
+    # the per-part writes only ever hold the prefix generated SO FAR; this one records the reused
+    # tail as well, so a kill in the gate below does not re-buy parts that are sitting on disk
+    _remember()
 
     if speech_gate is not None:
         parts_info = [{"index": i, "text": parts[i], "path": str(part_files[i])}
@@ -228,6 +279,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
                     Path(old).unlink(missing_ok=True)
             except Exception:
                 pass
+            _remember()     # the take replaces the part: resume must not point at the deleted one
             return str(new_path)
 
         _log(status_cb, f"Halt after speech: waiting for your approval of {len(parts)} "
@@ -241,6 +293,8 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
             Path(p).unlink(missing_ok=True)
         except Exception:
             pass
+    # the parts are gone now and voiceover.wav carries the resume from here on
+    save_state(out_dir, tts_part_files=[])
     _log(status_cb, f"Voiceover ready: {out.name} ({len(parts)} part(s) stitched).")
     return out, len(parts)
 
@@ -688,7 +742,7 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
                                                    status_cb=status_cb, cancel_event=cancel_event,
                                                    speech_gate=speech_gate, voice=voice,
-                                                   speaker=speaker)
+                                                   speaker=speaker, resume=resume)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
         save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts, voice=voice or "",
