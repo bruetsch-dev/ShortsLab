@@ -2087,10 +2087,14 @@ async function pollJob() {
       const speedRow = el("div", "sa-field");
       speedRow.appendChild(el("label", "sa-lbl", "Narration speed"));
       const ssel = el("select");
-      [["", "Keep current (" + curSpeed.toFixed(2) + "x)"],
-       ["1.0", "1.00x"], ["1.15", "1.15x"], ["1.2", "1.20x"],
-       ["1.3", "1.30x"], ["1.4", "1.40x"], ["1.5", "1.50x"], ["1.6", "1.60x"]]
-        .forEach(([v, l]) => ssel.appendChild(new Option(l, v)));
+      // A Short is always pushed faster than life, so its list only climbs. A longform narration
+      // is the opposite problem - it can easily be too brisk over 15 minutes - so it also gets
+      // the slower end.
+      const steps = S.flow === "longform"
+        ? ["0.9", "0.95", "1.0", "1.05", "1.1", "1.15", "1.2", "1.3"]
+        : ["1.0", "1.15", "1.2", "1.3", "1.4", "1.5", "1.6"];
+      ssel.appendChild(new Option("Keep current (" + curSpeed.toFixed(2) + "x)", ""));
+      steps.forEach(v => ssel.appendChild(new Option((+v).toFixed(2) + "x", v)));
       ssel.addEventListener("change", () => {
         const sel = +ssel.value || curSpeed;
         au.playbackRate = Math.max(0.5, Math.min(2.5, sel / curSpeed));
@@ -2105,6 +2109,10 @@ async function pollJob() {
         sp.innerHTML = ""; delete sp.dataset.done;
       }, "primary"));
       c.appendChild(approveRow);
+      // Redo is clip-only: /replace-speech restarts the run with a new speaker, which longform
+      // has no path for (its narrator lives on the job, and its parts were already approved one
+      // by one on the card above). Longform stops at the player + speed.
+      if (S.flow === "longform") { scrollDown(); return; }
       // redo section (voice + model + new take), visually subordinate
       const redo = el("div", "sa-redo");
       redo.appendChild(el("div", "sa-lbl", "Not happy? Redo with a different voice"));

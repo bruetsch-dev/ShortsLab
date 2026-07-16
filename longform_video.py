@@ -177,8 +177,37 @@ def concat_audio_parts(part_paths, out_path, ffmpeg):
     return out_path
 
 
+def apply_voice_speed(path, speed, ffmpeg=None, status_cb=None):
+    """Re-tempo a voiceover in place (pitch-preserving). Returns the path; a no-op at 1.0x."""
+    try:
+        speed = float(speed or 0)
+    except (TypeError, ValueError):
+        return Path(path)
+    path = Path(path)
+    if not speed:
+        return path
+    speed = max(0.5, min(2.0, speed))     # the picker offers 0.90-1.30; never trust it blindly
+    if abs(speed - 1.0) < 0.01:
+        return path
+    ffmpeg = ffmpeg or pipeline.find_ffmpeg()
+    if not ffmpeg:
+        return path
+    tmp = path.with_name(path.stem + "_respeed" + path.suffix)
+    # atempo only accepts 0.5..2.0, so anything outside has to be chained - pipeline already
+    # knows how to build that chain, and the clip pipeline uses the same one
+    out = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                          "-af", pipeline.atempo_filter_chain(speed), str(tmp)],
+                         capture_output=True, text=True, timeout=600)
+    if not tmp.exists() or tmp.stat().st_size < MIN_AUDIO_BYTES:
+        tmp.unlink(missing_ok=True)
+        raise LongformError((out.stderr or "voice speed conversion failed")[-180:])
+    os.replace(tmp, path)
+    _log(status_cb, f"Narration speed set to {speed:.2f}x.")
+    return path
+
+
 def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
-                       speech_gate=None, voice=None, speaker=None, resume=True):
+                       speech_gate=None, voice=None, speaker=None, resume=True, mix_gate=None):
     """Script -> voiceover.wav (parts stitched). Returns (path, parts_count).
 
     `voice` / `speaker` pick the Gemini TTS narrator (None = pipeline defaults), so longform uses
@@ -219,6 +248,18 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     # The style matters as much as the voice: parts recorded under the old viral-narrator directive
     # are the wrong PERFORMANCE, and reusing them would silently undo an edit to TTS_STYLE_LONGFORM.
     saved = load_state(out_dir, script) if resume else None
+
+    # A stitched voiceover for this exact script/narrator/directive IS the finished product of this
+    # function. The parts are deleted at stitch time, so without this shortcut an interruption
+    # anywhere after it - the mix gate below blocks on a human, the transcription takes minutes -
+    # would find no parts and re-buy the entire TTS.
+    voice_path = out_dir / "voiceover.wav"
+    if (resume and saved and saved.get("voiceover_ready") and _audio_done(voice_path)
+            and str(saved.get("voice") or "") == str(voice or "")
+            and str(saved.get("tts_style") or "") == str(tts_kw["style"] or "")):
+        _log(status_cb, f"Resume: the voiceover is already stitched ({voice_path.name}) - keeping it.")
+        return voice_path, int(saved.get("tts_parts") or len(parts))
+
     saved_files = (saved or {}).get("tts_part_files") or []
     if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
             or str((saved or {}).get("voice") or "") != str(voice or "")
@@ -237,6 +278,8 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         """
         save_state(out_dir, script=script, voice=voice or "", tts_style=tts_kw["style"] or "",
                    tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
+                   # parts are being (re)made, so any stitched voiceover on disk is the old one
+                   voiceover_ready=False, voice_speed=1.0,
                    lines=None, prompts=None, audio_duration=0.0)
 
     for i, part in enumerate(parts):
@@ -297,8 +340,16 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         except Exception:
             pass
     # the parts are gone now and voiceover.wav carries the resume from here on
-    save_state(out_dir, tts_part_files=[])
+    save_state(out_dir, tts_part_files=[], voiceover_ready=True)
     _log(status_cb, f"Voiceover ready: {out.name} ({len(parts)} part(s) stitched).")
+
+    # `mix_gate(path) -> speed`: the stitched voiceover, played whole, before anything is timed
+    # against it. Returns the narration speed to bake in (None/1.0 = leave it). It blocks on the
+    # user, which is exactly why the resume shortcut above exists.
+    if mix_gate is not None:
+        speed = mix_gate(str(out))
+        out = apply_voice_speed(out, speed, ffmpeg, status_cb=status_cb)
+        save_state(out_dir, voice_speed=float(speed or 1.0))
     return out, len(parts)
 
 
@@ -698,7 +749,7 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
                        status_cb=None, cancel_event=None, speech_gate=None, resume=True,
-                       voice=None, speaker=None):
+                       voice=None, speaker=None, mix_gate=None):
     """The whole pipeline. Returns a result dict for the job UI.
 
     RESUME (default on): re-running the SAME script continues the existing project instead of
@@ -745,7 +796,8 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
                                                    status_cb=status_cb, cancel_event=cancel_event,
                                                    speech_gate=speech_gate, voice=voice,
-                                                   speaker=speaker, resume=resume)
+                                                   speaker=speaker, resume=resume,
+                                                   mix_gate=mix_gate)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
         save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts, voice=voice or "",

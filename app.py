@@ -4594,6 +4594,9 @@ def start_longform_video_job(fields):
     if tts_voice and tts_voice not in set(pipeline.GEMINI_TTS_VOICES):
         tts_voice = ""
     cancel_event = threading.Event()
+    # the mix gate below waits on this; /approve-speech and cancel_job both set it, exactly as
+    # they do for the clip runs, so the gate needs no route of its own
+    approval_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
             "status": "running",
@@ -4602,6 +4605,7 @@ def start_longform_video_job(fields):
             "result": None,
             "error": None,
             "cancel_event": cancel_event,
+            "approval_event": approval_event,
             "project_dir": None,
             "created_at": time.time(),
             "job_kind": "longform",
@@ -4700,6 +4704,40 @@ def start_longform_video_job(fields):
                 return True
             time.sleep(0.5)
 
+    def lf_mix_gate(audio):
+        """After the parts are approved and stitched: play the WHOLE voiceover and set the
+        narration speed before anything is timed against it. Returns the chosen speed (None =
+        leave it at 1.0x). Publishing `speech_audio` is all it takes - job-status turns that into
+        speech_audio_url and the chat shell already renders the player + speed picker for it."""
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise RunCancelled("Run cancelled by user.")
+            job["status"] = "awaiting_approval"
+            job["speech_audio"] = str(audio)
+            job["speech_decision"] = None
+            job["speech_speed_choice"] = None
+            job["speech_speed"] = 1.0        # longform TTS is never pre-sped, so 1.0 is the take
+            job.pop("lf_parts", None)
+            job["logs"].append("Voiceover stitched - listen to the whole take and set the "
+                               "narration speed, then Approve to continue.")
+            job.setdefault("log_times", []).append(time.time())
+        while not approval_event.wait(timeout=0.5):
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+        approval_event.clear()
+        if cancel_event.is_set():        # a cancel is what woke us, not an approval
+            raise RunCancelled("Run cancelled by user.")
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            chosen = job.get("speech_speed_choice") if job else None
+            if job:
+                job["status"] = "running"
+                job.pop("speech_audio", None)
+                job["logs"].append("Voiceover approved - continuing the run.")
+                job.setdefault("log_times", []).append(time.time())
+        return chosen
+
     def worker():
         try:
             reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
@@ -4707,6 +4745,7 @@ def start_longform_video_job(fields):
                 script, tts_model=tts_model, reasoning_model=reasoning_model,
                 status_cb=status_cb, cancel_event=cancel_event,
                 speech_gate=lf_speech_gate if halt_after_speech else None,
+                mix_gate=lf_mix_gate if halt_after_speech else None,
                 voice=tts_voice or None)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
@@ -12439,6 +12478,15 @@ def job_status_payload(job_id):
 def _speech_current_speed(job):
     """The narration speed currently baked into the halted voiceover (so the approval UI can show
     it and preview other speeds relative to it). Falls back to the clip-source default."""
+    # A job that states its own baked-in speed wins: longform never pre-speeds its TTS, and the
+    # clip fallback below would claim 1.15x for it - which makes the UI preview (playbackRate =
+    # chosen/current) quietly wrong in both directions.
+    try:
+        stated = float((job or {}).get("speech_speed") or 0)
+        if stated > 0:
+            return round(stated, 2)
+    except (TypeError, ValueError):
+        pass
     # the job knows its clip_source from the start (the config file may not have persisted
     # voice_speed yet at the gate) - use it so the label shows the true 1.30x for scrape, not 1.15x.
     job_src = str((job or {}).get("clip_source") or "").lower()
