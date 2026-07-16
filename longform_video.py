@@ -11,10 +11,11 @@ Stages (fully autonomous after Start):
                   STAGE-3 doodle prompt; the app auto-replies "next" until every timestamp has
                   an image prompt, then writes image_prompts_<slug>.txt itself.
   4. IMAGES     - each prompt (timestamp stripped) goes to the user's logged-in Higgsfield
-                  session: FLUX.2 Pro (unlimited), 16:9, up to 4 generations in flight - a new
-                  prompt is only submitted when active generations drop below 4. Failed
-                  generations are retried. A character-reference frame is generated FIRST.
-                  Files are named with the timestamp AND the on-screen duration.
+                  session: FLUX.2 Pro (unlimited), 16:9, IMAGE_CONCURRENCY generations in
+                  flight (1 today - see the constant for why). Failed generations are retried;
+                  a run whose generations ALL fail stops early instead of grinding out black
+                  frames. A character-reference frame is generated FIRST. Files are named with
+                  the timestamp AND the on-screen duration.
   5. ASSEMBLY   - the reasoning model verifies every timestamp has an image; the video is cut
                   image-by-image to the exact per-line duration (black frame where an image is
                   missing) and muxed with the voiceover. The app's done-notification chimes.
@@ -35,7 +36,12 @@ ROOT = Path(__file__).resolve().parent
 OUT_ROOT = agent_core.PROJECTS_DIR / "_longform"
 
 TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
-IMAGE_CONCURRENCY = 4               # max Higgsfield generations in flight
+# 1, deliberately, until higgsfield_login runs more than one real worker: its executor is
+# max_workers=1, so extra "slots" only queue - but generate_sync's wait clock starts at SUBMIT,
+# so with 4 in flight the 4th call times out whenever one image takes >~97s (390s/4), gets
+# counted as a failure and re-queued while its orphaned worker task generates on regardless.
+# The scheduler below keeps full slot semantics; raise this once the session parallelizes.
+IMAGE_CONCURRENCY = 1               # max Higgsfield generations in flight
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
 MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
 VIDEO_W, VIDEO_H, VIDEO_FPS = 1920, 1080, 30
@@ -259,6 +265,13 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
             and str(saved.get("voice") or "") == str(voice or "")
             and str(saved.get("tts_style") or "") == str(tts_kw["style"] or "")):
         _log(status_cb, f"Resume: the voiceover is already stitched ({voice_path.name}) - keeping it.")
+        # The mix gate (hear the whole take, set the speed) runs AFTER stitching, so a run killed
+        # at that screen resumes right here - with the choice never made. Re-offer it; once a
+        # speed is recorded ("keep 1.0x" included) the question is settled and stays settled.
+        if mix_gate is not None and saved.get("voice_speed") is None:
+            speed = mix_gate(str(voice_path))
+            apply_voice_speed(voice_path, speed, ffmpeg, status_cb=status_cb)
+            save_state(out_dir, voice_speed=float(speed or 1.0))
         return voice_path, int(saved.get("tts_parts") or len(parts))
 
     saved_files = (saved or {}).get("tts_part_files") or []
@@ -279,8 +292,10 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         """
         save_state(out_dir, script=script, voice=voice or "", tts_style=tts_kw["style"] or "",
                    tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
-                   # parts are being (re)made, so any stitched voiceover on disk is the old one
-                   voiceover_ready=False, voice_speed=1.0,
+                   # parts are being (re)made, so any stitched voiceover on disk is the old one.
+                   # voice_speed None means "the speed question was never answered" - a NUMBER
+                   # (1.0 included) means the user chose, and only then may resume skip the gate.
+                   voiceover_ready=False, voice_speed=None,
                    lines=None, prompts=None, audio_duration=0.0)
 
     for i, part in enumerate(parts):
@@ -626,6 +641,9 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY)
     inflight = {}
     dead = 0                            # failed generation attempts so far
+    fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
+    #                                     judging the provider by yesterday's images would disable
+    #                                     the dead-provider stop exactly when a login has expired
 
     def submit(idx):
         prompt = prompts[idx]["prompt"]
@@ -657,6 +675,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                     path = None
                 if path:
                     results[idx] = str(path)
+                    fresh_ok += 1
                     _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
                                     f"#{idx + 1} done")
                 else:
@@ -666,8 +685,10 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                     # nearly all of them have been tried twice - waiting for that burnt ~2.5 of the
                     # 3 hours we are trying to save. And "no image has EVER worked" is what makes
                     # this safe: a run that is producing images can never trip it, however many
-                    # single prompts fail.
-                    if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not any(results.values()):
+                    # single prompts fail. "Worked" means THIS session - resume pre-fills
+                    # yesterday's images into results, and those say nothing about whether the
+                    # login is still alive today.
+                    if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
                         raise LongformError(
                             f"The first {dead} image generations all failed - Higgsfield looks "
                             "down or logged out. Stopping instead of spending hours filling the "
