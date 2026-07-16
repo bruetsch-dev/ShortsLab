@@ -487,13 +487,76 @@ def projects_list_payload(show_hidden=False, limit=200):
                 items.append(item)
             except Exception:
                 continue
+    if not show_hidden:
+        items.extend(longform_projects_payload(active_project_slugs))
+        items.sort(key=lambda i: str(i.get("edited") or ""), reverse=True)
     hidden_count = 0
     try:
-        hidden_count = sum(1 for p in projects_dir.iterdir()
-                           if agent_core.is_project_dir(p) and app.is_project_hidden(p))             if projects_dir.exists() else 0
+        hidden_count = (sum(1 for p in projects_dir.iterdir()
+                            if agent_core.is_project_dir(p) and app.is_project_hidden(p))
+                        if projects_dir.exists() else 0)
     except Exception:
         pass
     return {"projects": items, "hidden_count": hidden_count, "showing_hidden": bool(show_hidden)}
+
+
+def longform_projects_payload(active_project_slugs=()):
+    """The longform mode's projects, which live in their own container (projects/_longform/<slug>)
+    and so never appeared in the list at all - only the container did, and opening THAT rendered a
+    clip project made of defaults.
+
+    Same item shape as a clip project (the shell and its tests expect one schema), plus the script
+    so the shell can drop you back into the flow with it: longform resumes by re-running the SAME
+    script, and the pipeline then reuses the voiceover parts it already paid for. The script comes
+    from state.json, NOT script.txt - Path.write_text mangles newlines on Windows and resume
+    compares the script exactly, so a round-tripped copy would never match.
+    """
+    import app
+    import longform_video
+    out = []
+    root = longform_video.OUT_ROOT
+    if not root.exists():
+        return out
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("_"):
+            continue
+        try:
+            state = json.loads((d / "state.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        script = str(state.get("script") or "")
+        if not script:
+            continue                      # nothing to resume with, so nothing to offer
+        video = next(iter(sorted(d.glob("*.mp4"))), None)
+        images = sorted(d.glob("img*.png"))
+        title = " ".join(script.split())[:58].strip() or d.name.replace("_", " ")
+        out.append({
+            "slug": d.name,
+            "title": title,
+            "edited": time.strftime("%Y-%m-%d %H:%M", time.localtime(app.project_edited_mtime(d))),
+            # never "failed": an unfinished longform project is one waiting for you at a gate, and
+            # its voiceover is reusable either way - a red overlay would just be wrong.
+            "failed": False,
+            "running": d.name in set(active_project_slugs or ()),
+            "hidden": False,
+            "has_video": bool(video),
+            "counters": {"web": 0, "gpt": len(images), "clips": 0},
+            "thumb_url": app.link_for(images[0]) if images else "",
+            "preview_kind": "",
+            "video_url": app.link_for(video) if video else "",
+            "results_url": app.view_for(video, "assets") if video else app.view_for(d, "assets"),
+            "has_timeline": False,        # longform has no timeline editor
+            "kind": "longform",
+            # longform-only extras the shell reads to reopen the flow
+            "longform": True,
+            "script": script,
+            "tts_voice": str(state.get("voice") or ""),
+            "status": ("Done" if video else
+                       "Voiceover ready" if (d / "voiceover.wav").exists() else
+                       "Voiceover in progress"),
+            "images": len(images),
+        })
+    return out
 
 
 def jobs_list_payload():

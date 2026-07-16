@@ -1735,6 +1735,11 @@ async function loadProject(slug) {
     announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = "";
     lastAssignedKey = "";
     history.replaceState(null, "", "/?project=" + encodeURIComponent(slug));
+    // the list entry is fetched anyway (for S._projInfo); read it FIRST so a longform project
+    // never reaches /project-preset, which only knows clip projects and would answer with defaults
+    const plist = await jget("/projects-list");
+    const info = (plist.projects || []).find(p => p.slug === slug) || {};
+    if (info.longform) { openLongformProject(info); return; }
     const d = await jget("/project-preset?slug=" + encodeURIComponent(slug));
     S.projectSlug = d.slug; S.projectTitle = d.title || d.slug;
     const st = d.state || {};
@@ -1744,14 +1749,25 @@ async function loadProject(slug) {
       if (MAN.run.state_hidden.includes(k)) S.values[k] = !!st[k];
     });
     S.values.loaded_project_source = d.slug;
-    // metadata for the summary
-    const pl = await jget("/projects-list");
-    S._projInfo = (pl.projects || []).find(p => p.slug === slug) || {};
+    S._projInfo = info;                 // already fetched above
     S.flow = "project"; S.step = "summary"; S.completed = [];
     S.view = "chat";
     hideLoading();
     renderAll(); persist();
   } catch (e) { hideLoading(); errorCard(T.err_generic, String(e)); }
+}
+// Longform has no "project overview" of its own: it resumes by re-running the same script, and the
+// pipeline reuses the voiceover it already paid for. So opening one lands you in its Production
+// step with the script and narrator restored - Create picks up exactly where the run stopped.
+function openLongformProject(info) {
+  S.projectSlug = info.slug;
+  S.projectTitle = info.title || info.slug;
+  S.flow = "longform"; S.step = "settings"; S.completed = ["script"]; S.draft = true;
+  S.longform.script = info.script || "";
+  if (info.tts_voice) S.longform.tts_voice = info.tts_voice;
+  S.view = "chat";
+  hideLoading();
+  renderAll(); persist();
 }
 async function continueProject(slug) {
   const d = await jpost("/resume-project", { slug });
