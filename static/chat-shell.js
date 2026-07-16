@@ -1621,7 +1621,10 @@ function renderLongformFlow() {
       S.longform.tts_voice = vsel.value;
       vsel.addEventListener("change", () => { S.longform.tts_voice = vsel.value; persist(); });
       const prev = btn("▶ " + T.preview, () => {
-        const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.longform.tts_voice || "");
+        // mode=longform so the sample is read with the calm directive this mode actually uses -
+        // the default Shorts preview would sell you a punchier narrator than you will get here
+        const a = ensureAudio();
+        a.src = BOOT.voices_preview + encodeURIComponent(S.longform.tts_voice || "") + "&mode=longform";
         a.play().catch(() => {});
       }, "ghost small");
       voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
@@ -1997,9 +2000,36 @@ async function pollJob() {
       lfp.dataset.lfSig = sig; lfp.innerHTML = "";
       const m = el("div", "msg assistant"); m.appendChild(el("div", "bubble", esc(T.lf_parts_ready))); lfp.appendChild(m);
       const c = el("div", "chat-card"); lfp.appendChild(c);
+      // bulk actions + the total runtime go ABOVE the parts: a long script makes this card
+      // thousands of pixels tall, so anything under the last part is effectively unreachable.
+      const pending = (d.lf_parts || []).filter(p => p.state === "pending");
+      const total = (d.lf_parts || []).reduce((s, p) => s + (+p.dur || 0), 0);
+      const head = el("div", "lf-bulk");
+      head.appendChild(el("span", "lf-bulk-lbl",
+        (d.lf_parts || []).length + " " + (T.lf_parts_word || "parts") +
+        (total > 0 ? " · " + clock(total) + " " + (T.lf_total || "total") : "")));
+      head.appendChild(el("span", "spacer"));
+      if (pending.length > 1) {
+        const runAll = async (action, btnEl) => {
+          [...head.querySelectorAll("button")].forEach(b => b.disabled = true);
+          btnEl.textContent = "…";
+          // sequential on purpose: parallel declines would fire N regenerations at the TTS backend
+          for (const p of pending) {
+            await fetch("/longform-speech-decide?id=" + encodeURIComponent(S.jobId) +
+              "&part=" + encodeURIComponent(p.index) + "&action=" + action, { method: "POST" });
+          }
+          setTimeout(pollJob, 700);
+        };
+        head.appendChild(btn("✓ " + (T.lf_approve_all || "Approve all") + " (" + pending.length + ")",
+          ev => runAll("approve", ev.currentTarget), "primary"));
+        head.appendChild(btn("↻ " + (T.lf_decline_all || "Decline & regenerate all"),
+          ev => runAll("decline", ev.currentTarget), "danger"));
+      }
+      c.appendChild(head);
       (d.lf_parts || []).forEach(p => {
         const row = el("div", "lf-part");
         row.appendChild(el("div", "card-cap", esc(T.lf_part) + " " + (p.index + 1) +
+          (+p.dur > 0 ? " · " + clock(p.dur) : "") +
           (p.state === "approved" ? " · ✓ " + esc(T.lf_approved) :
            p.state === "regenerating" ? " · ↻ " + esc(T.lf_regenerating) : "")));
         row.appendChild(el("div", "lf-part-text", esc((p.text || "").slice(0, 220))));
@@ -2020,31 +2050,6 @@ async function pollJob() {
         }
         c.appendChild(row);
       });
-      // bulk actions: a long script splits into many parts, so deciding each one by hand is
-      // tedious. Both act on the PENDING parts only (already-approved ones stay untouched) and
-      // fire sequentially so the TTS backend isn't hammered with parallel regenerations.
-      const pending = (d.lf_parts || []).filter(p => p.state === "pending");
-      if (pending.length > 1) {
-        const bulk = el("div", "card-foot lf-bulk");
-        const runAll = async (action, btnEl) => {
-          const all = [...bulk.querySelectorAll("button")];
-          all.forEach(b => b.disabled = true);
-          btnEl.textContent = "…";
-          for (const p of pending) {
-            await fetch("/longform-speech-decide?id=" + encodeURIComponent(S.jobId) +
-              "&part=" + encodeURIComponent(p.index) + "&action=" + action, { method: "POST" });
-          }
-          setTimeout(pollJob, 700);
-        };
-        bulk.appendChild(el("span", "lf-bulk-lbl",
-          (T.lf_bulk_hint || "All %n remaining parts:").replace("%n", pending.length)));
-        bulk.appendChild(el("span", "spacer"));
-        bulk.appendChild(btn("✓ " + (T.lf_approve_all || "Approve all"),
-          ev => runAll("approve", ev.currentTarget), "primary"));
-        bulk.appendChild(btn("↻ " + (T.lf_decline_all || "Decline & regenerate all"),
-          ev => runAll("decline", ev.currentTarget), "danger"));
-        c.appendChild(bulk);
-      }
       scrollDown();
     }
   } else if (lfp && lfp.dataset.lfSig && d.status !== "awaiting_approval") {
@@ -2650,6 +2655,13 @@ function btn(label, fn, cls) {
   const b = el("button", "btn " + (cls || ""), prototypeLabel(label));
   b.addEventListener("click", fn);
   return b;
+}
+// seconds -> m:ss, or h:mm:ss once it runs past the hour (a longform voiceover does)
+function clock(seconds) {
+  const t = Math.max(0, Math.round(+seconds || 0));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
 }
 function linkBtn(label, href, cls) {
   const a = el("a", "btn " + (cls || ""), prototypeLabel(label)); a.href = href;

@@ -95,35 +95,47 @@ GEMINI_TTS_VOICES = [
 TTS_STYLE_DIRECTIVE = ("Read the following with high energy and enthusiasm - an upbeat, engaging, "
                        "punchy viral-narrator delivery, with crisp, clear enunciation")
 
+# The directive above is written for a 30-second Short, where relentless energy is the point. Over a
+# long narration it is exhausting and fights an informative narrator, so the long formats ask for a
+# delivery that stays listenable for many minutes instead.
+TTS_STYLE_LONGFORM = ("Read the following in a calm, measured documentary-narrator voice - warm, "
+                      "thoughtful and unhurried, with natural pauses between sentences and clear, "
+                      "relaxed enunciation that stays easy to listen to for a long time")
 
-def format_tts_script(speaker_name, text):
+
+def format_tts_script(speaker_name, text, style=None):
     """Prefix the script with the chosen speaker name, e.g. 'Rose: In 1814, ...', plus an optional
-    energetic delivery directive that Gemini applies to the performance (not spoken).
+    delivery directive that Gemini applies to the performance (not spoken).
 
     Gemini multi-speaker TTS keys lines by the speaker label, so the same name
     must lead each line and appear in the `speakers` array.
+
+    `style` is the delivery directive: None (the default) keeps TTS_STYLE_DIRECTIVE, so every caller
+    that does not care sounds exactly as it did before; "" drops the directive entirely.
     """
     speaker = (str(speaker_name or "").strip() or DEFAULT_TTS_SPEAKER)
     body = str(text or "").strip()
     if not body:
         return speaker
     line = f"{speaker}: {body}"
-    return f"{TTS_STYLE_DIRECTIVE}:\n{line}" if TTS_STYLE_DIRECTIVE else line
+    directive = TTS_STYLE_DIRECTIVE if style is None else str(style or "")
+    return f"{directive}:\n{line}" if directive else line
 
 
 def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER,
                            voice=DEFAULT_TTS_VOICE, model=DEFAULT_TTS_MODEL,
                            language=DEFAULT_TTS_LANGUAGE, cancel_event=None,
-                           status_cb=None):
+                           status_cb=None, style=None):
     """Generate a spoken voiceover with Gemini TTS and download it to out_path.
 
     Returns the local Path. `model` accepts 'flash'/'pro' or a full model id.
+    `style` is the delivery directive; None keeps the default viral-narrator one.
     """
     key = key or api_key()
     model_id = GEMINI_TTS_MODELS.get(model, model)
     speaker = (str(speaker or "").strip() or DEFAULT_TTS_SPEAKER)
     payload = {
-        "text": format_tts_script(speaker, text),
+        "text": format_tts_script(speaker, text, style=style),
         "language": language or DEFAULT_TTS_LANGUAGE,
         "speakers": [{"speaker": speaker, "voice": voice or DEFAULT_TTS_VOICE}],
     }

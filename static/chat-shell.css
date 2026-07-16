@@ -883,9 +883,17 @@ audio.inline-audio { width: 100%; margin-top: 8px; }
 /* longform per-part speech approval + settings toggle */
 .toggle-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; cursor: pointer; font-size: 13px; }
 .toggle-row input { accent-color: var(--accent, #23d160); }
-/* bulk approve/decline row under the per-part list (long scripts split into many parts) */
-.lf-bulk { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line, #2a2f2c); align-items: center; }
-.lf-bulk-lbl { font-size: 12px; color: var(--muted, #9aa39e); font-weight: 700; }
+/* Header of the voiceover approval card: part count + total runtime on the left, bulk actions on
+   the right. It sits ABOVE the parts on purpose - a long script makes this card thousands of
+   pixels tall, so a footer row is never seen. (Not sticky: .chat-card is transformed, which makes
+   it the containing block and breaks position:sticky against the chat scroller.) */
+.lf-bulk { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+           margin: 0 0 12px; padding-bottom: 10px;
+           border-bottom: 1px solid var(--line, #2a2f2c); }
+.prototype-ui .lf-bulk { border-bottom-color: var(--p-line); }
+.lf-bulk .spacer { flex: 1; }
+.lf-bulk-lbl { font-size: 12px; color: var(--muted, #9aa39e); font-weight: 700;
+               letter-spacing: .02em; white-space: nowrap; }
 .lf-part { border: 1px solid var(--line, #2a2f2c); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
 .lf-part-text { font-size: 12.5px; color: var(--muted, #9aa39e); margin: 4px 0 2px; line-height: 1.45; }
 
@@ -1484,6 +1492,11 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .prototype-ui .btn:hover { transform:translateY(-1px); border-color:var(--p-line-hot); background:color-mix(in srgb,var(--p-raised) 86%,var(--p-paper)); }
 .prototype-ui .btn.primary { border-color:var(--p-green); background:var(--p-green); color:var(--p-green-ink); box-shadow:0 8px 24px rgba(167,255,131,.11); }
 .prototype-ui .btn.primary:hover { background:var(--p-green); transform:translateY(-2px); box-shadow:0 12px 30px rgba(167,255,131,.17); }
+/* .btn.danger has the same specificity as `.prototype-ui .btn` above but loses on order, so every
+   destructive button (decline a voiceover take, delete) rendered in the default paper colour and
+   read as just another neutral action. Restate it here like .primary already does. */
+.prototype-ui .btn.danger { border-color:rgba(239,102,92,.45); background:var(--p-raised); color:var(--danger); }
+.prototype-ui .btn.danger:hover { border-color:var(--danger); background:rgba(239,102,92,.12); }
 .prototype-ui .assets-grid { grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); }
 .prototype-ui .asset-card2 { border-color:var(--p-line); border-radius:12px; background:var(--p-panel); }
 .prototype-ui .asset-card2:hover { border-color:var(--p-line-hot); transform:translateY(-2px); transition:transform 300ms var(--p-ease),border-color 200ms ease; }

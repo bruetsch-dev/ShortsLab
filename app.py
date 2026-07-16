@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -4631,6 +4632,20 @@ def start_longform_video_job(fields):
         URL), block until each one is APPROVED; a DECLINE re-generates that part via
         `regen_part` and puts it back to pending. Runs on the worker thread."""
         states = {p["index"]: "pending" for p in parts_info}
+        durations = {}
+
+        def part_seconds(path):
+            """Length of a TTS part, straight out of the wav header (no ffprobe subprocess: this
+            runs on every publish, i.e. on every approve/decline click). Cached per path - a
+            regenerated take always lands on a new filename, so the cache can never go stale."""
+            path = str(path)
+            if path not in durations:
+                try:
+                    with wave.open(path, "rb") as w:
+                        durations[path] = w.getnframes() / float(w.getframerate() or 1)
+                except Exception:      # not a wav (Gemini may hand back mp3) or still being written
+                    durations[path] = 0.0
+            return durations[path]
 
         def publish():
             with JOB_LOCK:
@@ -4639,7 +4654,8 @@ def start_longform_video_job(fields):
                     raise RunCancelled("Run cancelled by user.")
                 job["lf_parts"] = [
                     {"index": p["index"], "text": str(p["text"])[:500],
-                     "url": link_for(Path(p["path"])), "state": states[p["index"]]}
+                     "url": link_for(Path(p["path"])), "state": states[p["index"]],
+                     "dur": round(part_seconds(p["path"]), 2)}
                     for p in sorted(parts_info, key=lambda x: x["index"])]
 
         with JOB_LOCK:
@@ -12842,9 +12858,15 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass        # the player closed the connection mid-stream (normal when seeking)
 
-    def serve_voice_preview(self, voice):
+    def serve_voice_preview(self, voice, mode=""):
         """Generate (once, cached) and serve a ~10s sample of a Gemini TTS voice so the user can
-        preview it before committing. Cached under generated_assets/voice_previews/<voice>.wav."""
+        preview it before committing. Cached under generated_assets/voice_previews/<voice>.wav.
+
+        `mode` picks the delivery directive, because the SAME voice sounds like a different narrator
+        under a different one - a preview read with the punchy Shorts directive would misrepresent
+        how that voice narrates a longform video. Each mode caches its own file; the default keeps
+        the original filename and sample, so the Shorts preview is untouched.
+        """
         voice = (voice or "").strip()
         if voice not in pipeline.GEMINI_TTS_VOICES:
             self.send_error(400, "Unknown voice")
@@ -12854,15 +12876,23 @@ class Handler(BaseHTTPRequestHandler):
             prev_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        path = prev_dir / f"{voice}.wav"
+        if str(mode or "").strip().lower() == "longform":
+            style = pipeline.TTS_STYLE_LONGFORM
+            sample = ("This is a preview of this voice. I can narrate your video calmly and "
+                      "clearly, at a pace that stays easy to follow all the way through.")
+            path = prev_dir / f"{voice}_longform.wav"
+        else:
+            style = None            # None = the default directive: the Shorts preview is unchanged
+            sample = ("Hey — this is a quick preview of this voice. I can narrate your story with "
+                      "energy, warmth, and a clear, punchy delivery for your short videos.")
+            path = prev_dir / f"{voice}.wav"
         if not path.exists() or path.stat().st_size < 4096:
             if not os.environ.get("WAVESPEED_API_KEY", "").strip():
                 self.send_error(503, "WAVESPEED_API_KEY not set")
                 return
-            sample = ("Hey — this is a quick preview of this voice. I can narrate your story with "
-                      "energy, warmth, and a clear, punchy delivery for your short videos.")
             try:
-                out = pipeline.generate_speech_gemini(sample, path, voice=voice, model="pro", status_cb=None)
+                out = pipeline.generate_speech_gemini(sample, path, voice=voice, model="pro",
+                                                      status_cb=None, style=style)
                 path = Path(out)
             except Exception as exc:  # noqa: BLE001
                 print("[voice-preview] failed:", exc)
@@ -13055,8 +13085,8 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/music-list":
             self.send_bytes(music_list_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/voice-preview":
-            voice = urllib.parse.parse_qs(parsed.query).get("voice", [""])[0]
-            self.serve_voice_preview(voice)
+            _q = urllib.parse.parse_qs(parsed.query)
+            self.serve_voice_preview(_q.get("voice", [""])[0], _q.get("mode", [""])[0])
         elif parsed.path == "/reddit":
             self.send_bytes(reddit_page() if legacy else chat_ui.chat_shell_page({"flow": "reddit"}))
         elif parsed.path == "/twitter-status":

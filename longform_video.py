@@ -205,21 +205,24 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     # only pass a narrator when one was chosen, so an empty pick keeps pipeline's own defaults
-    tts_kw = {}
+    tts_kw = {"style": pipeline.TTS_STYLE_LONGFORM}
     if voice:
         tts_kw["voice"] = voice
     if speaker:
         tts_kw["speaker"] = speaker
 
-    # Reusable parts must belong to THIS script and narrator: the state is keyed on the script
-    # (load_state) and the split it was recorded under must still produce the same part count,
-    # else part 3 of the old split would be spoken over part 3 of the new one. The saved list is
-    # an index-aligned PREFIX - a run that died on part 3 of 8 saved 2 paths, and those 2 are
+    # Reusable parts must belong to THIS script, narrator and delivery directive: the state is keyed
+    # on the script (load_state) and the split it was recorded under must still produce the same part
+    # count, else part 3 of the old split would be spoken over part 3 of the new one. The saved list
+    # is an index-aligned PREFIX - a run that died on part 3 of 8 saved 2 paths, and those 2 are
     # still worth reusing - so it is the recorded total that is compared, not the list length.
+    # The style matters as much as the voice: parts recorded under the old viral-narrator directive
+    # are the wrong PERFORMANCE, and reusing them would silently undo an edit to TTS_STYLE_LONGFORM.
     saved = load_state(out_dir, script) if resume else None
     saved_files = (saved or {}).get("tts_part_files") or []
     if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
-            or str((saved or {}).get("voice") or "") != str(voice or "")):
+            or str((saved or {}).get("voice") or "") != str(voice or "")
+            or str((saved or {}).get("tts_style") or "") != str(tts_kw["style"] or "")):
         saved_files = []
 
     part_files = []
@@ -232,7 +235,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         and a resume that found the new script next to the old lines would happily pair the new
         audio with the old script's timings.
         """
-        save_state(out_dir, script=script, voice=voice or "",
+        save_state(out_dir, script=script, voice=voice or "", tts_style=tts_kw["style"] or "",
                    tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
                    lines=None, prompts=None, audio_duration=0.0)
 
