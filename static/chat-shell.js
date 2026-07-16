@@ -307,9 +307,15 @@ function activateStepper() {
   }
 }
 // Per-step header copy [KICKER, TITLE, SUBTITLE], keyed by step id.
+function isLongform() { return S.flow === "longform"; }
 function stepCopy(step) {
   return ({
-    script:["STORY", "Add your script", "Paste it or generate a fresh one."],
+    // `script` and `settings` are shared keys, so their copy has to bend to the flow that is
+    // using them - longform cannot generate a script, and its settings step is about narration,
+    // not the "enhancement intensity" the SFX/Visual/Caption masters set there.
+    script: isLongform()
+      ? ["SCRIPT", "Paste your script", "The full narration, start to finish - it sets the length of the video."]
+      : ["STORY", "Add your script", "Paste it or generate a fresh one."],
     hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
     version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
     source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
@@ -322,7 +328,9 @@ function stepCopy(step) {
     discover:["DISCOVER", "Find the story", "Choose where the search should begin."],
     pick:["SELECT", "Choose the strongest story", "Pick the version worth producing."],
     upload:["SOURCE", "Add your video", "Drop in the cut you want to enhance."],
-    settings:["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
+    settings: isLongform()
+      ? ["PRODUCTION", "Set up the narration", "Pick the narrator, the models and how the voiceover gets approved."]
+      : ["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
     choose:["UPGRADE", "Choose an enhancement", "Pick one production pass."],
     summary:["PROJECT", "Project overview", "Choose the next action."],
   }[step] || ["SETTINGS", "Configure this step", "Make your choices and continue."]);
@@ -1256,11 +1264,7 @@ function renderOutputsCard() {
   const scrape = S.values.clip_source === "scrape";
   // one clean section = a compact header + a body of controls, evenly spaced.
   const section = (title, ...nodes) => {
-    const sec = el("div", "out-sec");
-    sec.appendChild(el("div", "out-sec-cap", esc(title)));
-    const body = el("div", "out-sec-body");
-    nodes.forEach(n => n && body.appendChild(n));
-    sec.appendChild(body); c.appendChild(sec);
+    outSection(c, title, ...nodes);
   };
   const grid = (fields) => {
     const g = el("div", "tgl-grid");
@@ -1609,10 +1613,13 @@ function renderLongformFlow() {
   }
   if (S.completed.includes("script") && !S.jobId && (S.step === "settings" || S.step === "review")) {
     const c = card();
+    // Same anatomy as the script flow's Finish step: outSection blocks, not a flat stack of
+    // fields - one section per decision, in the order you make them.
     // narrator: voice dropdown + Preview, same as the script flow (longform used to always use
     // the built-in default voice with no way to pick or hear one).
+    let voiceFld = null;
     if ((OPT.tts_voice || []).length) {
-      const voiceFld = el("div", "fld voice-fld");
+      voiceFld = el("div", "fld voice-fld");
       voiceFld.appendChild(el("label", "", esc(T.tts_voice || "Narrator")));
       const voiceInline = el("div", "voice-inline");
       const vsel = el("select");
@@ -1629,29 +1636,34 @@ function renderLongformFlow() {
       }, "ghost small");
       voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
       voiceFld.appendChild(voiceInline);
-      c.appendChild(voiceFld);
     }
-    if (OPT.longform_tts.length) c.appendChild(selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model, v => S.longform.tts_model = v));
+    outSection(c, T.sec_narration || "Narration", voiceFld,
+      OPT.longform_tts.length ? selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model,
+        v => S.longform.tts_model = v) : null,
+      el("div", "out-sec-hint", esc(T.longform_voice_hint)));
     if (OPT.longform_reasoning.length) {
-      c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
-      appendReasoningField(c, S.longform.reasoning_model || firstVal(OPT.longform_reasoning), S.longform);
+      const dir = outSection(c, T.sec_director || "Director",
+        selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
+      const body = dir.querySelector(".out-sec-body");
+      appendReasoningField(body, S.longform.reasoning_model || firstVal(OPT.longform_reasoning), S.longform);
+      // it hard-codes a 22px top margin for the bare card it normally lands on; inside a section
+      // the body's own 14px gap sets the rhythm, and 22 on top of it breaks the grid
+      const rm = body.lastElementChild;
+      if (rm && rm.classList.contains("fld")) rm.style.marginTop = "";
     }
-    // "Halt after speech": pause after TTS so every voiceover part can be approved/declined
-    {
-      const row = el("label", "toggle-row");
-      const cb = document.createElement("input"); cb.type = "checkbox";
-      cb.checked = S.longform.halt_after_speech !== false;   // default ON
-      cb.addEventListener("change", () => { S.longform.halt_after_speech = cb.checked; persist(); });
-      row.appendChild(cb);
-      row.appendChild(el("span", "", esc(T.longform_halt_speech)));
-      c.appendChild(row);
-    }
-    c.appendChild(el("div", "card-cap", esc(T.connections)));
-    c.appendChild(connectionRow("higgsfield", T.connect_higgsfield, "/higgsfield-status", "/higgsfield-login"));
+    // "Halt after speech": pause after TTS so every voiceover part can be approved/declined.
+    // Same toggleField + hint the script flow's Speech section uses (this was a raw checkbox).
+    outSection(c, T.sec_speech || "Speech",
+      toggleField(T.longform_halt_speech, S.longform.halt_after_speech !== false,
+        v => S.longform.halt_after_speech = v),
+      el("div", "out-sec-hint", esc(T.longform_halt_hint)));
+    outSection(c, T.connections,
+      connectionRow("higgsfield", T.connect_higgsfield, "/higgsfield-status", "/higgsfield-login"));
+    // Back is injected by decoratePrototypeFlow (it strips any manual one), so the footer only
+    // carries the primary action - review-cta gives it the same weight as "Create Short".
     const foot = el("div", "card-foot");
-    foot.appendChild(btn(T.back, () => editStep("script"), "ghost"));
     foot.appendChild(el("span", "spacer"));
-    foot.appendChild(btn("🎬 " + T.create_longform, submitLongform, "primary"));
+    foot.appendChild(btn("🎬 " + T.create_longform, submitLongform, "primary review-cta"));
     c.appendChild(foot);
   }
   setComposer("off");
@@ -2681,6 +2693,17 @@ function selectField(label, options, value, onChange) {
   s.addEventListener("change", () => { onChange(s.value); persist(); });
   f.appendChild(s);
   return f;
+}
+// The design system's section block: a green mono cap over a 14px-gap body, separated by a
+// hairline. Shared, so a config step never has to invent its own stack of bare fields.
+function outSection(card, title, ...nodes) {
+  const sec = el("div", "out-sec");
+  sec.appendChild(el("div", "out-sec-cap", esc(title)));
+  const body = el("div", "out-sec-body");
+  nodes.forEach(n => n && body.appendChild(n));
+  sec.appendChild(body);
+  card.appendChild(sec);
+  return sec;
 }
 function toggleField(label, value, onChange, disabled) {
   const l = el("label", "tgl");

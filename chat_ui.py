@@ -232,6 +232,14 @@ UI_STRINGS = {
     "longform_tts": "Voiceover TTS",
     "longform_reasoning": "Reasoning model",
     "longform_halt_speech": "Halt after speech (approve each part)",
+    # section captions for the longform production step (same blocks the script flow's Finish uses)
+    "sec_narration": "Narration",
+    "sec_director": "Director",
+    "sec_speech": "Speech",
+    "longform_voice_hint": "The narrator reads the whole video, so pick one that stays easy to "
+                           "listen to. Preview plays it with this mode's calm delivery.",
+    "longform_halt_hint": "Pause after the voiceover so you can approve or re-do each part "
+                          "before the images are generated.",
     "lf_parts_ready": "Your voiceover parts are ready. Approve each part - declining re-generates that part.",
     "lf_part": "Part",
     "lf_approve": "Approve",
