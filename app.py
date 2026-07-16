@@ -4588,6 +4588,10 @@ def start_longform_video_job(fields):
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
     reasoning_mode = fields.get("reasoning_mode")
     halt_after_speech = agent_core.form_flag(fields, "halt_after_speech", False)
+    # narrator: only honour a voice the TTS layer actually knows, else keep pipeline's default
+    tts_voice = (fields.get("tts_voice") or "").strip()
+    if tts_voice and tts_voice not in set(pipeline.GEMINI_TTS_VOICES):
+        tts_voice = ""
     cancel_event = threading.Event()
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -4686,7 +4690,8 @@ def start_longform_video_job(fields):
             result = longform_video.run_longform_video(
                 script, tts_model=tts_model, reasoning_model=reasoning_model,
                 status_cb=status_cb, cancel_event=cancel_event,
-                speech_gate=lf_speech_gate if halt_after_speech else None)
+                speech_gate=lf_speech_gate if halt_after_speech else None,
+                voice=tts_voice or None)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -10438,10 +10443,17 @@ def _agent_fetch_plan(text, log):
 
 
 def _ensure_browser_playable(path):
-    """Re-encode a fetched clip to H.264 if it's HEVC/h265. Chromium / the WebView2 <video> element
-    can't decode HEVC, so HEVC clips (common from TikTok) showed as a frozen poster image on the
-    timeline and refused to play. ffmpeg (the renderer) handles HEVC fine, so this only matters for
-    the in-browser preview - we normalise to H.264 so both preview AND render behave. #fetched-clips."""
+    """Normalise a fetched clip to H.264 + CONSTANT 30fps. Two separate reasons, one re-encode:
+
+    1. H.264: Chromium / the WebView2 <video> element can't decode HEVC, so HEVC clips (common from
+       TikTok) showed as a frozen poster and refused to play in the timeline preview.
+    2. CFR 30: the renderer builds frames at a fixed 30fps and samples each source with
+       `round(t * source_fps)` (pipeline.SceneClip). That is only 1:1 when the source is exactly
+       30fps CFR. Raw TikTok/IG downloads are 60 / 59.94 / 29.97 / 25 / 24 fps or outright VFR, so
+       they got unevenly duplicated/skipped frames -> the render looked subtly choppy. The scrape
+       path already forced fps=30 via clip_scraper.normalize_clip; this fetch/manual path did not,
+       which is why only agent_*/manual_* clips juddered.
+    """
     try:
         import pipeline as _pl
         import subprocess
@@ -10449,16 +10461,24 @@ def _ensure_browser_playable(path):
         ffprobe = _pl.find_ffprobe(ffmpeg)
         if not ffmpeg or not ffprobe:
             return
-        codec = subprocess.run(
+        info = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "stream=codec_name", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=30).stdout.strip().lower()
-        if codec not in ("hevc", "h265", "hev1", "hvc1"):
+             "stream=codec_name,r_frame_rate,avg_frame_rate", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+        parts = [x.strip() for x in info.split(",")]
+        codec = (parts[0] if parts else "").lower()
+        r_rate = parts[1] if len(parts) > 1 else ""
+        avg_rate = parts[2] if len(parts) > 2 else ""
+        need_h264 = codec in ("hevc", "h265", "hev1", "hvc1")
+        # not exactly 30fps, or r != avg (the VFR signature) -> resample to constant 30
+        need_cfr30 = (avg_rate != "30/1") or (r_rate != avg_rate)
+        if not need_h264 and not need_cfr30:
             return
         p = Path(path)
-        tmp = p.with_suffix(".h264.mp4")
+        tmp = p.with_suffix(".norm.mp4")
         subprocess.run(
             [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(p),
+             "-vf", "fps=30", "-r", "30",
              "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(tmp)],
             capture_output=True, timeout=420)

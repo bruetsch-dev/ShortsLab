@@ -1609,6 +1609,25 @@ function renderLongformFlow() {
   }
   if (S.completed.includes("script") && !S.jobId && (S.step === "settings" || S.step === "review")) {
     const c = card();
+    // narrator: voice dropdown + Preview, same as the script flow (longform used to always use
+    // the built-in default voice with no way to pick or hear one).
+    if ((OPT.tts_voice || []).length) {
+      const voiceFld = el("div", "fld voice-fld");
+      voiceFld.appendChild(el("label", "", esc(T.tts_voice || "Narrator")));
+      const voiceInline = el("div", "voice-inline");
+      const vsel = el("select");
+      (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+      if (S.longform.tts_voice && [...vsel.options].some(o => o.value === S.longform.tts_voice)) vsel.value = S.longform.tts_voice;
+      S.longform.tts_voice = vsel.value;
+      vsel.addEventListener("change", () => { S.longform.tts_voice = vsel.value; persist(); });
+      const prev = btn("▶ " + T.preview, () => {
+        const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.longform.tts_voice || "");
+        a.play().catch(() => {});
+      }, "ghost small");
+      voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
+      voiceFld.appendChild(voiceInline);
+      c.appendChild(voiceFld);
+    }
     if (OPT.longform_tts.length) c.appendChild(selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model, v => S.longform.tts_model = v));
     if (OPT.longform_reasoning.length) {
       c.appendChild(selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
@@ -1638,6 +1657,7 @@ async function submitLongform() {
   const fd = new FormData();
   fd.append("script", S.longform.script || "");
   fd.append("tts_model", S.longform.tts_model || firstVal(OPT.longform_tts) || "pro");
+  fd.append("tts_voice", S.longform.tts_voice || firstVal(OPT.tts_voice) || "");
   fd.append("reasoning_model", S.longform.reasoning_model || firstVal(OPT.longform_reasoning) || "anthropic/claude-opus-4.8");
   fd.append("reasoning_mode", S.longform.reasoning_mode || "");
   if (S.longform.halt_after_speech !== false) fd.append("halt_after_speech", "on");

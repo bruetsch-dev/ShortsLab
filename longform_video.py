@@ -168,8 +168,11 @@ def concat_audio_parts(part_paths, out_path, ffmpeg):
 
 
 def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
-                       speech_gate=None):
+                       speech_gate=None, voice=None, speaker=None):
     """Script -> voiceover.wav (parts stitched). Returns (path, parts_count).
+
+    `voice` / `speaker` pick the Gemini TTS narrator (None = pipeline defaults), so longform uses
+    the same narrator selection as the other modes instead of always the built-in default voice.
 
     `speech_gate(parts_info, regen_part)` (optional, "Halt after speech"): called AFTER all
     TTS parts exist and BEFORE they are stitched. `parts_info` is a list of
@@ -185,15 +188,22 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         raise LongformError("ffmpeg not found.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # only pass a narrator when one was chosen, so an empty pick keeps pipeline's own defaults
+    tts_kw = {}
+    if voice:
+        tts_kw["voice"] = voice
+    if speaker:
+        tts_kw["speaker"] = speaker
     part_files = []
     for i, part in enumerate(parts):
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Cancelled.")
         _log(status_cb, f"Voiceover part {i + 1}/{len(parts)} ({len(part)} chars) "
-                        f"with Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS...")
+                        f"with Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS"
+                        f"{(' - narrator ' + str(voice)) if voice else ''}...")
         p = pipeline.generate_speech_gemini(part, out_dir / f"vo_part{i:02d}.wav",
                                             model=tts_model, cancel_event=cancel_event,
-                                            status_cb=status_cb)
+                                            status_cb=status_cb, **tts_kw)
         part_files.append(p)
 
     if speech_gate is not None:
@@ -210,7 +220,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
             # a NEW filename per take: browsers cache the old audio URL otherwise
             new_path = pipeline.generate_speech_gemini(
                 parts[i], out_dir / f"vo_part{i:02d}_take{take}.wav",
-                model=tts_model, cancel_event=cancel_event, status_cb=status_cb)
+                model=tts_model, cancel_event=cancel_event, status_cb=status_cb, **tts_kw)
             old = part_files[i]
             part_files[i] = Path(new_path)
             try:
@@ -630,7 +640,8 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
 # ------------------------------------------------------------------ ORCHESTRATOR
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
-                       status_cb=None, cancel_event=None, speech_gate=None, resume=True):
+                       status_cb=None, cancel_event=None, speech_gate=None, resume=True,
+                       voice=None, speaker=None):
     """The whole pipeline. Returns a result dict for the job UI.
 
     RESUME (default on): re-running the SAME script continues the existing project instead of
@@ -659,6 +670,11 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         except Exception:
             return 0.0
 
+    # A different narrator means the saved voiceover is the wrong voice -> regenerate it (and with
+    # it the timings), otherwise resume would silently keep the old narrator forever.
+    if state and voice and str(state.get("voice") or "") != str(voice):
+        _log(status_cb, "Narrator changed - regenerating the voiceover (timings will be redone).")
+        state = None
     reusable = bool(state and state.get("lines") and voice_path.exists())
     if reusable:
         # Reusing the voiceover is what makes resume work at all: fresh TTS would shift every
@@ -671,10 +687,11 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     else:
         voice_path, tts_parts = generate_voiceover(script, out_dir, tts_model=tts_model,
                                                    status_cb=status_cb, cancel_event=cancel_event,
-                                                   speech_gate=speech_gate)
+                                                   speech_gate=speech_gate, voice=voice,
+                                                   speaker=speaker)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
-        save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts,
+        save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts, voice=voice or "",
                    audio_duration=round(audio_duration, 3))
     transcript_path = write_transcript(lines, out_dir / "transcript.txt")
     _log(status_cb, f"Transcript written: {transcript_path.name}")
@@ -686,7 +703,7 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
                                          status_cb=status_cb, cancel_event=cancel_event)
         save_state(out_dir, script=script, lines=lines, prompts=prompts, tts_parts=tts_parts,
-                   audio_duration=round(audio_duration, 3))
+                   voice=voice or "", audio_duration=round(audio_duration, 3))
     prompts_path = write_prompts_file(prompts, out_dir / f"image_prompts_{slug}.txt")
     _log(status_cb, f"Prompt file written: {prompts_path.name}")
 
