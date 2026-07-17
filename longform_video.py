@@ -504,6 +504,11 @@ def write_transcript(lines, out_path):
 
 # ------------------------------------------------------------------ 3) IMAGE PROMPTS
 
+# Bump when the STAGE-3 doodle-prompt FORMAT changes (e.g. the mandatory ALL-CAPS top caption).
+# A resumed project whose saved prompts predate this version regenerates ALL prompts - and the
+# images made from them - in the new style instead of reusing the old-format cache.
+PROMPT_FORMAT_VERSION = 2
+
 STAGE3_PROMPT = """## STAGE 3 - GENERATE IMAGE PROMPTS FOR EVERY TIMESTAMP
 
 Once the user pastes their timestamped script, generate one detailed text-to-image prompt for every single timestamp line.
@@ -513,17 +518,21 @@ Once the user pastes their timestamped script, generate one detailed text-to-ima
 1. Every prompt must begin with its timestamp COPIED EXACTLY as it appears in the script (e.g. `[0:03.4]`) - do not reformat or round timestamps
 2. Every prompt must open with the style anchor: "Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines,"
 3. Every prompt must end with the style lock: "no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style."
-4. Be specific inside each prompt - describe what characters are present and what they are doing, their exact expression, what objects are in the scene, what background color is used, whether any on-screen text or labels appear
-5. Translate abstract narration into concrete visuals - if the script says "your body doesn't know the difference", show a confused stick figure looking at two identical objects; if it says "millions of years", show a large hourglass with bold red ALL CAPS text "MILLIONS OF YEARS" at the top of the frame
-6. Match tone to background color:
+4. Be specific inside each prompt - describe what characters are present and what they are doing, their exact expression, what objects are in the scene, what background color is used
+5. MANDATORY on-screen caption: every prompt MUST include a bold black ALL CAPS marker text at the top of the frame reading a short punchy 1-4 word caption that captures the essence of that line - phrase it exactly as: `bold black ALL CAPS marker text at the top reading "CHEERS"`. Pick the caption from the narration of that line (a key word, reaction, or label), like the on-screen words in a viral doodle explainer (CHEERS, WAR!, SORRY!, MOST COUNTRIES, 2 KM UNNOTICED, MILLIONS OF YEARS). Keep captions varied and specific to each line; hold the same caption only while the same beat is held across consecutive timestamps.
+6. Translate abstract narration into concrete visuals - if the script says "your body doesn't know the difference", show a confused stick figure looking at two identical objects; if it says "millions of years", show a large hourglass with the top caption reading "MILLIONS OF YEARS"
+
+GOLD-STANDARD EXAMPLE (match this exact shape - style anchor, then a rich concrete scene, then the mandatory top caption, then background, then the style lock):
+`Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines, a Swiss-helmeted stick figure and a crowned stick figure happily clinking two frothy beer mugs together with big warm smiles, a red heart above them and a small white dove of neutrality flying overhead, bold black ALL CAPS marker text at the top reading "CHEERS", plain white background, no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style.`
+7. Match tone to background color:
    - Ancient / prehistoric -> tan or dark blue background
    - Danger / threat -> stark white with red text or red-tinted sky
    - Happy / triumph / discovery -> bright white or yellow background
    - Underwater / science -> solid blue background
    - Outdoor / nature / evolution -> flat green ground + blue sky
    - Fire / night / ancient ritual -> solid orange background
-7. Hold scenes across consecutive timestamps - if 3 lines describe the same moment, keep the same scene and only adjust the character's expression or add one new element. Do not generate a brand new scene every 5 seconds.
-8. Use these proven frame types when appropriate:
+8. Hold scenes across consecutive timestamps - if 3 lines describe the same moment, keep the same scene and only adjust the character's expression or add one new element. Do not generate a brand new scene every 5 seconds.
+9. Use these proven frame types when appropriate:
    - **Concept text frame:** Large object (hourglass, clock, skull) centered + bold ALL CAPS text at top
    - **Evolution sequence:** Left-to-right creature or human progression with a right-pointing arrow
    - **Labeled diagram:** Animal or object with a yellow diagonal arrow + ALL CAPS label word
@@ -631,6 +640,30 @@ def image_key(index, line, duration):
     """Filename stem: index + timestamp + on-screen DURATION (user rule: length visible)."""
     ts = fmt_ts(line["start"]).replace(":", "-").replace(".", "-").strip("[]")
     return f"img{index:03d}_[{ts}]_dur{duration:.2f}s"
+
+
+def _archive_old_images(images_dir, status_cb=None):
+    """Move existing frames aside (not delete) so a format change regenerates them from scratch.
+    Nothing is lost - the old PNGs live on under images/_old_format_<ts>/ if ever needed."""
+    images_dir = Path(images_dir)
+    if not images_dir.is_dir():
+        return 0
+    stale = [p for p in images_dir.glob("*.png")]
+    if not stale:
+        return 0
+    dest = images_dir / f"_old_format_{time.strftime('%Y%m%d_%H%M%S')}"
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for p in stale:
+        try:
+            p.replace(dest / p.name)
+            moved += 1
+        except Exception:
+            pass
+    if moved:
+        _log(status_cb, f"Moved {moved} old-format frame(s) to {dest.name}/ - they will be "
+                        "regenerated in the new caption style.")
+    return moved
 
 
 def line_durations(lines, audio_duration):
@@ -1045,13 +1078,23 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     _log(status_cb, f"Transcript written: {transcript_path.name}")
 
     prompts = (state or {}).get("prompts") if reusable else retimed_prompts
-    if prompts and len(prompts) == len(lines):
+    cached_fmt = (state or {}).get("prompt_format") if reusable else None
+    stale_format = bool(prompts) and cached_fmt != PROMPT_FORMAT_VERSION
+    if prompts and len(prompts) == len(lines) and not stale_format:
         _log(status_cb, f"Resume: reusing the {len(prompts)} saved image prompt(s).")
     else:
+        if stale_format:
+            # The saved prompts predate the current doodle-prompt format (e.g. before the
+            # mandatory ALL-CAPS top caption). Regenerate ALL prompts, and move the images made
+            # from the old prompts aside so they are regenerated in the new style too.
+            _log(status_cb, "Image prompts are an older format - regenerating all prompts in the "
+                            "new caption style (and the images made from them).")
+            _archive_old_images(out_dir / "images", status_cb)
         prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
                                          status_cb=status_cb, cancel_event=cancel_event)
         save_state(out_dir, script=script, lines=lines, prompts=prompts, tts_parts=tts_parts,
-                   voice=voice or "", audio_duration=round(audio_duration, 3))
+                   voice=voice or "", audio_duration=round(audio_duration, 3),
+                   prompt_format=PROMPT_FORMAT_VERSION)
     prompts_path = write_prompts_file(prompts, out_dir / f"image_prompts_{slug}.txt")
     _log(status_cb, f"Prompt file written: {prompts_path.name}")
 
