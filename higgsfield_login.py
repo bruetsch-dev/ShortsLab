@@ -295,6 +295,8 @@ class Session:
         self._watcher = None
         self._gen_page = None               # the ONE reused generator page (manual-Unlimited mode)
         self._captured = []                 # generated-image URLs seen on the reused page
+        self._gen_model = None              # desired model/aspect, re-applied before EVERY generate
+        self._gen_aspect = None             # (a DataDome captcha reload resets the aspect to 3:4)
         self._open()
 
     def _open(self):
@@ -671,6 +673,7 @@ class Session:
         cb = status_cb or self._status_cb
         model = model or DEFAULT_MODEL
         aspect = aspect or DEFAULT_ASPECT
+        self._gen_model, self._gen_aspect = model, aspect      # re-applied before every generate
         if self._gen_page is None:
             self._gen_page = self._ctx.new_page()
             self._attach_capture(self._gen_page)
@@ -737,6 +740,15 @@ class Session:
             return "CAPTCHA"
         if not self.unlimited_is_on():
             return "UNLIMITED_OFF"
+        # A DataDome captcha reload (or any re-render) resets the aspect to Higgsfield's 3:4
+        # default; re-assert model + aspect right before generating so we never make a 3:4 frame
+        # that _image_done then rejects as "not 16:9".
+        self._dismiss_overlays(page)
+        self._set_model(page, self._gen_model or DEFAULT_MODEL)
+        if not self._set_aspect(page, self._gen_aspect or DEFAULT_ASPECT):
+            _status(cb, "Higgsfield: could not confirm the 16:9 ratio - skipping this frame "
+                        "instead of generating a wrong-aspect image.")
+            return None
         if not self._type_prompt(page, prompt):
             _status(cb, "Higgsfield: could not enter the prompt.")
             return None
@@ -872,6 +884,15 @@ class Session:
                     _pause_for_user()
                     if cancel_check and cancel_check():
                         break
+                # Re-assert 16:9 on this page (a captcha reload/re-render resets it to 3:4).
+                self._dismiss_overlays(page)
+                self._set_model(page, model)
+                if not self._set_aspect(page, aspect):
+                    idx, prompt, path = queue.pop(0)
+                    results[idx] = None
+                    if on_done:
+                        on_done(idx, None)
+                    continue
                 idx, prompt, path = queue[0]
                 if not self._type_prompt(page, prompt):
                     queue.pop(0)
