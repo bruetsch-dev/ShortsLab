@@ -293,6 +293,8 @@ class Session:
         self._pids = set()
         self._hide_stop = threading.Event()
         self._watcher = None
+        self._gen_page = None               # the ONE reused generator page (manual-Unlimited mode)
+        self._captured = []                 # generated-image URLs seen on the reused page
         self._open()
 
     def _open(self):
@@ -618,6 +620,151 @@ class Session:
                     return True
         return False
 
+    # ---- manual-Unlimited, single-reused-page generation ------------------------------------
+    # Higgsfield resets the Unlimited switch on every fresh page load, and DataDome throws a
+    # bot-check CAPTCHA on an automated Generate click. Both are solved by NOT reopening the page
+    # per image: we open ONE visible page, the USER turns Unlimited on (and clears any DataDome
+    # verification) once, and then every prompt is generated on that same page - the Unlimited
+    # state and the DataDome trust cookie both persist, so nothing has to be automated around the
+    # bot-check. We never touch a CAPTCHA ourselves.
+
+    def _attach_capture(self, page):
+        def _maybe_add(url):
+            if not url or not _IMG_EXT_RE.search(url) or not _GEN_URL_RE.search(url):
+                return
+            if url not in self._captured:
+                self._captured.append(url)
+
+        def _on_resp(resp):
+            try:
+                url = resp.url
+                ctype = ""
+                try:
+                    ctype = (resp.headers or {}).get("content-type", "")
+                except Exception:
+                    pass
+                if "image" in ctype or _IMG_EXT_RE.search(url):
+                    _maybe_add(url)
+                elif "json" in ctype:
+                    try:
+                        _scan_json_for_images(resp.json(), _maybe_add)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+
+    def _has_captcha(self, page):
+        """True while a DataDome / captcha-delivery verification is mounted over the page."""
+        try:
+            return bool(page.evaluate(
+                """() => [...document.querySelectorAll('iframe')]
+                     .some(f => /captcha-delivery|datadome/i.test(f.src || ''))
+                   || !!document.querySelector('[id*=datadome i],[class*=datadome i]')"""))
+        except Exception:
+            return False
+
+    def open_generator(self, model=None, aspect=None, status_cb=None):
+        """Open (once) the single reused generator page and set model + aspect. The Unlimited
+        switch is deliberately NOT touched here - the user sets it. Returns True on success."""
+        cb = status_cb or self._status_cb
+        model = model or DEFAULT_MODEL
+        aspect = aspect or DEFAULT_ASPECT
+        if self._gen_page is None:
+            self._gen_page = self._ctx.new_page()
+            self._attach_capture(self._gen_page)
+        page = self._gen_page
+        try:
+            page.goto(CREATE_URL, timeout=60000, wait_until="domcontentloaded")
+        except Exception as exc:            # noqa: BLE001
+            _status(cb, f"Higgsfield: could not open the generator ({exc.__class__.__name__}).")
+            return False
+        page.wait_for_timeout(1200)
+        self._dismiss_overlays(page)
+        self._wait_for_generator_bar(page)
+        self._dismiss_overlays(page)
+        self._set_model(page, model)
+        self._set_aspect(page, aspect)
+        return True
+
+    def unlimited_is_on(self):
+        page = self._gen_page
+        if page is None:
+            return False
+        sw = self._find_unlimited_switch(page)
+        return sw is not None and self._control_state(sw) is True
+
+    def wait_for_user_unlimited(self, status_cb=None, cancel_check=None, timeout_s=1200):
+        """Bring the window forward and WAIT until the USER turns Unlimited ON (and clears any
+        DataDome verification). Returns True once Unlimited reads on with no CAPTCHA showing."""
+        cb = status_cb or self._status_cb
+        page = self._gen_page
+        if page is None:
+            return False
+        deadline = time.time() + timeout_s
+        nagged = 0.0
+        while time.time() < deadline:
+            if cancel_check and cancel_check():
+                return False
+            if self.unlimited_is_on() and not self._has_captcha(page):
+                _status(cb, "Unlimited is ON - starting image generation.")
+                return True
+            now = time.time()
+            if now - nagged > 8:
+                nagged = now
+                if self._has_captcha(page):
+                    _status(cb, "Higgsfield shows a quick verification - please complete it in the "
+                                "window, then flip the 'Unlimited' switch on.")
+                else:
+                    _status(cb, "Waiting for you: turn ON the 'Unlimited' switch in the Higgsfield "
+                                "window - generation then starts automatically.")
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                break
+        return False
+
+    def generate_reuse(self, prompt, out_path, timeout_s=300, status_cb=None):
+        """Generate ONE image on the already-open, user-prepared generator page. Never navigates
+        (that would reset Unlimited). Returns the path, None on a plain timeout, or the sentinels
+        'UNLIMITED_OFF' / 'CAPTCHA' so the caller can pause for the user instead of spending."""
+        cb = status_cb or self._status_cb
+        page = self._gen_page
+        if page is None:
+            return None
+        if self._has_captcha(page):
+            return "CAPTCHA"
+        if not self.unlimited_is_on():
+            return "UNLIMITED_OFF"
+        if not self._type_prompt(page, prompt):
+            _status(cb, "Higgsfield: could not enter the prompt.")
+            return None
+        cut = len(self._captured)
+        if not self._click_generate(page):
+            _status(cb, "Higgsfield: generate button not found.")
+            return None
+        _status(cb, f"Higgsfield: generating {os.path.basename(str(out_path))} ...")
+        deadline = time.time() + max(30, int(timeout_s))
+        chosen = None
+        while time.time() < deadline:
+            if self._has_captcha(page):
+                return "CAPTCHA"
+            fresh = self._captured[cut:]
+            if fresh:
+                page.wait_for_timeout(1500)          # let the queue settle on the final asset
+                fresh = self._captured[cut:]
+                chosen = fresh[-1]
+                break
+            page.wait_for_timeout(1000)
+        if not chosen:
+            _status(cb, f"Higgsfield: timed out waiting for the image for {out_path}.")
+            return None
+        if self._download(page, chosen, out_path):
+            return str(out_path)
+        _status(cb, f"Higgsfield: failed to download the finished image ({chosen}).")
+        return None
+
     def _click_generate(self, page):
         for sel in ("button:has-text('Generate')", "button:has-text('Create')",
                     "button:has-text('Imagine')", "button[type='submit']",
@@ -923,6 +1070,86 @@ def generate_batch(items, out_dir, concurrency=4, aspect=None, model=None, ext="
             except Exception:
                 pass
     return results
+
+
+# ---- manual-Unlimited session (visible window, one reused page) -----------------------------
+# The longform image batch uses THIS instead of generate_batch: it opens a VISIBLE Higgsfield
+# window, waits for the user to flip Unlimited on (and clear any DataDome check), then generates
+# every image on the one page the user prepared - so Unlimited and the trust cookie both persist.
+
+def _open_visible_on_worker(status_cb=None):
+    # A manual run needs the window ON-SCREEN; if a prior off-screen session is around, drop it.
+    if _SESSION[0] is not None:
+        try:
+            _SESSION[0].close()
+        except Exception:
+            pass
+        _SESSION[0] = None
+    os.environ["HIGGSFIELD_WINDOW_VISIBLE"] = "1"
+    return _session_on_worker(status_cb)
+
+
+def _begin_manual_on_worker(model, aspect, status_cb, cancel_check, timeout_s):
+    sess = _open_visible_on_worker(status_cb)
+    if sess is None:
+        return False
+    if not sess.open_generator(model=model, aspect=aspect, status_cb=status_cb):
+        return False
+    return sess.wait_for_user_unlimited(status_cb=status_cb, cancel_check=cancel_check,
+                                        timeout_s=timeout_s)
+
+
+def begin_manual_session(model=None, aspect=None, status_cb=None, cancel_check=None,
+                         timeout_s=1200):
+    """Open a VISIBLE Higgsfield generator and block until the user has turned Unlimited on.
+    True when ready to generate; False on timeout/cancel/failure."""
+    if not is_ready():
+        _status(status_cb, "Higgsfield is not connected - click Connect Higgsfield first.")
+        return False
+    try:
+        return bool(_executor().submit(_begin_manual_on_worker, model, aspect, status_cb,
+                                       cancel_check, timeout_s).result(timeout=timeout_s + 60))
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield manual session failed ({exc.__class__.__name__}: {exc}).")
+        return False
+
+
+def _generate_shared_on_worker(prompt, out_path, timeout_s, status_cb):
+    sess = _SESSION[0]
+    if sess is None:
+        return None
+    try:
+        return sess.generate_reuse(prompt, out_path, timeout_s=timeout_s, status_cb=status_cb)
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield generate failed ({exc.__class__.__name__}: {exc}).")
+        return None
+
+
+def generate_shared_sync(prompt, out_path, timeout_s=300, status_cb=None):
+    """Generate ONE image on the manual session's reused page. Returns a path, None, or the
+    sentinels 'UNLIMITED_OFF' / 'CAPTCHA' (caller should pause for the user, then retry)."""
+    wait = max(30.0, float(timeout_s) + 90.0)
+    try:
+        return (_executor().submit(_generate_shared_on_worker, prompt, str(out_path),
+                                   timeout_s, status_cb).result(timeout=wait))
+    except concurrent.futures.TimeoutError:
+        _status(status_cb, f"Higgsfield generate timed out for {out_path}.")
+        return None
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield generate failed ({exc.__class__.__name__}: {exc}).")
+        return None
+
+
+def wait_for_user_unlimited_sync(status_cb=None, cancel_check=None, timeout_s=1200):
+    """Re-block for the user to turn Unlimited back on mid-batch (it flipped off / a CAPTCHA
+    appeared). True once ready again."""
+    try:
+        return bool(_executor().submit(
+            lambda: (_SESSION[0].wait_for_user_unlimited(
+                status_cb=status_cb, cancel_check=cancel_check, timeout_s=timeout_s)
+                if _SESSION[0] is not None else False)).result(timeout=timeout_s + 60))
+    except Exception:
+        return False
 
 
 def close_session():

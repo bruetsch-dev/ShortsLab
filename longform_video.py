@@ -744,16 +744,50 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # MANUAL, single-reused-page generation. Higgsfield's DataDome bot-check throws a CAPTCHA on
+    # an automated Generate click, and the Unlimited switch resets on every fresh page load. Both
+    # are solved by opening ONE visible page and letting the USER turn Unlimited on (and clear any
+    # verification) once - every frame is then generated on that same page, so Unlimited and the
+    # DataDome trust cookie persist. We never touch the CAPTCHA ourselves.
+    cancel_check = (lambda: cancel_event is not None and cancel_event.is_set())
+    _log(status_cb, "Opening the Higgsfield window - please turn ON the 'Unlimited' switch (and "
+                    "complete any quick verification). Generation then starts automatically.")
+    if not higgsfield_login.begin_manual_session(model="FLUX.2 Pro", aspect="16:9",
+                                                 status_cb=status_cb, cancel_check=cancel_check,
+                                                 timeout_s=1800):
+        if cancel_check():
+            raise pipeline.PipelineCancelled("Cancelled.")
+        raise LongformError("Higgsfield: the Unlimited switch was not turned on in time. Turn it "
+                            "on in the Higgsfield window, then resume (nothing is lost).")
+
+    def _generate_one(prompt, path):
+        """Generate one image on the shared page, pausing for the user if Unlimited flips off or a
+        DataDome CAPTCHA appears (never spending on an unverified toggle). Returns path or None."""
+        for _ in range(4):
+            if cancel_check():
+                raise pipeline.PipelineCancelled("Cancelled.")
+            res = higgsfield_login.generate_shared_sync(prompt, path, timeout_s=300,
+                                                        status_cb=status_cb)
+            if res in ("UNLIMITED_OFF", "CAPTCHA"):
+                _log(status_cb, "Paused - re-enable Unlimited / finish the verification in the "
+                                "Higgsfield window; generation resumes automatically.")
+                if not higgsfield_login.wait_for_user_unlimited_sync(
+                        status_cb=status_cb, cancel_check=cancel_check, timeout_s=1800):
+                    if cancel_check():
+                        raise pipeline.PipelineCancelled("Cancelled.")
+                    return None
+                continue
+            return res
+        return None
+
     # character reference FIRST (consistency anchor; also proves the session works)
     ref_path = out_dir / "character_reference.png"
     if _image_done(ref_path, "16:9"):
         _log(status_cb, "Character reference already there - reusing it.")
     else:
         _log(status_cb, "Generating the character reference frame first...")
-        ref = higgsfield_login.generate_sync(CHARACTER_REFERENCE_PROMPT, ref_path,
-                                             aspect="16:9", model="FLUX.2 Pro",
-                                             timeout_s=300, status_cb=status_cb)
-        if ref:
+        ref = _generate_one(CHARACTER_REFERENCE_PROMPT, ref_path)
+        if ref and _image_done(ref_path, "16:9"):
             _log(status_cb, "Character reference saved (used as the style anchor).")
         else:
             _log(status_cb, "Character reference failed - continuing without it.")
@@ -761,7 +795,6 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     total = len(prompts)
     results = {}
     attempts = {}
-    lock = threading.Lock()
     # RESUME: every image whose file is already on disk is reused, so a re-run only generates
     # what is actually missing. The filename (index + timestamp + duration) identifies the line,
     # so a reused file always belongs to the line it is mapped onto - if the script or its timing
@@ -774,90 +807,60 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         _log(status_cb, f"Resume: {len(results)}/{total} image(s) already generated - "
                         f"only the missing {total - len(results)} will be generated.")
     queue = [i for i in range(total) if i not in results]
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY)
-    inflight = {}
     dead = 0                            # failed generation attempts so far
     fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
     #                                     judging the provider by yesterday's images would disable
     #                                     the dead-provider stop exactly when a login has expired
     consec = 0                          # failures since the last success (mid-run death signal)
 
-    def submit(idx):
-        prompt = prompts[idx]["prompt"]
+    # One reused page = sequential generation (Unlimited + the trust cookie only persist on that
+    # single page). The circuit breakers below are unchanged.
+    while queue:
+        if cancel_check():
+            raise pipeline.PipelineCancelled("Cancelled.")
+        idx = queue.pop(0)
         key = image_key(idx, lines[idx], durations[idx])
-        return pool.submit(higgsfield_login.generate_sync, prompt, out_dir / f"{key}.png",
-                           "16:9", "FLUX.2 Pro", 300, status_cb)
-
-    try:
-        while queue or inflight:
-            if cancel_event is not None and cancel_event.is_set():
-                raise pipeline.PipelineCancelled("Cancelled.")
-            # refill: only submit while fewer than IMAGE_CONCURRENCY are active
-            while queue and len(inflight) < IMAGE_CONCURRENCY:
-                idx = queue.pop(0)
-                inflight[submit(idx)] = idx
-                with lock:
-                    done_n = sum(1 for v in results.values() if v)
-                _log(status_cb, f"image {done_n}/{total} - submitted #{idx + 1} "
-                                f"({len(inflight)} active)")
-            done, _pending = concurrent.futures.wait(
-                list(inflight.keys()), timeout=5.0,
-                return_when=concurrent.futures.FIRST_COMPLETED)
-            for fut in done:
-                idx = inflight.pop(fut)
-                path = None
-                try:
-                    path = fut.result()
-                except Exception:
-                    path = None
-                if path and _image_done(path, "16:9"):
-                    results[idx] = str(path)
-                    fresh_ok += 1
-                    consec = 0
-                    _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
-                                    f"#{idx + 1} done")
-                else:
-                    if path:
-                        _log(status_cb, f"image #{idx + 1} was not a valid 16:9 frame - rejecting it")
-                    dead += 1
-                    # Counting failed ATTEMPTS, not dead images: with 4 in flight every image runs
-                    # attempt 1 before any runs attempt 3, so no image exhausts its retries until
-                    # nearly all of them have been tried twice - waiting for that burnt ~2.5 of the
-                    # 3 hours we are trying to save. And "no image has EVER worked" is what makes
-                    # this safe: a run that is producing images can never trip it, however many
-                    # single prompts fail. "Worked" means THIS session - resume pre-fills
-                    # yesterday's images into results, and those say nothing about whether the
-                    # login is still alive today.
-                    if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
-                        raise LongformError(
-                            f"The first {dead} image generations all failed - Higgsfield looks "
-                            "down or logged out. Stopping instead of spending hours filling the "
-                            "video with black frames; reconnect and resume (nothing is lost).")
-                    consec += 1
-                    # Mid-run death (the rule above is blind once anything succeeded): retries go
-                    # to the BACK of the queue, so mid-run a failure streak is interleaved with
-                    # fresh successes unless the provider actually stopped working. Only trip
-                    # while UNTRIED images remain - at the tail the queue holds nothing but the
-                    # retries of a few hopeless prompts (content-filter rejects and the like),
-                    # and those should become black frames as designed, not kill a run that has
-                    # already produced almost everything.
-                    if (consec >= MAX_CONSECUTIVE_FAILURES_MIDRUN
-                            and any(attempts.get(i, 0) == 0 for i in queue)):
-                        raise LongformError(
-                            f"{consec} generations in a row have failed with untried images "
-                            "still queued - Higgsfield looks like it died mid-run. Stopping; "
-                            "reconnect and resume (the finished images are kept).")
-                    attempts[idx] = attempts.get(idx, 0) + 1
-                    if attempts[idx] <= IMAGE_RETRIES:
-                        _log(status_cb, f"image #{idx + 1} failed - regenerating "
-                                        f"(retry {attempts[idx]}/{IMAGE_RETRIES})")
-                        queue.append(idx)
-                    else:
-                        results[idx] = None
-                        _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
-                                        "- a black frame will be used.")
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
+                        f"generating #{idx + 1}")
+        path = _generate_one(prompts[idx]["prompt"], out_dir / f"{key}.png")
+        if path and _image_done(path, "16:9"):
+            results[idx] = str(path)
+            fresh_ok += 1
+            consec = 0
+            _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
+                            f"#{idx + 1} done")
+        else:
+            if path:
+                _log(status_cb, f"image #{idx + 1} was not a valid 16:9 frame - rejecting it")
+            dead += 1
+            # "No image has EVER worked this session" is what makes the cold-start stop safe: a run
+            # that is producing images can never trip it. Resume pre-fills yesterday's images into
+            # results, which say nothing about whether the login is still alive today.
+            if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
+                raise LongformError(
+                    f"The first {dead} image generations all failed - Higgsfield looks "
+                    "down or logged out. Stopping instead of spending hours filling the "
+                    "video with black frames; reconnect and resume (nothing is lost).")
+            consec += 1
+            # Mid-run death (blind once anything succeeded): retries go to the BACK of the queue,
+            # so a failure streak is interleaved with fresh successes unless the provider actually
+            # stopped. Only trip while UNTRIED images remain - at the tail the queue holds nothing
+            # but retries of a few hopeless prompts, which should become black frames as designed.
+            if (consec >= MAX_CONSECUTIVE_FAILURES_MIDRUN
+                    and any(attempts.get(i, 0) == 0 for i in queue)):
+                raise LongformError(
+                    f"{consec} generations in a row have failed with untried images "
+                    "still queued - Higgsfield looks like it died mid-run. Stopping; "
+                    "reconnect and resume (the finished images are kept).")
+            attempts[idx] = attempts.get(idx, 0) + 1
+            if attempts[idx] <= IMAGE_RETRIES:
+                _log(status_cb, f"image #{idx + 1} failed - regenerating "
+                                f"(retry {attempts[idx]}/{IMAGE_RETRIES})")
+                queue.append(idx)
+            else:
+                results[idx] = None
+                _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
+                                "- a black frame will be used.")
     ok = sum(1 for v in results.values() if v)
     _log(status_cb, f"Images finished: {ok}/{total} generated.")
     return results
