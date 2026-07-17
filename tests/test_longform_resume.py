@@ -16,6 +16,8 @@ import unittest
 import wave
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -176,6 +178,102 @@ class LongformResumeTest(unittest.TestCase):
                          "another narrator means the parts are the wrong voice")
         self.assertEqual(self.run_vo(gate=self.gate_dies, voice="Sulafat", resume=False),
                          self.parts, "resume=False must ignore the disk")
+
+    def test_voice_speed_never_replaces_the_file_playing_in_the_browser(self):
+        source = self.dir / "voiceover.wav"
+        original = b"R" * (lf.MIN_AUDIO_BYTES + 100)
+        source.write_bytes(original)
+
+        def fake_ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"S" * (lf.MIN_AUDIO_BYTES + 200))
+            return SimpleNamespace(stderr="")
+
+        with mock.patch.object(lf.subprocess, "run", side_effect=fake_ffmpeg), \
+             mock.patch.object(lf.pipeline, "atempo_filter_chain", return_value="atempo=1.15"):
+            sped = lf.apply_voice_speed(source, 1.15, ffmpeg="ffmpeg")
+
+        self.assertNotEqual(sped, source)
+        self.assertIn("_speed_1p15x_", sped.name)
+        self.assertEqual(source.read_bytes(), original,
+                         "the streamed approval file must remain immutable on Windows")
+        self.assertGreater(sped.stat().st_size, lf.MIN_AUDIO_BYTES)
+        lf.save_state(self.dir, voiceover_file=sped.name)
+        self.assertEqual(lf.voiceover_path_from_state(self.dir, self.state()), sped)
+
+    def test_resume_after_speed_gate_uses_and_records_the_new_immutable_file(self):
+        raw = self.dir / "voiceover.wav"
+        raw.write_bytes(b"R" * (lf.MIN_AUDIO_BYTES + 100))
+        sped = self.dir / "voiceover_speed_1p15x_test.wav"
+        sped.write_bytes(b"S" * (lf.MIN_AUDIO_BYTES + 100))
+        lf.save_state(
+            self.dir, script=self.script, voice="Kore", tts_style=lf.pipeline.TTS_STYLE_LONGFORM,
+            voiceover_ready=True, voice_speed=None, voiceover_file=raw.name,
+            tts_parts=self.parts)
+
+        with mock.patch.object(lf.pipeline, "find_ffmpeg", return_value="ffmpeg"), \
+             mock.patch.object(lf, "apply_voice_speed", return_value=sped) as apply:
+            selected, count = lf.generate_voiceover(
+                self.script, self.dir, voice="Kore", resume=True, mix_gate=lambda _path: 1.15)
+
+        self.assertEqual(selected, sped)
+        self.assertEqual(count, self.parts)
+        apply.assert_called_once_with(raw, 1.15, "ffmpeg", status_cb=None)
+        state = self.state()
+        self.assertEqual(state["voice_speed"], 1.15)
+        self.assertEqual(state["voiceover_file"], sped.name)
+
+    def test_speed_change_renames_images_and_rewrites_their_timeline_positions(self):
+        old_lines = [
+            {"start": 0.0, "end": 4.5, "text": "First line"},
+            {"start": 5.0, "end": 9.5, "text": "Second line"},
+        ]
+        new_lines = [
+            {"start": 0.0, "end": 3.5, "text": "First line"},
+            {"start": 4.0, "end": 7.5, "text": "Second line"},
+        ]
+        images = self.dir / "images"
+        images.mkdir()
+        old_durations = lf.line_durations(old_lines, 10.0)
+        old_paths = []
+        for idx, line in enumerate(old_lines):
+            path = images / f"{lf.image_key(idx, line, old_durations[idx])}.png"
+            path.write_bytes(b"P" * (lf.MIN_IMAGE_BYTES + idx + 1))
+            old_paths.append(path)
+
+        prompts = [{"timestamp": "[0:00.0]", "prompt": "first"},
+                   {"timestamp": "[0:05.0]", "prompt": "second"}]
+        updated = lf.retime_longform_assets(
+            self.dir, old_lines, new_lines, 10.0, 8.0, prompts=prompts)
+        new_durations = lf.line_durations(new_lines, 8.0)
+        new_paths = [images / f"{lf.image_key(i, line, new_durations[i])}.png"
+                     for i, line in enumerate(new_lines)]
+
+        self.assertTrue(all(p.exists() for p in new_paths))
+        self.assertTrue(all(not p.exists() for p in old_paths))
+        self.assertEqual([p["timestamp"] for p in updated], ["[0:00.0]", "[0:04.0]"])
+
+        manifest = lf.write_timeline_manifest(
+            new_lines, new_durations, {0: str(new_paths[0]), 1: str(new_paths[1])},
+            8.0, self.dir / "timeline.json", voice_speed=1.25)
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(data["voice_speed"], 1.25)
+        self.assertEqual([(row["start"], row["end"], row["image"])
+                          for row in data["scenes"]],
+                         [(0.0, 4.0, new_paths[0].name),
+                          (4.0, 8.0, new_paths[1].name)])
+
+    def test_longform_resume_rejects_a_healthy_but_portrait_image(self):
+        from PIL import Image
+
+        portrait = self.dir / "portrait.png"
+        landscape = self.dir / "landscape.png"
+        Image.new("RGB", (384, 516), "red").save(portrait)
+        Image.new("RGB", (1600, 900), "green").save(landscape)
+
+        self.assertTrue(lf._image_done(portrait), "the file itself is healthy")
+        self.assertFalse(lf._image_done(portrait, "16:9"),
+                         "a 3:4 generation may never be reused in the longform timeline")
+        self.assertTrue(lf._image_done(landscape, "16:9"))
 
 
 if __name__ == "__main__":

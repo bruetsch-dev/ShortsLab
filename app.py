@@ -4056,6 +4056,25 @@ def _make_speech_gate(job_id, cancel_event, approval_event):
 def start_job(fields, files):
     job_id = str(int(time.time() * 1000))
     fields = dict(fields)
+    # Project presets/UI state can carry Script-Creator emphasis words from the previous script.
+    # Keep only keywords that actually occur in this run's script; otherwise an unrelated old
+    # topic can leak into caption emphasis (and into any downstream hook-aware planning).
+    script_text = str(fields.get("script") or "")
+    try:
+        saved_keywords = json.loads(str(fields.get("hook_keywords") or "[]"))
+    except Exception:
+        saved_keywords = []
+    if isinstance(saved_keywords, list):
+        script_folded = script_text.casefold()
+        valid_keywords = [str(word).strip() for word in saved_keywords
+                          if str(word).strip()
+                          and str(word).strip().casefold() in script_folded]
+        fields["hook_keywords"] = json.dumps(valid_keywords[:14], ensure_ascii=False)
+    if fields.get("hook_text") and str(fields["hook_text"]) not in script_text:
+        fields["hook_text"] = ""
+    if (fields.get("impact_word")
+            and str(fields["impact_word"]).casefold() not in script_text.casefold()):
+        fields["impact_word"] = ""
     audio_path = save_upload(files.get("audio_file"), job_id)
     speaker_image_path = save_upload(files.get("speaker_image_file"), job_id)
     cancel_event = threading.Event()
@@ -4597,6 +4616,11 @@ def start_longform_video_job(fields):
     # the mix gate below waits on this; /approve-speech and cancel_job both set it, exactly as
     # they do for the clip runs, so the gate needs no route of its own
     approval_event = threading.Event()
+    # Publish the deterministic project folder immediately, not only after the final render.
+    # Failed/paused longform jobs can then be identified and their saved transcript/prompts shown
+    # in the job UI instead of appearing as an anonymous "Active production".
+    project_dir = (longform_video.OUT_ROOT / longform_video.slug_for(script)
+                   if len(script) >= 40 else None)
     with JOB_LOCK:
         JOBS[job_id] = {
             "status": "running",
@@ -4606,7 +4630,7 @@ def start_longform_video_job(fields):
             "error": None,
             "cancel_event": cancel_event,
             "approval_event": approval_event,
-            "project_dir": None,
+            "project_dir": str(project_dir) if project_dir else None,
             "created_at": time.time(),
             "job_kind": "longform",
         }
@@ -5943,7 +5967,11 @@ def resume_project(slug):
         job_id = start_job(fields, {})
     except Exception as exc:                                # noqa: BLE001
         return {"ok": False, "error": f"Could not start: {exc}"}
-    return {"ok": True, "job_id": job_id}
+    # The chat shell consumes the same `job` URL shape as every other JSON run endpoint. Keep
+    # job_id too for legacy callers. Returning only job_id made the visible Continue project
+    # button report failure even though the backend had already started the replacement job.
+    return {"ok": True, "job_id": job_id,
+            "job": f"/job?id={urllib.parse.quote(job_id)}"}
 
 
 def is_project_hidden(project_dir):

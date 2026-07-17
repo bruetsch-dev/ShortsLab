@@ -1,5 +1,5 @@
 {
-  "script": "In Japan, service workers must pass a daily AI smile test. Many companies use special cameras to grade an employee's face from zero to one hundred. If your smile score is too low, the system rejects you. You cannot start your shift until you look happy enough. This intense pressure to look perfect continues throughout the entire workday. Cashiers must keep this exact smile even while dealing with angry customers. They are trained to speak in a precise, artificially high-pitched voice. But the harshest reality? Under this system, workers are trained to never say the word no to a customer. Instead, they must bow deeply and apologize even when the customer is completely wrong.",
+  "script": "Three insane things young Japanese couples do on normal dates. First, they dress exactly like twins. They do not just wear matching colors; they will buy the exact same shirts, sneakers, and even bags just to walk around the city together. Next, they take photos that completely change their faces. They go into famous photo booths called Purikura. The machine automatically makes your eyes massive and your skin perfectly smooth, and you keep the printed stickers inside your phone case. But the absolute best part? The dates are super cheap. Instead of fancy romantic dinners, young couples will just go to a casual family restaurant, order a three-dollar pizza, and drink unlimited sodas from the drink machine for hours.",
   "visual_script": "",
   "title": "The Great Emu War",
   "slug": "",
@@ -16,8 +16,8 @@
   "tts_voice": "Laomedeia",
   "tts_model": "pro",
   "image_model": "openai/gpt-image-2/text-to-image",
-  "hook_text": "In Japan, service workers must pass a daily AI smile test.",
-  "impact_word": "test",
+  "hook_text": "Three insane things young Japanese couples do on normal dates.",
+  "impact_word": "dates",
   "hook_keywords": "[\"service workers\",\"pass\",\"daily AI smile test\"]",
   "pipeline_version": "v0.2",
   "hook_pause_s": "0.45",

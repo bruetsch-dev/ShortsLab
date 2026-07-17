@@ -57,12 +57,29 @@ class LongformError(RuntimeError):
     pass
 
 
-def _image_done(path):
-    """True when an image is already on disk and is not a truncated stub."""
+def _image_done(path, expected_aspect=None):
+    """True when an image is healthy and, when requested, has the right canvas ratio.
+
+    Higgsfield's generator defaults to 3:4.  A UI-selector regression once produced a valid but
+    portrait frame for a 16:9 longform project; checking only byte size made every resume trust
+    that wrong frame forever.
+    """
     try:
         p = Path(path)
-        return p.is_file() and p.stat().st_size >= MIN_IMAGE_BYTES
-    except OSError:
+        if not p.is_file() or p.stat().st_size < MIN_IMAGE_BYTES:
+            return False
+        if expected_aspect:
+            from PIL import Image
+            with Image.open(p) as image:
+                width, height = image.size
+            left, right = str(expected_aspect).split(":", 1)
+            target = float(left) / float(right)
+            actual = float(width) / float(height)
+            # Allow normal rounding/cropping differences while rejecting 3:4 as 16:9.
+            if abs(actual - target) > 0.06:
+                return False
+        return True
+    except (OSError, ValueError, ZeroDivisionError):
         return False
 
 
@@ -186,7 +203,13 @@ def concat_audio_parts(part_paths, out_path, ffmpeg):
 
 
 def apply_voice_speed(path, speed, ffmpeg=None, status_cb=None):
-    """Re-tempo a voiceover in place (pitch-preserving). Returns the path; a no-op at 1.0x."""
+    """Return a pitch-preserving re-tempoed copy of ``path``.
+
+    Never replace ``path`` itself.  The approval player can still be streaming that file when
+    the user clicks Continue and Windows then rejects ``os.replace`` with ``WinError 5``.  A
+    versioned output also keeps the untouched TTS take as the source of truth, so selecting a
+    different speed later cannot accidentally apply atempo twice.
+    """
     try:
         speed = float(speed or 0)
     except (TypeError, ValueError):
@@ -200,18 +223,36 @@ def apply_voice_speed(path, speed, ffmpeg=None, status_cb=None):
     ffmpeg = ffmpeg or pipeline.find_ffmpeg()
     if not ffmpeg:
         return path
-    tmp = path.with_name(path.stem + "_respeed" + path.suffix)
+    try:
+        stat = path.stat()
+        source_version = f"{stat.st_size:x}_{stat.st_mtime_ns:x}"
+    except OSError:
+        source_version = str(time.time_ns())
+    speed_tag = f"{speed:.2f}".replace(".", "p")
+    # The timestamp makes every conversion target unique.  ffmpeg therefore never has to open
+    # an earlier preview/output for replacement either (that file may also still be streamed).
+    out_path = path.with_name(
+        f"{path.stem}_speed_{speed_tag}x_{source_version}_{time.time_ns():x}{path.suffix}")
     # atempo only accepts 0.5..2.0, so anything outside has to be chained - pipeline already
     # knows how to build that chain, and the clip pipeline uses the same one
     out = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
-                          "-af", pipeline.atempo_filter_chain(speed), str(tmp)],
+                          "-af", pipeline.atempo_filter_chain(speed), str(out_path)],
                          capture_output=True, text=True, timeout=600)
-    if not tmp.exists() or tmp.stat().st_size < MIN_AUDIO_BYTES:
-        tmp.unlink(missing_ok=True)
+    if not out_path.exists() or out_path.stat().st_size < MIN_AUDIO_BYTES:
+        out_path.unlink(missing_ok=True)
         raise LongformError((out.stderr or "voice speed conversion failed")[-180:])
-    os.replace(tmp, path)
     _log(status_cb, f"Narration speed set to {speed:.2f}x.")
-    return path
+    return out_path
+
+
+def voiceover_path_from_state(out_dir, state=None):
+    """Resolve the immutable voiceover selected by the resume state, safely inside out_dir."""
+    out_dir = Path(out_dir)
+    name = Path(str((state or {}).get("voiceover_file") or "voiceover.wav")).name
+    selected = out_dir / name
+    if _audio_done(selected):
+        return selected
+    return out_dir / "voiceover.wav"
 
 
 def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
@@ -261,19 +302,30 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     # function. The parts are deleted at stitch time, so without this shortcut an interruption
     # anywhere after it - the mix gate below blocks on a human, the transcription takes minutes -
     # would find no parts and re-buy the entire TTS.
-    voice_path = out_dir / "voiceover.wav"
-    if (resume and saved and saved.get("voiceover_ready") and _audio_done(voice_path)
+    raw_voice_path = out_dir / "voiceover.wav"
+    saved_voice_path = voiceover_path_from_state(out_dir, saved)
+    if (resume and saved and saved.get("voiceover_ready") and _audio_done(raw_voice_path)
             and str(saved.get("voice") or "") == str(voice or "")
             and str(saved.get("tts_style") or "") == str(tts_kw["style"] or "")):
-        _log(status_cb, f"Resume: the voiceover is already stitched ({voice_path.name}) - keeping it.")
+        _log(status_cb, f"Resume: the voiceover is already stitched ({raw_voice_path.name}) - keeping it.")
         # The mix gate (hear the whole take, set the speed) runs AFTER stitching, so a run killed
         # at that screen resumes right here - with the choice never made. Re-offer it; once a
         # speed is recorded ("keep 1.0x" included) the question is settled and stays settled.
         if mix_gate is not None and saved.get("voice_speed") is None:
-            speed = mix_gate(str(voice_path))
-            apply_voice_speed(voice_path, speed, ffmpeg, status_cb=status_cb)
-            save_state(out_dir, voice_speed=float(speed or 1.0))
-        return voice_path, int(saved.get("tts_parts") or len(parts))
+            speed = mix_gate(str(raw_voice_path))
+            saved_voice_path = apply_voice_speed(raw_voice_path, speed, ffmpeg,
+                                                 status_cb=status_cb)
+            save_state(out_dir, voice_speed=float(speed or 1.0),
+                       voiceover_file=saved_voice_path.name)
+        elif (saved.get("voice_speed") not in (None, 1, 1.0)
+              and (Path(str(saved.get("voiceover_file") or "voiceover.wav")).name == "voiceover.wav"
+                   or not _audio_done(out_dir / Path(str(saved.get("voiceover_file"))).name))):
+            # The selected derivative was removed, but the paid raw TTS is intact. Rebuild it
+            # locally without another approval/TTS round.
+            saved_voice_path = apply_voice_speed(raw_voice_path, saved.get("voice_speed"), ffmpeg,
+                                                 status_cb=status_cb)
+            save_state(out_dir, voiceover_file=saved_voice_path.name)
+        return saved_voice_path, int(saved.get("tts_parts") or len(parts))
 
     saved_files = (saved or {}).get("tts_part_files") or []
     if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
@@ -296,7 +348,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
                    # parts are being (re)made, so any stitched voiceover on disk is the old one.
                    # voice_speed None means "the speed question was never answered" - a NUMBER
                    # (1.0 included) means the user chose, and only then may resume skip the gate.
-                   voiceover_ready=False, voice_speed=None,
+                   voiceover_ready=False, voice_speed=None, voiceover_file="voiceover.wav",
                    lines=None, prompts=None, audio_duration=0.0)
 
     for i, part in enumerate(parts):
@@ -357,7 +409,8 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         except Exception:
             pass
     # the parts are gone now and voiceover.wav carries the resume from here on
-    save_state(out_dir, tts_part_files=[], voiceover_ready=True)
+    save_state(out_dir, tts_part_files=[], voiceover_ready=True,
+               voice_speed=None, voiceover_file=out.name)
     _log(status_cb, f"Voiceover ready: {out.name} ({len(parts)} part(s) stitched).")
 
     # `mix_gate(path) -> speed`: the stitched voiceover, played whole, before anything is timed
@@ -366,7 +419,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     if mix_gate is not None:
         speed = mix_gate(str(out))
         out = apply_voice_speed(out, speed, ffmpeg, status_cb=status_cb)
-        save_state(out_dir, voice_speed=float(speed or 1.0))
+        save_state(out_dir, voice_speed=float(speed or 1.0), voiceover_file=out.name)
     return out, len(parts)
 
 
@@ -591,6 +644,88 @@ def line_durations(lines, audio_duration):
     return durs
 
 
+def retime_longform_assets(out_dir, old_lines, new_lines, old_audio_duration,
+                           new_audio_duration, prompts=None, status_cb=None):
+    """Move already-generated images onto a changed narration clock.
+
+    Images are semantic and positional: image N still illustrates script line N when only the
+    voice speed changes.  Their timestamp/duration filenames, however, must follow the NEW audio
+    clock or resume would regenerate them and assembly could place stale durations on the cut.
+    Rename in two phases so two new names can never collide with an old one mid-migration.
+    """
+    old_lines = list(old_lines or [])
+    new_lines = list(new_lines or [])
+    if not old_lines or len(old_lines) != len(new_lines):
+        return list(prompts or []) if prompts is not None else None
+    old_durations = line_durations(old_lines, old_audio_duration)
+    new_durations = line_durations(new_lines, new_audio_duration)
+    images_dir = Path(out_dir) / "images"
+    staged = []
+    if images_dir.exists():
+        for idx in range(len(new_lines)):
+            old_path = images_dir / f"{image_key(idx, old_lines[idx], old_durations[idx])}.png"
+            new_path = images_dir / f"{image_key(idx, new_lines[idx], new_durations[idx])}.png"
+            if old_path == new_path or _image_done(new_path):
+                continue
+            source = old_path if _image_done(old_path) else None
+            if source is None:
+                candidates = [p for p in images_dir.glob(f"img{idx:03d}_*.png")
+                              if _image_done(p) and p != new_path]
+                if len(candidates) == 1:
+                    source = candidates[0]
+            if source is None:
+                continue
+            temp = images_dir / f".retime_{idx:03d}_{time.time_ns():x}.png"
+            try:
+                os.replace(source, temp)
+                staged.append((temp, new_path))
+            except OSError as exc:
+                _log(status_cb, f"Could not stage image #{idx + 1} for retiming ({exc}).")
+        moved = 0
+        for temp, destination in staged:
+            try:
+                os.replace(temp, destination)
+                moved += 1
+            except OSError as exc:
+                _log(status_cb, f"Could not rename {temp.name} to its new timing ({exc}).")
+        if moved:
+            _log(status_cb, f"Voice speed changed: renamed and retimed {moved} existing image(s).")
+
+    if prompts is None:
+        return None
+    updated = []
+    for idx, prompt in enumerate(prompts):
+        row = dict(prompt) if isinstance(prompt, dict) else {"prompt": str(prompt or "")}
+        if idx < len(new_lines):
+            row["timestamp"] = fmt_ts(new_lines[idx]["start"])
+        updated.append(row)
+    return updated
+
+
+def write_timeline_manifest(lines, durations, results, audio_duration, out_path,
+                            voice_speed=1.0):
+    """Persist the exact image placement used by assembly and later timeline/resume tooling."""
+    out_path = Path(out_path)
+    rows = []
+    for idx, (line, duration) in enumerate(zip(lines, durations)):
+        image = results.get(idx) if isinstance(results, dict) else None
+        rows.append({
+            "index": idx,
+            "start": round(float(line["start"]), 3),
+            "end": round(float(line["start"]) + float(duration), 3),
+            "duration": round(float(duration), 3),
+            "image": Path(image).name if image else None,
+            "text": str(line.get("text") or ""),
+        })
+    payload = {"audio_duration": round(float(audio_duration or 0.0), 3),
+               "voice_speed": round(float(voice_speed or 1.0), 3),
+               "scenes": rows}
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, out_path)
+    return out_path
+
+
 def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_event=None):
     """FLUX.2 Pro (unlimited) 16:9 on the user's Higgsfield session.
 
@@ -611,7 +746,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
 
     # character reference FIRST (consistency anchor; also proves the session works)
     ref_path = out_dir / "character_reference.png"
-    if _image_done(ref_path):
+    if _image_done(ref_path, "16:9"):
         _log(status_cb, "Character reference already there - reusing it.")
     else:
         _log(status_cb, "Generating the character reference frame first...")
@@ -633,7 +768,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     # changed, the key changes and the image is regenerated instead of silently mismatched.
     for idx in range(total):
         existing = out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png"
-        if _image_done(existing):
+        if _image_done(existing, "16:9"):
             results[idx] = str(existing)
     if results:
         _log(status_cb, f"Resume: {len(results)}/{total} image(s) already generated - "
@@ -675,13 +810,15 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                     path = fut.result()
                 except Exception:
                     path = None
-                if path:
+                if path and _image_done(path, "16:9"):
                     results[idx] = str(path)
                     fresh_ok += 1
                     consec = 0
                     _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
                                     f"#{idx + 1} done")
                 else:
+                    if path:
+                        _log(status_cb, f"image #{idx + 1} was not a valid 16:9 frame - rejecting it")
                     dead += 1
                     # Counting failed ATTEMPTS, not dead images: with 4 in flight every image runs
                     # attempt 1 before any runs attempt 3, so no image exhausts its retries until
@@ -818,7 +955,8 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     (out_dir / "script.txt").write_text(script, encoding="utf-8")
 
     state = load_state(out_dir, script) if resume else None
-    voice_path = out_dir / "voiceover.wav"
+    raw_voice_path = out_dir / "voiceover.wav"
+    voice_path = voiceover_path_from_state(out_dir, state)
     ffprobe = pipeline.find_ffprobe(pipeline.find_ffmpeg())
 
     def _probe_duration(path):
@@ -843,7 +981,29 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         _log(status_cb, "Delivery directive changed - regenerating the voiceover "
                         "(timings will be redone).")
         state = None
-    reusable = bool(state and state.get("lines") and voice_path.exists())
+    if state is None:
+        voice_path = raw_voice_path
+
+    # If only the derived file vanished, recreate it from the untouched paid TTS. The existing
+    # line clock remains valid because the same recorded speed is applied again.
+    recorded_speed = float((state or {}).get("voice_speed") or 1.0)
+    recorded_name = Path(str((state or {}).get("voiceover_file") or "voiceover.wav")).name
+    recorded_path = out_dir / recorded_name
+    if (state and abs(recorded_speed - 1.0) >= 0.01 and not _audio_done(recorded_path)
+            and _audio_done(raw_voice_path)):
+        voice_path = apply_voice_speed(raw_voice_path, recorded_speed, status_cb=status_cb)
+        save_state(out_dir, voiceover_file=voice_path.name)
+
+    # Older/interrupted states can already contain timed images while the speed decision is still
+    # pending. Do not silently reuse that old clock: ask for speed, transcribe the resulting audio,
+    # then rename the same semantic images onto the new clock below.
+    speed_retime = bool(state and state.get("lines") and mix_gate is not None
+                        and state.get("voice_speed") is None and _audio_done(raw_voice_path))
+    old_lines = list((state or {}).get("lines") or []) if speed_retime else []
+    old_prompts = list((state or {}).get("prompts") or []) if speed_retime else None
+    old_audio_duration = float((state or {}).get("audio_duration") or 0.0)
+    reusable = bool(state and state.get("lines") and _audio_done(voice_path) and not speed_retime)
+    retimed_prompts = None
     if reusable:
         # Reusing the voiceover is what makes resume work at all: fresh TTS would shift every
         # timestamp, which changes every image key and would orphan the images already generated.
@@ -860,12 +1020,17 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
                                                    mix_gate=mix_gate)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
+        if speed_retime and len(old_lines) == len(lines):
+            retimed_prompts = retime_longform_assets(
+                out_dir, old_lines, lines, old_audio_duration, audio_duration,
+                prompts=old_prompts, status_cb=status_cb)
         save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts, voice=voice or "",
+                   prompts=retimed_prompts,
                    audio_duration=round(audio_duration, 3))
     transcript_path = write_transcript(lines, out_dir / "transcript.txt")
     _log(status_cb, f"Transcript written: {transcript_path.name}")
 
-    prompts = (state or {}).get("prompts") if reusable else None
+    prompts = (state or {}).get("prompts") if reusable else retimed_prompts
     if prompts and len(prompts) == len(lines):
         _log(status_cb, f"Resume: reusing the {len(prompts)} saved image prompt(s).")
     else:
@@ -881,11 +1046,16 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
                               status_cb=status_cb, cancel_event=cancel_event)
 
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
+    latest_state = load_state(out_dir, script) or {}
+    timeline_path = write_timeline_manifest(
+        lines, durations, results, audio_duration, out_dir / "timeline.json",
+        voice_speed=latest_state.get("voice_speed") or 1.0)
     final = assemble_video(lines, durations, results, voice_path,
                            out_dir / f"{slug}.mp4", status_cb=status_cb)
     return {
         "project_dir": str(out_dir), "video": str(final), "voiceover": str(voice_path),
         "transcript": str(transcript_path), "prompts_file": str(prompts_path),
+        "timeline": str(timeline_path),
         "images_done": sum(1 for v in results.values() if v), "images_total": len(lines),
         "missing_images": [fmt_ts(lines[i]["start"]) for i in missing],
         "tts_parts": tts_parts, "audio_duration": round(audio_duration, 2),

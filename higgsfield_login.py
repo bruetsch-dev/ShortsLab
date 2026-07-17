@@ -70,7 +70,7 @@ _LOCALE = os.environ.get("HIGGSFIELD_LOCALE", "en-US").strip() or "en-US"
 
 # --- calibration points (override via env; locked against the live UI after Connect) ----------
 LOGIN_URL = os.environ.get("HIGGSFIELD_LOGIN_URL") or "https://higgsfield.ai/"
-CREATE_URL = os.environ.get("HIGGSFIELD_CREATE_URL") or "https://higgsfield.ai/create/image"
+CREATE_URL = os.environ.get("HIGGSFIELD_CREATE_URL") or "https://higgsfield.ai/ai/image?model=flux_2"
 DEFAULT_MODEL = os.environ.get("HIGGSFIELD_MODEL") or "FLUX.2 Pro"
 DEFAULT_ASPECT = os.environ.get("HIGGSFIELD_ASPECT") or "16:9"
 # an image URL "looks generated" when it points at Higgsfield's own media/CDN storage. Kept broad
@@ -350,68 +350,237 @@ class Session:
 
     # ---- the generation click-path (calibration-pending; see module docstring) --------------
 
-    def _dismiss_overlays(self, page):
-        for sel in ("button:has-text('Accept all')", "button:has-text('Allow all')",
-                    "button:has-text('Got it')", "button[aria-label='Close']",
-                    "div[aria-label='Close'] button"):
+    @staticmethod
+    def _elements(page, selector):
+        """All matches, not only the first hidden clone rendered by the current React UI."""
+        try:
+            return page.query_selector_all(selector)
+        except Exception:
             try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    el.click(timeout=1200)
+                one = page.query_selector(selector)
+                return [one] if one else []
+            except Exception:
+                return []
+
+    @staticmethod
+    def _text(el):
+        try:
+            return re.sub(r"\s+", " ", el.inner_text() or "").strip()
+        except Exception:
+            return ""
+
+    def _dismiss_overlays(self, page):
+        """Close every visible consent/onboarding dialog.
+
+        Higgsfield can stack the cookie dialog and an "Organize. Share. Create together" modal.
+        The old query_selector clicked only the first Close button, leaving the second dialog over
+        the prompt.  Playwright then reported the textbox as visible but could not click it.
+        """
+        selectors = (
+            "[role='button']:has-text('Accept all')",
+            "[role='button']:has-text('Allow all')",
+            "[role='button']:has-text('Got it')",
+            "[role='button']:has-text('Maybe later')",
+            "[role='button']:has-text('Save & Close')",
+            "button[aria-label='Dismiss']", "[role='button'][aria-label='Dismiss']",
+            "[role='dialog'] button[aria-label='Close']",
+            "[role='dialog'] button:has-text('Close')",
+            "[role='dialog'] [role='button'][aria-label='Close']",
+            "div[role='dialog'] button:has-text('×')",
+        )
+        for _round in range(3):
+            clicked = False
+            for sel in selectors:
+                for el in self._elements(page, sel):
+                    try:
+                        if el and el.is_visible():
+                            el.click(timeout=1500)
+                            clicked = True
+                    except Exception:
+                        continue
+            if not clicked:
+                break
+            try:
+                page.wait_for_timeout(250)
             except Exception:
                 pass
 
     def _type_prompt(self, page, prompt):
         """Type the prompt into the most likely prompt field. Returns True if it landed text."""
         selectors = [
+            "[role='textbox'][contenteditable='true']",
+            "div[contenteditable='true'][role='textbox']",
+            "[contenteditable='true'][data-placeholder*='describe' i]",
             "textarea[placeholder*='prompt' i]",
             "textarea[placeholder*='describe' i]",
             "textarea[placeholder*='imagine' i]",
             "textarea[name='prompt']",
             "div[contenteditable='true']",
             "textarea",
+            "[role='textbox']",
             "input[type='text'][placeholder*='prompt' i]",
         ]
-        for sel in selectors:
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    el.click(timeout=1500)
+        deadline = time.time() + 12.0
+        while time.time() < deadline:
+            self._dismiss_overlays(page)
+            for sel in selectors:
+                for el in self._elements(page, sel):
                     try:
-                        el.fill("")
+                        if not el or not el.is_visible():
+                            continue
+                        el.click(timeout=2000)
+                        # fill works for both textarea/input and contenteditable and fires the
+                        # input event React needs. It is also much faster than typing 700 chars.
+                        el.fill(prompt)
+                        landed = ""
+                        try:
+                            landed = el.input_value()
+                        except Exception:
+                            landed = self._text(el)
+                        if landed.strip():
+                            return True
                     except Exception:
-                        pass
-                    el.type(prompt, delay=6)
+                        # Some editor wrappers reject fill but accept real keyboard input.
+                        try:
+                            el.press("Control+A")
+                            el.type(prompt, delay=2)
+                            return True
+                        except Exception:
+                            continue
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+        return False
+
+    def _set_aspect(self, page, aspect):
+        if not aspect:
+            return True
+        wanted = str(aspect).strip()
+        # Already selected: do not click it again (clicking a selected control merely opens its
+        # popup and leaves an overlay over the prompt).
+        for el in self._elements(page, "button[aria-haspopup='listbox']"):
+            try:
+                if el.is_visible() and self._text(el) == wanted:
+                    return True
+            except Exception:
+                continue
+        # Find the ratio trigger by its current ratio (3:4 on Higgsfield's new page), open it,
+        # then choose the exact listbox option.
+        ratio_re = re.compile(r"^\d{1,2}:\d{1,2}$")
+        for trigger in self._elements(page, "button[aria-haspopup='listbox']"):
+            try:
+                current = self._text(trigger)
+                if not trigger.is_visible() or not ratio_re.fullmatch(current):
+                    continue
+                trigger.click(timeout=1500)
+                page.wait_for_timeout(250)
+                for option in self._elements(page, "[role='option']"):
+                    if option.is_visible() and self._text(option) == wanted:
+                        option.click(timeout=1500)
+                        return True
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        return False
+
+    def _set_model(self, page, model):
+        if not model:
+            return True
+        wanted = re.sub(r"\s+", " ", str(model)).strip().lower()
+        # Critical: when FLUX.2 Pro is already selected, never click its button. The old code did,
+        # opening the model popup; the following prompt click was then blocked by that popup.
+        for el in self._elements(page, "main button"):
+            try:
+                if el.is_visible() and self._text(el).lower() == wanted:
                     return True
             except Exception:
                 continue
         return False
 
-    def _set_aspect(self, page, aspect):
-        if not aspect:
-            return
-        for sel in (f"button:has-text('{aspect}')", f"[role='option']:has-text('{aspect}')",
-                    f"[data-value='{aspect}']", f"label:has-text('{aspect}')"):
+    @staticmethod
+    def _control_state(el):
+        """Return True/False for a switch-like control, or None if it exposes no state."""
+        for name in ("aria-checked", "aria-pressed"):
             try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    el.click(timeout=1200)
-                    return
+                value = str(el.get_attribute(name) or "").strip().lower()
             except Exception:
-                continue
+                value = ""
+            if value in ("true", "false"):
+                return value == "true"
+        try:
+            value = str(el.get_attribute("data-state") or "").strip().lower()
+        except Exception:
+            value = ""
+        if value in ("checked", "on", "active", "enabled"):
+            return True
+        if value in ("unchecked", "off", "inactive", "disabled"):
+            return False
+        try:
+            if str(el.get_attribute("type") or "").lower() == "checkbox":
+                return bool(el.is_checked())
+        except Exception:
+            pass
+        return None
 
-    def _set_model(self, page, model):
-        if not model:
-            return
-        for sel in (f"button:has-text('{model}')", f"[role='option']:has-text('{model}')",
-                    f"[data-value*='{model}' i]"):
+    def _set_unlimited(self, page):
+        """Find Higgsfield's Unlimited switch, enable it and verify the resulting state.
+
+        Unlimited is separate from the FLUX model selection.  Missing it can silently charge
+        credits even on a plan that includes unlimited FLUX generations, so absence/ambiguity is
+        a hard failure rather than a best-effort click.
+        """
+        selectors = (
+            "[role='switch']",
+            "input[type='checkbox']",
+            "button[aria-pressed]",
+            "button[data-state]",
+        )
+        controls = []
+        seen = set()
+        for selector in selectors:
+            for el in self._elements(page, selector):
+                marker = id(el)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                try:
+                    if not el.is_visible():
+                        continue
+                    context = el.evaluate(
+                        """node => {
+                          const own = [node.innerText, node.getAttribute('aria-label'),
+                            node.getAttribute('title'), node.getAttribute('name'),
+                            node.getAttribute('data-testid')].filter(Boolean).join(' ');
+                          const wrap = node.closest('label') || node.parentElement;
+                          return (own + ' ' + (wrap && wrap.innerText || '')).trim();
+                        }""")
+                except Exception:
+                    context = self._text(el)
+                    try:
+                        context += " " + str(el.get_attribute("aria-label") or "")
+                    except Exception:
+                        pass
+                if "unlimited" in str(context or "").lower():
+                    controls.append(el)
+
+        for control in controls:
+            state = self._control_state(control)
+            if state is True:
+                return True
+            if state is not False:
+                continue
             try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    el.click(timeout=1200)
-                    return
+                control.click(timeout=1500)
+                page.wait_for_timeout(300)
+                if self._control_state(control) is True:
+                    return True
             except Exception:
                 continue
+        return False
 
     def _click_generate(self, page):
         for sel in ("button:has-text('Generate')", "button:has-text('Create')",
@@ -482,18 +651,47 @@ class Session:
 
         page.on("response", _on_resp)
         try:
-            try:
-                page.goto(CREATE_URL, timeout=60000, wait_until="domcontentloaded")
-            except Exception as exc:
-                _status(cb, f"Higgsfield: navigation to create page failed ({exc.__class__.__name__}).")
-            page.wait_for_timeout(1500)
-            self._dismiss_overlays(page)
-            self._set_model(page, model)
-            self._set_aspect(page, aspect)
-            if not self._type_prompt(page, prompt):
-                _status(cb, "Higgsfield: could not find the prompt input (needs calibration). "
-                            "Run: python higgsfield_login.py probe")
-                return None
+            def prepare_generator(reload=False):
+                """Open a clean generator and prove its controls are usable before spending.
+
+                Higgsfield's July 2026 UI occasionally leaves a model/onboarding popup mounted
+                over the editor.  One clean reload is enough to recover from that transient
+                state; silently submitting the site's default 3:4 ratio is never acceptable for
+                a 16:9 longform timeline.
+                """
+                try:
+                    if reload:
+                        page.reload(timeout=60000, wait_until="domcontentloaded")
+                    else:
+                        page.goto(CREATE_URL, timeout=60000, wait_until="domcontentloaded")
+                except Exception as exc:
+                    _status(cb, "Higgsfield: navigation to the image generator failed "
+                                f"({exc.__class__.__name__}).")
+                    return False
+                page.wait_for_timeout(2000)
+                self._dismiss_overlays(page)
+                # CREATE_URL selects FLUX.2 Pro directly.  _set_model deliberately verifies the
+                # selected label without clicking it, because clicking it opens a blocking popup.
+                if not self._set_model(page, model):
+                    page.wait_for_timeout(1000)
+                    if not self._set_model(page, model):
+                        _status(cb, f"Higgsfield: {model} is not selected on {page.url}.")
+                        return False
+                if not self._set_aspect(page, aspect):
+                    _status(cb, f"Higgsfield: could not select the required {aspect} aspect ratio.")
+                    return False
+                if not self._set_unlimited(page):
+                    _status(cb, "Higgsfield: Unlimited mode is unavailable or could not be "
+                                "verified as enabled; refusing to spend credits.")
+                    return False
+                return self._type_prompt(page, prompt)
+
+            if not prepare_generator():
+                _status(cb, "Higgsfield: generator controls were not ready; reloading once...")
+                if not prepare_generator(reload=True):
+                    _status(cb, "Higgsfield: could not prepare the prompt/model/aspect controls "
+                                f"after recovery (page: {page.url}).")
+                    return None
             # everything captured up to now is pre-existing gallery art; only NEW urls count.
             pre_submit["cut"] = len(captured)
             if not self._click_generate(page):
@@ -583,6 +781,21 @@ def _session_on_worker(status_cb=None):
         except Exception as exc:            # noqa: BLE001
             _status(status_cb, f"Higgsfield session failed to open ({exc.__class__.__name__}: {exc}).")
             _SESSION[0] = None
+    # The marker only says that this profile was logged in once. Session cookies can expire
+    # months later; treating the marker as live authentication made the UI say Connected while
+    # Higgsfield showed Login, then the longform scheduler burned ten generation attempts.
+    if _SESSION[0] is not None and not _SESSION[0].logged_in():
+        _status(status_cb, "Higgsfield login has expired - reconnect Higgsfield, then resume. "
+                           "The voiceover, transcript and image prompts are already saved.")
+        try:
+            _SESSION[0].close()
+        except Exception:
+            pass
+        _SESSION[0] = None
+        try:
+            _MARKER.unlink(missing_ok=True)
+        except OSError:
+            pass
     return _SESSION[0]
 
 

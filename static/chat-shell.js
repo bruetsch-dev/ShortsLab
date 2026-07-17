@@ -944,6 +944,12 @@ function renderScriptFlow() {
       S.values.script = v;
       if (S.values.hook_text && !v.includes(S.values.hook_text)) S.values.hook_text = "";
       if (S.values.impact_word && !v.toLowerCase().includes(S.values.impact_word.toLowerCase())) S.values.impact_word = "";
+      try {
+        const folded = v.toLocaleLowerCase();
+        const valid = JSON.parse(S.values.hook_keywords || "[]")
+          .filter(k => String(k || "").trim() && folded.includes(String(k).trim().toLocaleLowerCase()));
+        S.values.hook_keywords = JSON.stringify(valid.slice(0, 14));
+      } catch (e) { S.values.hook_keywords = "[]"; }
       completeStep("script", "source");
     }, "primary"));
     c.appendChild(foot);
@@ -1866,7 +1872,10 @@ function renderJobSection() {
   const head = el("div", "prog-head");
   const dot = el("span", "status-pulse"); dot.id = "job-dot";
   head.appendChild(dot);
-  head.appendChild(el("b", "", "Creating your Short"));
+  const runTitle = el("b", "", S.flow === "longform"
+    ? "Creating your longform video" : "Creating your Short");
+  runTitle.id = "job-kind-title";
+  head.appendChild(runTitle);
   head.appendChild(el("span", "spacer"));
   // "Show technical details" button next to Cancel (replaces the status badge text)
   const techBtn = el("button", "job-tech-btn"); techBtn.id = "job-tech-btn"; techBtn.type = "button";
@@ -2015,6 +2024,9 @@ async function pollJob() {
     stopPolling(); S.jobStatus = "missing";
     errorCard(T.err_no_job, ""); persist(); return;
   }
+  const kindTitle = $("job-kind-title");
+  if (kindTitle) kindTitle.textContent = d.job_kind === "longform"
+    ? "Creating your longform video" : "Creating your Short";
   if (d.status !== S.jobStatus) {
     const prev = S.jobStatus;
     S.jobStatus = d.status; renderTopbar(); persist();

@@ -81,7 +81,8 @@ def _cancel_active_jobs():
 def _close_scraper_sessions():
     """Close Playwright contexts so their Chromium child processes do not survive Shortslab."""
     closers = []
-    for module_name in ("tiktok_login", "twitter_login", "instagram_login"):
+    for module_name in ("tiktok_login", "twitter_login", "instagram_login",
+                        "higgsfield_login"):
         try:
             module = __import__(module_name)
             close = getattr(module, "close_session", None)
