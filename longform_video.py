@@ -949,6 +949,17 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     script = str(script or "").strip()
     if len(script) < 40:
         raise LongformError("Please paste the full script (at least a few sentences).")
+
+    # Higgsfield is required for the image stage, but the only check used to live INSIDE
+    # generate_images - after the paid TTS, the transcription and the paid prompt calls. A fresh
+    # run with no login spent all of that and only THEN failed on a precondition. Check it up front
+    # so the run stops in ~0s having spent nothing. (Resume is unaffected: it also has to reach the
+    # image stage, so the same requirement holds, and the cached voiceover/prompts are untouched.)
+    import higgsfield_login
+    if not higgsfield_login.is_ready():
+        raise LongformError("Higgsfield is not connected - click Connect Higgsfield first, "
+                            "then start the run.")
+
     slug = slug_for(script)
     out_dir = OUT_ROOT / slug
     out_dir.mkdir(parents=True, exist_ok=True)
