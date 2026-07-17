@@ -809,10 +809,22 @@ body.sb-resizing .sidebar { transition: none; }
    browser card flexes to fill the whole row. */
 .last-accepted-card { flex:0 0 300px; max-width:300px; min-width:0; align-self:stretch; margin:10px 0; padding:10px; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:var(--r-lg); background:var(--surface); box-shadow:var(--shadow-sm); }
 .last-accepted-card[hidden] { display:none; }
+/* #job-media moved INTO .scrape-monitor (see renderJobSection): it is a narrow 9:16 column beside
+   the live browser now, not a full-width band stacked on top of it. */
+.scrape-monitor #job-media { flex:0 0 200px; max-width:200px; min-width:0; margin:10px 0; display:flex; flex-direction:column; gap:6px; }
+.scrape-monitor #job-media:empty { display:none; }
+.scrape-monitor #job-media .am-card { margin:0; padding:10px; }
+.scrape-monitor #job-media .am-grid { grid-template-columns:1fr; }
+/* one tile, in the shape the clip really has */
+.scrape-monitor #job-media .am-tile { aspect-ratio:9/16; max-height:none; }
+.scrape-monitor #job-media .am-tile video,
+.scrape-monitor #job-media .am-tile img { width:100%; height:100%; object-fit:cover; }
 .last-accepted-head { min-height:27px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:0 2px 7px; }
 .last-accepted-head b { color:var(--text-primary); font-size:12px; }
 .last-accepted-head span { color:var(--accent); font:700 9px/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; }
-.last-accepted-media { position:relative; flex:1; min-height:160px; overflow:hidden; display:grid; place-items:center; border:1px solid var(--border); border-radius:var(--r-md); background:#080a0d; }
+/* 9:16, because that is what the clips ARE. The box used to be a landscape 1.77 and object-fit
+   cover then chopped the sides off every portrait clip - you were judging a crop, not the take. */
+.last-accepted-media { position:relative; flex:0 0 auto; aspect-ratio:9/16; width:100%; overflow:hidden; display:grid; place-items:center; border:1px solid var(--border); border-radius:var(--r-md); background:#080a0d; }
 .last-accepted-media video { width:100%; height:100%; object-fit:cover; background:#000; }
 /* poster frame fills the box; the video (if its codec plays) layers on top of it */
 .last-accepted-media img#last-accepted-poster { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }

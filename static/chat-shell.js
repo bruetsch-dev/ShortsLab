@@ -1865,6 +1865,10 @@ function renderJobSection() {
   // box. Each new stat is appended to the bottom (right above the box), so the newest is always
   // closest to the box and older stats move up.
   const events = el("div", "job-events-stack"); events.id = "job-events"; chat.appendChild(events);
+  // The assigned card lives INSIDE the monitor row, not above it: the live browser is what you
+  // watch, and a band stacked on top of it just pushes it down. Appended after the accepted card
+  // so the row reads left-to-right: what the scraper sees -> what it took -> what it placed.
+  scrapeMonitor.appendChild(mwrap);
   // speech approval placeholder (interactive gate, right above the run box)
   const speech = el("div"); speech.id = "job-speech"; chat.appendChild(speech);
   // ---- hero progress card: FURTHEST DOWN, big prominent bar, pulsing status + elapsed
@@ -1964,11 +1968,18 @@ function renderAssignedMedia(items) {
   lastAssignedKey = key;
   mw.innerHTML = "";
   if (!items || !items.length) return;
-  if (prototypeMode) mw.appendChild(el("div", "assigned-head", `<span>ASSIGNED FOOTAGE</span><b>${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes</b>`));
-  else typedMsg(mw, `Assigned footage — ${items.length} clip${items.length === 1 ? "" : "s"} chosen for your scenes.`);
+  // Only the NEWEST assignment. The full grid was a wide band ABOVE the live browser, which is the
+  // thing you actually want to watch; one 9:16 tile beside it says the same thing in the shape the
+  // clip really has. The count stays in the header so nothing is hidden.
+  // Trade-off: the per-clip exclude (am-x) now only reaches the newest clip - the rest are
+  // excludable from the media library after the run.
+  const total = items.length;
+  const shown = items.slice(-1);
+  if (prototypeMode) mw.appendChild(el("div", "assigned-head", `<span>ASSIGNED FOOTAGE</span><b>${total} clip${total === 1 ? "" : "s"} chosen for your scenes</b>`));
+  else typedMsg(mw, `Assigned footage — ${total} clip${total === 1 ? "" : "s"} chosen for your scenes.`);
   const c = el("div", "chat-card am-card");
   const grid = el("div", "am-grid");
-  items.forEach(it => {
+  shown.forEach(it => {
     const t = el("div", "am-tile");
     if (it.type === "video") {
       const v = el("video"); v.muted = true; v.preload = "none"; v.setAttribute("playsinline", "");
@@ -1991,7 +2002,7 @@ function renderAssignedMedia(items) {
       t.classList.add("gone"); setTimeout(() => t.remove(), 250);
     });
     t.appendChild(x);
-    t.appendChild(el("span", "am-name", esc(it.name.replace(/^scraped_/, "").slice(0, 22))));
+    t.appendChild(el("span", "am-name", esc(String(it.name || "").replace(/^scraped_/, "").slice(0, 22))));
     grid.appendChild(t);
   });
   c.appendChild(grid);
