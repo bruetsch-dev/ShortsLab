@@ -792,38 +792,10 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         raise LongformError("Higgsfield: the Unlimited switch was not turned on in time. Turn it "
                             "on in the Higgsfield window, then resume (nothing is lost).")
 
-    def _generate_one(prompt, path):
-        """Generate one image on the shared page, pausing for the user if Unlimited flips off or a
-        DataDome CAPTCHA appears (never spending on an unverified toggle). Returns path or None."""
-        for _ in range(4):
-            if cancel_check():
-                raise pipeline.PipelineCancelled("Cancelled.")
-            res = higgsfield_login.generate_shared_sync(prompt, path, timeout_s=300,
-                                                        status_cb=status_cb)
-            if res in ("UNLIMITED_OFF", "CAPTCHA"):
-                _log(status_cb, "Paused - re-enable Unlimited / finish the verification in the "
-                                "Higgsfield window; generation resumes automatically.")
-                if not higgsfield_login.wait_for_user_unlimited_sync(
-                        status_cb=status_cb, cancel_check=cancel_check, timeout_s=1800):
-                    if cancel_check():
-                        raise pipeline.PipelineCancelled("Cancelled.")
-                    return None
-                continue
-            return res
-        return None
-
-    # character reference FIRST (consistency anchor; also proves the session works)
-    ref_path = out_dir / "character_reference.png"
-    if _image_done(ref_path, "16:9"):
-        _log(status_cb, "Character reference already there - reusing it.")
-    else:
-        _log(status_cb, "Generating the character reference frame first...")
-        ref = _generate_one(CHARACTER_REFERENCE_PROMPT, ref_path)
-        if ref and _image_done(ref_path, "16:9"):
-            _log(status_cb, "Character reference saved (used as the style anchor).")
-        else:
-            _log(status_cb, "Character reference failed - continuing without it.")
-
+    # No serial character-reference pre-step: it was generated as a "style anchor" but never fed
+    # into the content frames (they are text-only prompts), so it was ~4 min of the user staring at
+    # a blank screen before any real image appeared. Go straight to the concurrent pool - the first
+    # content frames start immediately and also prove the session works.
     total = len(prompts)
     results = {}
     attempts = {}
