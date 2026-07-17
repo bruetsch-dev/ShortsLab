@@ -526,60 +526,96 @@ class Session:
             pass
         return None
 
-    def _set_unlimited(self, page):
-        """Find Higgsfield's Unlimited switch, enable it and verify the resulting state.
+    def _wait_for_generator_bar(self, page, timeout_ms=25000):
+        """Wait for the create page's bottom control bar (model / aspect / Unlimited / Generate)
+        to actually render.
 
-        Unlimited is separate from the FLUX model selection.  Missing it can silently charge
-        credits even on a plan that includes unlimited FLUX generations, so absence/ambiguity is
-        a hard failure rather than a best-effort click.
-        """
-        selectors = (
-            "[role='switch']",
-            "input[type='checkbox']",
-            "button[aria-pressed]",
-            "button[data-state]",
-        )
-        controls = []
-        seen = set()
-        for selector in selectors:
-            for el in self._elements(page, selector):
-                marker = id(el)
-                if marker in seen:
-                    continue
-                seen.add(marker)
-                try:
-                    if not el.is_visible():
-                        continue
-                    context = el.evaluate(
-                        """node => {
-                          const own = [node.innerText, node.getAttribute('aria-label'),
-                            node.getAttribute('title'), node.getAttribute('name'),
-                            node.getAttribute('data-testid')].filter(Boolean).join(' ');
-                          const wrap = node.closest('label') || node.parentElement;
-                          return (own + ' ' + (wrap && wrap.innerText || '')).trim();
-                        }""")
-                except Exception:
-                    context = self._text(el)
-                    try:
-                        context += " " + str(el.get_attribute("aria-label") or "")
-                    except Exception:
-                        pass
-                if "unlimited" in str(context or "").lower():
-                    controls.append(el)
-
-        for control in controls:
-            state = self._control_state(control)
-            if state is True:
-                return True
-            if state is not False:
-                continue
+        It appears SECONDS after domcontentloaded - a screenshot at 3.5s still showed only a
+        spinner. The old flat 2s wait ran _set_unlimited before the Unlimited toggle existed, so it
+        'could not verify Unlimited' and refused to spend credits on a run that would have been
+        free. Ready = both a Generate button and an 'Unlimited' label are on the page."""
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
             try:
-                control.click(timeout=1500)
-                page.wait_for_timeout(300)
-                if self._control_state(control) is True:
-                    return True
+                ready = page.evaluate(
+                    """() => {
+                      const gen = [...document.querySelectorAll('button,[role=\"button\"]')]
+                        .some(b => /generate/i.test(b.innerText || ''));
+                      // The word 'Unlimited' is not a leaf - it labels a role=switch a few DOM
+                      // levels up. Ready = a real switch exists whose surrounding text says so.
+                      const unl = [...document.querySelectorAll('[role=\"switch\"]')].some(sw => {
+                        let n = sw, txt = '';
+                        for (let i = 0; i < 4 && n; i++) { txt += ' ' + (n.innerText || ''); n = n.parentElement; }
+                        return /unlimited/i.test(txt);
+                      });
+                      return gen && unl;
+                    }""")
             except Exception:
-                continue
+                ready = False
+            if ready:
+                page.wait_for_timeout(500)   # let the switch settle into its real on/off state
+                return True
+            page.wait_for_timeout(500)
+        return False
+
+    def _find_unlimited_switch(self, page):
+        """Return the live 'Unlimited' toggle, or None.
+
+        On the FLUX.2 create bar the real control is an inner <button role="switch"> whose
+        OWN text is empty - the word 'Unlimited' sits a couple of DOM levels up next to it
+        (label span is a sibling of the switch's wrapper). Matching on the element's own text
+        or its single parent misses it and lands on the inert outer wrapper (data-state
+        'closed'), which is why an earlier version clicked something that never toggled. So we
+        match on the text of up to a few ancestors, and only accept an element that exposes a
+        real on/off state (aria-checked / data-state on|off) so we never grab a popover trigger.
+        """
+        for el in self._elements(page, "[role='switch']"):
+            try:
+                if not el.is_visible():
+                    continue
+                ctx = el.evaluate(
+                    """node => {
+                      let n = node, txt = (node.getAttribute('aria-label') || '');
+                      for (let i = 0; i < 4 && n; i++) { txt += ' ' + (n.innerText || ''); n = n.parentElement; }
+                      return txt;
+                    }""")
+            except Exception:
+                ctx = ""
+            if "unlimited" in str(ctx or "").lower() and self._control_state(el) is not None:
+                return el
+        return None
+
+    def _set_unlimited(self, page):
+        """Enable Higgsfield's Unlimited switch and verify it turned on. Return True only when
+        the toggle reads on; absence/ambiguity is a hard False so the caller refuses to spend.
+
+        Unlimited is separate from the FLUX model selection. Missing it silently charges credits
+        even on a plan that includes unlimited FLUX generations, so this must be verified, not
+        best-effort. aria-checked/data-state give a clean on/off read (confirmed live: off->on,
+        and the Generate button drops its 'Generate 1' credit cost when it flips on).
+        """
+        switch = self._find_unlimited_switch(page)
+        if switch is None:
+            return False
+        if self._control_state(switch) is True:
+            return True
+        # Click, then poll: the switch animates and the bar re-renders, so a single quick
+        # check reads the stale pre-click state. Re-find between attempts in case React
+        # replaced the node during the re-render.
+        for _ in range(3):
+            try:
+                switch.click(timeout=1500)
+            except Exception:
+                break
+            for _ in range(8):                  # ~2.4s of polling per click
+                page.wait_for_timeout(300)
+                if self._control_state(switch) is True:
+                    return True
+            again = self._find_unlimited_switch(page)
+            if again is not None:
+                switch = again
+                if self._control_state(switch) is True:
+                    return True
         return False
 
     def _click_generate(self, page):
@@ -668,7 +704,11 @@ class Session:
                     _status(cb, "Higgsfield: navigation to the image generator failed "
                                 f"({exc.__class__.__name__}).")
                     return False
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(1200)
+                self._dismiss_overlays(page)
+                # The control bar renders late; wait for it before touching model/aspect/Unlimited,
+                # otherwise _set_unlimited runs on a page that has only a spinner.
+                self._wait_for_generator_bar(page)
                 self._dismiss_overlays(page)
                 # CREATE_URL selects FLUX.2 Pro directly.  _set_model deliberately verifies the
                 # selected label without clicking it, because clicking it opens a blocking popup.
@@ -954,6 +994,24 @@ if __name__ == "__main__":
         print("logged out")
     elif cmd == "probe":
         _probe()
+    elif cmd == "unlimited":
+        # Live-verify the Unlimited toggle ends up ON - WITHOUT clicking Generate (no credits).
+        if not is_ready():
+            print("not logged in - run: python higgsfield_login.py login")
+            sys.exit(1)
+        sess = Session(headless=False, status_cb=print)
+        try:
+            page = sess._ctx.new_page()
+            page.goto(CREATE_URL, timeout=60000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            sess._dismiss_overlays(page)
+            bar = sess._wait_for_generator_bar(page)
+            sess._dismiss_overlays(page)
+            ok = sess._set_unlimited(page)
+            print(json.dumps({"generator_bar_ready": bool(bar), "unlimited_on": bool(ok)}, indent=2))
+            sys.exit(0 if ok else 1)
+        finally:
+            sess.close()
     elif cmd == "parse":
         p = sys.argv[2] if len(sys.argv) > 2 else ""
         items = parse_prompt_lines(Path(p).read_text("utf-8")) if p else []
