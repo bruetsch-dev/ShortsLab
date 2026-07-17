@@ -765,6 +765,153 @@ class Session:
         _status(cb, f"Higgsfield: failed to download the finished image ({chosen}).")
         return None
 
+    # ---- concurrent generation: K pages, each owns its own result -----------------------------
+    # Every page has its OWN response listener + captured list, so the image a page produces is
+    # unambiguously that page's prompt - completion order never matters and frames can't be
+    # mis-mapped. All pages live in the one trusted, Unlimited context (the anchor cleared the
+    # DataDome check + turned Unlimited on once; worker pages auto-enable Unlimited).
+
+    @staticmethod
+    def _make_capture(caps):
+        def _on_resp(resp):
+            try:
+                url = resp.url
+                ctype = ""
+                try:
+                    ctype = (resp.headers or {}).get("content-type", "")
+                except Exception:
+                    pass
+                def _add(u):
+                    if u and _IMG_EXT_RE.search(u) and _GEN_URL_RE.search(u) and u not in caps:
+                        caps.append(u)
+                if "image" in ctype or _IMG_EXT_RE.search(url):
+                    _add(url)
+                elif "json" in ctype:
+                    try:
+                        _scan_json_for_images(resp.json(), _add)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return _on_resp
+
+    def _page_unlimited(self, page):
+        sw = self._find_unlimited_switch(page)
+        return sw is not None and self._control_state(sw) is True
+
+    def _prepare_extra_page(self, model, aspect, status_cb=None):
+        """Open + prepare an extra worker page (navigate, model/aspect, auto-Unlimited). The
+        DataDome trust cookie is context-wide, so an extra page inherits the anchor's trust and
+        does not re-challenge. Returns the page, or None if Unlimited could not be verified."""
+        cb = status_cb or self._status_cb
+        try:
+            page = self._ctx.new_page()
+            page.goto(CREATE_URL, timeout=60000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            self._dismiss_overlays(page)
+            self._wait_for_generator_bar(page)
+            self._dismiss_overlays(page)
+            self._set_model(page, model)
+            self._set_aspect(page, aspect)
+            if not self._set_unlimited(page):
+                _status(cb, "Higgsfield: an extra generation slot could not enable Unlimited - "
+                            "keeping fewer slots (never spending).")
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                return None
+            return page
+        except Exception:
+            return None
+
+    def generate_pool(self, items, k=4, timeout_s=300, status_cb=None, cancel_check=None,
+                      on_done=None):
+        """Generate `items` (each {idx, prompt, path}) with up to k generations in flight across
+        k pages. Calls on_done(idx, path|None) as each finishes. Returns {idx: path|None}.
+        Pauses the whole pool for the user if a page loses Unlimited or hits a DataDome check."""
+        cb = status_cb or self._status_cb
+        model, aspect = DEFAULT_MODEL, DEFAULT_ASPECT
+        slots = []
+        if self._gen_page is not None:                  # reuse the anchor the user prepared
+            caps = []
+            self._gen_page.on("response", self._make_capture(caps))
+            slots.append({"page": self._gen_page, "caps": caps, "idx": None})
+        while len(slots) < max(1, int(k)):
+            if cancel_check and cancel_check():
+                break
+            page = self._prepare_extra_page(model, aspect, status_cb=cb)
+            if page is None:
+                break
+            caps = []
+            page.on("response", self._make_capture(caps))
+            slots.append({"page": page, "caps": caps, "idx": None})
+        _status(cb, f"Higgsfield: {len(slots)} generation slot(s) in flight.")
+
+        queue = list(items)
+        results = {}
+        tick = slots[0]["page"]
+
+        def _pause_for_user():
+            _status(cb, "Paused - re-enable Unlimited / finish the verification in the Higgsfield "
+                        "window; generation resumes automatically.")
+            self.wait_for_user_unlimited(status_cb=cb, cancel_check=cancel_check, timeout_s=1800)
+            for s in slots:                             # re-arm Unlimited on every worker page
+                if not self._page_unlimited(s["page"]):
+                    self._set_unlimited(s["page"])
+
+        while queue or any(s["idx"] is not None for s in slots):
+            if cancel_check and cancel_check():
+                break
+            # assign free slots
+            for s in slots:
+                if s["idx"] is not None or not queue:
+                    continue
+                page = s["page"]
+                if self._has_captcha(page) or not self._page_unlimited(page):
+                    _pause_for_user()
+                    if cancel_check and cancel_check():
+                        break
+                idx, prompt, path = queue[0]
+                if not self._type_prompt(page, prompt):
+                    queue.pop(0)
+                    results[idx] = None
+                    if on_done:
+                        on_done(idx, None)
+                    continue
+                queue.pop(0)
+                s["cut"] = len(s["caps"])
+                s["idx"], s["path"] = idx, path
+                self._click_generate(page)
+                s["deadline"] = time.time() + max(30, int(timeout_s))
+                _status(cb, f"Higgsfield: generating {os.path.basename(str(path))} ...")
+            # collect finished slots
+            for s in slots:
+                if s["idx"] is None:
+                    continue
+                page = s["page"]
+                fresh = s["caps"][s["cut"]:]
+                if fresh:
+                    page.wait_for_timeout(300)
+                    fresh = s["caps"][s["cut"]:]
+                    url = fresh[-1]
+                    ok = self._download(page, url, s["path"])
+                    results[s["idx"]] = s["path"] if ok else None
+                    if on_done:
+                        on_done(s["idx"], s["path"] if ok else None)
+                    s["idx"] = None
+                elif time.time() > s["deadline"]:
+                    _status(cb, f"Higgsfield: timed out waiting for {os.path.basename(str(s['path']))}.")
+                    results[s["idx"]] = None
+                    if on_done:
+                        on_done(s["idx"], None)
+                    s["idx"] = None
+            try:
+                tick.wait_for_timeout(500)
+            except Exception:
+                break
+        return results
+
     def _click_generate(self, page):
         for sel in ("button:has-text('Generate')", "button:has-text('Create')",
                     "button:has-text('Imagine')", "button[type='submit']",
@@ -1138,6 +1285,29 @@ def generate_shared_sync(prompt, out_path, timeout_s=300, status_cb=None):
     except Exception as exc:                # noqa: BLE001
         _status(status_cb, f"Higgsfield generate failed ({exc.__class__.__name__}: {exc}).")
         return None
+
+
+def _generate_pool_on_worker(items, k, timeout_s, status_cb, cancel_check, on_done):
+    sess = _SESSION[0]
+    if sess is None:
+        return {}
+    try:
+        return sess.generate_pool(items, k=k, timeout_s=timeout_s, status_cb=status_cb,
+                                  cancel_check=cancel_check, on_done=on_done)
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield pool failed ({exc.__class__.__name__}: {exc}).")
+        return {}
+
+
+def generate_pool_sync(items, k=4, timeout_s=300, status_cb=None, cancel_check=None, on_done=None):
+    """Run the whole item list through the K-in-flight pool on the worker thread. `on_done` is
+    invoked (on the worker thread) as each image finishes. Returns {idx: path|None}."""
+    try:
+        return _executor().submit(_generate_pool_on_worker, list(items), int(k), timeout_s,
+                                  status_cb, cancel_check, on_done).result()
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield pool failed ({exc.__class__.__name__}: {exc}).")
+        return {}
 
 
 def wait_for_user_unlimited_sync(status_cb=None, cancel_check=None, timeout_s=1200):

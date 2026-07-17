@@ -37,11 +37,10 @@ OUT_ROOT = agent_core.PROJECTS_DIR / "_longform"
 
 TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
 # 1, deliberately, until higgsfield_login runs more than one real worker: its executor is
-# max_workers=1, so extra "slots" only queue - but generate_sync's wait clock starts at SUBMIT,
-# so with 4 in flight the 4th call times out whenever one image takes >~97s (390s/4), gets
-# counted as a failure and re-queued while its orphaned worker task generates on regardless.
-# The scheduler below keeps full slot semantics; raise this once the session parallelizes.
-IMAGE_CONCURRENCY = 1               # max Higgsfield generations in flight
+# Real concurrency: the pool fires generate on IMAGE_CONCURRENCY separate pages in the ONE trusted
+# Higgsfield context and polls each page's own captured result, so all N generate server-side in
+# parallel while every image stays bound to its own page (exact attribution, no submit-clock race).
+IMAGE_CONCURRENCY = 4               # max Higgsfield generations in flight
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
 MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
 MAX_CONSECUTIVE_FAILURES_MIDRUN = 10    # unbroken failure streak while fresh work remains = died mid-run
@@ -846,54 +845,65 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     #                                     the dead-provider stop exactly when a login has expired
     consec = 0                          # failures since the last success (mid-run death signal)
 
-    # One reused page = sequential generation (Unlimited + the trust cookie only persist on that
-    # single page). The circuit breakers below are unchanged.
+    # Up to IMAGE_CONCURRENCY generations in flight across that many Higgsfield pages, each of
+    # which owns its own result (exact attribution regardless of completion order). Failures are
+    # retried in later rounds. The cold-start dead-provider stop trips via cancel from on_done so
+    # a broken session halts after a few tries, not after burning the whole batch.
+    done_count = {"n": sum(1 for v in results.values() if v)}
+    stop = {"cold": False}
+
+    def _on_done(idx, path):
+        nonlocal fresh_ok, dead
+        if path and _image_done(path, "16:9"):
+            fresh_ok += 1
+            done_count["n"] += 1
+            _log(status_cb, f"image {done_count['n']}/{total} - #{idx + 1} done")
+        else:
+            dead += 1
+            if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
+                stop["cold"] = True
+
+    pool_cancel = (lambda: cancel_check() or stop["cold"])
     while queue:
         if cancel_check():
             raise pipeline.PipelineCancelled("Cancelled.")
-        idx = queue.pop(0)
-        key = image_key(idx, lines[idx], durations[idx])
-        _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
-                        f"generating #{idx + 1}")
-        path = _generate_one(prompts[idx]["prompt"], out_dir / f"{key}.png")
-        if path and _image_done(path, "16:9"):
-            results[idx] = str(path)
-            fresh_ok += 1
-            consec = 0
-            _log(status_cb, f"image {sum(1 for v in results.values() if v)}/{total} - "
-                            f"#{idx + 1} done")
-        else:
-            if path:
-                _log(status_cb, f"image #{idx + 1} was not a valid 16:9 frame - rejecting it")
-            dead += 1
-            # "No image has EVER worked this session" is what makes the cold-start stop safe: a run
-            # that is producing images can never trip it. Resume pre-fills yesterday's images into
-            # results, which say nothing about whether the login is still alive today.
-            if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
-                raise LongformError(
-                    f"The first {dead} image generations all failed - Higgsfield looks "
-                    "down or logged out. Stopping instead of spending hours filling the "
-                    "video with black frames; reconnect and resume (nothing is lost).")
-            consec += 1
-            # Mid-run death (blind once anything succeeded): retries go to the BACK of the queue,
-            # so a failure streak is interleaved with fresh successes unless the provider actually
-            # stopped. Only trip while UNTRIED images remain - at the tail the queue holds nothing
-            # but retries of a few hopeless prompts, which should become black frames as designed.
-            if (consec >= MAX_CONSECUTIVE_FAILURES_MIDRUN
-                    and any(attempts.get(i, 0) == 0 for i in queue)):
-                raise LongformError(
-                    f"{consec} generations in a row have failed with untried images "
-                    "still queued - Higgsfield looks like it died mid-run. Stopping; "
-                    "reconnect and resume (the finished images are kept).")
-            attempts[idx] = attempts.get(idx, 0) + 1
-            if attempts[idx] <= IMAGE_RETRIES:
-                _log(status_cb, f"image #{idx + 1} failed - regenerating "
-                                f"(retry {attempts[idx]}/{IMAGE_RETRIES})")
-                queue.append(idx)
+        items = [(i, prompts[i]["prompt"],
+                  str(out_dir / f"{image_key(i, lines[i], durations[i])}.png")) for i in queue]
+        _log(status_cb, f"Generating {len(items)} image(s), up to {IMAGE_CONCURRENCY} at a time...")
+        res = higgsfield_login.generate_pool_sync(
+            items, k=IMAGE_CONCURRENCY, timeout_s=300, status_cb=status_cb,
+            cancel_check=pool_cancel, on_done=_on_done)
+        if stop["cold"]:
+            raise LongformError(
+                f"The first {dead} image generations all failed - Higgsfield looks down or "
+                "logged out. Stopping instead of filling the video with black frames; reconnect "
+                "and resume (nothing is lost).")
+        if cancel_check():
+            raise pipeline.PipelineCancelled("Cancelled.")
+        # tally the round + build the retry queue
+        next_queue = []
+        produced = 0
+        for idx in queue:
+            path = res.get(idx)
+            if path and _image_done(path, "16:9"):
+                results[idx] = path
+                produced += 1
             else:
-                results[idx] = None
-                _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
-                                "- a black frame will be used.")
+                attempts[idx] = attempts.get(idx, 0) + 1
+                if attempts[idx] <= IMAGE_RETRIES:
+                    next_queue.append(idx)
+                else:
+                    results[idx] = None
+                    _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
+                                    "- a black frame will be used.")
+        # mid-run death: a whole round produced nothing while retriable images remain
+        if produced == 0 and next_queue and fresh_ok == 0:
+            raise LongformError(
+                "A full generation round produced no images - Higgsfield looks down or logged "
+                "out. Stopping; reconnect and resume (the finished images are kept).")
+        if next_queue:
+            _log(status_cb, f"Retrying {len(next_queue)} image(s) that failed this round...")
+        queue = next_queue
     ok = sum(1 for v in results.values() if v)
     _log(status_cb, f"Images finished: {ok}/{total} generated.")
     return results
