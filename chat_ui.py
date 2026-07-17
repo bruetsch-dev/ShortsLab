@@ -480,7 +480,9 @@ def projects_list_payload(show_hidden=False, limit=200):
                     "video_url": (app.link_for(video) if has_video else ""),
                     "results_url": (app.view_for(video, "assets") if has_video
                                     else app.view_for(s.get("project_dir"), "assets")),
-                    "has_timeline": bool(app.project_has_render(s.get("slug"))),
+                    # a scrape clip-short opens its timeline WITHOUT a render (the timeline is its
+                    # render step), so "Open timeline" must appear for an edit, not only a render
+                    "has_timeline": bool(app.project_has_timeline_edit(s.get("slug"))),
                     # sidebar/asset overlay: "sfx" / "vfx" for a Master-processed upload, else "".
                     "kind": s.get("preview_kind") or _project_kind(s.get("slug"), s.get("title")),
                 }

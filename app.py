@@ -9952,6 +9952,30 @@ def project_has_render(slug):
     return latest_media(project_dir / "renders", {".mp4", ".webm"}) is not None
 
 
+def project_has_timeline_edit(slug):
+    """True when the project has a timeline-EDITABLE edit, render or not.
+
+    A scrape clip-short deliberately SKIPS the final render (open_timeline_no_render): it builds
+    the full edit, writes project.json with the scenes, and hands off to the timeline, which is
+    where the render actually happens. project_has_render() alone then said "not ready" and locked
+    the user out of the very screen the run just sent them to. An edit exists once project.json has
+    at least one scene carrying media (a clip, asset or image)."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        return False
+    if project_has_render(slug):
+        return True
+    try:
+        config = read_json_file(project_dir / "config" / "project.json") or {}
+        for scene in (config.get("scenes") or []):
+            if isinstance(scene, dict) and (scene.get("clip") or scene.get("asset")
+                                            or scene.get("image") or scene.get("speaker_hook")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_replace_media_paths(slug, scene_ids):
     """Map marked timeline clip ids -> their replaceable web-image asset paths."""
     project_dir = safe_project_dir(slug)
@@ -11973,11 +11997,14 @@ def timeline_page(slug):
     project_dir = safe_project_dir(slug)
     if not project_dir:
         return page("Shortslab", brand_header(back=False) + '<section class="panel"><div class="hint">Unknown project.</div></section>')
-    # The timeline editor is only available once the agent has produced a first render.
-    if not project_has_render(slug):
+    # The timeline editor opens once the agent has produced an editable EDIT - which for a scrape
+    # clip-short is the point of the run (it skips the render and the timeline is the render step),
+    # so requiring a finished render here locked the user out of the screen the run just sent them
+    # to. A render OR a scenes-in-config edit is enough.
+    if not project_has_timeline_edit(slug):
         msg = ('<section class="panel"><h2>Timeline not ready yet</h2>'
-               '<div class="hint">The timeline editor opens once this project has its first complete render. '
-               'Run the agent (Create Short) first &mdash; then come back here to fine-tune and re-render.</div></section>')
+               '<div class="hint">The timeline editor opens once this project has an edit to work on. '
+               'Run the agent (Create Short) first &mdash; then come back here to fine-tune and render.</div></section>')
         return page("Shortslab", brand_header(back=False) + msg)
     try:
         model = timeline_model(slug)
