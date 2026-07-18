@@ -814,6 +814,9 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         # timestamp's caption - resume would trust it forever. OCR-audit the reused frames and
         # drop the provably wrong ones back into the queue.
         audit_images(prompts, lines, durations, out_dir, results, status_cb=status_cb)
+    # Parked mis-attributed frames are good images on wrong slots: OCR each one and move it onto
+    # the empty slot whose caption it actually shows, instead of regenerating it.
+    reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=status_cb)
     queue = [i for i in range(total) if i not in results]
     dead = 0                            # failed generation attempts so far
     fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
@@ -1074,6 +1077,68 @@ def audit_images(prompts, lines, durations, out_dir, results, status_cb=None):
     _log(status_cb, f"Caption audit: {checked} frame(s) checked, {len(bad)} stale frame(s) "
                     "rejected." if checked else "Caption audit: nothing to check.")
     return bad
+
+
+def reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=None):
+    """Give parked mis-attributed frames back to their RIGHTFUL timestamps.
+
+    The stale-attribution cascade produced perfectly good images on the wrong slots; the audit
+    parks them in images/_mismatched_*/. Their on-image caption identifies where each one truly
+    belongs (the timestamp whose prompt wants exactly that caption), so instead of regenerating
+    ~everything we OCR each parked frame and move it onto a still-empty slot whose expected
+    caption it FULLY matches. Ambiguity (the same caption used by several timestamps) resolves
+    to the empty slot nearest the frame's original index - cascade shifts were local.
+    Mutates `results` in place; returns the number of recovered frames."""
+    ocr = _get_frame_ocr()
+    if ocr is None:
+        return 0
+    import numpy as np
+    from PIL import Image
+    out_dir = Path(out_dir)
+    parked = []
+    for folder in sorted(out_dir.glob("_mismatched_*")):
+        parked.extend(p for p in folder.glob("img*.png"))
+    if not parked:
+        return 0
+    expected = {i: expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
+                                    else prompts[i]) for i in range(len(prompts))}
+    empty = {i for i in range(len(lines)) if not results.get(i) and expected.get(i)}
+    _log(status_cb, f"Re-assigning {len(parked)} parked frame(s) to their rightful timestamps...")
+    recovered = 0
+    for p in sorted(parked):
+        m = re.match(r"img(\d{3})_", p.name)
+        orig = int(m.group(1)) if m else -1
+        try:
+            with Image.open(p) as im:
+                arr = np.array(im.convert("RGB"))
+            res, _elapsed = ocr(arr)
+            text = " ".join(r[1] for r in (res or []))
+        except Exception:
+            continue
+        # the caption this frame ACTUALLY shows = the fully-matched expected caption with the
+        # most words (so "TRY IT RIGHT NOW" beats its subset "TRY IT")
+        best_cap, best_words = "", 0
+        for cap in set(expected.values()):
+            if cap and _caption_score(cap, text) >= 0.99 and len(_norm_words(cap)) > best_words:
+                best_cap, best_words = cap, len(_norm_words(cap))
+        if not best_cap:
+            continue
+        candidates = [i for i in empty if expected[i] == best_cap]
+        if not candidates:
+            continue
+        target = min(candidates, key=lambda i: abs(i - orig))
+        dest = out_dir / f"{image_key(target, lines[target], durations[target])}.png"
+        try:
+            p.replace(dest)
+        except OSError:
+            continue
+        results[target] = str(dest)
+        empty.discard(target)
+        recovered += 1
+        _log(status_cb, f"Recovered frame -> #{target + 1} (\"{best_cap}\", was img{orig:03d}).")
+    _log(status_cb, f"Re-assignment done: {recovered} frame(s) recovered, "
+                    f"{len(empty)} still missing.")
+    return recovered
 
 
 def frames_from_disk(project_dir):
