@@ -493,7 +493,11 @@ def transcribe_lines(script, audio_path, status_cb=None):
             break
         out.append({"start": round(float(chunk[0]["start"]), 2),
                     "end": round(float(chunk[-1]["end"]), 2),
-                    "text": ln})
+                    "text": ln,
+                    # per-word timings: the caption-synced cut needs to know WHEN inside the
+                    # line its key word is actually spoken
+                    "words": [{"w": str(w.get("word") or w.get("w") or ""),
+                               "s": round(float(w["start"]), 2)} for w in chunk]})
     # audio end = real duration (last line holds to the end during assembly)
     _log(status_cb, f"Transcript: {len(out)} timestamped line(s).")
     return out
@@ -644,6 +648,87 @@ def image_key(index, line, duration):
     """Filename stem: index + timestamp + on-screen DURATION (user rule: length visible)."""
     ts = fmt_ts(line["start"]).replace(":", "-").replace(".", "-").strip("[]")
     return f"img{index:03d}_[{ts}]_dur{duration:.2f}s"
+
+
+def caption_cut_starts(lines, prompts, audio_duration, lead=0.15):
+    """Caption-synced cut times: frame i appears when its CAPTION word is actually SPOKEN.
+
+    The whisper line start is the first word of the sentence - but the caption usually names a
+    word from the middle/end of it ("...almost nothing. WHY?"), so cutting at the sentence start
+    showed the WHY? frame seconds before "why" is heard. For every line we look up the first
+    per-word timing that matches a caption word (>=3 letters) and cut there, `lead` seconds
+    early (anticipation). Fallback: the line start. Cuts are forced monotonic and the first cut
+    is pinned to 0 so the video never opens on black."""
+    cuts = []
+    for i, line in enumerate(lines):
+        cap = expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
+                               else prompts[i]) if i < len(prompts) else ""
+        cut = float(line["start"])
+        cap_words = [w for w in _norm_words(cap) if len(w) >= 3]
+        words = line.get("words") or []
+        if cap_words and words:
+            for w in words:
+                token = _norm_words(w.get("w") or "")
+                if token and token[0] in cap_words:
+                    # anticipation: show the frame a touch BEFORE the word lands (may nibble a
+                    # few ms off the previous sentence's tail - that reads as intentional)
+                    cut = max(0.0, float(w["s"]) - lead)
+                    break
+        cuts.append(cut)
+    # monotonic, minimum frame life 0.35s, first frame from 0
+    for i in range(1, len(cuts)):
+        cuts[i] = max(cuts[i], cuts[i - 1] + 0.35)
+    if cuts:
+        cuts[0] = 0.0
+        cuts[-1] = min(cuts[-1], max(0.0, audio_duration - 0.4))
+    return cuts
+
+
+def caption_cut_durations(lines, prompts, audio_duration):
+    """Per-frame on-screen durations derived from the caption-synced cuts."""
+    cuts = caption_cut_starts(lines, prompts, audio_duration)
+    durs = []
+    for i, c in enumerate(cuts):
+        nxt = cuts[i + 1] if i + 1 < len(cuts) else max(audio_duration, c + 0.4)
+        durs.append(max(0.35, round(nxt - c, 3)))
+    return durs
+
+
+def ensure_line_words(project_dir, status_cb=None):
+    """Retrofit per-word timings onto a state whose lines predate the words field (needed by the
+    caption-synced cuts). Re-transcribes the recorded voiceover and maps the words onto the
+    EXISTING lines by word count - the stored start/end stay untouched."""
+    import voice_align
+    project_dir = Path(project_dir)
+    try:
+        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    lines = state.get("lines") or []
+    if not lines or all(l.get("words") for l in lines):
+        return bool(lines)
+    if not voice_align.available():
+        _log(status_cb, "faster-whisper not available - keeping sentence-start cuts.")
+        return False
+    voice = project_dir / Path(str(state.get("voiceover_file") or "voiceover.wav")).name
+    if not voice.is_file():
+        return False
+    _log(status_cb, "Computing per-word timings for caption-synced cuts (one-time)...")
+    asr = voice_align.transcribe_words(voice, status_cb=status_cb)
+    aligned = voice_align.align_script_to_words(str(state.get("script") or ""), asr)
+    wi = 0
+    for l in lines:
+        n = len(str(l.get("text") or "").split())
+        chunk = aligned[wi:wi + n]
+        wi += n
+        l["words"] = [{"w": str(w.get("word") or ""), "s": round(float(w["start"]), 2)}
+                      for w in chunk]
+    state["lines"] = lines
+    tmp = (project_dir / STATE_FILE).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(project_dir / STATE_FILE)
+    _log(status_cb, "Per-word timings saved.")
+    return True
 
 
 def _archive_old_images(images_dir, status_cb=None):
@@ -1275,6 +1360,12 @@ def rebuild_from_disk(project_dir, status_cb=None):
         if f["exists"]:
             results[f["idx"]] = str(project_dir / "images" / f["file"])
     _log(status_cb, f"Rebuilding from disk: {len(results)}/{len(lines)} frames present.")
+    # caption-synced cuts (retrofit the per-word timings once for older states)
+    prompts = state.get("prompts") or []
+    if prompts and ensure_line_words(project_dir, status_cb=status_cb):
+        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
+        lines = state["lines"]
+        durations = caption_cut_durations(lines, prompts, audio_duration)
     slug = project_dir.name
     out = project_dir / f"{slug}.mp4"
     n = 2
@@ -1425,10 +1516,13 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
 
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
     latest_state = load_state(out_dir, script) or {}
+    # Assembly cuts are CAPTION-synced: each frame appears when its caption word is spoken, not
+    # at the sentence start (image filenames / resume keys stay on the plain line clock).
+    cut_durations = caption_cut_durations(lines, prompts, audio_duration)
     timeline_path = write_timeline_manifest(
-        lines, durations, results, audio_duration, out_dir / "timeline.json",
+        lines, cut_durations, results, audio_duration, out_dir / "timeline.json",
         voice_speed=latest_state.get("voice_speed") or 1.0)
-    final = assemble_video(lines, durations, results, voice_path,
+    final = assemble_video(lines, cut_durations, results, voice_path,
                            out_dir / f"{slug}.mp4", status_cb=status_cb)
     return {
         "project_dir": str(out_dir), "video": str(final), "voiceover": str(voice_path),
