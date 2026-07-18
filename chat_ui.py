@@ -532,6 +532,9 @@ def longform_projects_payload(active_project_slugs=()):
             continue                      # nothing to resume with, so nothing to offer
         video = next(iter(sorted(d.glob("*.mp4"))), None)
         images = sorted(d.glob("img*.png"))
+        # the dedicated click-thumbnail wins over the first frame for the poster
+        thumb = d / "thumbnail.png"
+        poster = thumb if thumb.is_file() else (images[0] if images else None)
         title = " ".join(script.split())[:58].strip() or d.name.replace("_", " ")
         out.append({
             "slug": d.name,
@@ -544,7 +547,7 @@ def longform_projects_payload(active_project_slugs=()):
             "hidden": False,
             "has_video": bool(video),
             "counters": {"web": 0, "gpt": len(images), "clips": 0},
-            "thumb_url": app.link_for(images[0]) if images else "",
+            "thumb_url": app.link_for(poster) if poster else "",
             "preview_kind": "",
             "video_url": app.link_for(video) if video else "",
             "results_url": app.view_for(video, "assets") if video else app.view_for(d, "assets"),

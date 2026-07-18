@@ -917,6 +917,89 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     return results
 
 
+# ------------------------------------------------------------------ 4b) THUMBNAIL
+
+_THUMB_STYLE_HEAD = ("Hand-drawn 2D doodle cartoon, flat colors, bold black outlines, slightly "
+                     "imperfect sketchy marker lines, ")
+_THUMB_STYLE_TAIL = (", bright white background, high contrast, no gradients, no shadows, no "
+                     "textures, no photorealism, no 3D, no realistic faces, 16:9 aspect ratio, "
+                     "eye-catching YouTube thumbnail doodle style.")
+
+
+def _fallback_thumb_hook(script, lines):
+    """A short, punchy ALL-CAPS thumbnail hook derived from the script when no model is used."""
+    first = ""
+    for l in (lines or []):
+        t = str(l.get("text") or "").strip()
+        if t:
+            first = t
+            break
+    first = first or " ".join(str(script or "").split()[:8])
+    words = [w for w in re.sub(r"[^A-Za-z0-9?' ]", " ", first).split() if w]
+    hook = " ".join(words[:4]).upper().strip(" '")
+    return (hook + ("?" if first.rstrip().endswith("?") else "")) or "WATCH THIS"
+
+
+def build_thumbnail_prompt(script, lines, reasoning_model=None, status_cb=None):
+    """Compose a click-optimised doodle-thumbnail prompt: an expressive stick figure + one bold
+    visual + a HUGE ALL-CAPS hook. Uses the reasoning model for hook+subject when a key is
+    present, else a deterministic fallback."""
+    hook, subject = "", ("a stick figure with a hugely exaggerated shocked, wide-eyed curious "
+                         "face, both hands raised")
+    if os.environ.get("WAVESPEED_API_KEY"):
+        try:
+            data = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, {
+                "model": str(reasoning_model or "anthropic/claude-opus-4.8"),
+                "messages": [
+                    {"role": "system", "content":
+                        "You design a viral YouTube thumbnail for a doodle explainer video. "
+                        "Reply STRICT JSON: {\"hook\": \"1-4 word ALL-CAPS curiosity hook\", "
+                        "\"subject\": \"one short vivid visual of an expressive stick-figure "
+                        "doodle scene, no text\"}. The hook creates a curiosity gap; never spoil "
+                        "the answer."},
+                    {"role": "user", "content": "SCRIPT:\n" + str(script or "")[:4000]}],
+                "temperature": 0.7, "max_tokens": 200,
+                "response_format": {"type": "json_object"},
+            }, timeout=90)
+            j = agent_core.extract_json_object(data["choices"][0]["message"]["content"]) or {}
+            hook = str(j.get("hook") or "").strip().upper()
+            subject = str(j.get("subject") or "").strip() or subject
+        except Exception as exc:            # noqa: BLE001
+            _log(status_cb, f"Thumbnail concept fell back to the script ({exc}).")
+    hook = hook or _fallback_thumb_hook(script, lines)
+    return (f"{_THUMB_STYLE_HEAD}{subject}, a big bold red circle or arrow highlighting the key "
+            f"element, HUGE bold black ALL CAPS marker text filling the top of the frame reading "
+            f"\"{hook}\"{_THUMB_STYLE_TAIL}"), hook
+
+
+def generate_thumbnail(out_dir, script, lines, reasoning_model=None, status_cb=None,
+                       cancel_event=None):
+    """Generate a dedicated click-thumbnail (thumbnail.png) for the longform video on the still-open
+    Higgsfield session. Reuses an existing thumbnail; never blocks the video if it fails."""
+    import higgsfield_login
+    out_dir = Path(out_dir)
+    thumb = out_dir / "thumbnail.png"
+    if _image_done(thumb, "16:9"):
+        _log(status_cb, "Thumbnail already there - reusing it.")
+        return str(thumb)
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    prompt, hook = build_thumbnail_prompt(script, lines, reasoning_model=reasoning_model,
+                                          status_cb=status_cb)
+    _log(status_cb, f"Generating a click thumbnail (\"{hook}\")...")
+    try:
+        res = higgsfield_login.generate_shared_sync(prompt, str(thumb),
+                                                    timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb)
+    except Exception as exc:                # noqa: BLE001
+        _log(status_cb, f"Thumbnail generation failed ({exc}).")
+        return None
+    if isinstance(res, str) and _image_done(thumb, "16:9"):
+        _log(status_cb, "Thumbnail saved.")
+        return str(thumb)
+    _log(status_cb, "Thumbnail could not be generated - the first frame will be used instead.")
+    return None
+
+
 # ------------------------------------------------------------------ 5) VERIFY + ASSEMBLE
 
 def verify_images(lines, results, reasoning_model=None, status_cb=None):
@@ -1336,6 +1419,10 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     results = generate_images(prompts, lines, durations, out_dir / "images",
                               status_cb=status_cb, cancel_event=cancel_event)
 
+    # Dedicated click-thumbnail on the still-open Higgsfield session (before assembly closes it).
+    thumbnail = generate_thumbnail(out_dir, script, lines, reasoning_model=reasoning_model,
+                                   status_cb=status_cb, cancel_event=cancel_event)
+
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
     latest_state = load_state(out_dir, script) or {}
     timeline_path = write_timeline_manifest(
@@ -1350,4 +1437,5 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         "images_done": sum(1 for v in results.values() if v), "images_total": len(lines),
         "missing_images": [fmt_ts(lines[i]["start"]) for i in missing],
         "tts_parts": tts_parts, "audio_duration": round(audio_duration, 2),
+        "thumbnail": thumbnail or "",
     }
