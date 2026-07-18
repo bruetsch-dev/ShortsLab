@@ -870,8 +870,15 @@ class Session:
             _status(cb, "Paused - re-enable Unlimited / finish the verification in the Higgsfield "
                         "window; generation resumes automatically.")
             self.wait_for_user_unlimited(status_cb=cb, cancel_check=cancel_check, timeout_s=1800)
-            for s in slots:                             # re-arm Unlimited on every worker page
-                if not self._page_unlimited(s["page"]):
+            # The user solves the challenge on the VISIBLE (anchor) tab; the DataDome trust is
+            # context-wide, but a worker page that already SHOWS the challenge stays stuck on it -
+            # recycle those onto fresh pages, and re-arm Unlimited on the healthy ones.
+            for s in slots:
+                if s["page"] is None:
+                    continue
+                if self._has_captcha(s["page"]):
+                    _recycle_slot(s)
+                elif not self._page_unlimited(s["page"]):
                     self._set_unlimited(s["page"])
 
         def _recycle_slot(s):
@@ -932,6 +939,9 @@ class Session:
                     _pause_for_user()
                     if cancel_check and cancel_check():
                         break
+                    page = s["page"]            # the pause may have recycled this slot's page
+                    if page is None:
+                        continue
                 # Re-assert 16:9 on this page (a captcha reload/re-render resets it to 3:4).
                 self._dismiss_overlays(page)
                 self._set_model(page, model)
@@ -950,7 +960,7 @@ class Session:
                     continue
                 queue.pop(0)
                 s["cut"] = len(s["caps"])
-                s["idx"], s["path"] = idx, path
+                s["idx"], s["path"], s["prompt"] = idx, path, prompt
                 self._click_generate(page)
                 s["deadline"] = time.time() + max(30, int(timeout_s))
                 _status(cb, f"Higgsfield: generating {os.path.basename(str(path))} ...")
@@ -997,6 +1007,16 @@ class Session:
                     if on_done:
                         on_done(s["idx"], s["path"] if ok else None)
                     s["idx"] = None
+                elif self._has_captcha(page):
+                    # DataDome swallowed the generate click mid-flight. Waiting out the full
+                    # timeout here burned 4x420s of dead time; instead pause for the user NOW,
+                    # then requeue this prompt (front of the queue, NOT counted as a failure).
+                    # _pause_for_user recycles this page itself (it still shows the challenge).
+                    _status(cb, "Higgsfield: verification appeared mid-generation - please solve "
+                                "it in the window; this frame will be retried automatically.")
+                    queue.insert(0, (s["idx"], s.get("prompt") or "", s["path"]))
+                    s["idx"] = None
+                    _pause_for_user()
                 elif time.time() > s["deadline"]:
                     _status(cb, f"Higgsfield: timed out waiting for "
                                 f"{os.path.basename(str(s['path']))} - recycling the slot so its "
@@ -1006,10 +1026,16 @@ class Session:
                         on_done(s["idx"], None)
                     s["idx"] = None
                     _recycle_slot(s)
-            try:
-                tick.wait_for_timeout(500)
-            except Exception:
+            # The bottom tick must run on a LIVE page: after a recycle `tick` can point at the
+            # CLOSED old page, and waiting on it raised - which silently broke the whole loop
+            # with 100+ prompts still queued (the "round produced no images" abort).
+            live = next((s["page"] for s in slots if s["page"] is not None), None)
+            if live is None:
                 break
+            try:
+                live.wait_for_timeout(500)
+            except Exception:
+                continue                        # that page just died; the top filter drops it
         return results
 
     def _click_generate(self, page):
