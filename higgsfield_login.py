@@ -896,10 +896,29 @@ class Session:
                 self._gen_page = fresh_page
             return True
 
+        try:
+            self._run_pool_loop(slots, queue, results, timeout_s, cb, cancel_check, on_done,
+                                model, aspect, used_urls, used_hashes, _pause_for_user,
+                                _recycle_slot)
+        finally:
+            # Every pool round opens fresh worker pages; without closing them here each retry /
+            # audit round STACKED 3 more Higgsfield windows (4 -> 7 -> 10 ...). Only the anchor
+            # page survives - it carries the user's Unlimited/trust state between rounds.
+            for s in slots:
+                page = s.get("page")
+                if page is not None and page is not self._gen_page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+        return results
+
+    def _run_pool_loop(self, slots, queue, results, timeout_s, cb, cancel_check, on_done,
+                       model, aspect, used_urls, used_hashes, _pause_for_user, _recycle_slot):
         while queue or any(s["idx"] is not None for s in slots):
             if cancel_check and cancel_check():
                 break
-            slots = [s for s in slots if s["page"] is not None]
+            slots[:] = [s for s in slots if s["page"] is not None]
             if not slots:
                 _status(cb, "Higgsfield: no usable generation slots left.")
                 break
