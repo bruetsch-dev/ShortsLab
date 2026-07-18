@@ -863,6 +863,8 @@ class Session:
         queue = list(items)
         results = {}
         tick = slots[0]["page"]
+        used_urls = set()                   # every asset URL already claimed by ANY slot
+        used_hashes = {}                    # md5 -> idx of images already accepted this run
 
         def _pause_for_user():
             _status(cb, "Paused - re-enable Unlimited / finish the verification in the Higgsfield "
@@ -872,9 +874,36 @@ class Session:
                 if not self._page_unlimited(s["page"]):
                     self._set_unlimited(s["page"])
 
+        def _recycle_slot(s):
+            """Replace a slot's page with a FRESH one. A timed-out generation keeps running on
+            Higgsfield's side, and its late image would land in the old page's capture list and be
+            claimed by whatever prompt runs there next - that stale-attribution cascade is exactly
+            what produced identical frames on consecutive timestamps. A fresh page can never
+            inherit another prompt's image."""
+            old = s["page"]
+            try:
+                old.close()
+            except Exception:
+                pass
+            fresh_page = self._prepare_extra_page(model, aspect, status_cb=cb)
+            if fresh_page is None:
+                s["page"] = None
+                return False
+            caps = []
+            fresh_page.on("response", self._make_capture(caps))
+            s["page"], s["caps"] = fresh_page, caps
+            if old is self._gen_page:       # keep the pause-for-user anchor pointing at a live page
+                self._gen_page = fresh_page
+            return True
+
         while queue or any(s["idx"] is not None for s in slots):
             if cancel_check and cancel_check():
                 break
+            slots = [s for s in slots if s["page"] is not None]
+            if not slots:
+                _status(cb, "Higgsfield: no usable generation slots left.")
+                break
+            tick = slots[0]["page"]
             # assign free slots
             for s in slots:
                 if s["idx"] is not None or not queue:
@@ -911,22 +940,53 @@ class Session:
                 if s["idx"] is None:
                     continue
                 page = s["page"]
-                fresh = s["caps"][s["cut"]:]
+                fresh = [u for u in s["caps"][s["cut"]:] if u not in used_urls]
                 if fresh:
                     page.wait_for_timeout(300)
-                    fresh = s["caps"][s["cut"]:]
+                    fresh = [u for u in s["caps"][s["cut"]:] if u not in used_urls]
                     url = fresh[-1]
+                    used_urls.add(url)
                     ok = self._download(page, url, s["path"])
+                    if ok:
+                        # Content guard: a late image from a PREVIOUS prompt can slip past the URL
+                        # guard under a new asset URL. Identical bytes to an already-accepted frame
+                        # = stale attribution -> reject it, requeue via the caller's retry, and
+                        # recycle this contaminated page.
+                        try:
+                            import hashlib
+                            digest = hashlib.md5(
+                                open(s["path"], "rb").read()).hexdigest()
+                        except Exception:
+                            digest = None
+                        if digest and digest in used_hashes and used_hashes[digest] != s["idx"]:
+                            _status(cb, f"Higgsfield: {os.path.basename(str(s['path']))} came back "
+                                        "identical to an earlier frame (stale delivery) - "
+                                        "rejecting it and recycling the slot.")
+                            try:
+                                os.remove(s["path"])
+                            except OSError:
+                                pass
+                            results[s["idx"]] = None
+                            if on_done:
+                                on_done(s["idx"], None)
+                            s["idx"] = None
+                            _recycle_slot(s)
+                            continue
+                        if digest:
+                            used_hashes[digest] = s["idx"]
                     results[s["idx"]] = s["path"] if ok else None
                     if on_done:
                         on_done(s["idx"], s["path"] if ok else None)
                     s["idx"] = None
                 elif time.time() > s["deadline"]:
-                    _status(cb, f"Higgsfield: timed out waiting for {os.path.basename(str(s['path']))}.")
+                    _status(cb, f"Higgsfield: timed out waiting for "
+                                f"{os.path.basename(str(s['path']))} - recycling the slot so its "
+                                "late image can't leak into the next prompt.")
                     results[s["idx"]] = None
                     if on_done:
                         on_done(s["idx"], None)
                     s["idx"] = None
+                    _recycle_slot(s)
             try:
                 tick.wait_for_timeout(500)
             except Exception:

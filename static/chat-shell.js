@@ -1708,6 +1708,9 @@ function renderLongformFlow() {
     // carries the primary action - review-cta gives it the same weight as "Create Short".
     const foot = el("div", "card-foot");
     foot.appendChild(el("span", "spacer"));
+    // a previously run project has frames on disk: let the user fix them without a new run
+    if (S.projectSlug)
+      foot.appendChild(btn("🖼 Edit frames", () => openLongformFrameEditor(S.projectSlug), "ghost"));
     foot.appendChild(btn("🎬 " + T.create_longform, submitLongform, "primary review-cta"));
     c.appendChild(foot);
   }
@@ -2291,11 +2294,100 @@ function renderResultCard(container, d) {
   }
   jget("/jobs-list").then(dd => {
     const j = (dd.jobs || []).find(x => x.id === S.jobId);
-    if (j && j.project_slug)
+    if (!j || !j.project_slug) return;
+    if ((j.kind || d.job_kind) === "longform")
+      side.appendChild(btn("🖼 Edit frames", () => openLongformFrameEditor(j.project_slug), "secondary"));
+    else
       side.appendChild(linkBtn("🎞 " + T.open_timeline, "/timeline?slug=" + encodeURIComponent(j.project_slug)));
   }).catch(() => {});
   side.appendChild(btn(T.new_project, resetToMode, "ghost"));
   side.appendChild(btn(T.nav_assets, () => showAssets(false), "ghost"));
+}
+
+/* ---------------------------------------------------- longform post-run frame editor */
+async function openLongformFrameEditor(slug) {
+  document.querySelectorAll(".lf-frame-editor").forEach(x => x.remove());
+  let d;
+  try { d = await jget("/longform-frames?slug=" + encodeURIComponent(slug)); } catch (e) { d = null; }
+  if (!d || !d.ok) { errorCard(T.err_generic, (d && d.error) || "Could not load the frames."); return; }
+  const c = el("div", "chat-card lf-frame-editor"); chat.appendChild(c);
+  c.appendChild(el("h3", "", "🖼 Frame editor — " + esc(d.slug)));
+  c.appendChild(el("div", "card-note",
+    "Click a frame to replace or move it. Missing frames are black in the video. " +
+    "Rebuild renders a new MP4 from the frames below (the previous render is kept)."));
+  const grid = el("div", "lf-frames"); c.appendChild(grid);
+  let swapFrom = null;                       // idx armed for "Move/Swap" (click a target next)
+  const bust = () => "&t=" + Date.now();
+
+  const paint = (frames) => {
+    grid.innerHTML = "";
+    frames.forEach(f => {
+      const tile = el("div", "lf-frame" + (f.exists ? "" : " missing") +
+                              (swapFrom === f.idx ? " swap-src" : ""));
+      tile.dataset.idx = f.idx;
+      const im = el("div", "lf-frame-img");
+      if (f.exists) im.style.backgroundImage = `url("${f.img}${f.img.includes("?") ? bust() : ""}")`;
+      else im.textContent = "BLACK";
+      tile.appendChild(im);
+      tile.appendChild(el("div", "lf-frame-meta",
+        `<b>#${f.idx + 1}</b> ${esc(f.ts)} · ${(+f.dur).toFixed(1)}s`));
+      tile.appendChild(el("div", "lf-frame-text", esc((f.text || "").slice(0, 60))));
+      tile.title = f.text || "";
+      tile.addEventListener("click", async () => {
+        if (swapFrom !== null && swapFrom !== f.idx) {
+          const r = await jpost("/longform-frame-swap", { slug: d.slug, a: swapFrom, b: f.idx });
+          swapFrom = null;
+          if (!r || !r.ok) errorCard(T.err_generic, (r && r.error) || "Swap failed.");
+          refresh();
+          return;
+        }
+        // per-frame action menu (small, attached to the tile)
+        const old = tile.querySelector(".lf-frame-menu");
+        if (old) { old.remove(); return; }
+        grid.querySelectorAll(".lf-frame-menu").forEach(x => x.remove());
+        const menu = el("div", "lf-frame-menu");
+        menu.appendChild(btn("⬆ Replace…", (ev) => {
+          ev.stopPropagation();
+          pickFile("image/*", async file => {
+            const fd = new FormData();
+            fd.append("slug", d.slug); fd.append("idx", String(f.idx));
+            fd.append("file", file, file.name);
+            const r = await (await fetch("/longform-frame-upload", { method: "POST", body: fd })).json();
+            if (!r.ok) errorCard(T.err_generic, r.error || "Upload failed.");
+            refresh();
+          });
+        }, "small"));
+        menu.appendChild(btn("⇄ Move/Swap…", (ev) => {
+          ev.stopPropagation();
+          swapFrom = f.idx; paint(lastFrames);
+        }, "ghost small"));
+        menu.addEventListener("click", ev => ev.stopPropagation());
+        tile.appendChild(menu);
+      });
+      grid.appendChild(tile);
+    });
+  };
+
+  let lastFrames = d.frames;
+  const refresh = async () => {
+    try {
+      const nd = await jget("/longform-frames?slug=" + encodeURIComponent(d.slug));
+      if (nd && nd.ok) { lastFrames = nd.frames; paint(lastFrames); }
+    } catch (e) {}
+  };
+  paint(lastFrames);
+
+  const foot = el("div", "card-foot");
+  foot.appendChild(el("span", "spacer"));
+  foot.appendChild(btn("✖ Close", () => c.remove(), "ghost"));
+  foot.appendChild(btn("🎬 Rebuild video", async (ev) => {
+    ev.currentTarget.disabled = true;
+    const r = await jpost("/longform-rebuild", { slug: d.slug });
+    if (r && r.ok && r.id) { c.remove(); startJob(r.id); }
+    else { ev.currentTarget.disabled = false; errorCard(T.err_generic, (r && r.error) || "Rebuild failed."); }
+  }, "primary"));
+  c.appendChild(foot);
+  scrollDown();
 }
 async function cancelJob() {
   if (!S.jobId) return;

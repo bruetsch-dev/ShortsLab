@@ -1924,3 +1924,21 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .tech-modal-close:hover { color:var(--text-primary); border-color:var(--border-hover); }
 .tech-modal-close::after { display:none; }
 .tech-modal .tech-log { flex:1 1 auto; margin:0; border:0; border-radius:0; max-height:none; overflow-y:auto; }
+
+/* ---------------------------------------------------- longform post-run frame editor */
+.lf-frame-editor .lf-frames { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr));
+  gap:10px; margin-top:12px; max-height:56vh; overflow-y:auto; padding-right:4px; }
+.lf-frame { position:relative; border:1px solid var(--border); border-radius:10px; overflow:hidden;
+  cursor:pointer; background:var(--bg-elev, rgba(255,255,255,.03)); transition:border-color .15s; }
+.lf-frame:hover { border-color:var(--p-green, var(--brand)); }
+.lf-frame.swap-src { border-color:#e8b339; box-shadow:0 0 0 2px rgba(232,179,57,.35); }
+.lf-frame-img { aspect-ratio:16/9; background-size:cover; background-position:center;
+  background-color:#000; display:flex; align-items:center; justify-content:center;
+  color:#666; font:700 11px/1 var(--mono, monospace); letter-spacing:.14em; }
+.lf-frame.missing .lf-frame-img { color:#c33; }
+.lf-frame-meta { padding:6px 8px 0; font-size:11px; color:var(--text-muted); }
+.lf-frame-meta b { color:var(--text-primary); }
+.lf-frame-text { padding:2px 8px 7px; font-size:10.5px; color:var(--text-muted);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.lf-frame-menu { position:absolute; inset:auto 6px 6px 6px; display:flex; gap:6px; }
+.lf-frame-menu .btn { flex:1; min-width:0; padding:6px 8px; font-size:11px; }

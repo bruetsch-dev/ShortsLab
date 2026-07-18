@@ -842,8 +842,10 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         items = [(i, prompts[i]["prompt"],
                   str(out_dir / f"{image_key(i, lines[i], durations[i])}.png")) for i in queue]
         _log(status_cb, f"Generating {len(items)} image(s), up to {IMAGE_CONCURRENCY} at a time...")
+        # 420s: at 4 in flight Higgsfield takes 4-5+ min per image; 300s produced false timeouts
+        # whose late deliveries then mis-attributed onto the next prompts (the duplicate-frame bug).
         res = higgsfield_login.generate_pool_sync(
-            items, k=IMAGE_CONCURRENCY, timeout_s=300, status_cb=status_cb,
+            items, k=IMAGE_CONCURRENCY, timeout_s=420, status_cb=status_cb,
             cancel_check=pool_cancel, on_done=_on_done)
         if stop["cold"]:
             raise LongformError(
@@ -950,6 +952,64 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
         raise LongformError(f"Assembly failed: {(r.stderr or '')[-400:]}")
     _log(status_cb, f"Final longform video ready: {out_path}")
     return out_path
+
+
+def frames_from_disk(project_dir):
+    """The frame list the post-run editor works on: for every timed line the expected image
+    filename, whether it exists (missing = black frame in the video), timestamp, duration and
+    the narration text. Returns (state, frames) or (None, [])."""
+    project_dir = Path(project_dir)
+    try:
+        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None, []
+    lines = state.get("lines") or []
+    if not lines:
+        return state, []
+    audio_duration = float(state.get("audio_duration") or 0.0)
+    durations = line_durations(lines, audio_duration)
+    frames = []
+    for i, line in enumerate(lines):
+        name = f"{image_key(i, line, durations[i])}.png"
+        path = project_dir / "images" / name
+        frames.append({
+            "idx": i, "ts": fmt_ts(line["start"]), "dur": durations[i],
+            "text": str(line.get("text") or ""), "file": name,
+            "exists": path.is_file() and path.stat().st_size > 1024,
+        })
+    return state, frames
+
+
+def rebuild_from_disk(project_dir, status_cb=None):
+    """Re-assemble the longform MP4 from whatever images are on disk right now (the post-run
+    frame editor's Rebuild). The voiceover and line clock come from state.json untouched; images
+    the user replaced/moved are picked up by filename; a new VERSIONED mp4 is written so the
+    previous render is never overwritten."""
+    project_dir = Path(project_dir)
+    state, frames = frames_from_disk(project_dir)
+    if not state or not frames:
+        raise LongformError("No resumable state in this project - nothing to rebuild.")
+    lines = state["lines"]
+    audio_duration = float(state.get("audio_duration") or 0.0)
+    durations = line_durations(lines, audio_duration)
+    voice_path = project_dir / Path(str(state.get("voiceover_file") or "voiceover.wav")).name
+    if not _audio_done(voice_path):
+        raise LongformError("The voiceover file is missing - cannot rebuild.")
+    results = {}
+    for f in frames:
+        if f["exists"]:
+            results[f["idx"]] = str(project_dir / "images" / f["file"])
+    _log(status_cb, f"Rebuilding from disk: {len(results)}/{len(lines)} frames present.")
+    slug = project_dir.name
+    out = project_dir / f"{slug}.mp4"
+    n = 2
+    while out.exists():
+        out = project_dir / f"{slug}_v{n}.mp4"
+        n += 1
+    write_timeline_manifest(lines, durations, results, audio_duration,
+                            project_dir / "timeline.json",
+                            voice_speed=state.get("voice_speed") or 1.0)
+    return assemble_video(lines, durations, results, voice_path, out, status_cb=status_cb)
 
 
 # ------------------------------------------------------------------ ORCHESTRATOR

@@ -4611,6 +4611,119 @@ def start_longform_job(fields, files):
     return job_id
 
 
+def _longform_dir(slug):
+    """The longform project folder for `slug`, or None. Path-traversal-safe (name only)."""
+    import longform_video
+    name = Path(str(slug or "")).name.strip()
+    if not name:
+        return None
+    d = longform_video.OUT_ROOT / name
+    return d if d.is_dir() else None
+
+
+def longform_frames_payload(slug):
+    """Frame list for the post-run editor: every timestamp with its image (or missing=black)."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    state, frames = longform_video.frames_from_disk(d)
+    if not frames:
+        return {"ok": False, "error": "This project has no timed frames yet."}
+    for f in frames:
+        f["img"] = link_for(d / "images" / f["file"]) if f["exists"] else ""
+    videos = sorted(d.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return {"ok": True, "slug": d.name, "frames": frames,
+            "video": link_for(videos[0]) if videos else "",
+            "video_name": videos[0].name if videos else ""}
+
+
+def longform_frame_replace(slug, idx, upload):
+    """Overwrite ONE frame's PNG with an uploaded image (any size - assembly letterboxes)."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    state, frames = longform_video.frames_from_disk(d)
+    try:
+        i = int(idx)
+        frame = frames[i]
+    except (TypeError, ValueError, IndexError):
+        return {"ok": False, "error": "Unknown frame."}
+    data = upload.get("data") if isinstance(upload, dict) else upload
+    if not data or len(data) < 1024:
+        return {"ok": False, "error": "No image uploaded."}
+    target = d / "images" / frame["file"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return {"ok": True, "img": link_for(target)}
+
+
+def longform_frame_swap(slug, a, b):
+    """Swap (or move onto a missing slot) two frames' image files."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    state, frames = longform_video.frames_from_disk(d)
+    try:
+        fa, fb = frames[int(a)], frames[int(b)]
+    except (TypeError, ValueError, IndexError):
+        return {"ok": False, "error": "Unknown frame."}
+    pa, pb = d / "images" / fa["file"], d / "images" / fb["file"]
+    if not pa.exists() and not pb.exists():
+        return {"ok": False, "error": "Both frames are empty."}
+    tmp = pa.with_suffix(".swap.tmp")
+    try:
+        if pa.exists() and pb.exists():
+            pa.replace(tmp); pb.replace(pa); tmp.replace(pb)
+        elif pa.exists():
+            pa.replace(pb)
+        else:
+            pb.replace(pa)
+    except OSError as exc:
+        return {"ok": False, "error": f"Swap failed ({exc})."}
+    return {"ok": True}
+
+
+def start_longform_rebuild(slug):
+    """Re-assemble the longform MP4 from the (edited) images on disk, as a normal job."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Queued."], "log_times": [time.time()],
+            "result": None, "error": None, "cancel_event": cancel_event,
+            "project_dir": str(d), "created_at": time.time(), "job_kind": "longform",
+        }
+
+    def log(msg):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                job["logs"].append(str(msg))
+                job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            out = longform_video.rebuild_from_disk(d, status_cb=log)
+            with JOB_LOCK:
+                JOBS[job_id]["result"] = {"video": str(out), "project_dir": str(d)}
+                JOBS[job_id]["status"] = "done"
+        except Exception as exc:            # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = str(exc)
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "job": f"/job?id={job_id}", "id": job_id}
+
+
 def start_longform_video_job(fields):
     """Longform VIDEO: paste a script -> voiceover (Gemini TTS) -> exact-timestamp transcript
     (faster-whisper + alignment) -> one doodle prompt per timestamp (reasoning model) ->
@@ -13060,7 +13173,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         q_all = urllib.parse.parse_qs(parsed.query)
         legacy = q_all.get("legacy_ui", ["0"])[0] in ("1", "true", "yes")
-        if parsed.path == "/timeline-versions":
+        if parsed.path == "/longform-frames":
+            slug = str(q_all.get("slug", [""])[0])
+            self.send_bytes(json.dumps(longform_frames_payload(slug)).encode("utf-8"),
+                            "application/json; charset=utf-8")
+        elif parsed.path == "/timeline-versions":
             slug = str(q_all.get("slug", [""])[0])
             self.send_bytes(json.dumps({"ok": True, "versions": timeline_versions(slug)}).encode("utf-8"),
                             "application/json; charset=utf-8")
@@ -13449,6 +13566,39 @@ class Handler(BaseHTTPRequestHandler):
                         ok = True
             self.send_bytes(json.dumps({"ok": ok}).encode("utf-8"),
                             "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-frame-upload":
+            # replace ONE frame of a finished longform run with an uploaded image
+            content_type = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            try:
+                lf_fields, lf_files = parse_multipart(content_type, body)
+            except Exception:
+                lf_fields, lf_files = {}, {}
+            result = longform_frame_replace(lf_fields.get("slug"), lf_fields.get("idx"),
+                                            lf_files.get("file"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-frame-swap":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = longform_frame_swap(data.get("slug"), data.get("a"), data.get("b"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-rebuild":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = start_longform_rebuild(data.get("slug"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/higgsfield-login":
             try:
