@@ -589,6 +589,43 @@ class Session:
                 return el
         return None
 
+    # Higgsfield caps a session at ~4 concurrent generations. A generation that hit our timeout
+    # keeps running server-side (still occupying a slot), so after a few recycles a new Generate
+    # click is refused with a "reached the maximum ..." toast. The old code never read that toast
+    # - it treated the non-start as a 420s timeout, recycled (orphaning yet another slot) and
+    # cascaded into "a full round produced no images". These keywords catch that refusal (and the
+    # generic "try again"/"failed" error toasts) so the caller can BACK OFF instead of orphaning.
+    _BLOCK_RE = re.compile(
+        r"(concurrent|max(imum)?\s+.*generat|too many|reached the (max|limit)|generation limit|"
+        r"queue is full|please wait|slow down|rate.?limit|try again later|something went wrong|"
+        r"failed to (start|create|generate))", re.I)
+
+    def _submit_blocked(self, page):
+        """After clicking Generate, return the refusal text if Higgsfield did NOT start the job
+        (concurrency cap / rate limit / error toast), else ''. Short poll - a real submission
+        shows no such toast."""
+        deadline = time.time() + 3.5
+        while time.time() < deadline:
+            try:
+                hit = page.evaluate(
+                    r"""(pat) => {
+                      const re = new RegExp(pat, 'i');
+                      const nodes = [...document.querySelectorAll(
+                        '[role=alert],[role=status],[class*=toast i],[class*=notif i],'
+                        + '[class*=error i],[class*=snackbar i],[data-sonner-toast]')];
+                      for (const n of nodes) {
+                        const t = (n.innerText || '').trim();
+                        if (t && t.length < 200 && re.test(t) && n.offsetParent !== null) return t;
+                      }
+                      return '';
+                    }""", self._BLOCK_RE.pattern)
+            except Exception:
+                hit = ""
+            if hit:
+                return str(hit).replace("\n", " ").strip()[:140]
+            page.wait_for_timeout(400)
+        return ""
+
     def _set_unlimited(self, page):
         """Enable Higgsfield's Unlimited switch and verify it turned on. Return True only when
         the toggle reads on; absence/ambiguity is a hard False so the caller refuses to spend.
@@ -844,6 +881,7 @@ class Session:
         Pauses the whole pool for the user if a page loses Unlimited or hits a DataDome check."""
         cb = status_cb or self._status_cb
         model, aspect = DEFAULT_MODEL, DEFAULT_ASPECT
+        self._backoff_until = 0                  # set when a concurrency refusal is seen
         slots = []
         if self._gen_page is not None:                  # reuse the anchor the user prepared
             caps = []
@@ -930,9 +968,12 @@ class Session:
                 _status(cb, "Higgsfield: no usable generation slots left.")
                 break
             tick = slots[0]["page"]
+            # After a concurrency refusal, give the in-flight/orphaned generations time to finish
+            # and free a server slot before we submit anything new.
+            in_backoff = time.time() < getattr(self, "_backoff_until", 0)
             # assign free slots
             for s in slots:
-                if s["idx"] is not None or not queue:
+                if s["idx"] is not None or not queue or in_backoff:
                     continue
                 page = s["page"]
                 if self._has_captcha(page) or not self._page_unlimited(page):
@@ -958,10 +999,22 @@ class Session:
                     if on_done:
                         on_done(idx, None)
                     continue
-                queue.pop(0)
-                s["cut"] = len(s["caps"])
-                s["idx"], s["path"], s["prompt"] = idx, path, prompt
+                cut = len(s["caps"])
                 self._click_generate(page)
+                # Did Higgsfield actually START it, or refuse (concurrency cap / rate limit)?
+                blocked = self._submit_blocked(page)
+                if blocked:
+                    # Nothing was submitted, so NO orphan is created and this is NOT a failure -
+                    # leave the prompt in the queue and back this slot off until a server slot
+                    # frees. Backing off is what breaks the recycle->orphan->over-limit spiral.
+                    _status(cb, f"Higgsfield: generation not accepted ({blocked}) - waiting for a "
+                                "free slot, will retry this frame.")
+                    s["idx"] = None
+                    self._backoff_until = time.time() + 20
+                    continue
+                queue.pop(0)
+                s["cut"] = cut
+                s["idx"], s["path"], s["prompt"] = idx, path, prompt
                 s["deadline"] = time.time() + max(30, int(timeout_s))
                 _status(cb, f"Higgsfield: generating {os.path.basename(str(path))} ...")
             # collect finished slots
