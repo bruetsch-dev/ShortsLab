@@ -41,6 +41,11 @@ TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
 # Higgsfield context and polls each page's own captured result, so all N generate server-side in
 # parallel while every image stays bound to its own page (exact attribution, no submit-clock race).
 IMAGE_CONCURRENCY = 4               # max Higgsfield generations in flight
+# A normal Higgsfield generation legitimately takes 5-10 min. A too-short timeout counted those
+# healthy generations as failures, recycled the page (leaving the generation running server-side =
+# an orphan that keeps holding one of the ~4 concurrent slots) and cascaded into "max concurrent"
+# refusals. 900s (15 min) only fires on a genuinely stuck job, so healthy runs never orphan.
+IMAGE_TIMEOUT_S = 900
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
 MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
 MAX_CONSECUTIVE_FAILURES_MIDRUN = 10    # unbroken failure streak while fresh work remains = died mid-run
@@ -852,7 +857,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         # 420s: at 4 in flight Higgsfield takes 4-5+ min per image; 300s produced false timeouts
         # whose late deliveries then mis-attributed onto the next prompts (the duplicate-frame bug).
         res = higgsfield_login.generate_pool_sync(
-            items, k=IMAGE_CONCURRENCY, timeout_s=420, status_cb=status_cb,
+            items, k=IMAGE_CONCURRENCY, timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb,
             cancel_check=pool_cancel, on_done=_on_done)
         if stop["cold"]:
             raise LongformError(
@@ -901,7 +906,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                          str(out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png")))
         _log(status_cb, f"Regenerating {len(redo)} stale frame(s)...")
         res = higgsfield_login.generate_pool_sync(
-            redo, k=IMAGE_CONCURRENCY, timeout_s=420, status_cb=status_cb,
+            redo, k=IMAGE_CONCURRENCY, timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb,
             cancel_check=pool_cancel, on_done=_on_done)
         for idx, _p, path in redo:
             got = res.get(idx)
