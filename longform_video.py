@@ -1373,12 +1373,54 @@ def frames_from_disk(project_dir):
     return state, frames
 
 
+def reconcile_image_names(project_dir, status_cb=None):
+    """Rename each index's image onto the filename the CURRENT line clock expects.
+
+    Image filenames encode the on-screen timestamp+duration (image_key), so any change to the
+    timings - a re-transcription after the voiceover was edited, a speed change - shifts every
+    expected name and the untouched image files suddenly look "missing" (black frames), even
+    though the right picture for index i is sitting right there under its old name. The index i
+    is the stable key (same script -> same line order -> same img{i:03d}_ prefix), so we glob by
+    index and rename the real file onto the expected name. Idempotent; safe to call before every
+    rebuild."""
+    project_dir = Path(project_dir)
+    try:
+        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    lines = state.get("lines") or []
+    if not lines:
+        return 0
+    imgdir = project_dir / "images"
+    if not imgdir.is_dir():
+        return 0
+    durations = line_durations(lines, float(state.get("audio_duration") or 0.0))
+    renamed = 0
+    for i, line in enumerate(lines):
+        expected = imgdir / (image_key(i, line, durations[i]) + ".png")
+        if expected.is_file() and expected.stat().st_size > 1024:
+            continue                                     # already on the right name
+        real = [c for c in sorted(imgdir.glob(f"img{i:03d}_*.png"))
+                if c.stat().st_size > 1024]
+        if not real:
+            continue                                     # genuinely never generated
+        expected.unlink(missing_ok=True)                 # a stale/tiny placeholder under this name
+        real[0].rename(expected)
+        renamed += 1
+    if renamed:
+        _log(status_cb, f"Reconciled {renamed} image filename(s) to the current timings.")
+    return renamed
+
+
 def rebuild_from_disk(project_dir, status_cb=None):
     """Re-assemble the longform MP4 from whatever images are on disk right now (the post-run
     frame editor's Rebuild). The voiceover and line clock come from state.json untouched; images
     the user replaced/moved are picked up by filename; a new VERSIONED mp4 is written so the
     previous render is never overwritten."""
     project_dir = Path(project_dir)
+    # a re-timed voiceover shifts every duration-encoded image name; re-anchor by index first so
+    # the untouched pictures are not mistaken for missing (black) frames.
+    reconcile_image_names(project_dir, status_cb=status_cb)
     state, frames = frames_from_disk(project_dir)
     if not state or not frames:
         raise LongformError("No resumable state in this project - nothing to rebuild.")
