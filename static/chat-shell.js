@@ -917,6 +917,35 @@ function renderScriptFlow() {
       msel.addEventListener("change", () => { S.values.tts_model = msel.value; persist(); });
       nrow.appendChild(msel);
       c.appendChild(nrow);
+      // Region: drives the scrape search language/framing (japan = the original JP-first search).
+      // A <japan>-style tag typed in the script still wins server-side; these chips just make the
+      // choice visible. Default: japan for the culture-facts preset, general otherwise.
+      {
+        if (!S.values.region) S.values.region = isCultureFacts() ? "japan" : "general";
+        const rrow = el("div", "script-region");
+        rrow.appendChild(el("span", "sn-lbl", "Region"));
+        const REGIONS = [["japan", "🇯🇵 Japan"], ["general", "🌍 General"],
+                         ["switzerland", "🇨🇭 Switzerland"], ["history", "🏛 History"]];
+        REGIONS.forEach(([val, label]) => {
+          const b = btn(label, () => {
+            S.values.region = val; persist();
+            rrow.querySelectorAll("button").forEach(x => x.classList.toggle(
+              "region-on", x.dataset.region === val));
+          }, "ghost small");
+          b.dataset.region = val;
+          if (S.values.region === val) b.classList.add("region-on");
+          rrow.appendChild(b);
+        });
+        const ml = document.createElement("label");
+        ml.className = "region-multilang";
+        const cb = document.createElement("input");
+        cb.type = "checkbox"; cb.checked = !!S.values.multi_language_search;
+        cb.addEventListener("change", () => { S.values.multi_language_search = cb.checked; persist(); });
+        ml.appendChild(cb);
+        ml.appendChild(document.createTextNode(" Multi-language search"));
+        rrow.appendChild(ml);
+        c.appendChild(rrow);
+      }
       // optional talking-head speaker hook (non-scrape only) - a compact toggle; gallery on demand
       if (!isCultureFacts()) {
         const tog = toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {

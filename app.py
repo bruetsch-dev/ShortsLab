@@ -413,6 +413,10 @@ def advanced_hidden_inputs(state):
     parts.append(f'<input type="hidden" name="add_meme_reactions" value="{"on" if state.get("add_meme_reactions") else ""}">')
     parts.append(f'<input type="hidden" name="add_neko_reactions" value="{"on" if state.get("add_neko_reactions") else ""}">')
     parts.append(f'<input type="hidden" name="vfx_amount" value="{esc(str(state.get("vfx_amount") or "medium"))}">')
+    # region chips + multi-language checkbox live on the chat script step; the legacy form carries
+    # them as hidden inputs for payload parity (a typed <tag> in the script still wins server-side)
+    parts.append(f'<input type="hidden" name="region" value="{esc(str(state.get("region") or "general"))}">')
+    parts.append(f'<input type="hidden" name="multi_language_search" value="{"on" if state.get("multi_language_search") else ""}">')
     return "".join(parts)
 
 
@@ -4056,6 +4060,19 @@ def _make_speech_gate(job_id, cancel_event, approval_event):
 def start_job(fields, files):
     job_id = str(int(time.time() * 1000))
     fields = dict(fields)
+    # Region: a typed <japan>/<general>/<switzerland>/<history> tag in the script wins over the
+    # UI chips; either way the tag is STRIPPED here, before anything downstream sees the script,
+    # so the narrator never speaks it and the captions never show it. The effective region is
+    # persisted in the run form (config) for the scrape/search layers to read.
+    import region_profiles
+    _tag_region, _cleaned = region_profiles.parse_region_tag(fields.get("script") or "")
+    if region_profiles._TAG_RE.search(str(fields.get("script") or "")):
+        fields["region"] = _tag_region              # explicit tag in the text wins
+    elif str(fields.get("region") or "").strip().lower() not in region_profiles.REGION_TAGS:
+        fields["region"] = region_profiles.DEFAULT_REGION
+    else:
+        fields["region"] = str(fields["region"]).strip().lower()
+    fields["script"] = _cleaned
     # Project presets/UI state can carry Script-Creator emphasis words from the previous script.
     # Keep only keywords that actually occur in this run's script; otherwise an unrelated old
     # topic can leak into caption emphasis (and into any downstream hook-aware planning).

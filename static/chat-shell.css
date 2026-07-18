@@ -1375,8 +1375,14 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .prototype-ui .app.proto-flow .proto-step-script .script-narrator .sn-lbl { font:720 9px/1.2 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--p-muted); }
 .prototype-ui .app.proto-flow .proto-step-script .script-narrator select { flex:0 1 auto; width:auto; min-width:120px; min-height:42px!important; padding:8px 12px!important; }
 .prototype-ui .app.proto-flow .proto-step-script .script-narrator .btn { width:auto; min-width:0; padding:8px 12px; }
-.prototype-ui .app.proto-flow .proto-step-script .script-spk-toggle { grid-column:1; grid-row:5; margin:14px 0 0 28px!important; }
-.prototype-ui .app.proto-flow .proto-step-script .spk-grid { grid-column:1; grid-row:6; margin:10px 0 0 28px; }
+.prototype-ui .app.proto-flow .proto-step-script .script-region { grid-column:1; grid-row:5; display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:12px 0 0 28px; }
+.prototype-ui .app.proto-flow .proto-step-script .script-region .sn-lbl { font:720 9px/1.2 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--p-muted); }
+.prototype-ui .app.proto-flow .proto-step-script .script-region .btn { width:auto; min-width:0; padding:8px 12px; }
+.script-region .btn.region-on { border-color:var(--p-green); color:var(--p-green); background:rgba(64,192,110,.08); font-weight:700; }
+.script-region .region-multilang { display:inline-flex; align-items:center; gap:6px; margin-left:6px; font-size:12px; color:var(--p-muted); cursor:pointer; }
+.script-region .region-multilang input { accent-color:var(--p-green); }
+.prototype-ui .app.proto-flow .proto-step-script .script-spk-toggle { grid-column:1; grid-row:6; margin:14px 0 0 28px!important; }
+.prototype-ui .app.proto-flow .proto-step-script .spk-grid { grid-column:1; grid-row:7; margin:10px 0 0 28px; }
 .script-hookbar .btn { width:auto; min-width:0; }
 .script-hookbar .script-hookstatus { margin-left:4px; font-size:12px; color:var(--p-muted); }
 .script-hookbar .script-hookstatus.on { color:var(--p-green); font-weight:600; }

@@ -299,7 +299,7 @@ RUN_MANIFEST = {
         "scrape_platforms",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
-        "tts_voice", "tts_model", "speaker_image_path",
+        "tts_voice", "tts_model", "speaker_image_path", "region",
     ],
     # checkbox fields: posted as "on" only when checked (HTML checkbox semantics)
     "check": [
@@ -307,6 +307,7 @@ RUN_MANIFEST = {
         "out_sfx", "out_transition_sfx", "out_background_music", "out_captions",
         "halt_after_speech", "force_regenerate", "enable_speaker_hook",
         "add_visual_effects", "add_meme_reactions", "add_neko_reactions",
+        "multi_language_search",
     ],
     # file fields
     "file": ["speaker_image_file"],
