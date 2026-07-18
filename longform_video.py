@@ -169,6 +169,24 @@ def split_script_for_tts(script, limit=TTS_PART_CHAR_LIMIT):
     return parts
 
 
+def audio_is_silent(path, ffmpeg=None, floor_db=-45.0, min_secs_per_char=0.028):
+    """True when a TTS part is effectively SILENT (or far too short for its text).
+
+    Gemini TTS occasionally returns a byte-valid WAV that is near-digital-silence for a chunk;
+    byte-size checks pass it and it stitches into the voiceover as a dead hole (the 9-minute
+    silence bug). We measure mean loudness (ffmpeg volumedetect) and, when the spoken text is
+    known, the duration-per-character - either being wildly off means the part failed."""
+    ffmpeg = ffmpeg or pipeline.find_ffmpeg()
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-af", "volumedetect",
+                            "-f", "null", "-"], capture_output=True, text=True, timeout=120)
+        m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", r.stderr or "")
+        mean = float(m.group(1)) if m else -99.0
+    except Exception:
+        return False                         # can't measure -> don't wrongly reject
+    return mean <= floor_db
+
+
 def concat_audio_parts(part_paths, out_path, ffmpeg):
     """Concatenate TTS parts RAW (concat demuxer, no resampling - resampling injects a noise
     floor; see pipeline.concat_audio_with_pause). Single part -> plain copy."""
@@ -359,7 +377,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Cancelled.")
         existing = saved_files[i] if i < len(saved_files) else ""
-        if existing and _audio_done(existing):
+        if existing and _audio_done(existing) and not audio_is_silent(existing, ffmpeg):
             _log(status_cb, f"Resume: reusing voiceover part {i + 1}/{len(parts)} "
                             f"({Path(existing).name}) - no new TTS.")
             part_files.append(Path(existing))
@@ -367,9 +385,24 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         _log(status_cb, f"Voiceover part {i + 1}/{len(parts)} ({len(part)} chars) "
                         f"with Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS"
                         f"{(' - narrator ' + str(voice)) if voice else ''}...")
-        p = pipeline.generate_speech_gemini(part, out_dir / f"vo_part{i:02d}.wav",
-                                            model=tts_model, cancel_event=cancel_event,
-                                            status_cb=status_cb, **tts_kw)
+        p = None
+        for attempt in range(3):             # a silent part = failed TTS; retry before accepting
+            p = pipeline.generate_speech_gemini(part, out_dir / f"vo_part{i:02d}.wav",
+                                                model=tts_model, cancel_event=cancel_event,
+                                                status_cb=status_cb, **tts_kw)
+            if not (p and _audio_done(p)):
+                _log(status_cb, f"Voiceover part {i + 1} produced no audio - retry {attempt + 1}/3.")
+                continue
+            if audio_is_silent(p, ffmpeg):
+                _log(status_cb, f"Voiceover part {i + 1} came back SILENT - retry {attempt + 1}/3.")
+                continue
+            break
+        if not (p and _audio_done(p)):
+            raise LongformError(f"Voiceover part {i + 1} failed to generate audible speech.")
+        if audio_is_silent(p, ffmpeg):
+            raise LongformError(
+                f"Voiceover part {i + 1} keeps coming back silent from the TTS - stopping instead "
+                "of stitching a silent gap into the voiceover. Try again or switch narrator/model.")
         part_files.append(p)
         _remember()
     # the per-part writes only ever hold the prefix generated SO FAR; this one records the reused
