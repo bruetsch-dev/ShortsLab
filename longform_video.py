@@ -810,6 +810,10 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     if results:
         _log(status_cb, f"Resume: {len(results)}/{total} image(s) already generated - "
                         f"only the missing {total - len(results)} will be generated.")
+        # A stale-attributed frame from an earlier run is correctly NAMED but shows another
+        # timestamp's caption - resume would trust it forever. OCR-audit the reused frames and
+        # drop the provably wrong ones back into the queue.
+        audit_images(prompts, lines, durations, out_dir, results, status_cb=status_cb)
     queue = [i for i in range(total) if i not in results]
     dead = 0                            # failed generation attempts so far
     fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
@@ -878,6 +882,28 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
         if next_queue:
             _log(status_cb, f"Retrying {len(next_queue)} image(s) that failed this round...")
         queue = next_queue
+    # Final gate before assembly: OCR-audit everything that will reach the video and regenerate
+    # any frame that provably shows another timestamp's caption. Bounded so an OCR quirk can
+    # never loop the run forever.
+    for _audit_round in range(2):
+        stale = audit_images(prompts, lines, durations, out_dir,
+                             {i: v for i, v in results.items() if v}, status_cb=status_cb)
+        if not stale:
+            break
+        redo = []
+        for idx in stale:
+            results.pop(idx, None)
+            attempts[idx] = 0                     # a fresh problem, give it fresh retries
+            redo.append((idx, prompts[idx]["prompt"],
+                         str(out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png")))
+        _log(status_cb, f"Regenerating {len(redo)} stale frame(s)...")
+        res = higgsfield_login.generate_pool_sync(
+            redo, k=IMAGE_CONCURRENCY, timeout_s=420, status_cb=status_cb,
+            cancel_check=pool_cancel, on_done=_on_done)
+        for idx, _p, path in redo:
+            got = res.get(idx)
+            if got and _image_done(got, "16:9"):
+                results[idx] = got
     ok = sum(1 for v in results.values() if v)
     _log(status_cb, f"Images finished: {ok}/{total} generated.")
     return results
@@ -952,6 +978,102 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
         raise LongformError(f"Assembly failed: {(r.stderr or '')[-400:]}")
     _log(status_cb, f"Final longform video ready: {out_path}")
     return out_path
+
+
+# ---------------------------------------------------------------- caption audit (OCR)
+# The mandatory ALL-CAPS top caption doubles as a verification anchor: we KNOW which caption
+# every frame must show (the `reading "X"` in its prompt), and local OCR can read what a frame
+# actually shows. A frame whose on-image caption clearly belongs to a DIFFERENT timestamp is a
+# stale/mis-attributed delivery and must not reach the video.
+
+_OCR = [None]
+
+
+def _get_frame_ocr():
+    if _OCR[0] is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR[0] = RapidOCR()
+        except Exception:
+            _OCR[0] = False
+    return _OCR[0] or None
+
+
+_CAPTION_RE = re.compile(r'reading "([^"]+)"')
+
+
+def expected_caption(prompt_text):
+    m = _CAPTION_RE.search(str(prompt_text or ""))
+    return m.group(1).strip() if m else ""
+
+
+def _norm_words(text):
+    return [w for w in re.sub(r"[^A-Z0-9 ]", " ", str(text or "").upper()).split() if len(w) >= 2]
+
+
+def _caption_score(caption, ocr_text):
+    """Fraction of the caption's words present in the OCR text (0..1)."""
+    want = _norm_words(caption)
+    if not want:
+        return 0.0
+    have = set(_norm_words(ocr_text))
+    return sum(1 for w in want if w in have) / len(want)
+
+
+def audit_images(prompts, lines, durations, out_dir, results, status_cb=None):
+    """OCR every accepted frame and reject the ones whose on-image caption clearly belongs to a
+    DIFFERENT timestamp. Conservative on purpose: FLUX sometimes renders no caption at all, and
+    OCR sometimes reads nothing - neither is evidence of a wrong frame, so a frame is only
+    rejected when its own caption scores low AND another timestamp's caption scores high.
+    Rejected files move to images/_mismatched_<ts>/ (never deleted) and are dropped from
+    `results` so the caller regenerates them. Returns the rejected indexes."""
+    ocr = _get_frame_ocr()
+    if ocr is None:
+        _log(status_cb, "Caption audit skipped (no local OCR available).")
+        return []
+    import numpy as np
+    from PIL import Image
+    expected = {i: expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
+                                    else prompts[i]) for i in range(len(prompts))}
+    all_caps = [c for c in expected.values() if c]
+    bad = []
+    checked = 0
+    for idx, path in sorted(results.items()):
+        if not path or not expected.get(idx):
+            continue
+        try:
+            with Image.open(path) as im:
+                arr = np.array(im.convert("RGB"))
+            res, _elapsed = ocr(arr)
+            text = " ".join(r[1] for r in (res or []))
+        except Exception:
+            continue
+        checked += 1
+        own = _caption_score(expected[idx], text)
+        best_other, other_cap = 0.0, ""
+        for cap in all_caps:
+            if cap == expected[idx]:
+                continue
+            sc = _caption_score(cap, text)
+            if sc > best_other:
+                best_other, other_cap = sc, cap
+        if own < 0.5 and best_other >= 0.99:
+            _log(status_cb, f"Caption audit: frame #{idx + 1} shows \"{other_cap}\" but should "
+                            f"show \"{expected[idx]}\" - rejecting the stale frame.")
+            bad.append(idx)
+    if bad:
+        dest = Path(out_dir) / f"_mismatched_{time.strftime('%Y%m%d_%H%M%S')}"
+        dest.mkdir(parents=True, exist_ok=True)
+        for idx in bad:
+            try:
+                p = Path(results[idx])
+                p.replace(dest / p.name)
+            except OSError:
+                pass
+            results.pop(idx, None)
+    _log(status_cb, f"Caption audit: {checked} frame(s) checked, {len(bad)} stale frame(s) "
+                    "rejected." if checked else "Caption audit: nothing to check.")
+    return bad
 
 
 def frames_from_disk(project_dir):
