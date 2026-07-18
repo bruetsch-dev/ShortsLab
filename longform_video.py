@@ -169,13 +169,32 @@ def split_script_for_tts(script, limit=TTS_PART_CHAR_LIMIT):
     return parts
 
 
-def audio_is_silent(path, ffmpeg=None, floor_db=-45.0, min_secs_per_char=0.028):
-    """True when a TTS part is effectively SILENT (or far too short for its text).
+def longest_silence_run(path, ffmpeg=None, floor_db=-45.0):
+    """Length (s) of the single longest unbroken silent stretch in ``path`` (0.0 if none)."""
+    ffmpeg = ffmpeg or pipeline.find_ffmpeg()
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-af",
+                            f"silencedetect=noise={floor_db}dB:d=2", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=180)
+        runs = [float(x) for x in re.findall(r"silence_duration:\s*(\d+(?:\.\d+)?)", r.stderr or "")]
+        return max(runs) if runs else 0.0
+    except Exception:
+        return 0.0
 
-    Gemini TTS occasionally returns a byte-valid WAV that is near-digital-silence for a chunk;
-    byte-size checks pass it and it stitches into the voiceover as a dead hole (the 9-minute
-    silence bug). We measure mean loudness (ffmpeg volumedetect) and, when the spoken text is
-    known, the duration-per-character - either being wildly off means the part failed."""
+
+def audio_is_silent(path, ffmpeg=None, floor_db=-45.0, max_silence_run=8.0):
+    """True when a TTS part FAILED - either near-silent throughout, OR it speaks for a bit and
+    then holds a long unbroken silence.
+
+    Gemini TTS has two failure modes that a byte-size check passes straight into the voiceover as
+    a dead hole:
+      1. a whole chunk comes back near-digital-silence, and
+      2. the read is TRUNCATED - the first third is spoken and the rest is padded with minutes of
+         silence (the tickle part-5 bug: 56s of speech + 607s of silence). A whole-part MEAN check
+         is fooled by the spoken head (that part averaged -36 dB and sailed past a -45 dB floor),
+         so mean volume alone cannot see it.
+    We therefore fail a part if its mean is below the floor OR it contains a single silent run
+    longer than any legitimate narration pause (sentence gaps are well under 2s)."""
     ffmpeg = ffmpeg or pipeline.find_ffmpeg()
     try:
         r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-af", "volumedetect",
@@ -184,7 +203,9 @@ def audio_is_silent(path, ffmpeg=None, floor_db=-45.0, min_secs_per_char=0.028):
         mean = float(m.group(1)) if m else -99.0
     except Exception:
         return False                         # can't measure -> don't wrongly reject
-    return mean <= floor_db
+    if mean <= floor_db:
+        return True
+    return longest_silence_run(path, ffmpeg, floor_db) >= max_silence_run
 
 
 def concat_audio_parts(part_paths, out_path, ffmpeg):
@@ -440,6 +461,16 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         _log(status_cb, "All voiceover parts approved - stitching and continuing.")
 
     out = concat_audio_parts(part_files, out_dir / "voiceover.wav", ffmpeg)
+    # Last line of defence: even with the per-part guards, a silent hole in the STITCHED voiceover
+    # is the one defect the user must never ship unknowingly. Scan the whole take and refuse to
+    # continue on a minutes-long dead stretch - regenerating a specific part here is impossible
+    # (they are about to be deleted), so this hard-fails with a clear message instead.
+    hole = longest_silence_run(out, ffmpeg)
+    if hole >= 15.0:
+        raise LongformError(
+            f"The stitched voiceover contains a {hole:.0f}s silent gap - a TTS part came back "
+            "truncated/silent. Not continuing with a dead hole in the narration; please start the "
+            "voiceover again (a fresh run re-generates the failed part).")
     for p in part_files:
         try:
             Path(p).unlink(missing_ok=True)
