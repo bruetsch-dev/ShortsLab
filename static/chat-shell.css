@@ -165,11 +165,20 @@ body.sb-resizing .sidebar { transition: none; }
 .pv-tag-sfx { background: #7c5cff; }      /* SFX Master = violet */
 .pv-tag-vfx { background: #f0912b; }      /* VFX Master = orange */
 .pv-tag-longform { background: #38bdf8; }  /* Sketch explainer = cyan */
+/* STATE chips sit top-right so they can coexist with the kind chip top-left */
+.pv-tag.pv-state { left: auto; right: 3px; display: inline-flex; align-items: center; gap: 3px; }
 .pv-tag-failed { background: var(--danger); }
-.pv-tag-running { background:var(--warning); color:#171208; }
+.pv-tag-running { background: var(--warning); color: #171208; }
+.pv-tag-editing { background: color-mix(in srgb, var(--p-green, #40c06e) 82%, #000); }
+.pv-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+  animation: pv-pulse 1.2s ease-in-out infinite; }
+@keyframes pv-pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .pv-dot { animation: none; } }
 .pv-wrap.pv-sfx { border: 2px solid #7c5cff !important; box-shadow: 0 0 0 1px rgba(124,92,255,.22); box-sizing:border-box; }
 .pv-wrap.pv-vfx { border: 2px solid #f0912b !important; box-shadow: 0 0 0 1px rgba(240,145,43,.22); box-sizing:border-box; }
 .pv-wrap.pv-failed { border: 2px solid var(--danger) !important; box-shadow: 0 0 0 1px color-mix(in srgb,var(--danger) 24%,transparent); box-sizing:border-box; }
+.pv-wrap.pv-running { border: 2px solid var(--warning) !important; box-shadow: 0 0 0 1px color-mix(in srgb,var(--warning) 24%,transparent); box-sizing:border-box; }
+.pv-wrap.pv-editing { border: 1px solid color-mix(in srgb, var(--p-green, #40c06e) 55%, transparent) !important; box-sizing:border-box; }
 .pv-wrap.pv-running { border:2px solid var(--warning)!important; box-shadow:0 0 0 1px color-mix(in srgb,var(--warning) 24%,transparent); box-sizing:border-box; }
 .asset-card2 .pv-wrap.ath .pv-tag { font-size: 10px; left: 6px; top: 6px; padding: 2px 7px; }
 .asset-card2 .afig { position: relative; }

@@ -48,20 +48,30 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 // What a project's `kind` is CALLED on screen. The raw key doubles as a CSS class, so it stays
 // lowercase; only the badge text lives here. An ordinary generated/scraped project has no kind
 // and so no badge.
-const KIND_LABEL = { running: "running", failed: "failed", sfx: "SFX", vfx: "VFX",
-                     longform: "Sketch" };
+const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch" };
 function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
-/* single-frame project thumbnail (hook/opening) + a master-tool badge overlay */
+// STATE is separate from KIND: a failed Sketch used to show only "failed" and lose its
+// category. State sits top-right, kind top-left; both can show at once.
+const STATE_LABEL = { running: "Running", failed: "Failed", editing: "In edit" };
+function projState(p) {
+  if (p.running) return "running";
+  if (p.failed) return "failed";
+  if (p.has_timeline && !p.has_video) return "editing";   // clip short living in the timeline
+  return "";
+}
+/* single-frame project thumbnail (hook/opening) + kind badge (top-left) + state badge (top-right) */
 function projThumb(p, cls) {
-  // Overlay label + colored border: failed (red) wins, else an SFX/VFX-Master upload or a Sketch
-  // explainer gets its own colored tag.
-  const kind = p.running ? "running" : p.failed ? "failed" : (p.kind || p.preview_kind || "");
-  const txt = kindLabel(kind);
-  const tag = txt ? `<span class="pv-tag pv-tag-${kind}">${txt}</span>` : "";
+  const kind = p.kind || p.preview_kind || "";
+  const state = projState(p);
+  const kindTag = kindLabel(kind)
+    ? `<span class="pv-tag pv-tag-${kind}">${kindLabel(kind)}</span>` : "";
+  const stateTag = state
+    ? `<span class="pv-tag pv-state pv-tag-${state}">${state === "running" ? '<i class="pv-dot"></i>' : ""}${STATE_LABEL[state]}</span>` : "";
   const inner = p.thumb_url
     ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">`
     : (p.video_url ? `<video muted preload="none" src="${esc(p.video_url)}"></video>` : "");
-  return `<span class="pv-wrap ${cls || ""}${kind ? " pv-" + kind : ""}">${inner}${tag}</span>`;
+  const borders = [kind ? "pv-" + kind : "", state ? "pv-" + state : ""].filter(Boolean).join(" ");
+  return `<span class="pv-wrap ${cls || ""} ${borders}">${inner}${kindTag}${stateTag}</span>`;
 }
 async function jpost(url, data) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -2457,9 +2467,11 @@ async function openProjectPicker() {
   const list = el("div", "list"); m.appendChild(list);
   (d.projects || []).forEach(p => {
     const b = el("button", "sb-proj");
+    // state chip only when it says something ("ok" on every healthy row was noise)
+    const st = projState(p);
     b.innerHTML = `${projThumb(p, "th")}
       <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
-      <span class="st ${p.failed ? "fail" : "ok"}">${p.failed ? "failed" : "ok"}</span>`;
+      ${st ? `<span class="st ${st === "failed" ? "fail" : "ok"}">${STATE_LABEL[st]}</span>` : ""}`;
     b.addEventListener("click", () => { close(); loadProject(p.slug); });
     list.appendChild(b);
   });
@@ -2724,7 +2736,7 @@ function paintSidebarProjects() {
       const b = el("button", "sb-proj");
       b.innerHTML = `${projThumb(p, "th")}
         <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
-        ${p.failed ? '<span class="st fail">!</span>' : ""}`;
+        ${p.failed ? '<span class="st fail" title="Failed - open to see what went wrong">!</span>' : ""}`;
       b.title = p.title;
       row.classList.toggle("pinned", pins.has(p.slug));
       row.addEventListener("contextmenu", e => openProjectContextMenu(e, p));

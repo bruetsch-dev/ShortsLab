@@ -5949,7 +5949,10 @@ def project_summary(project_dir):
     if not created_at:
         created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(project_dir.stat().st_mtime))
     edited_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(project_edited_mtime(project_dir)))
-    failed = not bool(video)
+    # No render is NOT failure for a scrape clip-short: its run intentionally skips the final
+    # render and hands the edit to the timeline editor. Only a project with neither a render nor
+    # a timeline edit is actually broken.
+    failed = not bool(video) and not project_has_timeline_edit(project_dir.name)
     return {
         "title": report.get("title") or project_title_from_files(project_dir),
         "slug": project_dir.name,
