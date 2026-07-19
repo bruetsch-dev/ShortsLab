@@ -34,6 +34,9 @@ def test_settings():
           isinstance(app.normalize_ui_state({"clip_source": "scrape"}), dict))
     check("scraping_engine in preset fields (persisted)",
           '"scraping_engine"' in open("app.py", encoding="utf-8").read())
+    check("native 720x1280 accepted", v._is_native_9_16(720, 1280))
+    check("landscape rejected by native gate", not v._is_native_9_16(1920, 1080))
+    check("4:5 portrait rejected by native gate", not v._is_native_9_16(1080, 1350))
 
 
 # ---- planner query generation + diversity ---------------------------------

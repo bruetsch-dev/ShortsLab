@@ -3325,6 +3325,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
     <form id="short-form" method="post" action="/run" enctype="multipart/form-data">
       <input id="loaded-project-source" type="hidden" name="loaded_project_source" value="">
       <input type="hidden" name="ui_form" value="1">
+      <input type="hidden" name="clip_short_format" value="standard">
+      <input type="hidden" name="script_token_limit" value="">
 
       <div id="wizard">
         <div class="wiz-topnav" id="wiz-topnav" style="display:none;">
@@ -3945,7 +3947,7 @@ def longform_page():
             <li><strong>Timestamps</strong> &mdash; faster-whisper + script alignment produce an exact <code>[m:ss.d]</code> transcript.</li>
             <li><strong>Prompts</strong> &mdash; the reasoning model writes one doodle image prompt per timestamp (auto-batched).</li>
             <li><strong>Images</strong> &mdash; FLUX.2 Pro 16:9 on your Higgsfield account, 4 in flight, failed images auto-retried; each file is named with its timestamp + on-screen duration.</li>
-            <li><strong>Assembly</strong> &mdash; every image is cut to its exact duration (black frame if one is missing) and muxed with the voiceover. A chime plays when it's done.</li>
+            <li><strong>Assembly</strong> &mdash; every image is cut to its exact duration. Missing frames block the render, and the encoded video is checked for black-screen sections before success.</li>
           </ol>
           <div class="hint" style="margin-top: 16px;">Output lands in <code>projects/_longform/&lt;slug&gt;/</code>.</div>
         </div>
@@ -4622,7 +4624,7 @@ def _longform_dir(slug):
 
 
 def longform_frames_payload(slug):
-    """Frame list for the post-run editor: every timestamp with its image (or missing=black)."""
+    """Complete pre-render editor state: timed frames, narration, unused art and thumbnails."""
     import longform_video
     d = _longform_dir(slug)
     if not d:
@@ -4632,10 +4634,54 @@ def longform_frames_payload(slug):
         return {"ok": False, "error": "This project has no timed frames yet."}
     for f in frames:
         f["img"] = link_for(d / "images" / f["file"]) if f["exists"] else ""
+    current = {(d / "images" / f["file"]).resolve() for f in frames if f["exists"]}
+    unused = []
+    for path in sorted((d / "images").rglob("img*.png")):
+        try:
+            if path.resolve() in current or not longform_video._image_done(path, "16:9"):
+                continue
+            match = re.match(r"img(\d+)_", path.name, re.I)
+            original_idx = int(match.group(1)) if match else 0
+            intended_idx = min(max(original_idx, 0), len(frames) - 1)
+            intended = frames[intended_idx]
+            unused.append({
+                "rel_path": str(path.relative_to(d / "images")).replace("\\", "/"),
+                "img": link_for(path), "original_idx": original_idx,
+                "intended_idx": intended_idx, "intended_ts": intended["ts"],
+                "intended_text": intended["text"],
+                "folder": str(path.parent.relative_to(d / "images")).replace("\\", "/") or "Archive",
+            })
+        except (OSError, ValueError):
+            continue
+    voice = d / Path(str((state or {}).get("voiceover_file") or "voiceover.wav")).name
+    thumbs = []
+    for item in longform_video.thumbnail_variants(d):
+        item["img"] = link_for(d / item["file"])
+        thumbs.append(item)
     videos = sorted(d.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
     return {"ok": True, "slug": d.name, "frames": frames,
+            "unused": unused, "voiceover": link_for(voice) if voice.is_file() else "",
+            "audio_duration": float((state or {}).get("audio_duration") or 0),
+            "thumbnails": thumbs,
+            "thumbnail": link_for(d / "thumbnail.png") if (d / "thumbnail.png").is_file() else "",
+            "thumbnail_title": str((state or {}).get("thumbnail_title") or ""),
+            "render_pending": bool((state or {}).get("render_pending")),
             "video": link_for(videos[0]) if videos else "",
             "video_name": videos[0].name if videos else ""}
+
+
+def _archive_longform_frame(d, path):
+    """Keep a replaced timeline image available in the editor's unused-assets tray."""
+    if not path.is_file():
+        return
+    archive = d / "images" / ("_manual_unused_" + time.strftime("%Y%m%d_%H%M%S"))
+    archive.mkdir(parents=True, exist_ok=True)
+    target = archive / path.name
+    n = 2
+    while target.exists():
+        target = archive / f"{path.stem}_{n}{path.suffix}"
+        n += 1
+    path.replace(target)
 
 
 def longform_frame_replace(slug, idx, upload):
@@ -4655,6 +4701,10 @@ def longform_frame_replace(slug, idx, upload):
         return {"ok": False, "error": "No image uploaded."}
     target = d / "images" / frame["file"]
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _archive_longform_frame(d, target)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not archive the replaced frame ({exc})."}
     target.write_bytes(data)
     return {"ok": True, "img": link_for(target)}
 
@@ -4686,6 +4736,60 @@ def longform_frame_swap(slug, a, b):
     return {"ok": True}
 
 
+def longform_frame_use(slug, rel_path, idx):
+    """Move an unused generated image onto a selected narration slot."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    _state, frames = longform_video.frames_from_disk(d)
+    try:
+        frame = frames[int(idx)]
+    except (TypeError, ValueError, IndexError):
+        return {"ok": False, "error": "Unknown target frame."}
+    images = (d / "images").resolve()
+    source = (images / str(rel_path or "")).resolve()
+    try:
+        if os.path.commonpath([str(images), str(source)]) != str(images) or not source.is_file():
+            raise ValueError
+    except (OSError, ValueError):
+        return {"ok": False, "error": "Unknown unused image."}
+    target = d / "images" / frame["file"]
+    if source == target.resolve():
+        return {"ok": True}
+    try:
+        _archive_longform_frame(d, target)
+        source.replace(target)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not place the image ({exc})."}
+    return {"ok": True, "img": link_for(target)}
+
+
+def longform_thumbnail_select(slug, index):
+    """Select one of the three thumbnail/title pairs as the project's final thumbnail."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    variants = longform_video.thumbnail_variants(d)
+    try:
+        chosen = next(v for v in variants if int(v["index"]) == int(index))
+    except (StopIteration, TypeError, ValueError):
+        return {"ok": False, "error": "Unknown thumbnail variant."}
+    source = d / chosen["file"]
+    try:
+        shutil.copy2(source, d / "thumbnail.png")
+        meta_path = d / "thumbnail_variants.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["selected"] = int(chosen["index"])
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        longform_video.save_state(d, thumbnail_selected=int(chosen["index"]),
+                                  thumbnail_title=chosen["title"])
+    except (OSError, ValueError, TypeError) as exc:
+        return {"ok": False, "error": f"Could not select thumbnail ({exc})."}
+    return {"ok": True, "title": chosen["title"], "thumbnail": link_for(d / "thumbnail.png")}
+
+
 def start_longform_rebuild(slug):
     """Re-assemble the longform MP4 from the (edited) images on disk, as a normal job."""
     import longform_video
@@ -4711,14 +4815,214 @@ def start_longform_rebuild(slug):
     def worker():
         try:
             out = longform_video.rebuild_from_disk(d, status_cb=log)
+            thumbnail = ""
+            try:
+                state = json.loads((d / longform_video.STATE_FILE).read_text(encoding="utf-8"))
+                script = str(state.get("script") or "")
+                lines = state.get("lines") or []
+                if script and lines:
+                    thumbnail = longform_video.generate_thumbnail(
+                        d, script, lines, reasoning_model=state.get("reasoning_model"),
+                        status_cb=log, cancel_event=cancel_event, force=False) or ""
+            except Exception as thumb_exc:  # noqa: BLE001
+                # The finished video remains valid even if the optional marketing artwork fails.
+                log(f"Post-render thumbnail generation failed ({thumb_exc}).")
             with JOB_LOCK:
-                JOBS[job_id]["result"] = {"video": str(out), "project_dir": str(d)}
+                JOBS[job_id]["result"] = {
+                    "video": str(out), "project_dir": str(d), "thumbnail": str(thumbnail),
+                }
                 JOBS[job_id]["status"] = "done"
         except Exception as exc:            # noqa: BLE001
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "error"
                 JOBS[job_id]["error"] = str(exc)
                 JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "job": f"/job?id={job_id}", "id": job_id}
+
+
+def start_longform_thumbnail_generation(slug):
+    """Generate a fresh set of three thumbnail/title candidates as a normal background job."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    try:
+        state = json.loads((d / longform_video.STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    script, lines = str(state.get("script") or ""), state.get("lines") or []
+    if not script or not lines:
+        return {"ok": False, "error": "This project has no script/timeline for a thumbnail."}
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Preparing 3 thumbnail concepts."],
+            "log_times": [time.time()], "result": None, "error": None,
+            "cancel_event": cancel_event, "project_dir": str(d),
+            "created_at": time.time(), "job_kind": "longform",
+            "thumbnail_generation": True,
+        }
+
+    def log(msg):
+        with JOB_LOCK:
+            if JOBS.get(job_id) is not None:
+                JOBS[job_id]["logs"].append(str(msg))
+                JOBS[job_id].setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            thumb = longform_video.generate_thumbnail(
+                d, script, lines, reasoning_model=state.get("reasoning_model"),
+                status_cb=log, cancel_event=cancel_event, force=True)
+            variants = longform_video.thumbnail_variants(d)
+            if not thumb or len(variants) != 3:
+                raise RuntimeError("Could not generate all three thumbnail variants.")
+            with JOB_LOCK:
+                JOBS[job_id]["result"] = {
+                    "project_dir": str(d), "thumbnail": str(thumb),
+                    "thumbnail_generation": True, "open_longform_editor": True,
+                }
+                JOBS[job_id]["status"] = "done"
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = str(exc)
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "job": f"/job?id={job_id}", "id": job_id}
+
+
+def start_longform_speech_review(slug):
+    """Open an existing Sketch Explainer's narration as individually editable parts."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown Sketch Explainer project."}
+    try:
+        state = json.loads((d / longform_video.STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    script = str(state.get("script") or "")
+    if not script:
+        return {"ok": False, "error": "This project has no saved script."}
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Preparing speech parts..."],
+            "log_times": [time.time()], "result": None, "error": None,
+            "cancel_event": cancel_event, "project_dir": str(d),
+            "created_at": time.time(), "job_kind": "longform",
+            "speech_review": True,
+        }
+
+    def log(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(str(message))
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            manifest = (longform_video.load_speech_review_parts(d, script)
+                        or longform_video.reconstruct_speech_review_parts(d, script, status_cb=log))
+            if not manifest:
+                raise RuntimeError("No usable voiceover exists for this project.")
+            rows = sorted(manifest.get("parts") or [], key=lambda r: int(r.get("index", 0)))
+            states = {int(row["index"]): "pending" for row in rows}
+            changed = set()
+
+            def publish():
+                with JOB_LOCK:
+                    job = JOBS.get(job_id)
+                    if not job:
+                        raise RunCancelled("Run cancelled by user.")
+                    job["lf_parts"] = [{
+                        "index": int(row["index"]), "text": str(row.get("text") or "")[:1200],
+                        "url": link_for(d / str(row.get("file") or "")),
+                        "state": states[int(row["index"])],
+                        "dur": round(float(row.get("duration") or 0.0), 2),
+                    } for row in rows]
+
+            with JOB_LOCK:
+                JOBS[job_id]["lf_decisions"] = []
+                JOBS[job_id]["status"] = "awaiting_approval"
+            publish()
+            while True:
+                if cancel_event.is_set():
+                    raise RunCancelled("Run cancelled by user.")
+                with JOB_LOCK:
+                    job = JOBS.get(job_id)
+                    decisions = list((job or {}).get("lf_decisions") or [])
+                    if job is not None:
+                        job["lf_decisions"] = []
+                for decision in decisions:
+                    try:
+                        idx = int(decision.get("part"))
+                    except (TypeError, ValueError):
+                        continue
+                    action = str(decision.get("action") or "").lower()
+                    if idx not in states:
+                        continue
+                    if action == "approve" and states[idx] == "pending":
+                        states[idx] = "approved"
+                        publish()
+                    elif action == "decline" and states[idx] in ("pending", "approved"):
+                        states[idx] = "regenerating"
+                        publish()
+                        row = next(row for row in rows if int(row["index"]) == idx)
+                        take = int(row.get("take") or 0) + 1
+                        raw = pipeline.generate_speech_gemini(
+                            row.get("text") or "", d / "speech_parts" / f"part_{idx:03d}_take{take}.wav",
+                            model=str(manifest.get("tts_model") or "pro"),
+                            voice=str(manifest.get("voice") or pipeline.DEFAULT_TTS_VOICE),
+                            style=pipeline.TTS_STYLE_LONGFORM, cancel_event=cancel_event,
+                            status_cb=log)
+                        speed = float(manifest.get("voice_speed") or 1.0)
+                        final = (longform_video.apply_voice_speed(raw, speed, status_cb=log)
+                                 if abs(speed - 1.0) >= 0.01 else Path(raw))
+                        row.update({"file": os.path.relpath(final, d), "take": take,
+                                    "duration": round(longform_video.audio_duration_seconds(final), 3)})
+                        changed.add(idx)
+                        longform_video.save_speech_review_manifest(
+                            d, script, rows, voice=manifest.get("voice") or "",
+                            tts_model=manifest.get("tts_model") or "pro", voice_speed=speed)
+                        states[idx] = "pending"
+                        publish()
+                if states and all(value == "approved" for value in states.values()):
+                    break
+                time.sleep(0.35)
+
+            if changed:
+                manifest["parts"] = rows
+                voiceover = longform_video.commit_speech_review_parts(d, manifest, status_cb=log)
+                retimed = longform_video.finalize_speech_review_timing(d, status_cb=log)
+                result = {"project_dir": str(d), "speech_review": True,
+                          "voiceover": str(voiceover), "parts_changed": sorted(changed),
+                          "retime_required": False, "retimed": retimed}
+            else:
+                result = {"project_dir": str(d), "speech_review": True,
+                          "parts_changed": [], "retime_required": False}
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = result
+                JOBS[job_id].pop("lf_parts", None)
+                JOBS[job_id]["logs"].append(
+                    "Speech review saved. Image-switch timings were rebuilt from the new audio."
+                    if changed else "Speech review complete; no audio was changed.")
+        except Exception as exc:
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if job is not None:
+                    job["status"] = "cancelled" if cancel_event.is_set() else "error"
+                    job["error"] = None if cancel_event.is_set() else f"{exc}\n\n{traceback.format_exc()}"
+                    job["logs"].append("Cancelled." if cancel_event.is_set() else f"Error: {exc}")
 
     threading.Thread(target=worker, daemon=True).start()
     return {"ok": True, "job": f"/job?id={job_id}", "id": job_id}
@@ -6373,6 +6677,10 @@ TIMELINE_SKELETON = """
         <img id="tl-pimg" alt="">
         <video id="tl-pvid" muted playsinline preload="auto"></video>
         <video id="tl-pvid2" muted playsinline preload="auto" aria-hidden="true"></video>
+        <div class="tl-clip-transform-box" id="tl-clip-transform-box" aria-hidden="true">
+          <span class="tl-clip-transform-tag">CLIP SCALE</span>
+          <span class="tl-clip-scale-handle" id="tl-clip-scale-handle" title="Drag to scale the selected clip"></span>
+        </div>
         <div class="tl-preview-caption" id="tl-preview-caption" aria-live="off"></div>
         <div class="tl-overlay-layer" id="tl-overlay-layer"></div>
         <div class="tl-stage-empty" id="tl-stage-empty">Press play to preview</div>
@@ -6399,6 +6707,15 @@ TIMELINE_SKELETON = """
         </div>
         <label>Speed <span id="tl-insp-speed-val"></span></label>
         <input type="range" id="tl-insp-speed" min="0.5" max="2" step="0.05">
+        <div class="tl-clip-transform-controls">
+          <label class="tl-chk"><input type="checkbox" id="tl-insp-mirror"> Mirror horizontally</label>
+          <label class="tl-chk"><input type="checkbox" id="tl-insp-scale-mode"> Free scale</label>
+          <div class="tl-clip-scale-row" id="tl-insp-scale-row">
+            <label>Scale <span id="tl-insp-scale-val"></span></label>
+            <input type="range" id="tl-insp-scale" min="0.5" max="3" step="0.05">
+          </div>
+          <div class="hint">Free scale selects the clip in the player. Drag its corner handle or use the slider.</div>
+        </div>
         <label class="tl-chk" id="tl-insp-blur-row"><input type="checkbox" id="tl-insp-blurcap"> Blur burned-in captions</label>
         <div class="hint" id="tl-insp-blur-hint" hidden>OCR finds the caption letters in this clip and blurs only those. Applied on Save / Render (can take ~20s per clip the first time). Only blur added here can be toggled off again &mdash; blur baked in by an older scrape run is part of the footage itself (right-click the clip and replace the media instead).</div>
         <div class="tl-insp-actions">
@@ -6632,9 +6949,17 @@ TIMELINE_ASSETS = """
   /* two stacked videos for double-buffered playback: both stay in the render tree so both can decode;
      the active one is opaque + on top, the buffer sits behind at opacity 0 holding its preloaded frame. */
   .tl-stage-view video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; background:#000;
-    opacity:0; z-index:1; pointer-events:none; }
+    opacity:0; z-index:1; pointer-events:none; transform-origin:center center; }
+  .tl-stage-view > img { transform-origin:center center; }
   .tl-stage-view video.tl-pv-on { opacity:1; z-index:2; }
   .tl-stage-view.tl-pv-hidden video { opacity:0; }
+  .tl-clip-transform-controls { margin:10px 0; padding:10px; display:grid; gap:8px; border:1px solid var(--line); border-radius:10px; background:var(--bg-input); }
+  .tl-clip-scale-row { display:grid; gap:5px; transition:opacity .14s var(--ease); }
+  .tl-clip-scale-row.disabled { opacity:.38; pointer-events:none; }
+  .tl-clip-transform-box { position:absolute; inset:9px; z-index:3; display:none; border:1px dashed rgba(167,255,131,.9); box-shadow:inset 0 0 0 1px rgba(8,12,9,.55); pointer-events:none; }
+  .tl-clip-transform-box.active { display:block; }
+  .tl-clip-transform-tag { position:absolute; left:8px; top:8px; padding:3px 6px; border-radius:5px; background:rgba(7,10,8,.78); color:var(--accent); font:800 9px/1.2 var(--mono); letter-spacing:.08em; }
+  .tl-clip-scale-handle { position:absolute; right:-8px; bottom:-8px; width:18px; height:18px; border-radius:50%; background:var(--accent); border:2px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,.45); cursor:nwse-resize; pointer-events:auto; touch-action:none; }
   .tl-preview-caption { position:absolute; left:7%; right:7%; top:72%; z-index:6; display:none; text-align:center; color:#fff; font-size:clamp(18px,3.1vh,31px); line-height:1.04; font-weight:950; letter-spacing:.02em; text-transform:uppercase; text-shadow:-2px -2px 0 #111,2px -2px 0 #111,-2px 2px 0 #111,2px 2px 0 #111,0 4px 8px rgba(0,0,0,.8); pointer-events:none; }
   .tl-overlay-layer { position:absolute; inset:0; z-index:4; pointer-events:none; }
   .tl-preview-overlay { position:absolute; transform:translate(-50%,-50%); pointer-events:auto; cursor:move; touch-action:none; color:#ed2f25; filter:drop-shadow(2px 2px 0 #fff) drop-shadow(3px 3px 0 #17150f); transform-origin:center; }
@@ -7794,6 +8119,17 @@ TIMELINE_ASSETS = """
     document.getElementById('tl-insp-speed').value=sp;
     var mixed=chosen.some(function(x){return Math.abs((x.speed||1)-sp)>.001;});
     document.getElementById('tl-insp-speed-val').textContent=mixed?('Mixed \u2192 '+sp.toFixed(2)+'x'):sp.toFixed(2)+'x';
+    var mirror=document.getElementById('tl-insp-mirror');
+    mirror.checked=!!s.timeline_mirror;
+    mirror.indeterminate=chosen.some(function(x){return !!x.timeline_mirror!==!!s.timeline_mirror;});
+    var scaleMode=document.getElementById('tl-insp-scale-mode'), scaleInput=document.getElementById('tl-insp-scale');
+    var scaleEnabled=!!s.timeline_free_scale, clipScale=Math.max(.5,Math.min(3,+(s.timeline_clip_scale||1)));
+    scaleMode.checked=scaleEnabled;
+    scaleMode.indeterminate=chosen.some(function(x){return !!x.timeline_free_scale!==scaleEnabled;});
+    scaleInput.value=clipScale; scaleInput.disabled=!scaleEnabled;
+    document.getElementById('tl-insp-scale-row').classList.toggle('disabled',!scaleEnabled);
+    var scaleMixed=chosen.some(function(x){return Math.abs(Math.max(.5,Math.min(3,+(x.timeline_clip_scale||1)))-clipScale)>.001;});
+    document.getElementById('tl-insp-scale-val').textContent=scaleMixed?('Mixed \u2192 '+Math.round(clipScale*100)+'%'):Math.round(clipScale*100)+'%';
     document.getElementById('tl-insp-remove').textContent=chosen.length>1?('Remove '+chosen.length+' clips'):'Remove clip';
     // in/out range slider - single selection only (a range is per-clip)
     syncRangeFromClip(chosen.length===1 ? s : null);
@@ -7955,6 +8291,24 @@ TIMELINE_ASSETS = """
     var chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1&&x.clip;});
     if(chosen.length){ chosen.forEach(function(s){ s.blur_captions=on; }); this.indeterminate=false; markDirty(); }
   });
+  document.getElementById('tl-insp-mirror').addEventListener('change', function(){
+    var on=this.checked, chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
+    if(chosen.length){ chosen.forEach(function(s){s.timeline_mirror=on;}); this.indeterminate=false;
+      if(typeof stop==='function'&&playing)stop(); if(activeSceneInfo)applyClipPreviewTransform(activeSceneInfo.scene); markDirty(); }
+  });
+  document.getElementById('tl-insp-scale-mode').addEventListener('change', function(){
+    var on=this.checked, chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
+    if(chosen.length){ chosen.forEach(function(s){s.timeline_free_scale=on;if(s.timeline_clip_scale==null)s.timeline_clip_scale=1;}); this.indeterminate=false;
+      var inp=document.getElementById('tl-insp-scale');inp.disabled=!on;document.getElementById('tl-insp-scale-row').classList.toggle('disabled',!on);
+      if(typeof stop==='function'&&playing)stop(); if(activeSceneInfo)applyClipPreviewTransform(activeSceneInfo.scene); markDirty(); }
+  });
+  document.getElementById('tl-insp-scale').addEventListener('input', function(){
+    var value=Math.max(.5,Math.min(3,parseFloat(this.value)||1));
+    var chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
+    if(chosen.length){ chosen.forEach(function(s){s.timeline_free_scale=true;s.timeline_clip_scale=value;});
+      document.getElementById('tl-insp-scale-mode').checked=true;document.getElementById('tl-insp-scale-val').textContent=Math.round(value*100)+'%';
+      if(typeof stop==='function'&&playing)stop(); if(activeSceneInfo)applyClipPreviewTransform(activeSceneInfo.scene); markDirty(); }
+  });
   document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); markDirty(); } });
   document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); markDirty(); } });
   document.getElementById('tl-fx-trim').addEventListener('change', function(){
@@ -8034,12 +8388,37 @@ TIMELINE_ASSETS = """
   document.getElementById('tl-ov-delete').addEventListener('click',deleteCurrentOverlay);
 
   var pimg=document.getElementById('tl-pimg'), pvid=document.getElementById('tl-pvid'), pempty=document.getElementById('tl-stage-empty'), pcaption=document.getElementById('tl-preview-caption');
+  var clipTransformBox=document.getElementById('tl-clip-transform-box'), clipScaleHandle=document.getElementById('tl-clip-scale-handle');
   // #playback - DOUBLE BUFFER: pvid = the video on screen, pvidB = a hidden twin that preloads the
   // NEXT clip while the current one plays, so crossing a clip boundary is an instant swap instead of
   // a load+decode-from-scratch hitch. The two references swap roles at every boundary.
   var pvidB=document.getElementById('tl-pvid2');
   function pvOnTop(el){ el.classList.add('tl-pv-on'); }
   function pvBehind(el){ el.classList.remove('tl-pv-on'); }
+  function applyClipPreviewTransform(scene){
+    var enabled=!!(scene&&scene.timeline_free_scale), scale=enabled?Math.max(.5,Math.min(3,+(scene.timeline_clip_scale||1))):1;
+    var mirror=!!(scene&&scene.timeline_mirror), transform='scale('+scale+') scaleX('+(mirror?-1:1)+')';
+    if(pvid)pvid.style.transform=transform;
+    if(pimg)pimg.style.transform=transform;
+    var selected=!!(scene&&sel&&sel.type==='clip'&&selectedClipIds.indexOf(scene.id)!==-1&&enabled);
+    if(clipTransformBox){clipTransformBox.classList.toggle('active',selected);clipTransformBox.setAttribute('aria-hidden',selected?'false':'true');}
+  }
+  if(clipScaleHandle)clipScaleHandle.addEventListener('pointerdown',function(ev){
+    ev.preventDefault();ev.stopPropagation();
+    var chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
+    if(!chosen.length)return;
+    if(typeof stop==='function'&&playing)stop();
+    var sx=ev.clientX,sy=ev.clientY,start=Math.max(.5,Math.min(3,+(chosen[0].timeline_clip_scale||1))),changed=false;
+    function mv(e){
+      var value=Math.max(.5,Math.min(3,start+(e.clientX-sx+e.clientY-sy)/210));changed=true;
+      chosen.forEach(function(s){s.timeline_free_scale=true;s.timeline_clip_scale=value;});
+      var input=document.getElementById('tl-insp-scale');if(input)input.value=value;
+      var out=document.getElementById('tl-insp-scale-val');if(out)out.textContent=Math.round(value*100)+'%';
+      if(activeSceneInfo)applyClipPreviewTransform(activeSceneInfo.scene);
+    }
+    function up(){document.removeEventListener('pointermove',mv);document.removeEventListener('pointerup',up);if(changed)markDirty();}
+    document.addEventListener('pointermove',mv);document.addEventListener('pointerup',up);
+  });
   function preloadClipInto(el, scene){
     // warm the buffer video with a scene's clip: load, seek to its start frame, hold paused
     if(!el) return;
@@ -8190,9 +8569,10 @@ TIMELINE_ASSETS = """
   pvidB.addEventListener('loadedmetadata', onPvMeta);
   function showScene(info, forceSync){
     renderPreviewCaption(clock);
-    if(!info){ pvBehind(pvid); pvBehind(pvidB); try{pvid.pause();pvidB.pause();}catch(e){} pimg.style.display='none'; pempty.style.display='block'; renderPreviewOverlays(null); activeSceneInfo=null; return; }
+    if(!info){ pvBehind(pvid); pvBehind(pvidB); try{pvid.pause();pvidB.pause();}catch(e){} pimg.style.display='none'; pempty.style.display='block'; renderPreviewOverlays(null); applyClipPreviewTransform(null); activeSceneInfo=null; return; }
     pempty.style.display='none';
     activeSceneInfo=info;
+    applyClipPreviewTransform(info.scene);
     renderPreviewOverlays(info.scene);
     var vis=visible(), nextScene=vis[info.idx+1];
     if(curIdx===info.idx){
@@ -8224,6 +8604,7 @@ TIMELINE_ASSETS = """
       preloadClipInto(pvidB, nextScene);   // warm the NEXT clip so its boundary is seamless too
     }
     else { try{pvid.pause();pvidB.pause();}catch(e){} pvBehind(pvid); pvBehind(pvidB); pimg.style.display='block'; pimg.src=s.poster||''; preloadClipInto(pvidB, nextScene); }
+    applyClipPreviewTransform(s);   // pvid may have swapped with the preload buffer above
   }
 
   // ---- sequence-mode AUDIO: voice + music tracks follow the clock; SFX and cut sounds
@@ -8469,7 +8850,7 @@ TIMELINE_ASSETS = """
   function collectEdits(){
     var vis=visible();
     return {
-      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined};}),
+      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, mirror:!!s.timeline_mirror, scale_enabled:!!s.timeline_free_scale, scale:+(+(s.timeline_clip_scale||1)).toFixed(3), source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined};}),
       order: vis.map(function(s){return s.id;}),
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
       added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
@@ -11327,6 +11708,10 @@ def timeline_model(slug):
             spd = max(0.5, min(2.0, float(scene.get("timeline_speed") or 1.0)))
         except (TypeError, ValueError):
             spd = 1.0
+        try:
+            clip_scale = max(0.5, min(3.0, float(scene.get("timeline_clip_scale", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            clip_scale = 1.0
         scene_id = str(scene.get("id", index))
         try:
             source_trim = pipeline.seedance_clip_start_trim(config, scene) if clip_url else 0.0
@@ -11356,6 +11741,9 @@ def timeline_model(slug):
             "start": round(start, 3),
             "speed": spd,
             "blur_captions": bool(scene.get("blur_captions")),
+            "timeline_mirror": bool(scene.get("timeline_mirror")),
+            "timeline_free_scale": bool(scene.get("timeline_free_scale")),
+            "timeline_clip_scale": round(clip_scale, 3),
             "source_speed": round(source_speed, 3),
             "source_trim": round(source_trim, 3),
             # #117 - full playable length of the underlying clip (0 = image / unknown). The editor
@@ -12640,6 +13028,10 @@ def job_status_payload(job_id):
         "media_html": render_media_replacer(job_id, job),
         # chat-shell extras (additive; the legacy job page ignores them)
         "job_kind": job.get("job_kind", "run"),
+        "clip_source": job.get("clip_source", ""),
+        "scrape_preview_allowed": bool(_scrape_preview_project_slug(job)),
+        "speech_review": bool(job.get("speech_review")),
+        "thumbnail_generation": bool(job.get("thumbnail_generation")),
         "project_slug": (Path(job["project_dir"]).name
                          if job.get("project_dir") and Path(job["project_dir"]).exists() else ""),
         "speech_audio_url": (link_for(Path(job["speech_audio"]))
@@ -12651,6 +13043,7 @@ def job_status_payload(job_id):
         "created_at": job.get("created_at") or 0,
         # clip-short skips the final render and hands off to the timeline editor
         "open_timeline": bool((job.get("result") or {}).get("open_timeline")) if isinstance(job.get("result"), dict) else False,
+        "open_longform_editor": bool((job.get("result") or {}).get("open_longform_editor")) if isinstance(job.get("result"), dict) else False,
     }
     # direct result-video link for the standalone /progress view (additive)
     _res = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -12731,6 +13124,27 @@ def _assigned_media_payload(job, cap=60):
     except Exception:
         return []
     return items
+
+
+def _scrape_preview_project_slug(job):
+    """Project allowed to consume the live scrape preview for this particular job."""
+    if not isinstance(job, dict):
+        return ""
+    if str(job.get("status") or "").lower() not in ("running", "cancelling"):
+        return ""
+    if str(job.get("job_kind") or "run").lower() not in ("", "run"):
+        return ""
+    project_dir = project_dir_for_job(job)
+    if not project_dir:
+        return ""
+    clip_source = str(job.get("clip_source") or "").lower()
+    if not clip_source:
+        try:
+            run_form = read_json_file(project_dir / "input" / "run_form.json") or {}
+            clip_source = str(run_form.get("clip_source") or "").lower()
+        except Exception:
+            return ""
+    return project_dir.name if clip_source == "scrape" else ""
 
 
 def music_list_payload():
@@ -13345,7 +13759,18 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/higgsfield-status":
             self.send_bytes(higgsfield_status_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/scrape-browser-status":
+            _preview_jid = q_all.get("job_id", [""])[0]
+            with JOB_LOCK:
+                _preview_job = dict(JOBS.get(_preview_jid, {}))
+            _preview_slug = _scrape_preview_project_slug(_preview_job)
             scrape_status = scrape_browser_preview.status()
+            # The preview service is process-wide, but its consumer is one concrete scrape job.
+            # Reject missing/non-scrape jobs and frames owned by another concurrently running
+            # project (the old behavior leaked Clip Short Chromium into longform processing).
+            if (not _preview_slug
+                    or str(scrape_status.get("owner_slug") or "") != _preview_slug):
+                scrape_status.update(available=False, platform="", query="", sort="",
+                                     last_accepted_path="", last_accepted_poster="")
             # An EMPTY last-accepted path must map to NO url. safe_requested_path("") resolves the
             # empty string to the project ROOT (which exists), so the old code returned a bogus
             # /file?path=…AutoShortsClaude url -> the chat shell thought a clip was accepted and
@@ -13364,7 +13789,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(json.dumps(scrape_status).encode("utf-8"),
                             "application/json; charset=utf-8")
         elif parsed.path == "/scrape-browser-preview":
-            shot = scrape_browser_preview.snapshot().get("jpeg") or b""
+            _preview_jid = q_all.get("job_id", [""])[0]
+            with JOB_LOCK:
+                _preview_job = dict(JOBS.get(_preview_jid, {}))
+            _preview_slug = _scrape_preview_project_slug(_preview_job)
+            _preview_state = scrape_browser_preview.snapshot()
+            shot = (_preview_state.get("jpeg") or b"") if (
+                _preview_slug and str(_preview_state.get("owner_slug") or "") == _preview_slug
+            ) else b""
             if not shot:
                 self.send_error(404)
             else:
@@ -13519,15 +13951,21 @@ class Handler(BaseHTTPRequestHandler):
                 body = ""
             topic = ""
             instructions = ""
+            format_mode = "standard"
+            token_limit = None
             try:
                 request_data = json.loads(body) or {}
                 topic = str(request_data.get("topic") or "")
                 instructions = str(request_data.get("instructions") or "")
+                format_mode = str(request_data.get("format_mode") or "standard")
+                token_limit = request_data.get("token_limit")
             except Exception:
                 topic = urllib.parse.parse_qs(body).get("topic", [""])[0]
                 instructions = urllib.parse.parse_qs(body).get("instructions", [""])[0]
             try:
-                result = agent_core.generate_viral_script(topic, instructions=instructions)
+                result = agent_core.generate_viral_script(
+                    topic, instructions=instructions, format_mode=format_mode,
+                    token_limit=token_limit)
                 self.send_bytes(json.dumps({"ok": True, **result}).encode("utf-8"),
                                 "application/json; charset=utf-8")
             except Exception as exc:  # noqa: BLE001
@@ -13570,6 +14008,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(json.dumps({"ok": ok}).encode("utf-8"),
                             "application/json; charset=utf-8")
             return
+        if parsed.path == "/longform-speech-review":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                payload = json.loads(body) if body else {}
+                result = start_longform_speech_review(str(payload.get("slug") or ""))
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)[:400]}
+            self.send_bytes(json.dumps(result).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/longform-frame-upload":
             # replace ONE frame of a finished longform run with an uploaded image
             content_type = self.headers.get("Content-Type", "")
@@ -13591,6 +14040,36 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             result = longform_frame_swap(data.get("slug"), data.get("a"), data.get("b"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-frame-use":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = longform_frame_use(data.get("slug"), data.get("rel_path"), data.get("idx"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-thumbnail-select":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = longform_thumbnail_select(data.get("slug"), data.get("index"))
+            self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/longform-thumbnail":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = start_longform_thumbnail_generation(data.get("slug"))
             self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
         if parsed.path == "/longform-rebuild":

@@ -26,6 +26,13 @@ def _tone_wav(path, duration=0.12, rate=44100):
 
 
 class HookBodyPauseTests(unittest.TestCase):
+    def test_smart_dash_in_marked_hook_still_splits(self):
+        script = "This machine looks abandoned—but it still cooks lunch. Then the door opens."
+        hook = "This machine looks abandoned—but it still cooks lunch."
+        split_hook, body = agent_core.split_hook_from_script(script, hook)
+        self.assertEqual(split_hook, "This machine looks abandoned-but it still cooks lunch.")
+        self.assertEqual(body, "Then the door opens.")
+
     def test_pause_is_mandatory_when_split_flag_is_off(self):
         ffmpeg = pipeline.find_ffmpeg()
         if not ffmpeg:

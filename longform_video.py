@@ -16,17 +16,19 @@ Stages (fully autonomous after Start):
                   a run whose generations ALL fail stops early instead of grinding out black
                   frames. A character-reference frame is generated FIRST. Files are named with
                   the timestamp AND the on-screen duration.
-  5. ASSEMBLY   - the reasoning model verifies every timestamp has an image; the video is cut
-                  image-by-image to the exact per-line duration (black frame where an image is
-                  missing) and muxed with the voiceover. The app's done-notification chimes.
+  5. REVIEW     - the run stops on a movable image/voiceover timeline with archived generations
+                   and three optional thumbnail/title choices. Assembly begins only after approval;
+                   the encoded video is checked for real black-screen spans before success.
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
+import concurrent.futures
 from pathlib import Path
 
 import agent_core
@@ -695,6 +697,9 @@ def finalize_speech_review_timing(out_dir, status_cb=None):
     write_transcript(new_lines, out_dir / "transcript.txt")
     if prompts:
         write_prompts_file(prompts, out_dir / f"image_prompts_{out_dir.name}.txt")
+    # Retime can expose empty slots even though suitable pictures are parked in audit/archive
+    # folders. Reuse those project-local assets immediately before declaring anything missing.
+    recover_archived_images(out_dir, status_cb=status_cb)
     natural_durations = line_durations(new_lines, new_duration)
     results = {}
     for idx, line in enumerate(new_lines):
@@ -870,7 +875,8 @@ def parse_prompt_batch(text):
     return out
 
 
-def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_event=None):
+def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_event=None,
+                           checkpoint_path=None):
     """Transcript lines -> one doodle prompt per line, via the STAGE-3 conversation.
     The app itself replies "next" until every timestamp is covered. Mapping is POSITIONAL
     (prompt N belongs to line N) with a timestamp sanity check. Raises on shortfall."""
@@ -880,9 +886,36 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
     transcript = "\n".join(f"{fmt_ts(l['start'])} {l['text']}" for l in lines)
     messages = [{"role": "system", "content": STAGE3_PROMPT},
                 {"role": "user", "content": transcript}]
-    prompts = []
+    checkpoint = Path(checkpoint_path) if checkpoint_path else None
+    prompts, resumed_checkpoint = [], False
+
+    def save_checkpoint():
+        if not checkpoint:
+            return
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"line_count": len(lines), "first_ts": fmt_ts(lines[0]["start"]),
+                   "last_ts": fmt_ts(lines[-1]["start"]), "prompts": prompts[:len(lines)]}
+        tmp = checkpoint.with_suffix(checkpoint.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(checkpoint)
+
+    if checkpoint and checkpoint.is_file():
+        try:
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if (int(saved.get("line_count") or 0) == len(lines)
+                    and saved.get("first_ts") == fmt_ts(lines[0]["start"])
+                    and saved.get("last_ts") == fmt_ts(lines[-1]["start"])
+                    and isinstance(saved.get("prompts"), list)):
+                prompts = [p for p in saved["prompts"] if isinstance(p, dict)
+                           and p.get("timestamp") and p.get("prompt")][:len(lines)]
+                resumed_checkpoint = bool(prompts)
+                if resumed_checkpoint:
+                    _log(status_cb, f"Image prompts: resumed {len(prompts)}/{len(lines)} from "
+                                    "the saved batch checkpoint.")
+        except Exception as exc:  # noqa: BLE001
+            _log(status_cb, f"Image prompt checkpoint was unreadable; starting fresh ({exc}).")
     max_rounds = (len(lines) // 20) + 4
-    for round_no in range(max_rounds):
+    for round_no in range(0 if resumed_checkpoint else max_rounds):
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Cancelled.")
         _log(status_cb, f"Image prompts: batch {round_no + 1} from {model} "
@@ -893,14 +926,63 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
         reply = data["choices"][0]["message"]["content"]
         batch = parse_prompt_batch(reply)
         if not batch:
-            raise LongformError(f"Prompt batch {round_no + 1} contained no parseable prompts.")
+            _log(status_cb, f"Prompt batch {round_no + 1} contained no parseable prompts; "
+                            "switching to missing-slot recovery.")
+            break
         prompts.extend(batch)
+        save_checkpoint()
         messages.append({"role": "assistant", "content": reply})
         if len(prompts) >= len(lines) or "all image prompts are now delivered" in reply.lower():
             break
         messages.append({"role": "user", "content": "next"})
-    if len(prompts) < len(lines):
-        raise LongformError(f"Only {len(prompts)}/{len(lines)} image prompts were generated.")
+    # A model sometimes announces "all delivered" two or three items early. Recover ONLY the
+    # missing tail in small exact batches instead of throwing away a 20-30 minute conversation.
+    recovery_round = 0
+    while len(prompts) < len(lines) and recovery_round < 3:
+        if cancel_event is not None and cancel_event.is_set():
+            raise pipeline.PipelineCancelled("Cancelled.")
+        missing = lines[len(prompts):min(len(lines), len(prompts) + 20)]
+        exact = "\n".join(f"{fmt_ts(line['start'])} {line['text']}" for line in missing)
+        _log(status_cb, f"Image prompts: recovering {len(missing)} missing slot(s) "
+                        f"({len(prompts)}/{len(lines)} saved)...")
+        try:
+            data = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content":
+                        "Generate exactly one 16:9 image prompt for every supplied timestamp. "
+                        "Output only lines in the form '[m:ss.s] prompt', chronological, no fence, "
+                        "no commentary. Every prompt must request a concrete hand-drawn 2D doodle "
+                        "scene with flat colors, bold black outlines, simple stick figures, an "
+                        "ALL-CAPS top caption derived from the narration, and explicitly: no "
+                        "photorealism, no 3D, no gradients, no shadows, no textures, no anime."},
+                    {"role": "user", "content": exact}],
+                "temperature": 0.35, "max_tokens": 5000,
+            }, timeout=300)
+            recovered = parse_prompt_batch(data["choices"][0]["message"]["content"])
+        except Exception as exc:  # noqa: BLE001
+            recovered = []
+            _log(status_cb, f"Missing-slot recovery attempt failed ({exc}).")
+        if recovered:
+            prompts.extend(recovered[:len(missing)])
+            save_checkpoint()
+        recovery_round += 1
+    # Last-resort deterministic prompts keep the project renderable even if the LLM repeatedly
+    # omits a line. They remain tied to the exact narration rather than duplicating random art.
+    while len(prompts) < len(lines):
+        idx = len(prompts)
+        line = lines[idx]
+        words = re.findall(r"[A-Za-z0-9]+", str(line.get("text") or ""))
+        caption = " ".join(words[:5]).upper() or f"SCENE {idx + 1}"
+        prompt = ("Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, "
+                  "slightly imperfect marker lines, one concrete visual metaphor for the narration "
+                  f"\"{str(line.get('text') or '')[:300]}\", simple expressive stick figures and "
+                  f"one clear focal object, bold black ALL CAPS text at the top reading \"{caption}\", "
+                  "clean 16:9 composition, no photorealism, no 3D, no gradients, no shadows, no "
+                  "textures, no realistic faces, no anime style.")
+        prompts.append({"timestamp": fmt_ts(line["start"]), "prompt": prompt})
+        _log(status_cb, f"Image prompts: built a safe local fallback for slot {idx + 1}.")
+        save_checkpoint()
     prompts = prompts[:len(lines)]
     mismatch = sum(1 for l, p in zip(lines, prompts) if p["timestamp"] != fmt_ts(l["start"]))
     if mismatch:
@@ -1281,7 +1363,7 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                 else:
                     results[idx] = None
                     _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
-                                    "- a black frame will be used.")
+                                    "- the render will stay blocked until it is restored.")
         # mid-run death: a whole round produced nothing while retriable images remain
         if produced == 0 and next_queue and fresh_ok == 0:
             raise LongformError(
@@ -1372,32 +1454,192 @@ def build_thumbnail_prompt(script, lines, reasoning_model=None, status_cb=None):
             f"\"{hook}\"{_THUMB_STYLE_TAIL}"), hook
 
 
+def build_thumbnail_concepts(script, lines, reasoning_model=None, status_cb=None):
+    """Return three deliberately different thumbnail concepts, each with its matching title."""
+    fallback_hook = _fallback_thumb_hook(script, lines)
+    clean = re.sub(r"\s+", " ", str(script or "")).strip()
+    fallback_title = (clean.split(".", 1)[0][:88].strip(" -:;,.") or "The Story You Never Knew")
+    concepts = [
+        {"hook": fallback_hook, "title": fallback_title,
+         "subject": "one shocked stick figure discovering the central contradiction, extreme reaction"},
+        {"hook": "HOW IS THIS REAL?", "title": f"The Strange Truth Behind {fallback_title}"[:96],
+         "subject": "two stick figures on opposite sides of the central conflict, one clear visual contrast"},
+        {"hook": "NOBODY EXPECTED THIS", "title": f"What Really Happened: {fallback_title}"[:96],
+         "subject": "one dramatic oversized object from the story with a tiny worried stick figure beside it"},
+    ]
+    if os.environ.get("WAVESPEED_API_KEY"):
+        try:
+            data = agent_core.post_json_url(agent_core.WAVESPEED_LLM_API, {
+                "model": str(reasoning_model or "anthropic/claude-opus-4.8"),
+                "messages": [
+                    {"role": "system", "content":
+                        "Create exactly 3 DISTINCT viral YouTube thumbnail concepts for a doodle "
+                        "explainer. Each concept needs a matching honest video title. The IMAGE is "
+                        "minimal: one focal scene, at most two characters, one unanswered visual "
+                        "question, no labels or written words. Vary the angle: (1) shock/reaction, "
+                        "(2) conflict/contrast, (3) mystery/object. Reply STRICT JSON: "
+                        "{\"variants\":[{\"hook\":\"short internal concept tag\",\"title\":\"specific "
+                        "compelling video title\",\"subject\":\"one concise curiosity-driven visual "
+                        "scene, no written text\"}, ...]}. Never spoil the answer."},
+                    {"role": "user", "content": "SCRIPT:\n" + clean[:5000]}],
+                "temperature": 0.9, "max_tokens": 650,
+                "response_format": {"type": "json_object"},
+            }, timeout=120)
+            parsed = agent_core.extract_json_object(data["choices"][0]["message"]["content"]) or {}
+            got = parsed.get("variants") or []
+            if isinstance(got, list) and len(got) >= 3:
+                normalized = []
+                for item in got[:3]:
+                    if not isinstance(item, dict):
+                        break
+                    hook = str(item.get("hook") or "").strip().upper()[:48]
+                    title = str(item.get("title") or "").strip()[:110]
+                    subject = str(item.get("subject") or "").strip()[:420]
+                    if not hook or not title or not subject:
+                        break
+                    normalized.append({"hook": hook, "title": title, "subject": subject})
+                if len(normalized) == 3:
+                    concepts = normalized
+        except Exception as exc:  # noqa: BLE001
+            _log(status_cb, f"Thumbnail concepts fell back to the script ({exc}).")
+    return concepts
+
+
+def thumbnail_variants(out_dir):
+    """Read healthy generated thumbnail variants and their paired titles."""
+    out_dir = Path(out_dir)
+    try:
+        meta = json.loads((out_dir / "thumbnail_variants.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    try:
+        selected = int(meta.get("selected") or 0) if isinstance(meta, dict) else 0
+    except (TypeError, ValueError):
+        selected = 0
+    result = []
+    for i, item in enumerate((meta.get("variants") or []) if isinstance(meta, dict) else []):
+        path = out_dir / str(item.get("file") or "")
+        if _image_done(path, "16:9"):
+            result.append({"index": i, "file": str(path.relative_to(out_dir)).replace("\\", "/"),
+                           "title": str(item.get("title") or ""),
+                           "hook": str(item.get("hook") or ""), "selected": i == selected})
+    return result
+
+
+def _generate_wavespeed_thumbnail(prompt, out_path, key, cancel_event=None,
+                                  status_cb=None, label="Thumbnail"):
+    """Generate one 16:9 doodle thumbnail with GPT Image 2.0 through WaveSpeed."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise pipeline.PipelineCancelled("Cancelled.")
+    model = "openai/gpt-image-2/text-to-image"
+    payload = {
+        "aspect_ratio": "16:9",
+        "enable_base64_output": False,
+        "enable_sync_mode": False,
+        "output_format": "png",
+        "prompt": str(prompt),
+        "quality": "medium",
+        "resolution": "1k",
+    }
+    response = pipeline.request_json(
+        "POST", f"{pipeline.API_BASE}/{model}", key, payload, timeout=240)
+    prediction_id = pipeline.unwrap_id(response)
+    outputs, _ = pipeline.poll_wavespeed(
+        prediction_id, key, timeout_s=600, interval_s=3,
+        cancel_event=cancel_event, status_cb=status_cb, label=label)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pipeline.download_file(outputs[0], out_path)
+    if not _image_done(out_path, "16:9"):
+        raise LongformError(f"{label} returned an invalid image.")
+    return str(out_path)
+
+
 def generate_thumbnail(out_dir, script, lines, reasoning_model=None, status_cb=None,
-                       cancel_event=None):
-    """Generate a dedicated click-thumbnail (thumbnail.png) for the longform video on the still-open
-    Higgsfield session. Reuses an existing thumbnail; never blocks the video if it fails."""
-    import higgsfield_login
+                       cancel_event=None, force=False):
+    """Generate exactly three GPT Image 2.0 thumbnail/title pairs through WaveSpeed."""
     out_dir = Path(out_dir)
     thumb = out_dir / "thumbnail.png"
-    if _image_done(thumb, "16:9"):
-        _log(status_cb, "Thumbnail already there - reusing it.")
+    existing = thumbnail_variants(out_dir)
+    if not force and len(existing) == 3 and _image_done(thumb, "16:9"):
+        _log(status_cb, "Three thumbnail variants already exist - reusing them.")
         return str(thumb)
     if cancel_event is not None and cancel_event.is_set():
         return None
-    prompt, hook = build_thumbnail_prompt(script, lines, reasoning_model=reasoning_model,
-                                          status_cb=status_cb)
-    _log(status_cb, f"Generating a click thumbnail (\"{hook}\")...")
+    key = pipeline.api_key()
+    concepts = build_thumbnail_concepts(script, lines, reasoning_model=reasoning_model,
+                                        status_cb=status_cb)
+    variants_dir = out_dir / "thumbnails"
+    variants_dir.mkdir(parents=True, exist_ok=True)
+    if force and any(variants_dir.glob("thumbnail_*.png")):
+        archive = variants_dir / ("archive_" + time.strftime("%Y%m%d_%H%M%S"))
+        archive.mkdir(parents=True, exist_ok=True)
+        for old in variants_dir.glob("thumbnail_*.png"):
+            try:
+                old.replace(archive / old.name)
+            except OSError:
+                pass
+    jobs = []
+    metadata = []
+    for i, concept in enumerate(concepts[:3]):
+        path = variants_dir / f"thumbnail_{i + 1}.png"
+        prompt = (f"{_THUMB_STYLE_HEAD}{concept['subject']}. One dominant focal point, at most two "
+                  "characters, one expressive face, one intriguing object or physical contrast, "
+                  "strong readable silhouette and generous clean negative space. Create curiosity "
+                  "without explaining the answer. NO text, NO letters, NO words, NO numbers, NO "
+                  "labels, NO split panels, NO infographic layout, NO repeated annotations, NO "
+                  f"circles or arrows.{_THUMB_STYLE_TAIL} Family-friendly, clean professional "
+                  "YouTube thumbnail composition.")
+        jobs.append((i, prompt, str(path)))
+        metadata.append({"file": str(path.relative_to(out_dir)).replace("\\", "/"),
+                         "title": concept["title"], "hook": concept["hook"]})
+    # Persist the three titles BEFORE any paid image request. A restart/cancel after 1-2 images
+    # must not erase the concepts or leave completed thumbnails with unknowable matching titles.
+    metadata_path = out_dir / "thumbnail_variants.json"
+    metadata_path.write_text(
+        json.dumps({"selected": 0, "complete": False, "variants": metadata},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    _log(status_cb, "Generating 3 thumbnail variants with matching titles...")
     try:
-        res = higgsfield_login.generate_shared_sync(prompt, str(thumb),
-                                                    timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb)
+        pending, res = list(jobs), {}
+        for attempt in range(3):
+            if not pending or (cancel_event and cancel_event.is_set()):
+                break
+            if attempt:
+                _log(status_cb, f"Retrying {len(pending)} missing thumbnail variant(s) "
+                                f"(attempt {attempt + 1}/3)...")
+            batch = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
+                futures = {
+                    pool.submit(_generate_wavespeed_thumbnail, prompt, path, key,
+                                cancel_event, status_cb, f"Thumbnail {i + 1}"): (i, path)
+                    for i, prompt, path in pending
+                }
+                for future, (i, path) in futures.items():
+                    try:
+                        batch[i] = future.result()
+                    except pipeline.PipelineCancelled:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        _log(status_cb, f"Thumbnail {i + 1} failed ({exc}).")
+                        batch[i] = None
+            res.update(batch)
+            pending = [(i, prompt, path) for i, prompt, path in pending
+                       if not (_image_done(path, "16:9") and res.get(i))]
     except Exception as exc:                # noqa: BLE001
         _log(status_cb, f"Thumbnail generation failed ({exc}).")
         return None
-    if isinstance(res, str) and _image_done(thumb, "16:9"):
-        _log(status_cb, "Thumbnail saved.")
-        return str(thumb)
-    _log(status_cb, "Thumbnail could not be generated - the first frame will be used instead.")
-    return None
+    healthy = [i for i, _prompt, path in jobs if _image_done(path, "16:9") and res.get(i)]
+    if len(healthy) != 3:
+        _log(status_cb, f"Thumbnail set incomplete ({len(healthy)}/3); generate again from the editor.")
+        return None
+    metadata_path.write_text(
+        json.dumps({"selected": 0, "complete": True, "variants": metadata},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    shutil.copy2(variants_dir / "thumbnail_1.png", thumb)
+    save_state(out_dir, thumbnail_title=metadata[0]["title"], thumbnail_selected=0)
+    _log(status_cb, "Three thumbnail variants saved. Variant 1 is selected for now.")
+    return str(thumb)
 
 
 # ------------------------------------------------------------------ 5) VERIFY + ASSEMBLE
@@ -1405,7 +1647,8 @@ def generate_thumbnail(out_dir, script, lines, reasoning_model=None, status_cb=N
 def verify_images(lines, results, reasoning_model=None, status_cb=None):
     """Deterministic completeness check + (when a key is present) the reasoning model confirms
     the timestamp->image mapping before assembly."""
-    missing = [i for i in range(len(lines)) if not results.get(i)]
+    missing = [i for i in range(len(lines))
+               if not results.get(i) or not _image_done(results.get(i), "16:9")]
     _log(status_cb, f"Coverage check: {len(lines) - len(missing)}/{len(lines)} timestamps have "
                     f"an image" + (f"; missing: {[i + 1 for i in missing]}" if missing else "."))
     if os.environ.get("WAVESPEED_API_KEY"):
@@ -1431,11 +1674,39 @@ def verify_images(lines, results, reasoning_model=None, status_cb=None):
     return missing
 
 
+def detect_black_segments(video_path, min_duration=0.15):
+    """Inspect the encoded video itself; timeline/file coverage alone cannot prove it has pixels."""
+    ffmpeg = pipeline.find_ffmpeg()
+    if not ffmpeg or not Path(video_path).is_file():
+        return []
+    run = subprocess.run(
+        [ffmpeg, "-hide_banner", "-v", "info", "-i", str(video_path),
+         "-vf", f"blackdetect=d={float(min_duration):.3f}:pix_th=0.10:pic_th=0.98",
+         "-an", "-f", "null", os.devnull],
+        capture_output=True, text=True, timeout=3600, check=False)
+    segments = []
+    for match in re.finditer(
+            r"black_start:([0-9.]+)\s+black_end:([0-9.]+)\s+black_duration:([0-9.]+)",
+            (run.stderr or "")):
+        segments.append({"start": round(float(match.group(1)), 3),
+                         "end": round(float(match.group(2)), 3),
+                         "duration": round(float(match.group(3)), 3)})
+    return segments
+
+
 def assemble_video(lines, durations, results, audio_path, out_path, status_cb=None):
-    """Cut every image to its exact duration (black screen where missing), concat, mux voice."""
+    """Cut every image to its exact duration, refusing missing or encoded-black scenes."""
     ffmpeg = pipeline.find_ffmpeg()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    missing = [i for i in range(len(lines))
+               if not results.get(i) or not _image_done(results.get(i), "16:9")]
+    if missing:
+        preview = ", ".join(f"#{i + 1} {fmt_ts(lines[i]['start'])}" for i in missing[:12])
+        more = f" (+{len(missing) - 12} more)" if len(missing) > 12 else ""
+        raise LongformError(
+            f"Refusing to render a video with {len(missing)} black/missing scene(s): "
+            f"{preview}{more}. Restore or regenerate these images first.")
     work = out_path.parent / "_assembly"
     work.mkdir(exist_ok=True)
     black = work / "black.png"
@@ -1467,6 +1738,12 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
         str(out_path)], capture_output=True, text=True, timeout=3600)
     if not out_path.exists() or out_path.stat().st_size < 10000:
         raise LongformError(f"Assembly failed: {(r.stderr or '')[-400:]}")
+    black = detect_black_segments(out_path)
+    if black:
+        spans = ", ".join(f"{item['start']:.2f}-{item['end']:.2f}s" for item in black[:8])
+        raise LongformError(
+            f"Rendered video contains {len(black)} detected black-screen segment(s): {spans}. "
+            "The file was kept for diagnosis but is not marked as a successful render.")
     _log(status_cb, f"Final longform video ready: {out_path}")
     return out_path
 
@@ -1568,14 +1845,13 @@ def audit_images(prompts, lines, durations, out_dir, results, status_cb=None):
 
 
 def reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=None):
-    """Give parked mis-attributed frames back to their RIGHTFUL timestamps.
+    """Give any archived frame back to its RIGHTFUL timestamp.
 
-    The stale-attribution cascade produced perfectly good images on the wrong slots; the audit
-    parks them in images/_mismatched_*/. Their on-image caption identifies where each one truly
-    belongs (the timestamp whose prompt wants exactly that caption), so instead of regenerating
-    ~everything we OCR each parked frame and move it onto a still-empty slot whose expected
-    caption it FULLY matches. Ambiguity (the same caption used by several timestamps) resolves
-    to the empty slot nearest the frame's original index - cascade shifts were local.
+    The stale-attribution cascade produced perfectly good images on the wrong slots. They may be
+    parked in ``_mismatched_*``, ``_wrongcontent_*`` or an older-format/archive folder. Their
+    on-image caption identifies where each one truly belongs, so search EVERY project-local
+    archive before spending money on regeneration. Ambiguity (the same caption used by several
+    timestamps) resolves to the empty slot nearest the frame's original index.
     Mutates `results` in place; returns the number of recovered frames."""
     ocr = _get_frame_ocr()
     if ocr is None:
@@ -1584,14 +1860,17 @@ def reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=N
     from PIL import Image
     out_dir = Path(out_dir)
     parked = []
-    for folder in sorted(out_dir.glob("_mismatched_*")):
-        parked.extend(p for p in folder.glob("img*.png"))
+    # Direct children are the live timeline. Only recurse through subdirectories, which are all
+    # project-local archives created by audits/format migrations. Never reach outside the project.
+    for folder in sorted(path for path in out_dir.iterdir() if path.is_dir()):
+        parked.extend(p for p in folder.rglob("img*.png") if _image_done(p, "16:9"))
     if not parked:
         return 0
     expected = {i: expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
                                     else prompts[i]) for i in range(len(prompts))}
     empty = {i for i in range(len(lines)) if not results.get(i) and expected.get(i)}
-    _log(status_cb, f"Re-assigning {len(parked)} parked frame(s) to their rightful timestamps...")
+    _log(status_cb, f"Searching {len(parked)} archived frame(s) across all project folders for "
+                    f"{len(empty)} missing timeline slot(s)...")
     recovered = 0
     for p in sorted(parked):
         m = re.match(r"img(\d{3})_", p.name)
@@ -1648,9 +1927,11 @@ def frames_from_disk(project_dir):
         name = f"{image_key(i, line, durations[i])}.png"
         path = project_dir / "images" / name
         frames.append({
-            "idx": i, "ts": fmt_ts(line["start"]), "dur": durations[i],
+            "idx": i, "start": round(float(line["start"]), 3),
+            "end": round(float(line["start"]) + float(durations[i]), 3),
+            "ts": fmt_ts(line["start"]), "dur": durations[i],
             "text": str(line.get("text") or ""), "file": name,
-            "exists": path.is_file() and path.stat().st_size > 1024,
+            "exists": _image_done(path, "16:9"),
         })
     return state, frames
 
@@ -1694,6 +1975,56 @@ def reconcile_image_names(project_dir, status_cb=None):
     return renamed
 
 
+def recover_archived_images(project_dir, status_cb=None):
+    """Fill empty current-timeline slots from suitable images anywhere in this project."""
+    project_dir = Path(project_dir)
+    try:
+        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    lines, prompts = state.get("lines") or [], state.get("prompts") or []
+    if not lines or len(prompts) != len(lines):
+        return 0
+    durations = line_durations(lines, float(state.get("audio_duration") or 0.0))
+    image_dir = project_dir / "images"
+    results = {}
+    for idx, line in enumerate(lines):
+        path = image_dir / f"{image_key(idx, line, durations[idx])}.png"
+        if _image_done(path, "16:9"):
+            results[idx] = str(path)
+    before = len(results)
+    if before == len(lines):
+        return 0
+    reassign_mismatched(prompts, lines, durations, image_dir, results, status_cb=status_cb)
+    recovered = len(results) - before
+    if recovered:
+        _log(status_cb, f"Recovered {recovered} missing frame(s) from existing project assets.")
+    # Some archived frames were parked precisely because their captions/content belong elsewhere;
+    # never force those back merely because the old index matches. For any slot still empty, hold
+    # the nearest VALID neighbouring timeline image instead. A coherent extended shot is an honest
+    # edit and far better than either unrelated art or a black frame. Copy rather than move so the
+    # neighbour remains intact and every duration-encoded filename stays independently editable.
+    stable_sources = dict(results)
+    held = 0
+    if stable_sources:
+        for idx in range(len(lines)):
+            if results.get(idx):
+                continue
+            source_idx = min(stable_sources, key=lambda candidate: abs(candidate - idx))
+            source = Path(stable_sources[source_idx])
+            target = image_dir / f"{image_key(idx, lines[idx], durations[idx])}.png"
+            try:
+                shutil.copy2(source, target)
+            except OSError:
+                continue
+            if _image_done(target, "16:9"):
+                results[idx] = str(target)
+                held += 1
+                _log(status_cb, f"Filled frame #{idx + 1} with a hold of nearby frame "
+                                f"#{source_idx + 1} (no generation, no black screen).")
+    return recovered + held
+
+
 def rebuild_from_disk(project_dir, status_cb=None):
     """Re-assemble the longform MP4 from whatever images are on disk right now (the post-run
     frame editor's Rebuild). The voiceover and line clock come from state.json untouched; images
@@ -1703,6 +2034,7 @@ def rebuild_from_disk(project_dir, status_cb=None):
     # a re-timed voiceover shifts every duration-encoded image name; re-anchor by index first so
     # the untouched pictures are not mistaken for missing (black) frames.
     reconcile_image_names(project_dir, status_cb=status_cb)
+    recover_archived_images(project_dir, status_cb=status_cb)
     state, frames = frames_from_disk(project_dir)
     if not state or not frames:
         raise LongformError("No resumable state in this project - nothing to rebuild.")
@@ -1732,7 +2064,9 @@ def rebuild_from_disk(project_dir, status_cb=None):
     write_timeline_manifest(lines, durations, results, audio_duration,
                             project_dir / "timeline.json",
                             voice_speed=state.get("voice_speed") or 1.0)
-    return assemble_video(lines, durations, results, voice_path, out, status_cb=status_cb)
+    rendered = assemble_video(lines, durations, results, voice_path, out, status_cb=status_cb)
+    save_state(project_dir, render_pending=False, last_video=Path(rendered).name)
+    return rendered
 
 
 # ------------------------------------------------------------------ ORCHESTRATOR
@@ -1868,11 +2202,14 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
             _log(status_cb, "Image prompts are an older format - regenerating all prompts in the "
                             "new caption style (and the images made from them).")
             _archive_old_images(out_dir / "images", status_cb)
+        prompt_checkpoint = out_dir / "image_prompts_checkpoint.json"
         prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
-                                         status_cb=status_cb, cancel_event=cancel_event)
+                                         status_cb=status_cb, cancel_event=cancel_event,
+                                         checkpoint_path=prompt_checkpoint)
         save_state(out_dir, script=script, lines=lines, prompts=prompts, tts_parts=tts_parts,
                    voice=voice or "", audio_duration=round(audio_duration, 3),
                    prompt_format=PROMPT_FORMAT_VERSION)
+        prompt_checkpoint.unlink(missing_ok=True)
     prompts_path = write_prompts_file(prompts, out_dir / f"image_prompts_{slug}.txt")
     _log(status_cb, f"Prompt file written: {prompts_path.name}")
 
@@ -1880,9 +2217,11 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     results = generate_images(prompts, lines, durations, out_dir / "images",
                               status_cb=status_cb, cancel_event=cancel_event)
 
-    # Dedicated click-thumbnail on the still-open Higgsfield session (before assembly closes it).
-    thumbnail = generate_thumbnail(out_dir, script, lines, reasoning_model=reasoning_model,
-                                   status_cb=status_cb, cancel_event=cancel_event)
+    # Thumbnail generation is user-triggered from the pre-render editor. It deliberately is not
+    # hidden inside the already long image run: the editor always exposes Generate thumbnails,
+    # and one click produces three title-paired options. Reuse a prior selection on resume.
+    thumbnail_path = out_dir / "thumbnail.png"
+    thumbnail = str(thumbnail_path) if _image_done(thumbnail_path, "16:9") else ""
 
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
     latest_state = load_state(out_dir, script) or {}
@@ -1892,14 +2231,17 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     timeline_path = write_timeline_manifest(
         lines, cut_durations, results, audio_duration, out_dir / "timeline.json",
         voice_speed=latest_state.get("voice_speed") or 1.0)
-    final = assemble_video(lines, cut_durations, results, voice_path,
-                           out_dir / f"{slug}.mp4", status_cb=status_cb)
+    # The first assembly is intentionally deferred. The creator must see and approve the real
+    # image/voiceover timeline first; rendering here used to lock mistakes into a slow MP4 before
+    # the user had any chance to move frames or recover unused generations.
+    save_state(out_dir, render_pending=True, reasoning_model=str(reasoning_model or ""))
     return {
-        "project_dir": str(out_dir), "video": str(final), "voiceover": str(voice_path),
+        "project_dir": str(out_dir), "voiceover": str(voice_path),
         "transcript": str(transcript_path), "prompts_file": str(prompts_path),
         "timeline": str(timeline_path),
         "images_done": sum(1 for v in results.values() if v), "images_total": len(lines),
         "missing_images": [fmt_ts(lines[i]["start"]) for i in missing],
         "tts_parts": tts_parts, "audio_duration": round(audio_duration, 2),
-        "thumbnail": thumbnail or "",
+        "thumbnail": thumbnail or "", "render_pending": True,
+        "open_longform_editor": True,
     }

@@ -3,12 +3,27 @@ import threading
 import time
 
 _LOCK = threading.Lock()
+_THREAD = threading.local()
 _STATE = {"jpeg": b"", "version": 0, "captured_at": 0.0, "platform": "",
-          "query": "", "sort": "", "accepted_version": 0,
+          "query": "", "sort": "", "owner_slug": "", "accepted_version": 0,
           "last_accepted_path": "", "last_accepted_platform": "",
           "last_accepted_query": "", "last_accepted_clip_id": "",
           "last_accepted_at": 0.0, "last_accepted_start": 0.0,
           "last_accepted_poster": ""}
+
+
+def set_owner(project_slug=""):
+    """Associate screenshots produced by this scraper thread with one project.
+
+    Scrape searches run in worker threads.  Keeping the owner thread-local prevents a
+    simultaneous longform/other job from accidentally claiming the globally newest browser
+    image in its own processing screen.
+    """
+    _THREAD.owner_slug = str(project_slug or "").strip()
+
+
+def _owner():
+    return str(getattr(_THREAD, "owner_slug", "") or "").strip()
 
 
 def capture(page, platform, query="", sort="", force=False):
@@ -24,7 +39,7 @@ def capture(page, platform, query="", sort="", force=False):
     with _LOCK:
         _STATE.update(jpeg=jpeg, version=int(_STATE["version"]) + 1,
                       captured_at=now, platform=str(platform or ""),
-                      query=str(query or ""), sort=str(sort or ""))
+                      query=str(query or ""), sort=str(sort or ""), owner_slug=_owner())
     return True
 
 
@@ -47,6 +62,7 @@ def mark_accepted(path, platform="", query="", clip_id="", start=0.0, poster="")
     with the video only as a best-effort enhancement."""
     with _LOCK:
         _STATE.update(
+            owner_slug=_owner(),
             accepted_version=int(_STATE["accepted_version"]) + 1,
             last_accepted_path=str(path or ""),
             last_accepted_platform=str(platform or ""),
@@ -61,7 +77,7 @@ def mark_accepted(path, platform="", query="", clip_id="", start=0.0, poster="")
 def clear():
     with _LOCK:
         _STATE.update(jpeg=b"", version=int(_STATE["version"]) + 1,
-                      captured_at=0.0, platform="", query="", sort="",
+                      captured_at=0.0, platform="", query="", sort="", owner_slug="",
                       accepted_version=int(_STATE["accepted_version"]) + 1,
                       last_accepted_path="", last_accepted_platform="",
                       last_accepted_query="", last_accepted_clip_id="",

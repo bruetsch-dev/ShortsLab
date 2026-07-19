@@ -296,6 +296,7 @@ RUN_MANIFEST = {
         "loaded_project_source", "loaded_project_mode", "reasoning_model", "reasoning_mode",
         "pipeline_version",
         "clip_source", "video_model", "image_model", "scraping_engine",
+        "clip_short_format", "script_token_limit",
         "scrape_platforms",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
@@ -532,6 +533,9 @@ def longform_projects_payload(active_project_slugs=()):
             continue                      # nothing to resume with, so nothing to offer
         video = next(iter(sorted(d.glob("*.mp4"))), None)
         images = sorted(d.glob("img*.png"))
+        _state, timed_frames = longform_video.frames_from_disk(d)
+        missing_frames = sum(1 for frame in timed_frames if not frame.get("exists"))
+        is_running = d.name in set(active_project_slugs or ())
         # the dedicated click-thumbnail wins over the first frame for the poster
         thumb = d / "thumbnail.png"
         poster = thumb if thumb.is_file() else (images[0] if images else None)
@@ -542,8 +546,8 @@ def longform_projects_payload(active_project_slugs=()):
             "edited": time.strftime("%Y-%m-%d %H:%M", time.localtime(app.project_edited_mtime(d))),
             # never "failed": an unfinished longform project is one waiting for you at a gate, and
             # its voiceover is reusable either way - a red overlay would just be wrong.
-            "failed": False,
-            "running": d.name in set(active_project_slugs or ()),
+            "failed": bool(video and missing_frames and not is_running),
+            "running": is_running,
             "hidden": False,
             "has_video": bool(video),
             "counters": {"web": 0, "gpt": len(images), "clips": 0},
@@ -557,10 +561,12 @@ def longform_projects_payload(active_project_slugs=()):
             "longform": True,
             "script": script,
             "tts_voice": str(state.get("voice") or ""),
-            "status": ("Done" if video else
+            "status": (f"Needs {missing_frames} missing frame(s)" if missing_frames else
+                       "Done" if video else
                        "Voiceover ready" if (d / "voiceover.wav").exists() else
                        "Voiceover in progress"),
             "images": len(images),
+            "missing_frames": missing_frames,
         })
     return out
 

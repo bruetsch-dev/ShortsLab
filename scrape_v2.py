@@ -248,6 +248,9 @@ class SegmentCandidate:
     caption_probability: float = 0.0
     black_bar_score: float = 0.0
     vertical_quality: float = 0.0
+    source_width: int = 0
+    source_height: int = 0
+    native_9_16: bool = False
     # semantics (filled by vision)
     semantic_score: float = 0.0
     visual_description: dict = field(default_factory=dict)
@@ -1291,6 +1294,17 @@ def _segment_caption_signals(frames_bgr):
     return round(best_prob, 2), text_heaviness, hard_over_subject
 
 
+def _is_native_9_16(width, height):
+    """Return True only for genuine portrait source media close to a 9:16 canvas."""
+    try:
+        width, height = int(width), int(height)
+    except (TypeError, ValueError):
+        return False
+    if width <= 0 or height <= width:
+        return False
+    return abs((width / float(height)) - (9.0 / 16.0)) <= 0.04
+
+
 def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     """Segment-level quality: sample frames INSIDE [start,end] only, run the reusable primitives,
     produce a soft quality_score. Hard-reject only genuinely unusable material. Returns the segment
@@ -1305,6 +1319,9 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
         seg.rejection_reasons = ["unreadable"]
         return seg
     w, h = dims
+    seg.source_width = int(w)
+    seg.source_height = int(h)
+    seg.native_9_16 = _is_native_9_16(w, h)
     vertical_quality = 0.0
     if h > 0 and w > 0:
         ratio = h / float(w)
@@ -2089,6 +2106,18 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
             rej["download_failed"] = rej.get("download_failed", 0) + 1
             continue
         state["downloaded_sources"] = state.get("downloaded_sources", 0) + 1
+        if state.get("native_vertical_only"):
+            dims = clip_scraper._probe_dims(got, ffprobe)
+            if not dims or not _is_native_9_16(*dims):
+                shown = f"{dims[0]}x{dims[1]}" if dims else "unknown dimensions"
+                rej["not_native_9_16"] = rej.get("not_native_9_16", 0) + 1
+                _log(status_cb, f"Scrape V2 Mini Story: rejected {src.platform} clip "
+                                f"{src.source_id} ({shown}); native 9:16 is required.")
+                try:
+                    Path(got).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
         segs = discover_segments_v2(src, got, ffmpeg, ffprobe, status_cb=status_cb)
         state["segments_discovered"] = state.get("segments_discovered", 0) + len(segs)
         kept = 0
@@ -2410,6 +2439,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     try:
         import scrape_browser_preview
         scrape_browser_preview.clear()
+        scrape_browser_preview.set_owner(Path(project_dir).name)
     except Exception:
         pass
     # Backend result order chosen by the user (default RELEVANCE = TikTok's topical order, which
@@ -2426,6 +2456,19 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         pass
     ffmpeg, ffprobe = clip_scraper._ffmpeg_tools()
     state = {"rejections": {}, "scene_reports": [], "_downloaded_ids": set()}
+
+    if str(config.get("clip_short_format") or "").lower() == "mini_story":
+        state["native_vertical_only"] = True
+        understanding = dict(understanding or {})
+        understanding.setdefault(
+            "editorial_format",
+            "Mini Story: one continuous real event with setup, escalation and payoff; never a listicle")
+        understanding.setdefault(
+            "footage_strategy",
+            "Prefer one source video or one tightly related event/location cluster for every scene; "
+            "generic topical filler is not acceptable. Use only native 9:16 source footage; never "
+            "crop, stack or pad landscape footage into a portrait canvas.")
+        _log(status_cb, "Scrape V2 Mini Story: coherent source clusters + native 9:16 only.")
 
     _log(status_cb, "Scrape V2: Visual scenes planning...")
     intents = build_viral_search_plan_v2(config.get("title") or "", script_text or "", scenes,
@@ -2938,6 +2981,9 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         sc["script_match_score"] = round(sem, 1)
         sc["black_bar_score"] = seg.black_bar_score
         sc["is_fake_vertical"] = False
+        sc["source_width"] = seg.source_width
+        sc["source_height"] = seg.source_height
+        sc["native_9_16"] = seg.native_9_16
         sc["assignment_type"] = atype
         sc["fallback_level"] = flevel
         if visual_role:
@@ -2966,7 +3012,9 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                             "platform": seg.platform, "clip_id": seg.source_id,
                             "source_query": seg.query, "likes": 0,
                             "black_bar_score": seg.black_bar_score, "text_heaviness": seg.text_heaviness,
-                            "semantic_score": sem, "assignment_type": atype}
+                            "semantic_score": sem, "assignment_type": atype,
+                            "source_width": seg.source_width, "source_height": seg.source_height,
+                            "native_9_16": seg.native_9_16}
         candidate_statuses.append({"clip_id": seg.source_id, "bucket_id": scene_bucket.get(scene_idx, ""),
                                    "source_query": seg.query, "tier": "v2_segment",
                                    "status": "assigned_to_scene", "reason": atype,

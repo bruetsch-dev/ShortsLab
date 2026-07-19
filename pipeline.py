@@ -16,7 +16,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 
 ROOT = Path(__file__).resolve().parent
@@ -3171,6 +3171,9 @@ def render_video(config, basename=None):
                     shot_index = None
             extra_zoom = opening_punch_zoom(config, t, local, scene_id == first_scene_id)
             use_clip_frame = scene_id in clips and (shot is None or bool(shot.get("use_clip", True)))
+            manual_scale = (max(0.5, min(3.0, float(scene.get("timeline_clip_scale", 1.0) or 1.0)))
+                            if bool(scene.get("timeline_free_scale")) else 1.0)
+            manual_mirror = bool(scene.get("timeline_mirror"))
             if use_clip_frame:
                 fx = scene.get("fx") or {}
                 source_time = local + clip_continuity_offsets.get(scene_id, 0.0)
@@ -3185,6 +3188,7 @@ def render_video(config, basename=None):
                     zoom_c = ss + (es - ss) * ease_in_out(clamp(local / scene_duration, 0.0, 1.0))
                 else:
                     zoom_c = 1.0 + extra_zoom
+                zoom_c *= manual_scale
                 acx = float(fx.get("anchor_cx", 0.5)); acy = float(fx.get("anchor_cy", 0.45))
                 ox = int((acx - 0.5) * width * 1.1)
                 oy = int((acy - 0.45) * height * 0.9)
@@ -3194,7 +3198,11 @@ def render_video(config, basename=None):
                     if fno < 6:
                         amp = 11.0 * (1.0 - fno / 6.0)
                         ox += int(amp * math.sin(frame_no * 2.3)); oy += int(amp * math.cos(frame_no * 1.9))
-                img = image_fit_cover(clips[scene_id].frame_trimmed(source_time, seedance_clip_start_trim(config, scene), hold_last=_hold_last), (width, height), zoom=zoom_c, offset=(ox, oy))
+                clip_frame = clips[scene_id].frame_trimmed(
+                    source_time, seedance_clip_start_trim(config, scene), hold_last=_hold_last)
+                if manual_mirror:
+                    clip_frame = ImageOps.mirror(clip_frame)
+                img = image_fit_cover(clip_frame, (width, height), zoom=zoom_c, offset=(ox, oy))
                 img = apply_cut_transition(img, fx.get("transition", "clean_cut"), local, fps, frame_no)
             else:
                 motion = dict(scene.get("motion", {}))
@@ -3217,10 +3225,13 @@ def render_video(config, basename=None):
                 base_asset = assets[scene_id]
                 if shot_index is not None and (scene_id, shot_index) in shot_assets:
                     base_asset = shot_assets[(scene_id, shot_index)]
+                if manual_mirror:
+                    base_asset = ImageOps.mirror(base_asset)
                 shot_asset_ref = (shot or {}).get("asset") or scene.get("asset")
                 if bool(config.get("gpt_static_stills_disabled", True)) and asset_is_gpt_image(config, asset_dir, shot_asset_ref):
                     base_asset = make_placeholder(scene, width, height)
                 fit_mode = (shot or {}).get("fit", scene.get("fit", "cover"))
+                zoom *= manual_scale
                 if fit_mode == "contain":
                     img = image_fit_contain(base_asset, (width, height), zoom=zoom, offset=offset)
                 else:

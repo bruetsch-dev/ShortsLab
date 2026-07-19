@@ -97,6 +97,8 @@ const DEFAULT_VALUES = () => {
   if (!v.vfx_amount) v.vfx_amount = "medium";
   if (st.add_visual_effects === undefined) v.add_visual_effects = true;   // arrows on by default
   if (!v.pipeline_version) v.pipeline_version = "v0.2";   // version chooser removed; always v0.2
+  if (!v.clip_short_format) v.clip_short_format = "standard";
+  if (!v.script_token_limit) v.script_token_limit = "";
   if (!v.speaker_name) v.speaker_name = "Narrator";
   v.loaded_project_mode = v.loaded_project_mode || "normal";
   v.loaded_project_source = "";
@@ -147,6 +149,11 @@ const FLOW_STEPS = {
 };
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
 function isVisualsFromScript() { return S.flow === "script" && !!S.values.visuals_from_script_mode; }
+function isMiniStory() { return isCultureFacts() && S.values.clip_short_format === "mini_story"; }
+function estimatedScriptTokens(text) {
+  const chunks = String(text || "").trim().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) || [];
+  return chunks.length;
+}
 function applyCultureFactsPreset() {
   S.values.culture_facts_mode = true;
   S.values.clip_source = "scrape";
@@ -160,6 +167,7 @@ function applyCultureFactsPreset() {
   S.values.out_video_clips = true;
 }
 function stepsFor(flow) {
+  if (flow === "script" && isCultureFacts()) return ["format", "script", "source", "reasoning", "outputs", "review"];
   return FLOW_STEPS[flow] || [];
 }
 function stepIndex(step) { return stepsFor(S.flow).indexOf(step); }
@@ -754,7 +762,7 @@ async function refreshPrototypeHomeData() {
       b.innerHTML = `<span class="proto-live-thumb">${protoIcon("activity")}</span><span class="proto-live-copy"><small>LIVE · ${esc(j.kind || "PRODUCTION")}</small>
         <b>${esc(j.project_slug || "Active production")}</b><em>${esc(j.last_log || j.status)}</em><i><span style="width:${progress}%"></span></i></span>
         <strong>${progress}%</strong>${protoIcon("arrow")}`;
-      b.addEventListener("click", () => startJob(j.id)); dock.appendChild(b);
+      b.addEventListener("click", () => startJob(j.id, j.kind)); dock.appendChild(b);
     });
   } catch (e) { if (dock) dock.hidden = true; }
 }
@@ -764,7 +772,11 @@ function selectMode(id) {
   S.flow = (culture || visualScript) ? "script" : id; S.completed = [];
   S.values.culture_facts_mode = culture;
   S.values.visuals_from_script_mode = visualScript;
-  if (culture) applyCultureFactsPreset();
+  if (culture) {
+    applyCultureFactsPreset();
+    S.values.clip_short_format = "standard";
+    S.values.script_token_limit = "";
+  }
   else if (id === "script" || visualScript) {
     S.values.clip_source = "generate";
     S.values.scraping_engine = "v2";
@@ -776,7 +788,31 @@ function selectMode(id) {
 /* ------------------------------------------------------------------ FLOW: A Video from a Script */
 function renderScriptFlow() {
   const done = (s) => S.completed.includes(s);
-  msgU(esc(T.mode_script_t));
+  msgU(esc(isCultureFacts() ? "Clip Short" : T.mode_script_t));
+
+  // Clip Short has two genuinely different editorial structures. Mini Story deliberately
+  // stays on one real event/source cluster instead of turning every sentence into unrelated
+  // filler. This choice is persisted into /run so pacing and Scrape V2 can honour it too.
+  if (isCultureFacts() && !done("format")) {
+    msgA("Choose the Clip Short structure that fits your idea.");
+    const c = card("clip-format-card");
+    const grid = el("div", "clip-format-grid");
+    const choose = (value) => {
+      S.values.clip_short_format = value;
+      S.values.script_token_limit = value === "mini_story" ? "130" : "";
+      completeStep("format", "script");
+    };
+    const standard = el("button", "clip-format-choice");
+    standard.innerHTML = `<small>MULTI-BEAT</small><strong>Fact Short</strong><span>Several facts or angles, matched with broader real footage.</span><em>100–140 words</em>`;
+    standard.addEventListener("click", () => choose("standard"));
+    const mini = el("button", "clip-format-choice mini");
+    mini.innerHTML = `<small>20–25 SECONDS</small><strong>Mini Story</strong><span>One real event, one coherent footage cluster, a fast hook and a clear payoff.</span><em>Native 9:16 only · maximum 130 tokens</em>`;
+    mini.addEventListener("click", () => choose("mini_story"));
+    grid.appendChild(standard); grid.appendChild(mini); c.appendChild(grid);
+    const foot = el("div", "card-foot");
+    foot.appendChild(btn(T.back, resetToMode, "ghost")); c.appendChild(foot);
+    setComposer("off"); return;
+  }
 
   // step: script
   msgA(esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
@@ -793,8 +829,19 @@ function renderScriptFlow() {
       // compact: grows with content but starts small and never dominates the card
       ta.style.height = Math.min(Math.max(150, ta.scrollHeight + 2), Math.round(window.innerHeight * .42)) + "px";
     };
-    ta.addEventListener("input", sizeScriptBox);
+    let tokenMeter = null;
+    const paintTokenMeter = () => {
+      if (!tokenMeter) return;
+      const count = estimatedScriptTokens(ta.value);
+      tokenMeter.textContent = `${count} / 130 estimated tokens`;
+      tokenMeter.classList.toggle("over", count > 130);
+    };
+    ta.addEventListener("input", () => { sizeScriptBox(); paintTokenMeter(); });
     requestAnimationFrame(sizeScriptBox);
+    if (isMiniStory()) {
+      tokenMeter = el("div", "script-token-meter");
+      c.appendChild(tokenMeter); paintTokenMeter();
+    }
     // Hook + impact-word are marked RIGHT HERE on the same script field (no separate step, so the
     // text can never desync). Select text in the box above, then Mark hook / Mark impact.
     {
@@ -861,10 +908,13 @@ function renderScriptFlow() {
             body: JSON.stringify({
               topic: ti.value.trim(),
               instructions: instructionInput.value.trim(),
+              format_mode: isMiniStory() ? "mini_story" : "standard",
+              token_limit: isMiniStory() ? 130 : null,
             }) });
           const d = await r.json();
           if (!d.ok) throw new Error(d.error || "no script");
           ta.value = d.script; S.values.script = d.script;
+          paintTokenMeter();
           S.values.hook_keywords = JSON.stringify(d.hook_keywords || []);
           S.values.hook_text = ""; S.values.impact_word = "";   // a new script invalidates the old marks
           persist();
@@ -890,7 +940,7 @@ function renderScriptFlow() {
               <span>${esc(it.preview)}</span>`;
             r.title = it.preview;
             r.addEventListener("click", () => {
-              ta.value = it.script; S.values.script = it.script; persist(); box.remove();
+              ta.value = it.script; S.values.script = it.script; paintTokenMeter(); persist(); box.remove();
             });
             box.appendChild(r);
           });
@@ -976,10 +1026,16 @@ function renderScriptFlow() {
       }
     }
     const foot = el("div", "card-foot");
+    if (isCultureFacts()) foot.appendChild(btn(T.back, () => editStep("format"), "ghost"));
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
       if (!v) { ta.focus(); return; }
+      if (isMiniStory() && estimatedScriptTokens(v) > 130) {
+        tokenMeter.classList.add("over");
+        tokenMeter.textContent = `${estimatedScriptTokens(v)} / 130 estimated tokens — shorten the script to continue`;
+        ta.focus(); return;
+      }
       S.values.script = v;
       if (S.values.hook_text && !v.includes(S.values.hook_text)) S.values.hook_text = "";
       if (S.values.impact_word && !v.toLowerCase().includes(S.values.impact_word.toLowerCase())) S.values.impact_word = "";
@@ -1651,6 +1707,29 @@ function renderLongformFlow() {
     msgU(esc(script.length > 220 ? script.slice(0, 220) + "…" : script), "script");
   } else if (S.step === "script" || !S.completed.includes("script")) {
     const c = card();
+    const existing = el("div", "lf-existing");
+    const existingBtn = btn("Open an existing Sketch Explainer", async () => {
+      existingBtn.disabled = true;
+      try {
+        const data = await jget("/projects-list");
+        const projects = (data.projects || []).filter(project => project.longform);
+        existing.innerHTML = "";
+        if (!projects.length) {
+          existing.appendChild(el("div", "card-note", "No existing Sketch Explainers yet."));
+        } else {
+          projects.forEach(project => {
+            const row = el("button", "lf-project-choice");
+            row.innerHTML = `<b>${esc(project.title || project.slug)}</b><span>${esc(project.status || "")}</span>`;
+            row.addEventListener("click", () => openLongformProject(project));
+            existing.appendChild(row);
+          });
+        }
+      } catch (error) {
+        existing.innerHTML = `<div class="card-note">${esc(String(error))}</div>`;
+      } finally { existingBtn.disabled = false; }
+    }, "ghost");
+    existing.appendChild(existingBtn);
+    c.appendChild(existing);
     const ta = el("textarea", "script-box");
     ta.placeholder = T.longform_script_ph; ta.rows = 12; ta.value = S.longform.script || "";
     ta.addEventListener("input", () => { S.longform.script = ta.value; persist(); });
@@ -1720,11 +1799,39 @@ function renderLongformFlow() {
     foot.appendChild(el("span", "spacer"));
     // a previously run project has frames on disk: let the user fix them without a new run
     if (S.projectSlug)
-      foot.appendChild(btn("🖼 Edit frames", () => openLongformFrameEditor(S.projectSlug), "ghost"));
+      foot.appendChild(btn("Generate 3 thumbnails + titles", generateLongformThumbnails, "secondary"));
+    if (S.projectSlug)
+      foot.appendChild(btn("View thumbnails + titles", () => openLongformThumbnailResults(S.projectSlug), "ghost"));
+    if (S.projectSlug)
+      foot.appendChild(btn("Open pre-render timeline", () => openLongformFrameEditor(S.projectSlug), "ghost"));
+    if (S.projectSlug)
+      foot.appendChild(btn("Review speech parts", reviewLongformSpeech, "ghost"));
     foot.appendChild(btn("🎬 " + T.create_longform, submitLongform, "primary review-cta"));
     c.appendChild(foot);
   }
   setComposer("off");
+}
+async function generateLongformThumbnails(ev) {
+  if (!S.projectSlug) return;
+  const trigger = ev && ev.currentTarget;
+  if (trigger) { trigger.disabled = true; trigger.textContent = "Starting 3 thumbnails..."; }
+  const data = await jpost("/longform-thumbnail", { slug: S.projectSlug });
+  if (data && data.ok && data.id) {
+    startJob(data.id);
+    return;
+  }
+  if (trigger) { trigger.disabled = false; trigger.textContent = "Generate 3 thumbnails + titles"; }
+  errorCard(T.err_generic, (data && data.error) || "Could not start thumbnail generation.");
+}
+async function reviewLongformSpeech() {
+  if (!S.projectSlug) return;
+  const data = await jpost("/longform-speech-review", { slug: S.projectSlug });
+  if (!data || !data.ok) {
+    errorCard(T.err_generic, (data && data.error) || "Could not open speech parts.");
+    return;
+  }
+  const jid = data.id || String(data.job || "").split("id=")[1];
+  if (jid) startJob(jid);
 }
 async function submitLongform() {
   const fd = new FormData();
@@ -1833,8 +1940,18 @@ async function continueProject(slug) {
 }
 
 /* ------------------------------------------------------------------ job experience */
-function startJob(jobId) {
+function startJob(jobId, jobKind) {
+  // Active jobs can be opened while the asset library is selected.  A job is a processing view,
+  // so always leave that library state first; otherwise renderAll() immediately returns from its
+  // assets branch and the click appears to have opened Projects & Assets instead of the job.
+  S.view = "chat";
   S.jobId = jobId; S.jobStatus = "running"; S.draft = false;
+  if (jobKind) {
+    S.jobKind = String(jobKind);
+    const flowForKind = { longform:"longform", sfx:"sfx", visual:"visual",
+      caption:"captions", viraltrans:"viraltrans", reddit:"reddit" };
+    S.flow = flowForKind[S.jobKind] || "script";
+  }
   announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = ""; lastAssignedKey = "";
   history.replaceState(null, "", "/job?id=" + encodeURIComponent(jobId));
   renderAll(); persist();
@@ -1936,22 +2053,32 @@ function renderJobSection() {
   // outputs / result container (appears below the box when the run completes)
   const owrap = el("div"); owrap.id = "job-out"; chat.appendChild(owrap);
   pollJob(); pollTimer = setInterval(pollJob, 2500);
-  pollScrapeBrowser(); scrapePreviewTimer=setInterval(pollScrapeBrowser,3000);
   setComposer("off");
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if(scrapePreviewTimer){clearInterval(scrapePreviewTimer);scrapePreviewTimer=null;} }
+
+function setScrapePreviewPolling(enabled) {
+  if (!enabled) {
+    if (scrapePreviewTimer) { clearInterval(scrapePreviewTimer); scrapePreviewTimer = null; }
+    const monitor=$("scrape-monitor"); if (monitor) monitor.hidden=true;
+    return;
+  }
+  if (scrapePreviewTimer) return;
+  pollScrapeBrowser();
+  scrapePreviewTimer=setInterval(pollScrapeBrowser,3000);
+}
 
 async function pollScrapeBrowser(){
   const monitor=$("scrape-monitor"),card=$("scrape-browser-card"),image=$("scrape-browser-image"),meta=$("scrape-browser-meta");
   const accepted=$("last-accepted-card"),video=$("last-accepted-video"),acceptedMeta=$("last-accepted-meta"),acceptedQuery=$("last-accepted-query"),empty=$("last-accepted-empty"),poster=$("last-accepted-poster");
   if(!card||!image)return;
   try{
-    const d=await jget('/scrape-browser-status');
+    const d=await jget('/scrape-browser-status?job_id='+encodeURIComponent(S.jobId||''));
     card.hidden=!d.available;
     if(monitor)monitor.hidden=!d.available&&!d.last_accepted_url;
     meta.textContent=[d.platform,d.query,d.sort].filter(Boolean).join(' · ');
     if(d.available&&String(image.dataset.version||'')!==String(d.version)){
-      image.dataset.version=String(d.version); image.src='/scrape-browser-preview?v='+encodeURIComponent(d.version);
+      image.dataset.version=String(d.version); image.src='/scrape-browser-preview?job_id='+encodeURIComponent(S.jobId||'')+'&v='+encodeURIComponent(d.version);
     }
     if(accepted){
       // Only reveal the "Last accepted" card ONCE a clip has actually been accepted - it used to
@@ -2068,6 +2195,52 @@ function loadVisibleAssigned(grid) {
   grid.querySelectorAll(".am-tile").forEach(t => io.observe(t));
 }
 
+function speechPartsWaveform(parts) {
+  const timeline = el("div", "lf-waveform");
+  timeline.setAttribute("aria-label", "Voiceover loudness timeline");
+  const player = el("audio", "lf-wave-player"); player.controls = true;
+  const strip = el("div", "lf-wave-strip");
+  const total = Math.max(0.01, parts.reduce((sum, part) => sum + (+part.dur || 0), 0));
+  parts.forEach((part, order) => {
+    const segment = el("button", "lf-wave-segment");
+    segment.type = "button";
+    segment.style.flexGrow = String(Math.max(0.5, +part.dur || 0));
+    segment.title = `Part ${order + 1} · ${clock(+part.dur || 0)}`;
+    segment.setAttribute("aria-label", segment.title);
+    const canvas = document.createElement("canvas"); canvas.width = 320; canvas.height = 64;
+    segment.appendChild(canvas);
+    segment.appendChild(el("span", "lf-wave-number", String(order + 1)));
+    segment.addEventListener("click", () => {
+      strip.querySelectorAll(".lf-wave-segment").forEach(node => node.classList.remove("playing"));
+      segment.classList.add("playing"); player.src = part.url || "";
+      player.play().catch(() => {});
+    });
+    strip.appendChild(segment);
+    if (!part.url) return;
+    fetch(part.url).then(response => response.arrayBuffer()).then(buffer => {
+      const Context = window.AudioContext || window.webkitAudioContext;
+      if (!Context) return null;
+      const context = new Context();
+      return context.decodeAudioData(buffer.slice(0)).finally(() => context.close());
+    }).then(audio => {
+      if (!audio) return;
+      const data = audio.getChannelData(0), ctx = canvas.getContext("2d");
+      const buckets = canvas.width, step = Math.max(1, Math.floor(data.length / buckets));
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = part.state === "approved" ? "#8dfc68" : "#6fdc55";
+      for (let x = 0; x < buckets; x++) {
+        let peak = 0, start = x * step, stop = Math.min(data.length, start + step);
+        for (let i = start; i < stop; i++) peak = Math.max(peak, Math.abs(data[i]));
+        const h = Math.max(1, Math.pow(peak, .72) * (canvas.height - 8));
+        ctx.fillRect(x, (canvas.height - h) / 2, 1, h);
+      }
+    }).catch(() => { segment.classList.add("wave-unavailable"); });
+  });
+  player.addEventListener("ended", () => strip.querySelectorAll(".playing").forEach(n => n.classList.remove("playing")));
+  timeline.appendChild(strip); timeline.appendChild(player);
+  return timeline;
+}
+
 async function pollJob() {
   if (!S.jobId) return;
   let d;
@@ -2080,6 +2253,11 @@ async function pollJob() {
   const kindTitle = $("job-kind-title");
   if (kindTitle) kindTitle.textContent = d.job_kind === "longform"
     ? "Creating your longform video" : "Creating your Short";
+  S.jobKind = d.job_kind || "run";
+  // The live Chromium image belongs only to a running scrape Clip Short.  It used to poll a
+  // process-global endpoint from every processing screen, so a concurrent longform displayed the
+  // other run's TikTok/X browser.  The server also verifies the project owner for this job id.
+  setScrapePreviewPolling(!!d.scrape_preview_allowed);
   if (d.status !== S.jobStatus) {
     const prev = S.jobStatus;
     S.jobStatus = d.status; renderTopbar(); persist();
@@ -2129,6 +2307,7 @@ async function pollJob() {
           ev => runAll("decline", ev.currentTarget), "danger"));
       }
       c.appendChild(head);
+      c.appendChild(speechPartsWaveform(d.lf_parts || []));
       (d.lf_parts || []).forEach(p => {
         const row = el("div", "lf-part");
         row.appendChild(el("div", "card-cap", esc(T.lf_part) + " " + (p.index + 1) +
@@ -2252,7 +2431,27 @@ async function pollJob() {
       const fin = el("div"); fin.id = "job-final"; chat.appendChild(fin);
       if (d.status === "done") {
         // clip-short skips the final render and jumps straight into the timeline editor
-        if (d.open_timeline && d.project_slug) {
+        if (d.speech_review) {
+          const c = el("div", "chat-card"); fin.appendChild(c);
+          c.appendChild(el("h3", "", "Speech parts saved"));
+          c.appendChild(el("div", "card-note",
+            "The regenerated narration was transcribed again. Image-switch timings, image filenames and the timeline now follow the new speech."));
+          const foot = el("div", "card-foot"); foot.appendChild(el("span", "spacer"));
+          foot.appendChild(btn("Back to project", () => {
+            S.jobId = null; S.jobStatus = ""; renderAll(); persist();
+          }, "primary"));
+          c.appendChild(foot);
+        } else if (d.thumbnail_generation && d.project_slug) {
+          const m = el("div", "msg assistant");
+          m.appendChild(el("div", "bubble", "Three thumbnail and title options are ready."));
+          fin.appendChild(m); scrollDown();
+          setTimeout(() => openLongformThumbnailResults(d.project_slug), 350);
+        } else if (d.open_longform_editor && d.project_slug) {
+          const m = el("div", "msg assistant");
+          m.appendChild(el("div", "bubble", "All images are ready - opening the pre-render timeline before rendering..."));
+          fin.appendChild(m); scrollDown();
+          setTimeout(() => openLongformFrameEditor(d.project_slug), 500);
+        } else if (d.open_timeline && d.project_slug) {
           const m = el("div", "msg assistant");
           m.appendChild(el("div", "bubble", "✓ Your edit is ready — opening the timeline editor…"));
           fin.appendChild(m); scrollDown();
@@ -2302,11 +2501,13 @@ function renderResultCard(container, d) {
     const name = (raw.split(/[\\/]/).pop()) || "short.mp4";
     side.appendChild(btn("⬇ " + T.download, (ev) => downloadVideo(fileUrl, raw, name, ev.currentTarget), "primary"));
   }
+  if (d.job_kind === "longform" && d.project_slug)
+    renderLongformPostRender(c, d.project_slug);
   jget("/jobs-list").then(dd => {
     const j = (dd.jobs || []).find(x => x.id === S.jobId);
     if (!j || !j.project_slug) return;
     if ((j.kind || d.job_kind) === "longform")
-      side.appendChild(btn("🖼 Edit frames", () => openLongformFrameEditor(j.project_slug), "secondary"));
+      side.appendChild(btn("Open timeline", () => openLongformFrameEditor(j.project_slug), "secondary"));
     else
       side.appendChild(linkBtn("🎞 " + T.open_timeline, "/timeline?slug=" + encodeURIComponent(j.project_slug)));
   }).catch(() => {});
@@ -2314,8 +2515,268 @@ function renderResultCard(container, d) {
   side.appendChild(btn(T.nav_assets, () => showAssets(false), "ghost"));
 }
 
-/* ---------------------------------------------------- longform post-run frame editor */
+async function renderLongformPostRender(card, slug) {
+  let panel = card.querySelector(".lf-postrender");
+  if (!panel) { panel = el("section", "lf-postrender"); card.appendChild(panel); }
+  panel.innerHTML = `<div class="lf-postrender-head"><div><span>THUMBNAILS</span><h3>Choose the packaging</h3></div><p>One focused image, one matching video title.</p></div><div class="lf-postrender-loading">Loading thumbnail options...</div>`;
+  let data;
+  try { data = await jget("/longform-frames?slug=" + encodeURIComponent(slug)); } catch (e) { data = null; }
+  if (!data || !data.ok) { panel.querySelector(".lf-postrender-loading").textContent = "Could not load thumbnail options."; return; }
+  const loading = panel.querySelector(".lf-postrender-loading"); if (loading) loading.remove();
+  const grid = el("div", "lf-postrender-grid"); panel.appendChild(grid);
+  const variants = data.thumbnails || [];
+  if (!variants.length) {
+    const empty = el("div", "lf-empty-state", "No thumbnail set exists for this render yet.");
+    empty.appendChild(btn("Generate 3 thumbnails + titles", async ev => {
+      ev.currentTarget.disabled = true; const r = await jpost("/longform-thumbnail", {slug});
+      if (r && r.ok && r.id) startJob(r.id); else errorCard(T.err_generic, (r && r.error) || "Could not start generation.");
+    }, "secondary small")); panel.appendChild(empty); return;
+  }
+  variants.forEach(t => {
+    const option = el("article", "lf-postrender-option" + (t.selected ? " selected" : ""));
+    const image = el("img"); image.src=t.img; image.alt="Thumbnail option " + (t.index+1); option.appendChild(image);
+    const copy = el("div"); option.appendChild(copy);
+    if(t.selected) copy.appendChild(el("span","lf-selected-pill","SELECTED"));
+    copy.appendChild(el("h4","",esc(t.title||"Untitled video")));
+    if(!t.selected) copy.appendChild(btn("Use this pair",async ev=>{
+      ev.currentTarget.disabled=true; const r=await jpost("/longform-thumbnail-select",{slug,index:t.index});
+      if(!r||!r.ok){ev.currentTarget.disabled=false;errorCard(T.err_generic,(r&&r.error)||"Selection failed.");return;}
+      renderLongformPostRender(card,slug);
+    },"ghost small"));
+    grid.appendChild(option);
+  });
+}
+
+/* ---------------------------------------------------- generated thumbnail/title results */
+async function openLongformThumbnailResults(slug) {
+  document.querySelectorAll(".lf-thumbnail-results,.lf-frame-editor").forEach(x => x.remove());
+  let data;
+  try { data = await jget("/longform-frames?slug=" + encodeURIComponent(slug)); } catch (e) { data = null; }
+  if (!data || !data.ok) { errorCard(T.err_generic, (data && data.error) || "Could not load thumbnails."); return; }
+  const root = el("div", "chat-card lf-thumbnail-results"); chat.appendChild(root);
+  const head = el("div", "lf-editor-head"); root.appendChild(head);
+  const copy = el("div"); head.appendChild(copy);
+  copy.appendChild(el("div", "lf-eyebrow", "THUMBNAIL RESULTS"));
+  copy.appendChild(el("h2", "", "Choose your thumbnail + title"));
+  copy.appendChild(el("p", "", "All three GPT Image 2.0 results are shown with the title created specifically for that concept."));
+  head.appendChild(btn("Close", () => root.remove(), "ghost small"));
+  const list = el("div", "lf-thumbnail-options lf-results-grid"); root.appendChild(list);
+  const variants = data.thumbnails || [];
+  if (!variants.length) {
+    list.appendChild(el("div", "lf-empty-state", "No completed thumbnail variants were found."));
+  } else variants.forEach(t => {
+    const card = el("article", "lf-thumbnail-card" + (t.selected ? " selected" : ""));
+    const image = el("img"); image.src = t.img + (t.img.includes("?") ? "&" : "?") + "v=" + Date.now();
+    image.alt = "Thumbnail option " + (t.index + 1); card.appendChild(image);
+    const body = el("div", "lf-thumbnail-copy"); card.appendChild(body);
+    body.appendChild(el("span", "lf-option-label", t.selected ? "SELECTED" : "OPTION " + (t.index + 1)));
+    body.appendChild(el("h4", "", esc(t.title || "Untitled concept")));
+    if (!t.selected) body.appendChild(btn("Use this thumbnail + title", async ev => {
+      ev.currentTarget.disabled = true;
+      const result = await jpost("/longform-thumbnail-select", {slug:data.slug,index:t.index});
+      if (!result || !result.ok) { ev.currentTarget.disabled = false; errorCard(T.err_generic, (result && result.error) || "Selection failed."); return; }
+      root.remove(); openLongformThumbnailResults(data.slug);
+    }, "primary small"));
+    card.appendChild(body); list.appendChild(card);
+  });
+  const foot = el("div", "card-foot lf-results-foot");
+  foot.appendChild(btn("Generate 3 new options", async ev => {
+    ev.currentTarget.disabled = true;
+    const result = await jpost("/longform-thumbnail", {slug:data.slug});
+    if (result && result.ok && result.id) { root.remove(); startJob(result.id); }
+    else { ev.currentTarget.disabled = false; errorCard(T.err_generic, (result && result.error) || "Could not start generation."); }
+  }, "secondary"));
+  foot.appendChild(el("span", "spacer"));
+  foot.appendChild(btn("Open timeline", () => { root.remove(); openLongformFrameEditor(data.slug); }, "primary"));
+  root.appendChild(foot);
+  requestAnimationFrame(() => root.scrollIntoView({behavior:REDUCED ? "auto" : "smooth", block:"start"}));
+}
+
+/* ---------------------------------------------------- Sketch Explainer pre-render timeline */
+async function openLongformPreRenderEditor(slug) {
+  document.querySelectorAll(".lf-frame-editor").forEach(x => x.remove());
+  let data;
+  try { data = await jget("/longform-frames?slug=" + encodeURIComponent(slug)); } catch (e) { data = null; }
+  if (!data || !data.ok) { errorCard(T.err_generic, (data && data.error) || "Could not load the timeline."); return; }
+  const root = el("div", "chat-card lf-frame-editor lf-prerender"); chat.appendChild(root);
+  const head = el("div", "lf-editor-head"); root.appendChild(head);
+  const hc = el("div"); head.appendChild(hc);
+  hc.appendChild(el("div", "lf-eyebrow", "PRE-RENDER REVIEW"));
+  hc.appendChild(el("h2", "", "Shape the final Sketch Explainer"));
+  hc.appendChild(el("p", "", "Move images against the fixed narration, recover unused generations and choose the thumbnail before rendering."));
+  head.appendChild(btn("Close", () => root.remove(), "ghost small"));
+  const thumbs = el("section", "lf-section lf-thumbnail-section"); root.appendChild(thumbs);
+  const timeline = el("section", "lf-section lf-timeline-section"); root.appendChild(timeline);
+  const unused = el("section", "lf-section lf-unused-section"); root.appendChild(unused);
+  const audio = el("audio", "lf-voice-player"); audio.controls = true; audio.preload = "metadata";
+  let swapFrom = null, armedUnused = null, selectedFrame = 0, timelineScale = 28;
+
+  async function refresh() {
+    const next = await jget("/longform-frames?slug=" + encodeURIComponent(data.slug));
+    if (next && next.ok) { data = next; paintAll(); }
+  }
+  async function place(payload, idx) {
+    let r = null;
+    if (payload.kind === "unused") r = await jpost("/longform-frame-use", { slug: data.slug, rel_path: payload.rel_path, idx });
+    if (payload.kind === "frame" && Number(payload.idx) !== Number(idx))
+      r = await jpost("/longform-frame-swap", { slug: data.slug, a: payload.idx, b: idx });
+    swapFrom = null; armedUnused = null;
+    if (r && !r.ok) errorCard(T.err_generic, r.error || "Could not move the image.");
+    await refresh();
+  }
+  function sectionHead(title, note, aside) {
+    const bar = el("div", "lf-section-head"), copy = el("div");
+    copy.appendChild(el("h3", "", title)); copy.appendChild(el("p", "", note)); bar.appendChild(copy);
+    if (aside) bar.appendChild(aside); return bar;
+  }
+  function paintThumbs() {
+    thumbs.innerHTML = "";
+    const gen = btn((data.thumbnails || []).length ? "Generate new thumbnails" : "Generate thumbnails", async ev => {
+      ev.currentTarget.disabled = true;
+      const r = await jpost("/longform-thumbnail", { slug: data.slug });
+      if (r && r.ok && r.id) { root.remove(); startJob(r.id); }
+      else { ev.currentTarget.disabled = false; errorCard(T.err_generic, (r && r.error) || "Thumbnail generation failed."); }
+    }, "secondary");
+    thumbs.appendChild(sectionHead("Thumbnail + title", "Every generation creates three distinct image/title pairs.", gen));
+    const list = el("div", "lf-thumbnail-options"); thumbs.appendChild(list);
+    if (!(data.thumbnails || []).length) {
+      list.appendChild(el("div", "lf-empty-state", "No thumbnail set yet. Generate three options before rendering.")); return;
+    }
+    data.thumbnails.forEach(t => {
+      const card = el("article", "lf-thumbnail-card" + (t.selected ? " selected" : ""));
+      const im = el("img"); im.src = t.img; im.alt = "Thumbnail option " + (t.index + 1); im.loading = "lazy"; card.appendChild(im);
+      const body = el("div", "lf-thumbnail-copy"); card.appendChild(body);
+      body.appendChild(el("span", "lf-option-label", t.selected ? "SELECTED" : "OPTION " + (t.index + 1)));
+      body.appendChild(el("h4", "", esc(t.title || "Untitled concept")));
+      if (!t.selected) body.appendChild(btn("Use thumbnail + title", async ev => {
+        ev.currentTarget.disabled = true;
+        const r = await jpost("/longform-thumbnail-select", { slug: data.slug, index: t.index });
+        if (!r || !r.ok) errorCard(T.err_generic, (r && r.error) || "Selection failed."); await refresh();
+      }, "ghost small"));
+      list.appendChild(card);
+    });
+  }
+  function paintTimeline() {
+    timeline.innerHTML = "";
+    const frames = data.frames || [];
+    if (!frames.length) { timeline.appendChild(el("div", "lf-empty-state", "No timed images available.")); return; }
+    if (!frames.some(f => f.idx === selectedFrame)) selectedFrame = frames[0].idx;
+    const chosen = () => frames.find(f => f.idx === selectedFrame) || frames[0];
+    const count = el("span", "lf-duration", `${frames.length} images / ${Number(data.audio_duration || 0).toFixed(1)}s`);
+    timeline.appendChild(sectionHead("Timeline", "The same time scale controls both tracks; clip width now represents its real duration.", count));
+
+    const workspace = el("div", "lf-nle-workspace"); timeline.appendChild(workspace);
+    const preview = el("div", "lf-nle-preview"); workspace.appendChild(preview);
+    const previewImg = el("img"); previewImg.alt = "Selected timeline image"; preview.appendChild(previewImg);
+    const previewEmpty = el("span", "lf-preview-empty", "MISSING IMAGE"); preview.appendChild(previewEmpty);
+    const previewTime = el("span", "lf-preview-time"); preview.appendChild(previewTime);
+    const inspector = el("div", "lf-nle-inspector"); workspace.appendChild(inspector);
+    inspector.appendChild(el("div", "lf-eyebrow", "SELECTED IMAGE"));
+    const selectedTitle = el("h4"); inspector.appendChild(selectedTitle);
+    const selectedLine = el("p", "lf-selected-line"); inspector.appendChild(selectedLine);
+    const selectedActions = el("div", "lf-selected-actions"); inspector.appendChild(selectedActions);
+    const listenBtn = btn("Play from here", () => { const f=chosen(); audio.currentTime=Number(f.start||0); audio.play().catch(()=>{}); }, "secondary small");
+    const replaceBtn = btn("Replace image", () => { const f=chosen(); pickFile("image/*", async file => {
+      const fd=new FormData(); fd.append("slug",data.slug); fd.append("idx",String(f.idx)); fd.append("file",file,file.name);
+      const r=await (await fetch("/longform-frame-upload",{method:"POST",body:fd})).json();
+      if(!r.ok) errorCard(T.err_generic,r.error||"Upload failed."); await refresh();
+    }); }, "ghost small");
+    const moveBtn = btn("Move / swap", () => { swapFrom=chosen().idx; armedUnused=null; paintTimeline(); }, "ghost small");
+    selectedActions.appendChild(listenBtn); selectedActions.appendChild(replaceBtn); selectedActions.appendChild(moveBtn);
+    if (data.voiceover) { audio.src = data.voiceover; inspector.appendChild(audio); }
+    else inspector.appendChild(el("div", "lf-empty-inline", "Voiceover unavailable"));
+
+    const updatePreview = f => {
+      if (!f) return;
+      selectedFrame=f.idx; previewImg.hidden=!f.exists; previewEmpty.hidden=!!f.exists;
+      if(f.exists) previewImg.src=f.img+(f.img.includes("?")?"&":"?")+"v="+Date.now();
+      previewTime.textContent=`${f.ts} / ${Number(f.dur||0).toFixed(1)}s`;
+      selectedTitle.textContent=`Image ${f.idx+1}`; selectedLine.textContent=f.text||"No voiceover line";
+    };
+    updatePreview(chosen());
+
+    const tools = el("div", "lf-nle-toolbar"); timeline.appendChild(tools);
+    tools.appendChild(el("span", "lf-track-help", swapFrom!==null ? "Choose another image slot to complete the swap." : armedUnused ? "Choose an image slot for the unused asset." : "Drag clips to swap / click to inspect"));
+    const zoomLabel=el("label","lf-zoom-control","Zoom");
+    const zoom=el("select"); [[14,"Compact"],[28,"Normal"],[46,"Detailed"]].forEach(([v,n])=>zoom.appendChild(new Option(n,String(v))));
+    zoom.value=String(timelineScale); zoom.addEventListener("change",()=>{timelineScale=Number(zoom.value);paintTimeline();});
+    zoomLabel.appendChild(zoom); tools.appendChild(zoomLabel);
+
+    const rows=el("div","lf-nle-rows"); timeline.appendChild(rows);
+    const labels=el("div","lf-nle-labels","<span></span><b>Images</b><b>Voiceover</b>"); rows.appendChild(labels);
+    const scroll=el("div","lf-nle-scroll"); rows.appendChild(scroll);
+    const duration=Math.max(Number(data.audio_duration||0),Number(frames[frames.length-1].end||0));
+    const width=Math.max(900,Math.ceil(duration*timelineScale));
+    const canvas=el("div","lf-nle-canvas"); canvas.style.width=width+"px"; scroll.appendChild(canvas);
+    const ruler=el("div","lf-nle-ruler"); canvas.appendChild(ruler);
+    const imageTrack=el("div","lf-nle-track lf-nle-image-track"); canvas.appendChild(imageTrack);
+    const voiceTrack=el("div","lf-nle-track lf-nle-voice-track"); canvas.appendChild(voiceTrack);
+    const playhead=el("div","lf-nle-playhead"); canvas.appendChild(playhead);
+    const tickStep=timelineScale<=14?60:timelineScale<=28?30:10;
+    for(let t=0;t<=duration;t+=tickStep){const tick=el("span","lf-nle-tick",`${Math.floor(t/60)}:${String(Math.floor(t%60)).padStart(2,"0")}`);tick.style.left=(t*timelineScale)+"px";ruler.appendChild(tick);}
+    const seekAt=ev=>{const rect=canvas.getBoundingClientRect();const t=Math.max(0,Math.min(duration,(ev.clientX-rect.left)/timelineScale));if(data.voiceover)audio.currentTime=t;playhead.style.left=(t*timelineScale)+"px";const f=frames.find(x=>t>=Number(x.start)&&t<Number(x.end));if(f){imageTrack.querySelectorAll(".selected").forEach(x=>x.classList.remove("selected"));const node=imageTrack.querySelector(`[data-idx="${f.idx}"]`);if(node)node.classList.add("selected");updatePreview(f);}};
+    ruler.addEventListener("click",seekAt); imageTrack.addEventListener("click",ev=>{if(ev.target===imageTrack)seekAt(ev);}); voiceTrack.addEventListener("click",seekAt);
+    audio.ontimeupdate=()=>{const t=Number(audio.currentTime||0);playhead.style.left=(t*timelineScale)+"px";const f=frames.find(x=>t>=Number(x.start)&&t<Number(x.end));if(f&&f.idx!==selectedFrame)updatePreview(f);};
+
+    frames.forEach(f => {
+      const tile = el("div", "lf-nle-clip" + (f.exists ? "" : " missing") + (selectedFrame===f.idx?" selected":"") + (swapFrom===f.idx?" swap-src":""));
+      tile.dataset.idx=String(f.idx); tile.style.left=(Number(f.start||0)*timelineScale)+"px";
+      tile.style.width=Math.max(10,Number(f.dur||0)*timelineScale)+"px";
+      if(f.exists) tile.style.backgroundImage=`url("${f.img}")`;
+      tile.innerHTML=`<span>${f.idx+1}</span><em>${Number(f.dur||0).toFixed(1)}s</em>`;
+      tile.draggable = !!f.exists;
+      tile.addEventListener("dragstart", ev => { ev.dataTransfer.setData("application/json", JSON.stringify({kind:"frame",idx:f.idx})); tile.classList.add("dragging"); });
+      tile.addEventListener("dragend", () => tile.classList.remove("dragging"));
+      tile.addEventListener("dragover", ev => { ev.preventDefault(); tile.classList.add("drop-target"); });
+      tile.addEventListener("dragleave", () => tile.classList.remove("drop-target"));
+      tile.addEventListener("drop", ev => { ev.preventDefault(); tile.classList.remove("drop-target"); try { place(JSON.parse(ev.dataTransfer.getData("application/json")), f.idx); } catch (e) {} });
+      tile.addEventListener("click", ev => {
+        ev.stopPropagation();
+        if (armedUnused) return place({kind:"unused",rel_path:armedUnused}, f.idx);
+        if (swapFrom !== null && swapFrom !== f.idx) return place({kind:"frame",idx:swapFrom}, f.idx);
+        selectedFrame=f.idx; imageTrack.querySelectorAll(".selected").forEach(x=>x.classList.remove("selected"));tile.classList.add("selected");updatePreview(f);
+      });
+      imageTrack.appendChild(tile);
+      const vo=el("div","lf-nle-voice-segment"); vo.style.left=(Number(f.start||0)*timelineScale)+"px";
+      vo.style.width=Math.max(10,Number(f.dur||0)*timelineScale)+"px"; vo.title=f.text||"";
+      vo.innerHTML=`<span>${esc(f.text||"")}</span>`; voiceTrack.appendChild(vo);
+    });
+  }
+  function paintUnused() {
+    unused.innerHTML = "";
+    unused.appendChild(sectionHead("Unused generated images", "Archived images show where they were originally intended to appear.", el("span", "lf-count", String((data.unused || []).length))));
+    const tray = el("div", "lf-unused-tray"); unused.appendChild(tray);
+    if (!(data.unused || []).length) { tray.appendChild(el("div", "lf-empty-state", "No unused generated images in this project.")); return; }
+    data.unused.forEach(u => {
+      const item = el("article", "lf-unused-item" + (armedUnused === u.rel_path ? " armed" : "")); item.draggable = true;
+      item.addEventListener("dragstart", ev => ev.dataTransfer.setData("application/json", JSON.stringify({kind:"unused",rel_path:u.rel_path})));
+      const im = el("img"); im.src = u.img; im.alt = "Unused generated image"; im.loading = "lazy"; im.draggable = false; item.appendChild(im);
+      const cp = el("div", "lf-unused-copy"); item.appendChild(cp);
+      cp.appendChild(el("b", "", `Originally for #${u.intended_idx + 1} / ${esc(u.intended_ts)}`));
+      cp.appendChild(el("p", "", esc(u.intended_text || ""))); cp.appendChild(el("small", "", esc(u.folder || "Archive")));
+      cp.appendChild(btn(armedUnused === u.rel_path ? "Choose a slot above" : "Place on timeline", () => {
+        armedUnused = armedUnused === u.rel_path ? null : u.rel_path; swapFrom = null; paintUnused(); paintTimeline();
+      }, "ghost tiny")); tray.appendChild(item);
+    });
+  }
+  function paintAll() { paintThumbs(); paintTimeline(); paintUnused(); }
+  paintAll();
+  const foot = el("div", "card-foot lf-render-foot");
+  foot.appendChild(el("div", "lf-render-copy", "<b>Ready to render?</b><span>Your timeline and selected thumbnail are saved before assembly.</span>"));
+  foot.appendChild(el("span", "spacer"));
+  foot.appendChild(btn("Render video", async ev => {
+    ev.currentTarget.disabled = true;
+    const r = await jpost("/longform-rebuild", {slug:data.slug});
+    if (r && r.ok && r.id) { root.remove(); startJob(r.id); }
+    else { ev.currentTarget.disabled = false; errorCard(T.err_generic, (r && r.error) || "Render failed."); }
+  }, "primary")); root.appendChild(foot);
+  requestAnimationFrame(() => root.scrollIntoView({behavior:REDUCED ? "auto" : "smooth", block:"start"}));
+}
+
+/* ---------------------------------------------------- legacy longform frame editor fallback */
 async function openLongformFrameEditor(slug) {
+  return openLongformPreRenderEditor(slug);
+  /* istanbul ignore next -- retained only as an emergency reference for old saved builds */
   document.querySelectorAll(".lf-frame-editor").forEach(x => x.remove());
   let d;
   try { d = await jget("/longform-frames?slug=" + encodeURIComponent(slug)); } catch (e) { d = null; }
@@ -2671,7 +3132,7 @@ async function refreshSidebar() {
         `<span class="sb-job-body"><b>${esc(title)}</b><em>${esc(label)}</em></span>` +
         `<span class="sb-job-wave"><i></i><i></i><i></i></span>`;
       b.title = title + " — " + (j.last_log || label);
-      b.addEventListener("click", () => { startJob(j.id); closeDrawer(); });
+      b.addEventListener("click", () => { startJob(j.id, j.kind); closeDrawer(); });
       box.appendChild(b);
     });
   } catch (e) {

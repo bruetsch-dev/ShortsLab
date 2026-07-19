@@ -136,12 +136,46 @@ class LongformResumeTest(unittest.TestCase):
         self.assertIn("take1", (self.state().get("tts_part_files") or [""])[0])
         self.assertEqual(self.run_vo(gate=self.gate_dies), 0, "the take must not be re-bought")
 
-    def test_stitching_clears_the_parts_from_the_state(self):
+    def test_stitching_keeps_reviewable_parts_in_the_state(self):
         self.assertEqual(self.run_vo(gate=self.gate_ok), self.parts)
         self.assertTrue((self.dir / "voiceover.wav").exists())
-        self.assertEqual(list(self.dir.glob("vo_part*.wav")), [], "parts are cleaned up")
-        self.assertEqual(self.state().get("tts_part_files"), [],
-                         "the state must not point at deleted files")
+        kept = list(self.dir.glob("vo_part*.wav"))
+        self.assertEqual(len(kept), self.parts, "approved parts remain individually reviewable")
+        self.assertEqual(len(self.state().get("tts_part_files") or []), self.parts)
+        self.assertEqual(self.state().get("tts_part_texts"), lf.split_script_for_tts(self.script))
+
+    def test_reviewed_speech_invalidates_old_clock_but_keeps_retime_source(self):
+        self.run_vo(gate=self.gate_ok)
+        old_lines = [{"start": 0.0, "end": 1.0, "text": "First"}]
+        old_prompts = [{"timestamp": "[0:00.0]", "prompt": "first"}]
+        lf.save_state(self.dir, lines=old_lines, prompts=old_prompts, audio_duration=8.0,
+                      voice_speed=1.0)
+        manifest = lf.load_speech_review_parts(self.dir, self.script)
+        self.assertIsNotNone(manifest)
+        selected = lf.commit_speech_review_parts(self.dir, manifest)
+        state = self.state()
+        self.assertTrue(selected.exists())
+        self.assertIsNone(state.get("lines"))
+        self.assertIsNone(state.get("prompts"))
+        self.assertEqual(state.get("retime_source_lines"), old_lines)
+        self.assertEqual(state.get("retime_source_prompts"), old_prompts)
+        self.assertEqual(state.get("retime_source_audio_duration"), 8.0)
+        # Reviewing another part before continuing must not erase the original image clock.
+        lf.commit_speech_review_parts(self.dir, manifest)
+        state = self.state()
+        self.assertEqual(state.get("retime_source_lines"), old_lines)
+        self.assertEqual(state.get("retime_source_prompts"), old_prompts)
+        self.assertEqual(state.get("retime_source_audio_duration"), 8.0)
+
+    def test_review_parts_use_the_projects_selected_voice_speed(self):
+        self.run_vo(gate=self.gate_ok)
+        lf.save_state(self.dir, voice_speed=1.15)
+        retained = [Path(path) for path in self.state().get("tts_part_files") or []]
+        with mock.patch.object(lf, "apply_voice_speed", side_effect=lambda path, speed: Path(path)) as apply:
+            manifest = lf.load_speech_review_parts(self.dir, self.script)
+        self.assertEqual(apply.call_count, len(retained))
+        self.assertTrue(all(call.args[1] == 1.15 for call in apply.call_args_list))
+        self.assertEqual(manifest.get("voice_speed"), 1.15)
 
     def test_changed_script_reuses_nothing_and_leaves_no_stale_timings(self):
         self.run_vo(gate=self.gate_ok)
@@ -274,6 +308,122 @@ class LongformResumeTest(unittest.TestCase):
         self.assertFalse(lf._image_done(portrait, "16:9"),
                          "a 3:4 generation may never be reused in the longform timeline")
         self.assertTrue(lf._image_done(landscape, "16:9"))
+
+    def test_assembly_refuses_missing_scenes_instead_of_inserting_black(self):
+        lines = [{"start": 0.0, "end": 1.0, "text": "Visible narration"}]
+        with self.assertRaisesRegex(lf.LongformError, "black/missing scene"):
+            lf.assemble_video(lines, [1.0], {}, self.dir / "voiceover.wav",
+                              self.dir / "must_not_render.mp4")
+        self.assertFalse((self.dir / "must_not_render.mp4").exists())
+
+    def test_missing_frame_holds_nearest_existing_project_image(self):
+        from PIL import Image
+
+        lines = [{"start": 0.0, "end": 1.0, "text": "First"},
+                 {"start": 1.0, "end": 2.0, "text": "Second"}]
+        prompts = [{"timestamp": "[0:00.0]", "prompt": 'reading "FIRST"'},
+                   {"timestamp": "[0:01.0]", "prompt": 'reading "SECOND"'}]
+        lf.save_state(self.dir, script="First. Second.", lines=lines, prompts=prompts,
+                      audio_duration=2.0)
+        images = self.dir / "images"; images.mkdir()
+        durations = lf.line_durations(lines, 2.0)
+        first = images / f"{lf.image_key(0, lines[0], durations[0])}.png"
+        Image.new("RGB", (1600, 900), "white").save(first)
+        with mock.patch.object(lf, "reassign_mismatched", return_value=0):
+            recovered = lf.recover_archived_images(self.dir)
+        second = images / f"{lf.image_key(1, lines[1], durations[1])}.png"
+        self.assertEqual(recovered, 1)
+        self.assertTrue(lf._image_done(second, "16:9"))
+
+    def test_thumbnail_generation_always_creates_three_titled_options(self):
+        from PIL import Image
+
+        concepts = [
+            {"hook": "FIRST HOOK", "title": "First matching title", "subject": "first scene"},
+            {"hook": "SECOND HOOK", "title": "Second matching title", "subject": "second scene"},
+            {"hook": "THIRD HOOK", "title": "Third matching title", "subject": "third scene"},
+        ]
+
+        generated, sent_prompts = [], []
+        def fake_wavespeed(prompt, path, _key, *_args, **_kwargs):
+            idx = len(generated)
+            Image.new("RGB", (1600, 900), (40 + idx * 30, 70, 90)).save(path)
+            sent_prompts.append(prompt)
+            generated.append(path)
+            return path
+
+        with mock.patch.object(lf, "build_thumbnail_concepts", return_value=concepts), \
+                mock.patch.object(lf.pipeline, "api_key", return_value="test-key"), \
+                mock.patch.object(lf, "_generate_wavespeed_thumbnail", side_effect=fake_wavespeed):
+            selected = lf.generate_thumbnail(
+                self.dir, "A sufficiently long thumbnail test script about a strange event.",
+                [{"start": 0.0, "end": 1.0, "text": "A strange event happened."}], force=True)
+
+        variants = lf.thumbnail_variants(self.dir)
+        self.assertTrue(lf._image_done(selected, "16:9"))
+        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(generated), 3)
+        self.assertTrue(all("NO text" in prompt and "NO split panels" in prompt
+                            for prompt in sent_prompts))
+        self.assertEqual([v["title"] for v in variants], [c["title"] for c in concepts])
+        self.assertEqual([v["selected"] for v in variants], [True, False, False])
+
+    def test_thumbnail_image_request_uses_wavespeed_gpt_image_2_medium(self):
+        from PIL import Image
+
+        target = self.dir / "thumb.png"
+        captured = {}
+
+        def fake_request(method, url, key, payload, timeout=0):
+            captured.update(method=method, url=url, key=key, payload=payload, timeout=timeout)
+            return {"data": {"id": "prediction-1"}}
+
+        def fake_download(_url, path):
+            Image.new("RGB", (1600, 900), "white").save(path)
+            return Path(path).stat().st_size
+
+        with mock.patch.object(lf.pipeline, "request_json", side_effect=fake_request), \
+                mock.patch.object(lf.pipeline, "poll_wavespeed",
+                                  return_value=(["https://example.invalid/thumb.png"], {})), \
+                mock.patch.object(lf.pipeline, "download_file", side_effect=fake_download):
+            result = lf._generate_wavespeed_thumbnail(
+                "Minimal doodle. NO text.", target, "secret-test-key")
+
+        self.assertEqual(result, str(target))
+        self.assertTrue(captured["url"].endswith("/openai/gpt-image-2/text-to-image"))
+        self.assertEqual(captured["payload"]["quality"], "medium")
+        self.assertEqual(captured["payload"]["resolution"], "1k")
+        self.assertEqual(captured["payload"]["aspect_ratio"], "16:9")
+
+    def test_prompt_shortfall_recovers_only_missing_slots_and_checkpoints(self):
+        lines = [
+            {"start": 0.0, "end": 1.0, "text": "First line"},
+            {"start": 1.0, "end": 2.0, "text": "Second line"},
+            {"start": 2.0, "end": 3.0, "text": "Third line"},
+        ]
+        first = {"choices": [{"message": {"content":
+            "[0:00.0] first doodle prompt\n[0:01.0] second doodle prompt\n"
+            "All image prompts are now delivered - one for every timestamp in your script."}}]}
+        recovery = {"choices": [{"message": {"content":
+            "[0:02.0] recovered third doodle prompt"}}]}
+        checkpoint = self.dir / "prompt_checkpoint.json"
+        with mock.patch.dict("os.environ", {"WAVESPEED_API_KEY": "test-key"}, clear=False), \
+                mock.patch.object(lf.agent_core, "post_json_url",
+                                  side_effect=[first, recovery]) as request:
+            prompts = lf.generate_image_prompts(
+                lines, checkpoint_path=checkpoint, reasoning_model="test/model")
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("recovered third", prompts[2]["prompt"])
+        saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(len(saved["prompts"]), 3)
+
+        # A resumed process trusts the exact line-clock checkpoint and makes no paid request.
+        with mock.patch.dict("os.environ", {"WAVESPEED_API_KEY": "test-key"}, clear=False), \
+                mock.patch.object(lf.agent_core, "post_json_url") as no_request:
+            resumed = lf.generate_image_prompts(lines, checkpoint_path=checkpoint)
+        self.assertEqual(len(resumed), 3)
+        no_request.assert_not_called()
 
 
 if __name__ == "__main__":
