@@ -1044,7 +1044,10 @@ def split_hook_from_script(script, hook_text):
     def collapse(text):
         return re.sub(r"\s+", " ", text).strip()
 
-    s_norm = collapse(script)
+    # Normalize both sides identically. Previously smart dashes/quotes were normalized only in
+    # the marked hook, so an otherwise exact hook containing an em dash was not found and the
+    # mandatory 0.500s hook/body edit was silently skipped.
+    s_norm = collapse(clean_text(script))
     h_norm = collapse(hook)
     idx = s_norm.lower().find(h_norm.lower())
     if idx == -1:
@@ -1797,7 +1800,42 @@ def _script_text_similarity(left, right):
     return max(sequence, overlap)
 
 
-def generate_viral_script(topic="", status_cb=None, instructions=""):
+MINI_STORY_SCRIPT_TOKEN_LIMIT = 130
+
+
+def estimate_script_tokens(text):
+    """Stable, dependency-free token estimate shared by generation and run validation.
+
+    It counts spoken word/number chunks plus punctuation. This is intentionally conservative
+    enough for the short English narration used here without coupling the app to one tokenizer.
+    """
+    return len(re.findall(r"[\w]+|[^\s\w]", clean_text(text or ""), flags=re.UNICODE))
+
+
+def _trim_script_to_token_limit(text, limit):
+    """Keep complete sentences whenever possible and guarantee the configured hard ceiling."""
+    text = clean_text(text or "").strip()
+    if not limit or estimate_script_tokens(text) <= limit:
+        return text
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        candidate = " ".join(kept + [sentence]).strip()
+        if estimate_script_tokens(candidate) > limit:
+            break
+        kept.append(sentence)
+    if kept:
+        return " ".join(kept).strip()
+    raw_tokens = re.findall(r"[\w]+|[^\s\w]", text, flags=re.UNICODE)
+    # Reserve one slot for terminal punctuation when the truncated prefix has none.
+    reserve = 1 if raw_tokens and raw_tokens[min(len(raw_tokens), limit) - 1] not in ".!?" else 0
+    tokens = raw_tokens[:max(1, limit - reserve)]
+    out = " ".join(tokens)
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out).strip()
+    return out.rstrip(",;:") + ("." if out and out[-1:] not in ".!?" else "")
+
+
+def generate_viral_script(topic="", status_cb=None, instructions="", format_mode="standard",
+                          token_limit=None):
     """Write a reference-style viral short script from a topic (empty topic = the model picks
     its own high-potential topic in the same style). Returns {"topic","script","hook_keywords"}.
 
@@ -1809,6 +1847,13 @@ def generate_viral_script(topic="", status_cb=None, instructions=""):
     import secrets
     topic = clean_text(topic or "").strip()
     instructions = clean_text(instructions or "").strip()[:2000]
+    format_mode = str(format_mode or "standard").strip().lower()
+    mini_story = format_mode == "mini_story"
+    try:
+        token_limit = int(token_limit) if token_limit not in (None, "") else None
+    except (TypeError, ValueError):
+        token_limit = None
+    token_limit = max(80, min(180, token_limit or MINI_STORY_SCRIPT_TOKEN_LIMIT)) if mini_story else None
     recent = _script_creator_history()
     system = (
         "You are an elite short-form scriptwriter for viral 'dark facts' style TikTok/Shorts "
@@ -1875,11 +1920,22 @@ USER SCRIPT DIRECTIONS (follow these closely):
 
 These directions MAY override the default tone, specificity, number of facts, block structure,
 and level of dramatic language below. They may NOT override factual accuracy, the locked topic,
-the 100-140 word target, narration-only requirement, or strict JSON output.
+the active length limit, narration-only requirement, or strict JSON output.
 """
-    prompt = f"""{ask}{custom_direction}
-
-Write ONE narration script following ALL of these rules:
+    if mini_story:
+        structure_rules = f"""
+- MINI STORY FORMAT: tell ONE coherent, phone-filmable event in 20-25 seconds. This is not a
+  listicle and not three unrelated facts.
+- HOOK: one curiosity sentence of at most 10 words that names the concrete event or place.
+- BODY: 5-7 short sentences. Establish the situation, add two or three escalating physical
+  details, then land one clear payoff. Every sentence must advance the SAME event.
+- FOOTAGE COHERENCE: write so the complete narration can be covered by one real source video or
+  one tightly related footage cluster. Do not jump to another institution, era, city or theme.
+- 65-90 spoken words and never more than {token_limit} estimated script tokens. The token limit
+  is hard; shorten before returning. No headings, lists, emojis, hashtags or camera directions.
+"""
+    else:
+        structure_rules = """
 - HOOK: the first sentence is a shocking claim of AT MOST 12 words (a real number, a REAL
   ban, or a jaw-dropping TRUE practice - NEVER a fake ban).
 - ONE CENTRAL THEME: the hook names it; every following fact is framed as another example,
@@ -1889,10 +1945,14 @@ Write ONE narration script following ALL of these rules:
 - STRUCTURE: exactly 3 thought blocks after the hook, each 2-3 sentences. Escalate between
   blocks; open the final block with an escalation like "But the craziest part?" or
   "But the harshest reality?".
-- TRANSITIONS carry the theme: each block opener says how the next fact relates ("This
-  extends beyond the workplace...", "The same ideal also appears in..."). Never imply one
-  fact CAUSED another unless that link is verified. Order the facts so the strongest one
-  lands last.
+- TRANSITIONS carry the theme: each block opener says how the next fact relates. Never imply one
+  fact CAUSED another unless that link is verified. Order the facts so the strongest one lands last.
+- 100-140 words total.
+"""
+    prompt = f"""{ask}{custom_direction}
+
+Write ONE narration script following ALL of these rules:
+{structure_rules}
 - EVERY claim must be PHYSICALLY FILMABLE as real phone footage (a visible person, action,
   object or place). Never state an abstraction without its visible physical consequence.
 - SIMPLE, NATURAL LANGUAGE: write like a clear viral storyteller, never like a researcher,
@@ -1904,8 +1964,7 @@ Write ONE narration script following ALL of these rules:
   term immediately in plain language, or replace it with a familiar description.
 - READ-ALOUD TEST: every sentence must sound natural when spoken once at normal speed. Rewrite
   anything that feels dense, formal, overqualified, oddly specific or difficult to remember.
-- 100-140 words total. Simple spoken language, present tense, no lists, no emojis, no
-  hashtags, no camera directions - narration text only.
+- Simple spoken language, present tense, narration text only.
 - Weave in strong hook words - but ONLY where literally true: NEVER / ILLEGAL / BANNED /
   FORCED only for actual laws and actual bans; for norms use truthful hard words instead
   (unwritten, ruthless, obsessed, humiliating, judged, rejected, shamed), plus real numbers.
@@ -1934,9 +1993,10 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
                 f"Rejected draft to avoid: {script[:500]}\n"
                 f"Retry nonce: {secrets.token_hex(8)}."
             )
+        model_output_tokens = max(280, token_limit * 2) if mini_story else 4000
         data = _post_llm_json(SCRIPT_CREATOR_MODEL,
                               [{"role": "system", "content": system},
-                               {"role": "user", "content": attempt_prompt}], 4000,
+                               {"role": "user", "content": attempt_prompt}], model_output_tokens,
                               min(1.15, temperature + attempt * 0.08))
         if not isinstance(data, dict) or not str(data.get("script") or "").strip():
             continue
@@ -1946,11 +2006,17 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
         repeated_hook = any(candidate_hook and candidate_hook == old.split(".", 1)[0].strip().casefold()
                             for old in prior_scripts)
         script = candidate
-        if duplicate_score < 0.68 and not repeated_hook:
+        too_long = bool(token_limit and estimate_script_tokens(candidate) > token_limit)
+        if duplicate_score < 0.68 and not repeated_hook and not too_long:
             break
-        log(status_cb, f"Script creator: duplicate-like result ({duplicate_score:.0%}); requesting a new angle...")
+        if too_long:
+            log(status_cb, f"Mini Story draft exceeded {token_limit} tokens; requesting a shorter version...")
+        else:
+            log(status_cb, f"Script creator: duplicate-like result ({duplicate_score:.0%}); requesting a new angle...")
     if not script:
         raise RuntimeError("Script creator returned no usable script - try again.")
+    if token_limit and estimate_script_tokens(script) > token_limit:
+        script = _trim_script_to_token_limit(script, token_limit)
     kws = [str(k).strip() for k in (data.get("hook_keywords") or []) if str(k).strip()]
     out_topic = str(data.get("topic") or topic or "").strip()
     # ALWAYS record the generated script (user-topic runs too) so past outputs can be
@@ -1965,7 +2031,9 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
                                          encoding="utf-8")
     except Exception:
         pass
-    return {"topic": out_topic, "script": script, "hook_keywords": kws[:14]}
+    return {"topic": out_topic, "script": script, "hook_keywords": kws[:14],
+            "format_mode": format_mode, "estimated_tokens": estimate_script_tokens(script),
+            "token_limit": token_limit}
 
 
 def regenerate_script_from_reference(original_script, instructions="", status_cb=None):
@@ -2145,6 +2213,10 @@ def understanding_brief(understanding):
     if u.get("thesis"):          parts.append(f"Core point: {u['thesis']}")
     if u.get("setting"):         parts.append(f"Setting/world: {u['setting']}")
     if u.get("tone"):            parts.append(f"Tone: {u['tone']}")
+    if u.get("editorial_format"):
+        parts.append(f"Editorial format: {u['editorial_format']}")
+    if u.get("footage_strategy"):
+        parts.append(f"Footage strategy: {u['footage_strategy']}")
     if isinstance(u.get("visual_motifs"), list) and u["visual_motifs"]:
         parts.append("Things that visually represent it: " + ", ".join(str(m) for m in u["visual_motifs"][:9]))
     return ("UNDERSTAND THE VIDEO FIRST (all choices must fit this):\n" + "\n".join(parts) + "\n\n") if parts else ""
@@ -7885,6 +7957,12 @@ def apply_timeline_edits_to_config(config, edits, slug):
                    if d.get("speed") is not None}
     blur_by_id = {str(d.get("id")): bool(d.get("blur_captions")) for d in (edits.get("scenes") or [])
                   if d.get("blur_captions") is not None}
+    mirror_by_id = {str(d.get("id")): bool(d.get("mirror")) for d in (edits.get("scenes") or [])
+                    if d.get("mirror") is not None}
+    scale_enabled_by_id = {str(d.get("id")): bool(d.get("scale_enabled")) for d in (edits.get("scenes") or [])
+                           if d.get("scale_enabled") is not None}
+    scale_by_id = {str(d.get("id")): d.get("scale") for d in (edits.get("scenes") or [])
+                   if d.get("scale") is not None}
     # CapCut-style per-clip source in-point ("cut front") -> the renderer reads it via
     # seedance_clip_start_trim(config, scene) = scene["seedance_start_trim"].
     trim_by_id = {str(d.get("id")): d.get("source_trim") for d in (edits.get("scenes") or [])
@@ -7999,6 +8077,15 @@ def apply_timeline_edits_to_config(config, edits, slug):
             scene["overlays"] = overlays_by_id[sid]
         if sid in subject_override_by_id:
             scene["subject_override"] = subject_override_by_id[sid]
+        if sid in mirror_by_id:
+            scene["timeline_mirror"] = bool(mirror_by_id[sid])
+        if sid in scale_enabled_by_id:
+            scene["timeline_free_scale"] = bool(scale_enabled_by_id[sid])
+        if sid in scale_by_id:
+            try:
+                scene["timeline_clip_scale"] = round(max(0.5, min(3.0, float(scale_by_id[sid]))), 3)
+            except (TypeError, ValueError):
+                scene["timeline_clip_scale"] = 1.0
         # apply an in-editor media replacement for this scene (copy the chosen file into the project
         # so the renderer resolves it; keep the scene duration -> new clip is trimmed to that length)
         if sid in replaced_by_id:
@@ -9318,6 +9405,20 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
 def run_project(form, status_cb=None):
     check_cancel(form)
     script = clean_text(form.get("script", ""))
+    clip_short_format = str(form.get("clip_short_format") or "standard").strip().lower()
+    mini_story_mode = clip_short_format == "mini_story"
+    if mini_story_mode:
+        try:
+            script_token_limit = max(80, min(180, int(form.get("script_token_limit") or
+                                                       MINI_STORY_SCRIPT_TOKEN_LIMIT)))
+        except (TypeError, ValueError):
+            script_token_limit = MINI_STORY_SCRIPT_TOKEN_LIMIT
+        script_tokens = estimate_script_tokens(script)
+        if script_tokens > script_token_limit:
+            raise RuntimeError(
+                f"Mini Story scripts are limited to {script_token_limit} estimated tokens "
+                f"({script_tokens} supplied). Shorten the script before starting the run.")
+        log(status_cb, f"Clip Short format: MINI STORY ({script_tokens}/{script_token_limit} tokens).")
     reasoning_model = form.get("reasoning_model", "openai/gpt-5.5")
     reasoning_mode = reasoning_modes.set_current_reasoning_mode(
         reasoning_model, form.get("reasoning_mode"))
@@ -9387,6 +9488,33 @@ def run_project(form, status_cb=None):
             json.dumps(run_form_snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
+
+    # REFERENCE VIDEO (Gemini 3.1 Pro): a Mini Story run may name a reference clip whose style
+    # the Short should copy. The clip is watched ONCE by Gemini 3.1 Pro (user rule: every piece
+    # of video material we analyze goes through Gemini 3.1 Pro); the breakdown is stored with
+    # the project and later handed to the post-render self-review as the style yardstick. The
+    # script step upstream already used the same analysis when the script was generated from it.
+    reference_analysis = None
+    _ref_video = str(form.get("reference_video") or "").strip()
+    if _ref_video:
+        import gemini_video
+        try:
+            _ref_saved = project_dir / "review" / "reference_analysis.json"
+            if _ref_saved.exists():
+                reference_analysis = json.loads(_ref_saved.read_text(encoding="utf-8"))
+                log(status_cb, "Reference video: reusing the saved Gemini 3.1 Pro analysis.")
+            else:
+                log(status_cb, "Reference video: analyzing with Gemini 3.1 Pro...")
+                reference_analysis = gemini_video.analyze_reference(_ref_video, status_cb=status_cb)
+                _ref_saved.write_text(json.dumps(reference_analysis, indent=2, ensure_ascii=False),
+                                      encoding="utf-8")
+            log(status_cb, "Reference: "
+                + str(reference_analysis.get("topic") or "")[:80] + " - "
+                + str(reference_analysis.get("summary") or "")[:160])
+        except Exception as exc:  # noqa: BLE001 - a broken reference must not kill the run
+            log(status_cb, f"Reference analysis failed ({exc.__class__.__name__}: {exc}) - "
+                           "continuing without it.")
+            reference_analysis = None
 
     # A scrape run requires at least one selected, logged-in social source.
     # Enforce it up front so we don't burn voiceover/director work on a run that can't
@@ -9528,6 +9656,13 @@ def run_project(form, status_cb=None):
     # shared by every clip agent (search terms + clip matching) so they stop guessing per-step.
     script_understanding = comprehend_script(title, script, reasoning_model=reasoning_model,
                                              collaborate=collaborate_reasoning, status_cb=status_cb)
+    if mini_story_mode:
+        script_understanding = dict(script_understanding or {})
+        script_understanding["editorial_format"] = (
+            "Mini Story: one continuous real event with setup, escalation and payoff; never a listicle")
+        script_understanding["footage_strategy"] = (
+            "Prefer one source video or one tightly related event/location cluster across the full edit. "
+            "Do not fill later beats with generic theme footage or unrelated viral clips.")
     if script_understanding:
         try:
             (project_dir / "input" / "script_understanding.json").write_text(
@@ -9565,7 +9700,8 @@ def run_project(form, status_cb=None):
     # (clip_source is read straight from the form here; its canonical local is assigned later.)
     if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
         before_n = len(scenes_override)
-        scenes_override = enforce_reference_pacing(scenes_override, max_s=2.4)
+        scenes_override = enforce_reference_pacing(
+            scenes_override, max_s=(3.4 if mini_story_mode else 2.4))
         if len(scenes_override) != before_n:
             log(status_cb, f"Pacing: split long beats for reference cut rate ({before_n} -> {len(scenes_override)} beats, ~1 cut/2s).")
         canonical_words = word_timeline_cache or estimated_word_timeline_from_scenes(base_scenes)
@@ -9574,7 +9710,10 @@ def run_project(form, status_cb=None):
                 scenes_override, canonical_words, target_duration=target_duration)
             log(status_cb, "TikTok edit map locked to the words actually spoken in each cut.")
         before_stabilize = len(scenes_override)
-        scenes_override = coalesce_short_scrape_scenes(scenes_override, min_s=1.45, max_s=3.2)
+        scenes_override = coalesce_short_scrape_scenes(
+            scenes_override,
+            min_s=(1.8 if mini_story_mode else 1.45),
+            max_s=(4.2 if mini_story_mode else 3.2))
         if len(scenes_override) != before_stabilize:
             log(status_cb, f"Pacing: merged isolated sub-1.45s beats ({before_stabilize} -> "
                            f"{len(scenes_override)}) to prevent rapid double-cuts in TikTok footage.")
@@ -9981,7 +10120,8 @@ def run_project(form, status_cb=None):
                     # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
                     _v2cfg = {"title": title, "voice_speed": resolve_voice_speed(form, "scrape"),
                               "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE"),
-                              "pipeline_version": str(form.get("pipeline_version") or "v0.2")}
+                              "pipeline_version": str(form.get("pipeline_version") or "v0.2"),
+                              "clip_short_format": clip_short_format}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
                         _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
@@ -11329,8 +11469,13 @@ def run_project(form, status_cb=None):
     # written to project.json above, and scrape mode runs NO post-render Audio-Director pass
     # (sfx_semantic_vision is False for scrape) - so nothing is lost by skipping the encode. The
     # user opens the timeline with everything as edited and renders from there when happy.
+    # MINI STORY is the exception: it RENDERS here (the Gemini 3.1 Pro self-review below has to
+    # watch a finished MP4), and the project stays fully timeline-editable afterwards - the
+    # scenes are already in project.json, so the result card's "Open timeline" button works and
+    # any correction swaps are persisted back to project.json for the editor.
     _skip_render_open_timeline = (
-        clip_source == "scrape" and form_flag(form, "open_timeline_no_render", True))
+        clip_source == "scrape" and not mini_story_mode
+        and form_flag(form, "open_timeline_no_render", True))
     if _skip_render_open_timeline:
         log(status_cb, "Skipping the final render - opening the timeline editor with the "
                        "pipeline's edit. Render from the timeline when you're happy with it.")
@@ -11428,6 +11573,85 @@ def run_project(form, status_cb=None):
     check_cancel(form)
     log(status_cb, "Cleaning standard MP4 metadata for privacy...")
     metadata_cleanup_result = pipeline.sanitize_video_metadata(output, config)
+
+    # GEMINI 3.1 PRO SELF-REVIEW (Mini Story only): the finished render is WATCHED by Gemini
+    # 3.1 Pro and judged against the script (plus the reference brief when one was supplied).
+    # One bounded correction pass: scenes the reviewer flags as mismatched are swapped to
+    # unused clips from the project pool and re-rendered ONCE, then re-reviewed. This is the
+    # user-mandated exception (2026-07-20) to the one-render rule, and it exists only here.
+    gemini_review = None
+    if mini_story_mode and not os.environ.get("NO_PAID_API"):
+        import gemini_video
+
+        def _scenes_overlapping(t_str):
+            try:
+                span = str(t_str).replace("s", "").strip()
+                a, b = (float(x) for x in span.split("-")) if "-" in span else (
+                    float(span), float(span) + 0.5)
+            except Exception:
+                return []
+            hits = []
+            for _i, _sc in enumerate(config.get("scenes", [])):
+                _s0 = float(_sc.get("start", 0) or 0)
+                _s1 = float(_sc.get("end", 0) or 0)
+                if _s0 < b and _s1 > a:
+                    hits.append(_i)
+            return hits
+
+        def _gemini_review(video_path):
+            log(status_cb, "Gemini 3.1 Pro: reviewing our own render...")
+            return gemini_video.review_render(video_path, script,
+                                              reference_analysis=reference_analysis,
+                                              status_cb=status_cb)
+
+        try:
+            gemini_review = _gemini_review(output)
+            (project_dir / "review" / "gemini_video_review.json").write_text(
+                json.dumps(gemini_review, indent=2, ensure_ascii=False), encoding="utf-8")
+            log(status_cb, f"Gemini review: {gemini_review.get('verdict')} "
+                           f"(score {gemini_review.get('score')}) - "
+                           f"{str(gemini_review.get('summary') or '')[:220]}")
+            for _iss in (gemini_review.get("issues") or [])[:6]:
+                log(status_cb, f"  [{_iss.get('severity')}] {_iss.get('t')}: "
+                               f"{_iss.get('problem')} -> {_iss.get('fix')}")
+            _mismatches = gemini_review.get("scene_mismatches") or []
+            if str(gemini_review.get("verdict") or "").lower() == "fix" and _mismatches:
+                _clip_dir = project_dir / "local media"
+                _used = {str(_sc.get("clip") or "") for _sc in config.get("scenes", [])}
+                _spare = [p for p in sorted(_clip_dir.glob("*.mp4")) if p.name not in _used]
+                _flagged = sorted({i for m in _mismatches
+                                   for i in _scenes_overlapping(m.get("t"))})
+                if _flagged and _spare:
+                    log(status_cb, f"Correction pass: swapping {len(_flagged)} mismatched "
+                                   f"scene(s) ({len(_spare)} unused clip(s) available)...")
+                    for _i in _flagged:
+                        if not _spare:
+                            break
+                        config["scenes"][_i]["clip"] = _spare.pop(0).name
+                    output = pipeline.render_video(config)
+                    render_variants["all_sounds"] = str(output)
+                    pipeline.sanitize_video_metadata(output, config)
+                    # persist the swaps so the timeline editor shows the CORRECTED edit
+                    try:
+                        _cfg_path = project_dir / "config" / "project.json"
+                        _cfg_tmp = _cfg_path.with_suffix(".json.tmp")
+                        _cfg_tmp.write_text(json.dumps(config_for_json(config), indent=2,
+                                                       ensure_ascii=False), encoding="utf-8")
+                        os.replace(_cfg_tmp, _cfg_path)
+                    except Exception as _cfg_exc:  # noqa: BLE001
+                        log(status_cb, f"Could not persist corrected config ({_cfg_exc}).")
+                    gemini_review = _gemini_review(output)
+                    (project_dir / "review" / "gemini_video_review_corrected.json").write_text(
+                        json.dumps(gemini_review, indent=2, ensure_ascii=False), encoding="utf-8")
+                    log(status_cb, f"Gemini re-review: {gemini_review.get('verdict')} "
+                                   f"(score {gemini_review.get('score')}).")
+                elif _flagged:
+                    log(status_cb, "Correction skipped: no unused clips left to swap in.")
+        except pipeline.PipelineCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed review never kills a good render
+            log(status_cb, f"Gemini self-review failed ({exc.__class__.__name__}: {exc}) - "
+                           "keeping the render as-is.")
     if metadata_cleanup_result.get("cleaned"):
         log(status_cb, "Standard MP4 metadata cleaned.")
     else:
