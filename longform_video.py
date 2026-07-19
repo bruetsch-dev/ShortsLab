@@ -373,6 +373,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     saved_files = (saved or {}).get("tts_part_files") or []
     if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
             or str((saved or {}).get("voice") or "") != str(voice or "")
+            or str((saved or {}).get("tts_model") or tts_model) != str(tts_model)
             or str((saved or {}).get("tts_style") or "") != str(tts_kw["style"] or "")):
         saved_files = []
 
@@ -386,7 +387,8 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         and a resume that found the new script next to the old lines would happily pair the new
         audio with the old script's timings.
         """
-        save_state(out_dir, script=script, voice=voice or "", tts_style=tts_kw["style"] or "",
+        save_state(out_dir, script=script, voice=voice or "", tts_model=tts_model,
+                   tts_style=tts_kw["style"] or "",
                    tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
                    # parts are being (re)made, so any stitched voiceover on disk is the old one.
                    # voice_speed None means "the speed question was never answered" - a NUMBER
@@ -471,13 +473,11 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
             f"The stitched voiceover contains a {hole:.0f}s silent gap - a TTS part came back "
             "truncated/silent. Not continuing with a dead hole in the narration; please start the "
             "voiceover again (a fresh run re-generates the failed part).")
-    for p in part_files:
-        try:
-            Path(p).unlink(missing_ok=True)
-        except Exception:
-            pass
-    # the parts are gone now and voiceover.wav carries the resume from here on
-    save_state(out_dir, tts_part_files=[], voiceover_ready=True,
+    # Keep the approved source parts.  They are the only lossless way to review or regenerate one
+    # paragraph of an existing Sketch Explainer without buying/rebuilding the other paragraphs.
+    # Older builds deleted them here, which made per-part editing impossible after the first run.
+    save_state(out_dir, tts_part_files=[str(Path(p)) for p in part_files], tts_model=tts_model,
+               tts_part_texts=list(parts), voiceover_ready=True,
                voice_speed=None, voiceover_file=out.name)
     _log(status_cb, f"Voiceover ready: {out.name} ({len(parts)} part(s) stitched).")
 
@@ -489,6 +489,226 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         out = apply_voice_speed(out, speed, ffmpeg, status_cb=status_cb)
         save_state(out_dir, voice_speed=float(speed or 1.0), voiceover_file=out.name)
     return out, len(parts)
+
+
+def audio_duration_seconds(path, ffprobe=None):
+    """Return an audio duration without trusting a browser/file-size approximation."""
+    path = Path(path)
+    try:
+        with __import__("wave").open(str(path), "rb") as wav:
+            return wav.getnframes() / float(wav.getframerate() or 1)
+    except Exception:
+        pass
+    ffprobe = ffprobe or pipeline.find_ffprobe(pipeline.find_ffmpeg())
+    try:
+        done = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
+            capture_output=True, text=True, timeout=30, check=False)
+        return float((done.stdout or "0").strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _speech_review_manifest_path(out_dir):
+    return Path(out_dir) / "speech_parts" / "manifest.json"
+
+
+def save_speech_review_manifest(out_dir, script, parts, **extra):
+    """Persist the exact paragraph-to-audio mapping used by the approval waveform."""
+    out_dir = Path(out_dir)
+    manifest_path = _speech_review_manifest_path(out_dir)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "script": str(script or ""), "parts": parts, **extra}
+    tmp = manifest_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, manifest_path)
+    return payload
+
+
+def load_speech_review_parts(out_dir, script=None):
+    """Load durable speech parts, including parts retained by newer TTS runs.
+
+    The manifest is preferred because its text/audio association is explicit.  For a project
+    created before the manifest existed, retained ``tts_part_files`` are upgraded in place.
+    """
+    out_dir = Path(out_dir)
+    state = load_state(out_dir, script) or {}
+    script = str(script if script is not None else state.get("script") or "")
+    manifest_path = _speech_review_manifest_path(out_dir)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        rows = list(manifest.get("parts") or [])
+        if manifest.get("script") == script and rows and all(
+                _audio_done(out_dir / str(row.get("file") or "")) for row in rows):
+            return manifest
+    except Exception:
+        pass
+
+    texts = list(state.get("tts_part_texts") or split_script_for_tts(script))
+    files = [Path(p) for p in (state.get("tts_part_files") or [])]
+    if len(files) != len(texts) or not all(_audio_done(p) for p in files):
+        return None
+    speed = float(state.get("voice_speed") or 1.0)
+    # Retained TTS source parts are natural-speed audio, while the selected combined voiceover
+    # may be 1.15x. Review and regeneration must use ONE clock or a replaced paragraph would be
+    # fast between slower neighbours (and every downstream image switch would drift again).
+    if abs(speed - 1.0) >= 0.01:
+        files = [apply_voice_speed(path, speed) for path in files]
+    rows = []
+    for idx, (text, path) in enumerate(zip(texts, files)):
+        rows.append({"index": idx, "text": text, "file": os.path.relpath(path, out_dir),
+                     "duration": round(audio_duration_seconds(path), 3), "take": 0})
+    return save_speech_review_manifest(
+        out_dir, script, rows, voice=str(state.get("voice") or ""),
+        tts_model=str(state.get("tts_model") or "pro"),
+        voice_speed=speed)
+
+
+def reconstruct_speech_review_parts(out_dir, script=None, status_cb=None):
+    """Upgrade an old project by cutting its selected voiceover back into TTS-sized parts.
+
+    Word-aligned line timings are used when present, so cuts land between the exact script
+    sections.  The proportional fallback is only for very old projects without word timing.
+    """
+    out_dir = Path(out_dir)
+    state = load_state(out_dir, script) or {}
+    script = str(script if script is not None else state.get("script") or "")
+    texts = split_script_for_tts(script)
+    source = voiceover_path_from_state(out_dir, state)
+    if not texts or not _audio_done(source):
+        return None
+    duration = audio_duration_seconds(source)
+    if duration <= 0:
+        return None
+    word_starts = []
+    for line in state.get("lines") or []:
+        for word in line.get("words") or []:
+            try:
+                word_starts.append(float(word.get("s")))
+            except (TypeError, ValueError):
+                pass
+    counts = [max(1, len(re.findall(r"\b[\w'-]+\b", text))) for text in texts]
+    total_words = sum(counts)
+    boundaries = [0.0]
+    consumed = 0
+    for count in counts[:-1]:
+        consumed += count
+        if len(word_starts) >= total_words and consumed < len(word_starts):
+            before = word_starts[max(0, consumed - 1)]
+            after = word_starts[consumed]
+            boundary = (before + after) / 2.0
+        else:
+            boundary = duration * consumed / float(total_words or 1)
+        boundaries.append(max(boundaries[-1] + 0.01, min(duration, boundary)))
+    boundaries.append(duration)
+
+    parts_dir = out_dir / "speech_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = pipeline.find_ffmpeg()
+    rows = []
+    for idx, text in enumerate(texts):
+        target = parts_dir / f"part_{idx:03d}.wav"
+        start, end = boundaries[idx], boundaries[idx + 1]
+        done = subprocess.run(
+            [ffmpeg, "-y", "-ss", f"{start:.6f}", "-to", f"{end:.6f}", "-i", str(source),
+             "-vn", "-acodec", "pcm_s16le", str(target)],
+            capture_output=True, text=True, timeout=max(120, int(end - start) * 2), check=False)
+        if done.returncode != 0 or not _audio_done(target):
+            raise LongformError(f"Could not prepare speech part {idx + 1}: "
+                                f"{(done.stderr or '')[-240:]}")
+        rows.append({"index": idx, "text": text,
+                     "file": os.path.relpath(target, out_dir),
+                     "duration": round(audio_duration_seconds(target), 3), "take": 0})
+    _log(status_cb, f"Prepared {len(rows)} reviewable speech parts from the existing voiceover.")
+    return save_speech_review_manifest(
+        out_dir, script, rows, voice=str(state.get("voice") or ""),
+        tts_model=str(state.get("tts_model") or "pro"),
+        voice_speed=float(state.get("voice_speed") or 1.0), source=source.name)
+
+
+def commit_speech_review_parts(out_dir, manifest, status_cb=None):
+    """Stitch reviewed parts and invalidate every old image-switch timestamp.
+
+    The images themselves remain on disk.  On the next project continuation the new voiceover is
+    transcribed, :func:`retime_longform_assets` renames the matching images onto the new clock,
+    and ``timeline.json`` is rewritten from those new positions.
+    """
+    out_dir = Path(out_dir)
+    state = load_state(out_dir, manifest.get("script")) or {}
+    rows = sorted(manifest.get("parts") or [], key=lambda row: int(row.get("index", 0)))
+    paths = [out_dir / str(row.get("file") or "") for row in rows]
+    if not rows or not all(_audio_done(path) for path in paths):
+        raise LongformError("One or more reviewed speech parts are missing.")
+    ffmpeg = pipeline.find_ffmpeg()
+    target = out_dir / f"voiceover_review_{int(time.time() * 1000)}.wav"
+    concat_audio_parts(paths, target, ffmpeg)
+    # A second review can happen before the pending retime has run. Preserve the ORIGINAL clock
+    # in that case; replacing it with empty `lines` would orphan every existing image.
+    old_lines = list(state.get("lines") or state.get("retime_source_lines") or [])
+    old_prompts = list(state.get("prompts") or state.get("retime_source_prompts") or [])
+    old_duration = float(state.get("audio_duration") or
+                         state.get("retime_source_audio_duration") or 0.0)
+    save_state(
+        out_dir, voiceover_ready=True, voiceover_file=target.name,
+        tts_parts=len(rows), tts_part_total=len(rows),
+        tts_part_files=[str(path) for path in paths],
+        tts_part_texts=[str(row.get("text") or "") for row in rows],
+        # Explicit retime source: clearing `lines` prevents resume from pairing a new narration
+        # with the previous image clock, while these fields let it reuse/rename the images.
+        retime_source_lines=old_lines, retime_source_prompts=old_prompts,
+        retime_source_audio_duration=old_duration,
+        lines=None, prompts=None, audio_duration=0.0)
+    _log(status_cb, "Reviewed speech saved. Image-switch timings will be regenerated from the "
+                    "new narration when the project continues.")
+    return target
+
+
+def finalize_speech_review_timing(out_dir, status_cb=None):
+    """Immediately rebuild image filenames + timeline after speech-part regeneration."""
+    out_dir = Path(out_dir)
+    try:
+        state = json.loads((out_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    script = str(state.get("script") or "")
+    old_lines = list(state.get("retime_source_lines") or [])
+    old_prompts = list(state.get("retime_source_prompts") or [])
+    old_duration = float(state.get("retime_source_audio_duration") or 0.0)
+    voice = voiceover_path_from_state(out_dir, state)
+    if not script or not old_lines or not _audio_done(voice):
+        raise LongformError("The previous image clock or the reviewed voiceover is missing.")
+    _log(status_cb, "Re-transcribing reviewed narration to rebuild every image switch...")
+    new_duration = audio_duration_seconds(voice)
+    new_lines = transcribe_lines(script, voice, status_cb=status_cb)
+    if len(new_lines) != len(old_lines):
+        raise LongformError(
+            f"Speech retiming produced {len(new_lines)} lines but the project has "
+            f"{len(old_lines)} images. The old timeline was kept so no image is misplaced.")
+    prompts = retime_longform_assets(
+        out_dir, old_lines, new_lines, old_duration, new_duration,
+        prompts=old_prompts, status_cb=status_cb)
+    save_state(out_dir, lines=new_lines, prompts=prompts,
+               audio_duration=round(new_duration, 3),
+               retime_source_lines=None, retime_source_prompts=None,
+               retime_source_audio_duration=0.0)
+    write_transcript(new_lines, out_dir / "transcript.txt")
+    if prompts:
+        write_prompts_file(prompts, out_dir / f"image_prompts_{out_dir.name}.txt")
+    natural_durations = line_durations(new_lines, new_duration)
+    results = {}
+    for idx, line in enumerate(new_lines):
+        candidate = out_dir / "images" / f"{image_key(idx, line, natural_durations[idx])}.png"
+        if _image_done(candidate, "16:9"):
+            results[idx] = str(candidate)
+    cut_durations = caption_cut_durations(new_lines, prompts or [], new_duration)
+    write_timeline_manifest(
+        new_lines, cut_durations, results, new_duration, out_dir / "timeline.json",
+        voice_speed=float(state.get("voice_speed") or 1.0))
+    _log(status_cb, f"Timeline retimed: {len(new_lines)} image switches now follow the "
+                    "regenerated narration.")
+    return {"lines": len(new_lines), "duration": round(new_duration, 3),
+            "images": len(results), "timeline": str(out_dir / "timeline.json")}
 
 
 # ------------------------------------------------------------------ 2) TIMESTAMPS
@@ -715,14 +935,20 @@ def image_key(index, line, duration):
 
 
 def caption_cut_starts(lines, prompts, audio_duration, lead=0.15):
-    """Caption-synced cut times: frame i appears when its CAPTION word is actually SPOKEN.
+    """Caption-synced cut times: frame i appears when its CAPTION PHRASE is actually SPOKEN.
 
     The whisper line start is the first word of the sentence - but the caption usually names a
     word from the middle/end of it ("...almost nothing. WHY?"), so cutting at the sentence start
-    showed the WHY? frame seconds before "why" is heard. For every line we look up the first
-    per-word timing that matches a caption word (>=3 letters) and cut there, `lead` seconds
-    early (anticipation). Fallback: the line start. Cuts are forced monotonic and the first cut
-    is pinned to 0 so the video never opens on black."""
+    showed the WHY? frame seconds before "why" is heard.
+
+    The match must be the PHRASE, not any single caption word: with caption "SOMEONE ELSE" over
+    the line "...or is this something else? Someone else's hand..." a first-word-in-set match
+    hits the early "else" (of "something else") and cuts ~2s before "someone else" is spoken.
+    So for every position in the line we score how many consecutive caption words match from
+    there and cut at the position with the LONGEST run (earliest wins a tie); a single-word
+    caption keeps the old first-occurrence behaviour. The cut lands `lead` seconds early
+    (anticipation). Fallback: the line start. Cuts are forced monotonic and the first cut is
+    pinned to 0 so the video never opens on black."""
     cuts = []
     for i, line in enumerate(lines):
         cap = expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
@@ -731,13 +957,38 @@ def caption_cut_starts(lines, prompts, audio_duration, lead=0.15):
         cap_words = [w for w in _norm_words(cap) if len(w) >= 3]
         words = line.get("words") or []
         if cap_words and words:
+            # one normalized token per spoken word (None when the word is pure punctuation)
+            toks = []
             for w in words:
-                token = _norm_words(w.get("w") or "")
-                if token and token[0] in cap_words:
-                    # anticipation: show the frame a touch BEFORE the word lands (may nibble a
-                    # few ms off the previous sentence's tail - that reads as intentional)
-                    cut = max(0.0, float(w["s"]) - lead)
-                    break
+                t = _norm_words(w.get("w") or "")
+                toks.append(t[0] if t else None)
+            best_pos, best_run = None, 0
+            for j, tok in enumerate(toks):
+                if tok is None or tok != cap_words[0]:
+                    continue
+                run = 1
+                k = j + 1
+                for cw in cap_words[1:]:
+                    if k < len(toks) and toks[k] == cw:
+                        run += 1
+                        k += 1
+                    else:
+                        break
+                if run > best_run:            # longest consecutive match; earliest wins ties
+                    best_pos, best_run = j, run
+                    if run == len(cap_words):
+                        break                 # full phrase found - no better match exists
+            if best_pos is None:
+                # phrase never starts with cap_words[0] in this line (OCR-ish captions,
+                # rephrased text): fall back to the first occurrence of ANY caption word
+                for j, tok in enumerate(toks):
+                    if tok is not None and tok in cap_words:
+                        best_pos = j
+                        break
+            if best_pos is not None:
+                # anticipation: show the frame a touch BEFORE the word lands (may nibble a
+                # few ms off the previous sentence's tail - that reads as intentional)
+                cut = max(0.0, float(words[best_pos]["s"]) - lead)
         cuts.append(cut)
     # monotonic, minimum frame life 0.35s, first frame from 0
     for i in range(1, len(cuts)):
@@ -1558,11 +1809,15 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     # Older/interrupted states can already contain timed images while the speed decision is still
     # pending. Do not silently reuse that old clock: ask for speed, transcribe the resulting audio,
     # then rename the same semantic images onto the new clock below.
+    explicit_retime = bool(state and state.get("retime_source_lines"))
     speed_retime = bool(state and state.get("lines") and mix_gate is not None
                         and state.get("voice_speed") is None and _audio_done(raw_voice_path))
-    old_lines = list((state or {}).get("lines") or []) if speed_retime else []
-    old_prompts = list((state or {}).get("prompts") or []) if speed_retime else None
-    old_audio_duration = float((state or {}).get("audio_duration") or 0.0)
+    old_lines = (list((state or {}).get("retime_source_lines") or []) if explicit_retime
+                 else list((state or {}).get("lines") or []) if speed_retime else [])
+    old_prompts = (list((state or {}).get("retime_source_prompts") or []) if explicit_retime
+                   else list((state or {}).get("prompts") or []) if speed_retime else None)
+    old_audio_duration = (float((state or {}).get("retime_source_audio_duration") or 0.0)
+                          if explicit_retime else float((state or {}).get("audio_duration") or 0.0))
     reusable = bool(state and state.get("lines") and _audio_done(voice_path) and not speed_retime)
     retimed_prompts = None
     if reusable:
@@ -1581,18 +1836,27 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
                                                    mix_gate=mix_gate)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
-        if speed_retime and len(old_lines) == len(lines):
+        if (speed_retime or explicit_retime) and len(old_lines) == len(lines):
             retimed_prompts = retime_longform_assets(
                 out_dir, old_lines, lines, old_audio_duration, audio_duration,
                 prompts=old_prompts, status_cb=status_cb)
+        elif explicit_retime:
+            _log(status_cb, "The regenerated speech produced a different line count; existing "
+                            "images cannot be mapped safely and will be regenerated.")
         save_state(out_dir, script=script, lines=lines, tts_parts=tts_parts, voice=voice or "",
                    prompts=retimed_prompts,
-                   audio_duration=round(audio_duration, 3))
+                   audio_duration=round(audio_duration, 3),
+                   retime_source_lines=None, retime_source_prompts=None,
+                   retime_source_audio_duration=0.0)
     transcript_path = write_transcript(lines, out_dir / "transcript.txt")
     _log(status_cb, f"Transcript written: {transcript_path.name}")
 
     prompts = (state or {}).get("prompts") if reusable else retimed_prompts
-    cached_fmt = (state or {}).get("prompt_format") if reusable else None
+    # Retiming rewrites timestamps but not prompt semantics/format. Preserve the saved format
+    # marker or the normal stale-format guard would archive every reusable image immediately
+    # after a speech-only regeneration.
+    cached_fmt = ((state or {}).get("prompt_format")
+                  if (reusable or retimed_prompts is not None) else None)
     stale_format = bool(prompts) and cached_fmt != PROMPT_FORMAT_VERSION
     if prompts and len(prompts) == len(lines) and not stale_format:
         _log(status_cb, f"Resume: reusing the {len(prompts)} saved image prompt(s).")
