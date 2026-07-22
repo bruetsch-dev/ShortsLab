@@ -627,11 +627,14 @@ def caption_style(config):
     """USER-CUSTOMIZABLE caption style (per run, editable in the timeline editor too).
     Keys: caption_active_style (color|box|none), caption_active_color, caption_base_color,
     caption_box_color, caption_stroke (none|thin|bold). Defaults = the approved green-text look."""
-    mode = str(config.get("caption_active_style") or
-               ("box" if config.get("caption_active_box") else "color")).lower()
+    mode = str(config.get("caption_active_style") or "color").lower()
+    # The highlight BOX is gone for good (user 2026-07-23: "mach den gruenen background/box
+    # komplett weg") - any stored/legacy "box" value renders as the plain color mode.
+    if mode == "box":
+        mode = "color"
     stroke_mode = str(config.get("caption_stroke") or "thin").lower()
     return {
-        "mode": mode if mode in ("color", "box", "none") else "color",
+        "mode": mode if mode in ("color", "none") else "color",
         # default active word = WHITE (user 2026-07-23: "current word soll auch weiss sein");
         # any color, incl. the old green, remains one click away in the caption style panel.
         "active": _hex_rgb(config.get("caption_active_color"), CAPTION_BODY),
@@ -685,6 +688,37 @@ def _caption_display_word(word):
     ("UNREAL." -> "UNREAL", "countries," -> "countries"). Strip surrounding . , ; : quotes /
     brackets / ellipsis but KEEP ? ! and internal apostrophes/hyphens (don't, word-by-word)."""
     return (word or "").strip(_CAPTION_EDGE_PUNCT)
+
+
+def caption_chunk_sizes(tokens):
+    """Chunk-size plan for word-by-word captions (user rule 2026-07-23): 4+ char words
+    single; consecutive 1-3 char words group (max 4); a lone short word joins the next
+    word (or the previous chunk at the very end). `tokens` = display word strings."""
+    def _core(t):
+        return str(t or "").strip(".,!?…\"'")
+    sizes, i, n = [], 0, len(tokens)
+    while i < n:
+        if len(_core(tokens[i])) >= 4:
+            sizes.append(1)
+            i += 1
+            continue
+        j = i
+        while j < n and len(_core(tokens[j])) < 4 and j - i < 4:
+            j += 1
+        cnt = j - i
+        if cnt >= 2:
+            sizes.append(cnt)
+            i = j
+        elif i + 1 < n:
+            sizes.append(2)          # lone short word joins the next word
+            i += 2
+        elif sizes:
+            sizes[-1] += 1           # lone short at the very end joins the previous chunk
+            i += 1
+        else:
+            sizes.append(1)
+            i += 1
+    return sizes
 
 
 def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None, fps=None,
@@ -746,49 +780,16 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
                 cursor += span_d
     if not spans:
         return []
-    # Chunk sizes are planned so no chunk ends up as a lone leftover word (user rule:
-    # short words like "by"/"the" never stand alone - "by the" groups together instead).
-    # A trailing remainder of 1 is avoided by splitting the last max_words+1 as 2 + rest.
-    mw = max(1, max_words)
-    sizes = []
-    n = len(spans)
-    while n > 0:
-        if n == mw + 1 and mw >= 2:
-            sizes += [2, n - 2]
-            n = 0
-        elif n <= mw:
-            sizes.append(n)
-            n = 0
-        else:
-            sizes.append(mw)
-            n -= mw
+    # WORD-BY-WORD captions (user rule 2026-07-23): every word with 4+ characters stands
+    # ALONE on screen; short words (1-3 chars: "by", "the", "a") never stand alone -
+    # consecutive short words group ("by the"), a lone short word joins the NEXT word.
+    sizes = caption_chunk_sizes([s["text"] for s in spans])
     chunks = []
     i = 0
     for size in sizes:
         group = spans[i:i + size]
         i += size
         chunks.append({"start": group[0]["start"], "end": group[-1]["end"], "words": group})
-    # Safety net: a single SHORT word (<=4 chars) as its own chunk still reads broken -
-    # merge it into the previous chunk (or the next when it is the first).
-    merged = []
-    for ch in chunks:
-        alone = len(ch["words"]) == 1 and len(ch["words"][0]["text"].strip(".,!?…\"'")) <= 4
-        if alone and merged:
-            merged[-1].pop("_swallow_next", None)
-            merged[-1]["words"] += ch["words"]
-            merged[-1]["end"] = ch["end"]
-        elif alone and not merged and len(chunks) > 1:
-            merged.append(ch)          # first chunk: swallow the NEXT chunk into it instead
-            merged[-1]["_swallow_next"] = True
-        else:
-            if merged and merged[-1].pop("_swallow_next", None):
-                merged[-1]["words"] += ch["words"]
-                merged[-1]["end"] = ch["end"]
-            else:
-                merged.append(ch)
-    chunks = merged
-    for ch in chunks:
-        ch.pop("_swallow_next", None)
     if not chunks:
         return []
     # First chunk visible from the very start; no gaps between chunks; last lingers.

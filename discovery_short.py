@@ -503,7 +503,8 @@ def run_discovery_short(form, status_cb=None):
     # Built from whatever word list we have: script-aligned tokens normally, raw whisper
     # tokens on a mismatch - the short must never render caption-less.
     caption_track = []
-    sizes = _auto_phrases(counts) if aligned else [3] * (len(words) // 3) + ([len(words) % 3] if len(words) % 3 else [])
+    # word-by-word rule (user 2026-07-23): 4+ char words alone, short words grouped
+    sizes = pipeline.caption_chunk_sizes([w["word"] for w in words])
     wi = 0
     for n in sizes:
         ch = words[wi:wi + n]
@@ -589,7 +590,7 @@ def run_discovery_short(form, status_cb=None):
         "caption_max_words": 3, "caption_uppercase": True,
         "canonical_words": words, "impact_word": str(plan.get("impact_word") or ""),
         "sfx_enabled": True, "render_sfx_enabled": True, "custom_sfx": [],
-        "hook_riser_file": "hook_riser3",
+        "hook_riser_file": "hook_riser3", "hook_riser_full_hook": True,
         "background_music_enabled": False,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
@@ -832,8 +833,8 @@ def run_mini_topic_short(form, status_cb=None):
               bounds[i + 1][0] if i + 1 < len(bounds) else total_vo)
              for i in range(len(bounds))]
     caption_track = []
-    sizes = _auto_phrases(counts) if aligned else \
-        [3] * (len(words) // 3) + ([len(words) % 3] if len(words) % 3 else [])
+    # word-by-word rule (user 2026-07-23): 4+ char words alone, short words grouped
+    sizes = pipeline.caption_chunk_sizes([w["word"] for w in words])
     wi = 0
     for n in sizes:
         ch = words[wi:wi + n]
@@ -890,7 +891,7 @@ def run_mini_topic_short(form, status_cb=None):
         "caption_max_words": 3, "caption_uppercase": True,
         "canonical_words": words, "impact_word": str(plan.get("impact_word") or ""),
         "sfx_enabled": True, "render_sfx_enabled": True, "custom_sfx": [],
-        "hook_riser_file": "hook_riser3",
+        "hook_riser_file": "hook_riser3", "hook_riser_full_hook": True,
         "background_music_enabled": False,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",

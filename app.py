@@ -8576,9 +8576,9 @@ TIMELINE_ASSETS = """
       var txt=up?words[w].toUpperCase():words[w];
       txt=txt.replace(/&/g,'&amp;').replace(/</g,'&lt;');
       var st='font-weight:800; font-size:'+fs+'px; margin:0 3px; text-shadow:'+shadow+'; color:'+(cs.base_color||'#fff')+';';
-      if(active){
-        if(cs.active_style==='box') st='font-weight:800; font-size:'+fs+'px; margin:0 3px; padding:0 6px; border-radius:6px; background:'+(cs.box_color||'#23d160')+'; color:'+(cs.base_color||'#fff')+';';
-        else if(cs.active_style!=='none') st='font-weight:800; font-size:'+fs+'px; margin:0 3px; text-shadow:'+shadow+'; color:'+(cs.active_color||'#ffffff')+';';
+      if(active && cs.active_style!=='none'){
+        /* the highlight BOX mode is removed for good (user 2026-07-23) */
+        st='font-weight:800; font-size:'+fs+'px; margin:0 3px; text-shadow:'+shadow+'; color:'+(cs.active_color||'#ffffff')+';';
       }
       html+='<span style="'+st+'">'+txt+'</span>';
     }

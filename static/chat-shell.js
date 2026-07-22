@@ -1479,7 +1479,7 @@ function captionStylePanel() {
   // Fully user-customizable caption style (applies to every clip-short mode; the render
   // reads the same keys, and the timeline editor mirrors them from project.json).
   const V = S.values;
-  if (!V.caption_active_style) V.caption_active_style = "color";
+  if (!V.caption_active_style || V.caption_active_style === "box") V.caption_active_style = "color";
   const wrap = el("div", "capstyle");
   // live preview
   const prev = el("div", "capstyle-preview");
@@ -1487,7 +1487,6 @@ function captionStylePanel() {
     const up = (V.caption_uppercase_choice || "upper") !== "normal";
     const base = V.caption_base_color || "#ffffff";
     const act = V.caption_active_color || "#ffffff";
-    const box = V.caption_box_color || "#23d160";
     const strokeMode = V.caption_stroke || "thin";
     const sz = Math.max(13, Math.round((+V.caption_size || 84) * 0.28));
     const shadow = strokeMode === "none" ? "none"
@@ -1497,9 +1496,7 @@ function captionStylePanel() {
     const w = (t) => `<span style="color:${base}; font-weight:800; font-size:${sz}px; text-shadow:${shadow};">${t}</span>`;
     const at = up ? "WORD" : "word";
     let activeHtml;
-    if (V.caption_active_style === "box") {
-      activeHtml = `<span style="background:${box}; color:${base}; font-weight:800; font-size:${sz}px; padding:1px 7px; border-radius:6px;">${at}</span>`;
-    } else if (V.caption_active_style === "none") {
+    if (V.caption_active_style === "none") {
       activeHtml = w(at);
     } else {
       activeHtml = `<span style="color:${act}; font-weight:800; font-size:${sz}px; text-shadow:${shadow};">${at}</span>`;
@@ -1509,7 +1506,7 @@ function captionStylePanel() {
   wrap.appendChild(prev);
   // segmented highlight control
   const seg = el("div", "capstyle-seg");
-  [["color", "Colored word"], ["box", "Highlight box"], ["none", "Plain"]].forEach(([val, label]) => {
+  [["color", "Colored word"], ["none", "Plain"]].forEach(([val, label]) => {
     const b = el("button", "capstyle-seg-btn", esc(label));
     b.type = "button";
     b.dataset.capstyle = val;
@@ -1539,11 +1536,9 @@ function captionStylePanel() {
   };
   const fldActive = field("Active word", colorInput("caption_active_color", "#ffffff"));
   field("Text", colorInput("caption_base_color", "#ffffff"));
-  const fldBox = field("Box", colorInput("caption_box_color", "#23d160"));
-  // only show the controls the chosen highlight mode actually uses
+  // only show the controls the chosen highlight mode actually uses (the box mode is gone)
   const paintFields = () => {
     fldActive.style.display = V.caption_active_style === "color" ? "" : "none";
-    fldBox.style.display = V.caption_active_style === "box" ? "" : "none";
   };
   const strokeSel = el("select");
   [["thin", "Thin outline"], ["bold", "Bold outline"], ["none", "No outline"]].forEach(([v, l]) => strokeSel.appendChild(new Option(l, v)));

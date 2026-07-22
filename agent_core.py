@@ -5906,7 +5906,10 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     _hook_end = float(scenes[1].get("start", 0.0) or 0.0) if len(scenes) > 1 else 0.0
     _hook_beat = _hook_end
     _iw = str(config.get("impact_word") or "").strip()
-    if _iw:
+    # hook_riser_full_hook (discovery/mini, user 2026-07-23): with no impact hit placed,
+    # a riser that stops on the impact word mid-hook sounds CHOPPED - run it through the
+    # whole hook instead so it drops exactly on the first cut (with its whoosh).
+    if _iw and not config.get("hook_riser_full_hook"):
         hit = _find_word_time(_iw, 0.0, (_hook_end + 1.5) if _hook_end > 0 else None)
         if hit:
             _hook_beat = hit[0]          # riser peaks ON the word onset; impact fires there
@@ -6200,6 +6203,22 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             item, rlen, playback_rate = sfx_library.choose_riser_for_target(pick_pool, beat)
             if not item:
                 return False
+            # A short riser uniformly slowed to a far beat sounds mushy - and one that stops
+            # EARLY sounds chopped (user 2026-07-23). Progressive stretch: crisp 1x attack,
+            # progressively slower tail, total length EXACTLY beat, played at rate 1.0.
+            if beat > rlen + 0.12:
+                stretched = sfx_library.build_progressive_riser(item["path"], beat, rlen)
+                if stretched:
+                    # atempo chunk rounding makes the built file land slightly short of the
+                    # target; measure it and close the gap with a mild uniform rate so the
+                    # riser's drop hits EXACTLY on the beat (first cut) - never early silence.
+                    try:
+                        actual = float(probe_audio_duration(str(stretched)) or 0.0)
+                    except Exception:  # noqa: BLE001
+                        actual = 0.0
+                    item = dict(item, path=str(stretched))
+                    rlen = actual if actual > 0.1 else beat
+                    playback_rate = (rlen / beat) if beat > 0 else 1.0
             dur = beat
             start = 0.0
             source_trim = 0.0
