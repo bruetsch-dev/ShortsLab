@@ -417,6 +417,7 @@ def advanced_hidden_inputs(state):
     # them as hidden inputs for payload parity (a typed <tag> in the script still wins server-side)
     parts.append(f'<input type="hidden" name="region" value="{esc(str(state.get("region") or "general"))}">')
     parts.append(f'<input type="hidden" name="multi_language_search" value="{"on" if state.get("multi_language_search") else ""}">')
+    parts.append(f'<input type="hidden" name="search_languages" value="{esc(str(state.get("search_languages") or ""))}">')
     return "".join(parts)
 
 
@@ -3395,6 +3396,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="openai/gpt-5.6-sol"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-sol" else ""}>GPT-5.6 Sol</option>
               <option value="openai/gpt-5.6-terra"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-terra" else ""}>GPT-5.6 Terra</option>
               <option value="openai/gpt-5.6-luna"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-luna" else ""}>GPT-5.6 Luna</option>
+              <option value="moonshotai/kimi-k3"{' selected' if state.get("reasoning_model") == "moonshotai/kimi-k3" else ""}>Kimi K3</option>
               <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
               <option value="google/gemini-3.1-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-flash-lite" else ""}>Gemini 3.1 Flash Lite</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
@@ -3694,6 +3696,7 @@ def sfx_page():
             <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
@@ -3749,6 +3752,7 @@ def visual_page():
             <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
@@ -3920,6 +3924,7 @@ def longform_page():
             <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
@@ -4059,6 +4064,40 @@ def _make_speech_gate(job_id, cancel_event, approval_event):
     return gate
 
 
+def _make_discovery_gate(job_id, cancel_event, approval_event):
+    """Discovery mode: blocks the run after a topic + source video passed the vision review,
+    until the user APPROVES the found material (or asks for the next candidate)."""
+    def gate(info):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise RunCancelled("Run cancelled by user.")
+            job["status"] = "awaiting_approval"
+            job["discovery_review"] = dict(info or {})
+            job["discovery_decision"] = None
+            _n = len((info or {}).get("candidates") or [])
+            job["logs"].append(f"Discovery found {_n} candidate(s) — pick ONE on this page to continue.")
+            job.setdefault("log_times", []).append(time.time())
+        while not approval_event.wait(timeout=0.5):
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+        approval_event.clear()
+        if cancel_event.is_set():
+            raise RunCancelled("Run cancelled by user.")
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            decision = (job.get("discovery_decision") if job else "approve") or "approve"
+            if job:
+                job["discovery_review"] = None
+                job["status"] = "running"
+                job["logs"].append("Topic & material approved — writing the script."
+                                   if decision == "approve"
+                                   else "Candidate declined — searching for another one.")
+                job.setdefault("log_times", []).append(time.time())
+        return decision
+    return gate
+
+
 def start_job(fields, files):
     job_id = str(int(time.time() * 1000))
     fields = dict(fields)
@@ -4123,6 +4162,7 @@ def start_job(fields, files):
     fields["_media_exclusion_lock"] = media_exclusion_lock
     fields["_media_exclusions"] = media_exclusions
     fields["_speech_gate"] = _make_speech_gate(job_id, cancel_event, approval_event)
+    fields["_discovery_gate"] = _make_discovery_gate(job_id, cancel_event, approval_event)
     restart_fields = {k: v for k, v in fields.items() if not k.startswith("_") and k not in ("audio_path",)}
     if audio_path:
         fields["audio_path"] = audio_path
@@ -4173,7 +4213,20 @@ def start_job(fields, files):
     def worker():
         try:
             status_cb("Started.")
-            result = agent_core.run_project(fields, status_cb)
+            # Clip Short DISCOVERY mode: no script -> the agent finds one long process
+            # TikTok, writes the script itself and recuts the source to the voiceover.
+            _fmt = str(fields.get("clip_short_format") or "")
+            _no_script = not str(fields.get("script") or "").strip()
+            if _fmt == "discovery" and _no_script:
+                import discovery_short
+                result = discovery_short.run_discovery_short(fields, status_cb)
+            elif _fmt == "mini_story" and _no_script and str(fields.get("gen_topic") or "").strip():
+                # Mini Story TOPIC mode: scrape a one-subject footage cluster FIRST, then
+                # write a script the material can actually show.
+                import discovery_short
+                result = discovery_short.run_mini_topic_short(fields, status_cb)
+            else:
+                result = agent_core.run_project(fields, status_cb)
             with JOB_LOCK:
                 if cancel_event.is_set():
                     JOBS[job_id]["status"] = "cancelled"
@@ -5781,7 +5834,7 @@ def project_media_files(project_dir):
     manifest = project_web_manifest_by_name(project_dir)
     social_sources = project_social_sources_by_name(project_dir)
     items = []
-    folders = ["web images", "seedance 2.0", "gpt images", "speaker", "speaker clip", "renders", "review", "local media"]
+    folders = ["web images", "seedance 2.0", "gpt images", "speaker", "speaker clip", "renders", "review", "local media", "initial downloads"]
     suffixes = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".webm", ".mov", ".m4v", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
     for folder_name in folders:
         folder = project_dir / folder_name
@@ -5810,7 +5863,10 @@ def project_media_files(project_dir):
             # (review/_clip_match frames, _hook_match, _fx_frames, contact sheets, _debug...)
             # - hundreds of JPGs that are not project media and bloated the panel.
             rel_parts = Path(path).relative_to(project_dir).parts
-            if any(p.startswith("_") for p in rel_parts):
+            # exception: the discovery mode's FULL source video is real project media the
+            # user cuts from in the timeline (user rule 2026-07-23), not a working artifact.
+            if any(p.startswith("_") for p in rel_parts) \
+                    and path.name.lower() != "_discovery_source.mp4":
                 continue
             # derived poster thumbnails (clip.poster.jpg) are not real draggable media
             if path.name.lower().endswith(".poster.jpg"):
@@ -6586,6 +6642,7 @@ TIMELINE_SKELETON = """
             <option value="openai/gpt-5.6-sol">GPT-5.6 Sol</option>
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
@@ -6600,6 +6657,7 @@ TIMELINE_SKELETON = """
         <div class="tl-pop" id="tl-render-pop" hidden>
           <label class="tl-cap-toggle"><input type="checkbox" id="tl-captions"><span>Render with captions</span></label>
           <label class="tl-cap-toggle" title="Off = render with the voice only, no sound effects (content, transition, cut and added sounds are all muted)"><input type="checkbox" id="tl-sfx-toggle"><span>Render with sound effects</span></label>
+          <label class="tl-cap-toggle" title="Re-encodes the finished render for a much smaller file. Stays full 1080p &mdash; just tighter compression (slower, and a touch softer on fine grain)."><input type="checkbox" id="tl-compress"><span>Compress for small file</span></label>
           <button type="button" class="button primary tl-render-btn" id="tl-render" title="Saves your timeline automatically, then renders">&#11015; Render</button>
         </div>
       </div>
@@ -6688,6 +6746,7 @@ TIMELINE_SKELETON = """
           <button type="button" class="tl-ctrl" id="tl-back" title="Back 5s" aria-label="Back 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 6h2.2v12H6zM20 6v12L9.5 12z"/></svg></button>
           <button type="button" class="tl-ctrl tl-ctrl-main" id="tl-play" title="Play / Pause" aria-label="Play"><span id="tl-play-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></button>
           <button type="button" class="tl-ctrl" id="tl-fwd" title="Forward 5s" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M15.8 6H18v12h-2.2zM4 6v12l10.5-6z"/></svg></button>
+          <button type="button" class="tl-ctrl" id="tl-cut" title="Cut clip at playhead (C)" aria-label="Cut clip at playhead"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="6" r="2.6"/><circle cx="6" cy="18" r="2.6"/><path d="M8.2 7.6 20 19M8.2 16.4 20 5"/></svg></button>
           <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
         </div>
       </div>
@@ -8475,9 +8534,56 @@ TIMELINE_ASSETS = """
     return '';
   }
   function renderPreviewCaption(t){
-    if(!pcaption)return;var text=captionAt(t);pcaption.textContent=text;
+    if(!pcaption)return;
     pcaption.style.top=(Math.max(.1,Math.min(.9,+(model.caption_center_y||.72)))*100)+'%';
-    pcaption.style.display=text?'block':'none';
+    // mirror the USER'S caption style (colors / box / outline / case / size) word-by-word
+    var cs=model.caption_style||{};
+    var row=null;
+    if(captionsOn){
+      for(var i=0;i<captionTrack.length;i++){
+        var r=captionTrack[i], rs=+(r.start||0), re=+(r.end||rs);
+        if(t>=rs&&t<re){row=r;break;}
+      }
+    }
+    if(!row){ pcaption.style.display='none'; pcaption.innerHTML=''; return; }
+    var words=String(row.text||'').trim().split(/\\s+/).filter(Boolean);
+    if(!words.length){ pcaption.style.display='none'; return; }
+    var local=t-(+(row.start||0)), timings=row.word_timings||[];
+    var up=cs.uppercase!==false;
+    var stroke=String(cs.stroke||'thin');
+    var shadow=stroke==='none'?'none'
+      : stroke==='bold'?'-2px 0 0 #000,2px 0 0 #000,0 -2px 0 #000,0 2px 0 #000,2px 3px 4px rgba(0,0,0,.6)'
+      : '-1px 0 0 #000,1px 0 0 #000,0 -1px 0 #000,0 1px 0 #000,1px 2px 3px rgba(0,0,0,.5)';
+    // Clamp the caption to the ACTUAL displayed video area, not the stage box:
+    // with a wide stage + pillarboxed 9:16 video the old left/right:7% let long
+    // lines run far outside the video ("words go out of the screen").
+    var stage=pcaption.parentElement, sw=(stage&&stage.clientWidth)||270, sh=(stage&&stage.clientHeight)||480;
+    var media=(pvid&&pvid.style.display!=='none')?pvid:pimg;
+    var vw=9,vh=16;
+    if(media&&media.tagName==='VIDEO'&&media.videoWidth){ vw=media.videoWidth; vh=media.videoHeight; }
+    else if(media&&media.naturalWidth){ vw=media.naturalWidth; vh=media.naturalHeight; }
+    var scale=Math.min(sw/vw,sh/vh), dispW=vw*scale, dispH=vh*scale;
+    var capW=Math.round(dispW*0.82);
+    pcaption.style.left=Math.round((sw-capW)/2)+'px';
+    pcaption.style.right='auto';
+    pcaption.style.width=capW+'px';
+    var fs=Math.max(10,Math.round((+cs.size||84)*dispH/1920));
+    var html='';
+    for(var w=0;w<words.length;w++){
+      var wt=timings[w], active=false;
+      if(wt){ active=local>=+(wt.start||0)&&local<+(wt.end||0); }
+      else { active=Math.floor(local/(Math.max(.2,(+(row.end||0)-(+(row.start||0)))/words.length)))===w; }
+      var txt=up?words[w].toUpperCase():words[w];
+      txt=txt.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      var st='font-weight:800; font-size:'+fs+'px; margin:0 3px; text-shadow:'+shadow+'; color:'+(cs.base_color||'#fff')+';';
+      if(active){
+        if(cs.active_style==='box') st='font-weight:800; font-size:'+fs+'px; margin:0 3px; padding:0 6px; border-radius:6px; background:'+(cs.box_color||'#23d160')+'; color:'+(cs.base_color||'#fff')+';';
+        else if(cs.active_style!=='none') st='font-weight:800; font-size:'+fs+'px; margin:0 3px; text-shadow:'+shadow+'; color:'+(cs.active_color||'#ffffff')+';';
+      }
+      html+='<span style="'+st+'">'+txt+'</span>';
+    }
+    pcaption.innerHTML=html;
+    pcaption.style.display='block';
   }
   function renderPreviewOverlays(scene){
     if(!overlayLayer)return; overlayLayer.innerHTML='';
@@ -8751,6 +8857,29 @@ TIMELINE_ASSETS = """
   document.getElementById('tl-play').addEventListener('click', function(){ if(playing) stop(); else play(); });
   document.getElementById('tl-back').addEventListener('click', function(){ seekBy(-5); });
   document.getElementById('tl-fwd').addEventListener('click', function(){ seekBy(5); });
+  // CapCut-style cut: split the clip under the playhead into two independent clips at
+  // exactly the playhead time (user rule 2026-07-23). Both halves keep the source file;
+  // the right half continues where the left half ends (source_trim advanced by the
+  // consumed source time, dur split at the cut). Undo = one history entry.
+  function cutAtPlayhead(){
+    var info=sceneAt(clock); if(!info||!info.scene)return;
+    var s=info.scene, local=info.local;
+    if(local<0.25 || (s.dur-local)<0.25) return;   // too close to a clip edge
+    var b; try{ b=JSON.parse(JSON.stringify(s)); }catch(e){ return; }
+    b.id='cut-'+Date.now();
+    b.overlays=[];
+    b.dur=+((s.dur-local).toFixed(3));
+    b.source_trim=+(((+(s.source_trim||0))+local*effRate(s)).toFixed(3));
+    s.dur=+(local.toFixed(3));
+    var at=scenes.indexOf(s);
+    scenes.splice(at<0?scenes.length:at+1,0,b);
+    if(typeof clearClipSelection==='function')clearClipSelection();
+    sel=null; showPane(null);
+    layout(); markDirty();
+    var after=sceneAt(clock); if(after)showScene(after.scene,true);
+    updatePlayhead();
+  }
+  document.getElementById('tl-cut').addEventListener('click', function(){ cutAtPlayhead(); });
   // ruler + playhead: click to seek, drag to scrub (works in render and sequence mode)
   function timelineTimeFromClientX(clientX){
     var rect=ruler.getBoundingClientRect();
@@ -8813,6 +8942,7 @@ TIMELINE_ASSETS = """
     else if (e.key==='+' || e.key==='='){ setZoom(SCALE*1.3); }
     else if (e.key==='-'){ setZoom(SCALE/1.3); }
     else if (e.key.toLowerCase()==='f'){ fitZoom(); }
+    else if (e.key.toLowerCase()==='c' && !e.ctrlKey && !e.metaKey && !e.altKey){ e.preventDefault(); cutAtPlayhead(); }
     else if ((e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='ArrowUp'||e.key==='ArrowDown') && sel&&sel.type==='overlay'){
       e.preventDefault(); var rec=currentOverlay(); if(rec){var d=overlayDefaults(rec.overlay),step=e.shiftKey ? 0.02 : 0.005;
         if(e.key==='ArrowLeft')d.x-=step;if(e.key==='ArrowRight')d.x+=step;if(e.key==='ArrowUp')d.y-=step;if(e.key==='ArrowDown')d.y+=step;
@@ -8881,6 +9011,8 @@ TIMELINE_ASSETS = """
   document.getElementById('tl-render').addEventListener('click', function(){
     var btn=this; btn.disabled=true; var old=btn.innerHTML; btn.textContent='Saving…';
     var edits=collectEdits();
+    var _cmp=document.getElementById('tl-compress');
+    edits.compress=!!(_cmp&&_cmp.checked);   // "Compress for small file" (1080p stays)
     // ALWAYS save the project before a render starts (user rule)
     fetch('/timeline-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
       .then(function(){ dirty=false; try{ document.getElementById('tl-save').classList.remove('tl-unsaved'); }catch(e){} btn.textContent='Starting…';
@@ -11926,6 +12058,17 @@ def timeline_model(slug):
         # track (an uploaded MP4 with baked-in captions has none). SFX are removable/redoable when
         # the project has editable markers or can plan SFX (baked-in upload audio is neither).
         "captions_editable": bool([r for r in caption_track if isinstance(r, dict) and str(r.get("text") or "").strip()]),
+        # user-customizable caption style (same keys the render reads) - the preview mirrors it 1:1
+        "caption_style": {
+            "active_style": str(config.get("caption_active_style")
+                                or ("box" if config.get("caption_active_box") else "color")),
+            "active_color": str(config.get("caption_active_color") or "#ffffff"),
+            "base_color": str(config.get("caption_base_color") or "#ffffff"),
+            "box_color": str(config.get("caption_box_color") or "#23d160"),
+            "stroke": str(config.get("caption_stroke") or "thin"),
+            "uppercase": bool(config.get("caption_uppercase", True)),
+            "size": int(config.get("caption_size") or 84),
+        },
         "sfx_removable": bool(content) or bool(transitions) or bool(config.get("sfx_enabled", True)),
         # SFX/Captions-Master uploads split ONE finished video into seg_NN.mp4 pieces with the
         # captions BAKED into the pixels - replacing such a clip drops its caption and the render
@@ -12035,6 +12178,35 @@ def _regenerate_project_captions(slug, status_cb=None):
     if status_cb: status_cb(f"Redo captions: {len(analysis['sentence_timestamps'])} caption lines re-aligned.")
 
 
+def _compress_render_file(video_path, status_cb=None):
+    """'Compress for small file': re-encode the finished render in place.
+    Keeps full 1080p resolution/fps - only the compression gets tighter
+    (x264 slow + CRF 27, AAC 128k)."""
+    import subprocess
+    src = Path(video_path)
+    if not src.exists():
+        return video_path
+    ff = pipeline.find_ffmpeg()
+    tmp = src.with_name(src.stem + "_small_tmp.mp4")
+    size_before = src.stat().st_size
+    if status_cb:
+        status_cb(f"Compressing render ({size_before / 1e6:.0f} MB, 1080p kept)...")
+    proc = subprocess.run(
+        [ff, "-y", "-loglevel", "error", "-i", str(src),
+         "-c:v", "libx264", "-preset", "slow", "-crf", "27", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(tmp)],
+        capture_output=True, text=True)
+    if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        if status_cb:
+            status_cb("Compression failed - keeping the uncompressed render.")
+        return video_path
+    tmp.replace(src)
+    if status_cb:
+        status_cb(f"Compressed: {size_before / 1e6:.0f} MB -> {src.stat().st_size / 1e6:.0f} MB.")
+    return str(src)
+
+
 def start_timeline_job(slug, edits, regen_captions=False):
     job_id = str(int(time.time() * 1000))
     cancel_event = threading.Event()
@@ -12064,6 +12236,8 @@ def start_timeline_job(slug, edits, regen_captions=False):
             if regen_captions:
                 _regenerate_project_captions(slug, status_cb=status_cb)
             result = agent_core.render_project_timeline(slug, edits, status_cb=status_cb, cancel_event=cancel_event)
+            if edits.get("compress") and result and result.get("video"):
+                result["video"] = _compress_render_file(result["video"], status_cb=status_cb)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -12777,6 +12951,40 @@ def job_page(job_id):
             </form>
           </details>
         </section>"""
+    discovery_html = ""
+    if status == "awaiting_approval" and job.get("discovery_review"):
+        info = job["discovery_review"]
+        qid = urllib.parse.quote(job_id)
+        cards = ""
+        for c in (info.get("candidates") or []):
+            sheet_path = str(c.get("sheet") or "")
+            img_html = ""
+            if sheet_path and Path(sheet_path).exists():
+                img_html = (f'<img src="{link_for(Path(sheet_path))}" alt="Frame sheet" '
+                            f'style="width:100%; border-radius:8px; margin:8px 0;">')
+            stages_html = "".join(f"<li>{esc(s)}</li>" for s in (c.get("stages") or [])[:6])
+            meta = (f"@{esc(str(c.get('author') or ''))} &middot; {c.get('dur')}s &middot; "
+                    f"{int(c.get('likes') or 0):,} likes &middot; appeal {c.get('appeal')}/10")
+            cards += f"""
+            <div style="flex:1 1 260px; max-width:320px; border:1px solid var(--line-strong);
+                        border-radius:12px; padding:12px; background:var(--bg-input);">
+              <strong style="display:block; margin-bottom:2px;">{esc(str(c.get('title') or ''))}</strong>
+              <div class="hint" style="margin-bottom:4px;">{meta}</div>
+              {img_html}
+              <ol style="margin:4px 0 10px 18px; color:var(--muted); font-size:12px;">{stages_html}</ol>
+              <form class="inline-form" method="post"
+                    action="/approve-discovery?id={qid}&amp;action=pick&amp;choice={int(c.get('index') or 0)}">
+                <button type="submit" style="width:100%;">&#10003; Use candidate {int(c.get('index') or 0) + 1}</button>
+              </form>
+            </div>"""
+        discovery_html = f"""
+        <section class="panel accent" id="discovery-approval">
+          <h2>&#128269; Pick the topic &amp; material</h2>
+          <div class="hint">Discovery found these long TikTok sources. Pick ONE &mdash; only then is
+            the script written and the voiceover produced.</div>
+          <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:12px;">{cards}</div>
+        </section>"""
+    speech_html += discovery_html
     # Timeline-editor render: a clean animated progress bar only - no console log, no media sidebar,
     # and NO redundant "Rendering" heading / "running" status pill (the animated bar already says it).
     # Keep the Shortslab identity so the app doesn't look like it got replaced by a bare status page.
@@ -13037,6 +13245,11 @@ def job_status_payload(job_id):
         "speech_audio_url": (link_for(Path(job["speech_audio"]))
                              if status == "awaiting_approval" and job.get("speech_audio") else ""),
         "speech_speed": (_speech_current_speed(job) if status == "awaiting_approval" else 0),
+        # Discovery mode: the pick-one-of-N topic/material approval (sheet paths -> URLs)
+        "discovery_review": ([{**c, "sheet_url": (link_for(Path(c["sheet"]))
+                                                  if c.get("sheet") and Path(c["sheet"]).exists() else "")}
+                              for c in (job.get("discovery_review") or {}).get("candidates", [])]
+                             if status == "awaiting_approval" and job.get("discovery_review") else []),
         # longform per-part speech approval ("Halt after speech" in the longform creator)
         "lf_parts": (job.get("lf_parts") or []) if status == "awaiting_approval" else [],
         "assigned_media": _assigned_media_payload(job),
@@ -14169,6 +14382,25 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": ok}).encode("utf-8"))
             return
+        if parsed.path == "/approve-discovery":
+            _q = urllib.parse.parse_qs(parsed.query)
+            job_id = _q.get("id", [""])[0]
+            action = _q.get("action", ["pick"])[0]
+            try:
+                choice = max(0, int(_q.get("choice", ["0"])[0]))
+            except (TypeError, ValueError):
+                choice = 0
+            decision = f"pick:{choice}" if action == "pick" else "pick:0"
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if job and job.get("status") == "awaiting_approval" and job.get("discovery_review"):
+                    job["discovery_decision"] = decision
+            if job and job.get("approval_event"):
+                job["approval_event"].set()
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
+            self.end_headers()
+            return
         if parsed.path == "/approve-speech":
             _q = urllib.parse.parse_qs(parsed.query)
             job_id = _q.get("id", [""])[0]
@@ -14624,6 +14856,7 @@ class Handler(BaseHTTPRequestHandler):
             if reasoning_model not in {"anthropic/claude-fable-5", "anthropic/claude-sonnet-5",
                                        "anthropic/claude-opus-4.8", "openai/gpt-5.5",
                                        "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
+                                       "moonshotai/kimi-k3",
                                        "google/gemini-3.5-flash", "google/gemini-3.1-flash-lite",
                                        "google/gemini-3.1-pro-preview"}:
                 reasoning_model = "openai/gpt-5.5"

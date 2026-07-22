@@ -34,6 +34,9 @@ REASONING_CONFIG = {
                                      "options": GEMINI, "apiMode": "reasoning-object"},
     "google/gemini-3.1-pro-preview": {"supported": True, "defaultValue": "high",
                                       "options": GEMINI, "apiMode": "reasoning-object"},
+    # https://wavespeed.ai/llm/moonshotai/kimi-k3 - no exposed reasoning-effort control
+    "moonshotai/kimi-k3": {"supported": False, "defaultValue": None, "options": [],
+                           "apiMode": "none"},
 }
 
 _selected_mode = ContextVar("wavespeed_reasoning_mode", default=(None, None))

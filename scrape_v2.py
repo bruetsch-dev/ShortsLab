@@ -68,9 +68,11 @@ except Exception:                        # pragma: no cover
 V2_ANALYSIS_VERSION = 1   # bump when segment/quality/vision math changes -> invalidates cache
 
 SCRAPE_V2_CONFIG = {
-    "max_total_source_videos": 220,       # metadata candidates considered overall
-    "max_downloaded_analysis_videos": 100,
-    "max_final_segments": 180,
+    # COST (user 2026-07-22: "$2 LLM pro Mini-Run, was soll das"): the old budgets let one
+    # 25s mini short download 65 sources and push 174 segments through paid vision. Halved.
+    "max_total_source_videos": 120,       # metadata candidates considered overall
+    "max_downloaded_analysis_videos": 36,
+    "max_final_segments": 90,
     "max_queries_per_bucket": 30,
     "max_queries_per_scene_retry": 8,
     "max_bucket_time_seconds": 300,
@@ -115,10 +117,14 @@ V2_QUERY_TIERS = ["exact_action", "action_location", "semantic_action",
                   "native_vlog", "broad_context", "hashtag", "creator_style"]
 
 # script_floor = the minimum literal script_match; overall = minimum combined semantic score.
+# TIGHTENED 2026-07-22 ("material das 0 mit dem voiceover zu tun hat"): the abstract/context
+# floors let a key-hook DIY tutorial score 7/10 on "erase their existence overnight" because the
+# matcher rewarded the METAPHOR. Floors up; the matcher prompt must score the LITERAL on-screen
+# subject, not a poetic connection.
 MATCH_THRESHOLDS_V2 = {
     "concrete": {"script_floor": 5.8, "overall": 6.5},
-    "context":  {"script_floor": 4.8, "overall": 6.0},
-    "abstract": {"script_floor": 3.8, "overall": 5.5},
+    "context":  {"script_floor": 5.5, "overall": 6.5},
+    "abstract": {"script_floor": 5.2, "overall": 6.3},
     # shock/meme scenes: the visual punchline may ignore the script (that IS the joke), but the
     # segment must actually be absurd (absurdity gate enforced in the matcher loop)
     "shock":    {"script_floor": 2.5, "overall": 5.0},
@@ -1679,7 +1685,13 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         "sentence. A line about human bodies, weight, height or looks can NEVER be matched by an "
         "object-only segment (a scale on a store shelf, a suitcase for 'heavy', a calculator) - "
         "it requires a visible PERSON. Never match on one shared keyword when the surrounding "
-        "context differs (that is how a suitcase ended up illustrating body weight).\n\n"
+        "context differs (that is how a suitcase ended up illustrating body weight).\n"
+        "NO METAPHOR SCORING: script_match measures whether the LITERAL on-screen content shows "
+        "what the sentence talks about - a DIY key-holder tutorial is NOT a match for 'people "
+        "erase their existence' just because keys are 'left behind'. A poetic/metaphorical "
+        "connection caps script_match at 3. Tutorials, product demos, anime/avatar/cartoon "
+        "footage, gaming overlays and comedy face-filters cap script_match at 2 unless the "
+        "sentence is literally about that thing.\n\n"
         "SEGMENTS:\n" + "\n".join(seg_lines) + "\n\nSCENES:\n" + "\n".join(intent_lines) + "\n\n"
         'Return STRICT JSON: {"scenes": {"1": [{"seg": <seg index>, "subject_match":0-10,'
         '"action_match":0-10,"location_match":0-10,"mood_match":0-10,"script_match":0-10,'

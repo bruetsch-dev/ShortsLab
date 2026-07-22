@@ -1137,6 +1137,79 @@ def apply_approved_voice_speed(audio_path, chosen, form, status_cb=None):
     return src
 
 
+def split_voice_take_at_hook(full_take, hook_text, input_dir, ffmpeg, status_cb=None):
+    """Split a SINGLE full-script TTS take into hook.wav + body.wav at the hook boundary.
+
+    The boundary is found locally with faster-whisper word timestamps (no paid call): the
+    whisper words are greedily aligned onto the hook tokens; the hook slice ends just after
+    the last hook word, the body slice starts just before the next word. Falls back to the
+    longest silence near the expected character-ratio position when alignment fails."""
+    full_take = Path(full_take)
+    input_dir = Path(input_dir)
+    suffix = full_take.suffix or ".wav"
+
+    def _norm(x):
+        return re.sub(r"[^a-z0-9]", "", str(x or "").lower())
+
+    hook_end, body_start = None, None
+    try:
+        from faster_whisper import WhisperModel
+        wm = WhisperModel("base", device="cpu", compute_type="int8")
+        segs, _info = wm.transcribe(str(full_take), word_timestamps=True, language="en")
+        words = [w for s in segs for w in s.words]
+        toks = [t for t in (_norm(t) for t in hook_text.split()) if t]
+        ti, acc, end = 0, "", None
+        end_index = None
+        for wi, w in enumerate(words):
+            if ti >= len(toks):
+                break
+            acc += _norm(w.word)
+            end = float(w.end)
+            end_index = wi
+            if acc == toks[ti] or len(acc) >= len(toks[ti]):
+                ti += 1
+                acc = ""
+        if ti >= len(toks) and end is not None:
+            hook_end = end
+            nxt = next((float(w.start) for w in words[end_index + 1:]
+                        if float(w.start) > end - 0.01), None)
+            body_start = max(hook_end, (nxt - 0.05)) if nxt else hook_end
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Hook-boundary alignment failed ({exc.__class__.__name__}); "
+                       "using silence detection.")
+    if hook_end is None:
+        # fallback: biggest silence near the expected position (hook chars / script chars)
+        total = probe_audio_duration(full_take) or 0.0
+        if total <= 0:
+            raise RuntimeError("could not probe the full voiceover take")
+        import subprocess as _sp
+        r = _sp.run([ffmpeg, "-i", str(full_take), "-af",
+                     "silencedetect=noise=-32dB:d=0.12", "-f", "null", os.devnull],
+                    capture_output=True, text=True)
+        marks = [(float(m.group(1))) for m in
+                 re.finditer(r"silence_start: ([0-9.]+)", (r.stderr or ""))]
+        # pick the silence start closest to the hook's share of the take (by char count)
+        script_len = getattr(split_voice_take_at_hook, "_script_len", 0) or (len(hook_text) * 4)
+        approx = total * min(0.6, max(0.08, len(hook_text) / max(script_len, len(hook_text) + 1)))
+        cands = [m for m in marks if 0.5 < m < total - 0.5]
+        if not cands:
+            raise RuntimeError("no silence found to place the hook edit")
+        hook_end = min(cands, key=lambda m: abs(m - approx))
+        body_start = hook_end
+    hook_path = input_dir / f"hook{suffix}"
+    body_path = input_dir / f"body{suffix}"
+    import subprocess as _sp
+    _sp.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(full_take),
+             "-t", f"{hook_end + 0.06:.3f}", "-c:a", "pcm_s16le" if suffix == ".wav" else "copy",
+             str(hook_path)], check=True)
+    _sp.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{body_start:.3f}",
+             "-i", str(full_take), "-c:a", "pcm_s16le" if suffix == ".wav" else "copy",
+             str(body_path)], check=True)
+    log(status_cb, f"Hook boundary found at {hook_end:.2f}s in the single take "
+                   f"(hook {hook_path.name}, body {body_path.name}).")
+    return hook_path, body_path
+
+
 def generate_project_voiceover(script, project_dir, form, status_cb=None):
     """Generate the spoken voiceover from the script with Gemini TTS.
 
@@ -1208,15 +1281,16 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
         if hook and body:
             if not ffmpeg:
                 raise RuntimeError("ffmpeg is required for the mandatory hook/body voice edit")
-            log(status_cb, "Generating hook + body narration for the mandatory 0.500s edit...")
-            hook_path = pipeline.generate_speech_gemini(
-                hook, input_dir / "hook", speaker=speaker, voice=voice, model=model,
+            # ONE TTS call for the WHOLE script (user rule 2026-07-22: never two paid calls);
+            # the hook/body boundary is then found LOCALLY (faster-whisper) and 0.5s of
+            # silence is inserted there. Delivery stays continuous, cost is halved.
+            log(status_cb, "Generating the FULL narration in ONE take (hook edit cut locally)...")
+            full_take = pipeline.generate_speech_gemini(
+                script, input_dir / "voiceover_full", speaker=speaker, voice=voice, model=model,
                 cancel_event=cancel_event, status_cb=status_cb)
-            body_path = pipeline.generate_speech_gemini(
-                body, input_dir / "body", speaker=speaker, voice=voice, model=model,
-                cancel_event=cancel_event, status_cb=status_cb)
-            pipeline.apply_voice_postprocess(hook_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
-            pipeline.apply_voice_postprocess(body_path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
+            pipeline.apply_voice_postprocess(full_take, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
+            hook_path, body_path = split_voice_take_at_hook(
+                full_take, hook, input_dir, ffmpeg, status_cb=status_cb)
             full = input_dir / f"voiceover{hook_path.suffix}"
             joined = pipeline.concat_audio_with_pause(
                 hook_path, body_path, full, pause_s=HOOK_BODY_PAUSE_S, ffmpeg=ffmpeg)
@@ -3385,8 +3459,8 @@ def build_social_search_plan(title, script, scenes, understanding=None, reasonin
             "slang, formal/casual phrasing, different concrete nouns and camera perspectives (POV / vlog / "
             "walking tour / close-up). Near-duplicate wordings waste searches and are skipped.\n"
             "School terms: when the script IS about school life, DO use them actively in the body buckets "
-            "(学校 / 女子高生 / JK / 制服 / 教室 / 高校生活 / #jk) - they index that content best. When the "
-            "script is NOT about school, never use them.\n"
+            "(学校 / 制服 / 教室 / 高校生活) - they index that content best. When the "
+            "script is NOT about school, never use school terms, and NEVER emit the tags JK / #jk in any query.\n"
             "Also add creator-discussion queries where useful (a creator TALKING about the topic), e.g. "
             "恋愛について話す 女子, 仕事疲れた 話す.\n"
             f"Useful synonym families to widen with: {syn}.\n"
@@ -5554,6 +5628,88 @@ REACTION_DB = {"money_cash": -8, "celebrate": -8, "shock_reveal": -8, "death": -
 _REACTION_DB_DEFAULT = -11
 
 
+def enforce_unique_scene_clips(config, project_dir, status_cb=None):
+    """FINAL dedup pass over the assembled timeline (runs right before the pre-render gate).
+
+    The user's complaint ("massenhaft duplikate"): the same segment file - and other excerpts
+    of the same source TikTok - ended up on 3+ scenes. Whatever assignment/rebalance pass
+    produced that, this guard enforces: one clip FILE per scene, one SOURCE video per render.
+    Duplicates are swapped for UNUSED accepted clips from the project pool (best-scored first,
+    via their accept sidecar JSONs); when the pool is exhausted the repeat stays but is logged
+    loudly so it shows up in the report instead of silently rendering."""
+    scenes = config.get("scenes") or []
+    if len(scenes) < 2:
+        return 0
+    clip_dir = Path(project_dir) / "seedance 2.0"
+
+    def _source_of(name):
+        side = clip_dir / (str(name) + ".json")
+        alt = clip_dir / (Path(str(name)).stem + ".json")
+        for p in (side, alt):
+            try:
+                if p.exists():
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    return str(d.get("clip_id") or "")
+            except Exception:
+                continue
+        return ""
+
+    # pool of accepted, currently-unused clips (with their sidecar scores)
+    pool = []
+    on_timeline = {str(s.get("clip") or s.get("asset") or "") for s in scenes}
+    for p in sorted(clip_dir.glob("*.mp4")):
+        if p.name in on_timeline:
+            continue
+        try:
+            side = p.with_suffix(".json")
+            meta = json.loads(side.read_text(encoding="utf-8")) if side.exists() else {}
+        except Exception:
+            meta = {}
+        if str(meta.get("status") or "accepted") != "accepted":
+            continue
+        pool.append({"name": p.name, "clip_id": str(meta.get("clip_id") or ""),
+                     "score": float(meta.get("semantic_score") or 0)})
+    pool.sort(key=lambda c: -c["score"])
+
+    used_files, used_sources = set(), set()
+    swaps, unresolved = 0, 0
+    for i, sc in enumerate(scenes):
+        name = str(sc.get("clip") or sc.get("asset") or "")
+        if not name:
+            continue
+        src = str(sc.get("scrape_clip_id") or "") or _source_of(name)
+        dup = (name in used_files) or (src and src in used_sources)
+        if not dup:
+            used_files.add(name)
+            if src:
+                used_sources.add(src)
+            continue
+        # find a replacement whose file AND source are unused
+        repl = next((c for c in pool
+                     if c["name"] not in used_files
+                     and (not c["clip_id"] or c["clip_id"] not in used_sources)), None)
+        if repl is None:
+            unresolved += 1
+            log(status_cb, f"Duplicate guard: scene {i} repeats {name} and the pool has no "
+                           "unused replacement - repeat kept (visible in the report).")
+            continue
+        pool.remove(repl)
+        sc["clip"] = repl["name"]
+        sc["asset"] = repl["name"]
+        if repl["clip_id"]:
+            sc["scrape_clip_id"] = repl["clip_id"]
+        sc["duplicate_guard_swapped"] = True
+        used_files.add(repl["name"])
+        if repl["clip_id"]:
+            used_sources.add(repl["clip_id"])
+        swaps += 1
+        log(status_cb, f"Duplicate guard: scene {i} repeated {name} -> swapped to {repl['name']}.")
+    config["duplicate_guard"] = {"swaps": swaps, "unresolved_repeats": unresolved}
+    if swaps or unresolved:
+        log(status_cb, f"Duplicate guard: {swaps} swap(s), {unresolved} unresolved repeat(s).")
+    return swaps
+
+
 def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     """Place the user's LOCAL, classified SFX (sfx_library) on real edit events, synced to the
     visual-FX plan (scene['fx']): the hook, clip cuts, major reveals/shocking beats, visual
@@ -5842,7 +5998,16 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                     "idea_reveal": 0.6, "camera_flash": 0.35, "flash_blink": 0.3,
                     "impact_hit": 0.55, "low_impact": 0.7,
                     "payment_ding": 0.6, "school_bell": 0.7, "message_sent": 0.5}
-        dur = min(float(rec.get("trim_len") or 0.9), _MAX_DUR.get(cat, 0.45))
+        # RING FIX (user: "sfx abgehackt nach dem render"): decaying sounds (gong/bell/boom/
+        # impact/ding...) must play their WHOLE working copy - only quick cut transients
+        # (whoosh/pop/click/flash) keep the short played-length clamp.
+        _full_len = float(rec.get("trim_len") or 0.9)
+        if sfx_library._RINGY_RE.search(str(rec.get("file") or path)) or cat in (
+                "impact_hit", "low_impact", "notification_ding", "idea_reveal",
+                "school_bell", "payment_ding"):
+            dur = _full_len
+        else:
+            dur = min(_full_len, _MAX_DUR.get(cat, 0.45))
         events.append({"path": str(path), "start": round(t, 3),
                        "duration": round(dur + 0.02, 3), "volume": vol,
                        "category": cat, "id": f"sfx-{len(events):02d}", "sfx_type": cat})
@@ -5920,7 +6085,8 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                 k = react_rot.get(slug, 0); path = pool[k % len(pool)]; react_rot[slug] = k + 1
                 rec = rec_by_path.get(path, {})
                 db = REACTION_DB.get(slug, _REACTION_DB_DEFAULT)
-                dur = min(float(rec.get("trim_len") or 0.9), 1.1)
+                # reactions ring out fully (death gong etc.) - no more 1.1s amputation
+                dur = float(rec.get("trim_len") or 0.9)
                 events.append({"path": str(path), "start": round(t, 3),
                                "duration": round(dur + 0.02, 3),
                                "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
@@ -5985,12 +6151,19 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             _is_shock = str(sc.get("visual_match_category") or "").lower() == "shock"
             # frame 1 of a SHOCK scene gets the boom (visual punchline weight); a normal cut
             # gets the pop (attention reset). Never both on the same frame.
-            if _is_shock and i > 0:
+            # RE-APPLIED 2026-07-22 (a concurrent edit reverted it): the base pass places its
+            # whoosh at cut-0.08s, so exact-time dedup missed it and every cut got TWO
+            # transition sounds ("überall 2 transition sfx"). Dedup by PROXIMITY instead.
+            _CUT_FAMILY = ("swipe_whoosh", "bright_whoosh", "whoosh_hit_combo",
+                           "ui_click", "caption_pop", "impact_hit", "low_impact")
+            _has_cut_sound = any(abs(s0 - float(e["start"])) <= 0.35
+                                 and e.get("category") in _CUT_FAMILY for e in events)
+            if _is_shock and i > 0 and not _has_cut_sound:
                 _bp = _boom_pool or [{"path": p} for p in _boom_fallback]
                 if _bp:
-                    _v2_add(_bp[_rot["b"] % len(_bp)]["path"], s0, "impact_hit", -5, 0.8)
+                    _v2_add(_bp[_rot["b"] % len(_bp)]["path"], s0, "impact_hit", -5, 2.5)
                     _rot["b"] += 1; _v2n["boom"] += 1
-            elif i > 0 and _pop_pool:
+            elif i > 0 and _pop_pool and not _has_cut_sound:
                 _v2_add(_pop_pool[_rot["p"] % len(_pop_pool)], s0, "ui_click", -15, 0.25)
                 _rot["p"] += 1; _v2n["pop"] += 1
             # whoosh 0.13s before each overlay/arrow of this scene appears. Never inside the
@@ -6020,7 +6193,11 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         if beat <= 0.9 or not pool or any(abs(beat - p) < 4.0 for p in riser_peaks):
             return False
         if category == "hook_riser":
-            item, rlen, playback_rate = sfx_library.choose_riser_for_target(pool, beat)
+            # config["hook_riser_file"]: pin the riser to ONE specific file (user rule for
+            # discovery 2026-07-23: "hook riser ok, aber nur nummer 3" -> "hook_riser3").
+            want = str(config.get("hook_riser_file") or "").lower()
+            pick_pool = [it for it in pool if want and want in Path(it["path"]).name.lower()] or pool
+            item, rlen, playback_rate = sfx_library.choose_riser_for_target(pick_pool, beat)
             if not item:
                 return False
             dur = beat
@@ -9402,6 +9579,31 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
             "video": str(output), "rescript_lines": len(lines)}
 
 
+def apply_caption_style_from_form(config, form):
+    """USER-CUSTOMIZABLE caption style (user rule 2026-07-22): applies to EVERY clip-short
+    mode. Only fields the user actually set override the mode's default look; the resolved
+    values persist in project.json so the timeline editor mirrors them 1:1."""
+    if not isinstance(form, dict):
+        return
+    for k in ("caption_active_style", "caption_active_color", "caption_base_color",
+              "caption_box_color", "caption_stroke"):
+        v = str(form.get(k) or "").strip()
+        if v:
+            config[k] = v
+    for k in ("caption_size", "caption_max_words"):
+        try:
+            v = int(float(form.get(k)))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            config[k] = v
+    up = str(form.get("caption_uppercase_choice") or "").strip().lower()
+    if up in ("on", "true", "1", "upper"):
+        config["caption_uppercase"] = True
+    elif up in ("off", "false", "0", "normal"):
+        config["caption_uppercase"] = False
+
+
 def run_project(form, status_cb=None):
     check_cancel(form)
     script = clean_text(form.get("script", ""))
@@ -11105,6 +11307,7 @@ def run_project(form, status_cb=None):
         config["editor_sfx_max_per_minute"] = 46
         config["editor_sfx_volume_with_speech"] = 0.46
         config["final_loudness_lufs"] = -16.5
+        apply_caption_style_from_form(config, form)
         # music bed levels: ducked ~-16 dB under the voice when the user picked a track, else silent.
         if _bg_on:
             config["background_music_volume"] = 0.28            # intro/outro (no speech) bed level
@@ -11410,6 +11613,12 @@ def run_project(form, status_cb=None):
 
     # Catch exclusions clicked during visual/SFX planning as close to render as possible.
     reconcile_manual_scrape_exclusions(config, project_dir, form, status_cb=status_cb)
+
+    # FINAL duplicate guard (user 2026-07-22: "massenhaft duplikate"): whatever assignment or
+    # rebalance pass ran before, the SAME clip file - or a second excerpt of the same source
+    # video - must never sit on two scenes when unused accepted clips exist in the pool.
+    if clip_source == "scrape":
+        enforce_unique_scene_clips(config, project_dir, status_cb=status_cb)
 
     # Persist the actual render state after visual-FX/SFX planning. Older runs saved project.json
     # before this stage, so arrows appeared in the MP4 but were absent from the timeline editor.

@@ -99,3 +99,8 @@ push_to_github.bat
 
 # generated: progressively time-stretched hook risers (regenerable cache)
 _stretched_risers/
+
+# --- Local media archives (never delete; too large for the repo) ---
+/wavespeed assets/
+/assets/broll/
+/reference.mp4

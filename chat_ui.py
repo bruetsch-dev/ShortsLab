@@ -296,11 +296,14 @@ RUN_MANIFEST = {
         "loaded_project_source", "loaded_project_mode", "reasoning_model", "reasoning_mode",
         "pipeline_version",
         "clip_source", "video_model", "image_model", "scraping_engine",
-        "clip_short_format", "script_token_limit",
+        "clip_short_format", "script_token_limit", "gen_topic",
         "scrape_platforms",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
         "tts_voice", "tts_model", "speaker_image_path", "region",
+        "caption_active_style", "caption_active_color", "caption_base_color",
+        "caption_box_color", "caption_stroke", "caption_size", "caption_uppercase_choice",
+        "search_languages",
     ],
     # checkbox fields: posted as "on" only when checked (HTML checkbox semantics)
     "check": [

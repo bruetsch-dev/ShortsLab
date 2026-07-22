@@ -609,9 +609,46 @@ def draw_caption(img, text, y, width, height, font_size=None):
 # Viral word-by-word ("karaoke") caption system
 # ---------------------------------------------------------------------------
 
-CAPTION_ACCENT = (255, 219, 26)      # punchy yellow for the currently spoken word
+CAPTION_ACCENT = (35, 209, 96)       # ACTIVE word = green TEXT (user style, NO box)
 CAPTION_BODY = (255, 255, 255)       # already-spoken / idle words
-CAPTION_UPCOMING = (216, 220, 226)   # words not reached yet (slightly dimmed)
+
+
+def _hex_rgb(value, fallback):
+    try:
+        v = str(value or "").strip().lstrip("#")
+        if len(v) == 6:
+            return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+    except (TypeError, ValueError):
+        pass
+    return fallback
+
+
+def caption_style(config):
+    """USER-CUSTOMIZABLE caption style (per run, editable in the timeline editor too).
+    Keys: caption_active_style (color|box|none), caption_active_color, caption_base_color,
+    caption_box_color, caption_stroke (none|thin|bold). Defaults = the approved green-text look."""
+    mode = str(config.get("caption_active_style") or
+               ("box" if config.get("caption_active_box") else "color")).lower()
+    stroke_mode = str(config.get("caption_stroke") or "thin").lower()
+    return {
+        "mode": mode if mode in ("color", "box", "none") else "color",
+        # default active word = WHITE (user 2026-07-23: "current word soll auch weiss sein");
+        # any color, incl. the old green, remains one click away in the caption style panel.
+        "active": _hex_rgb(config.get("caption_active_color"), CAPTION_BODY),
+        "base": _hex_rgb(config.get("caption_base_color"), CAPTION_BODY),
+        "box": _hex_rgb(config.get("caption_box_color"), CAPTION_HIGHLIGHT),
+        "stroke_mode": stroke_mode if stroke_mode in ("none", "thin", "bold") else "thin",
+    }
+
+
+def caption_stroke_px(base_size, config):
+    m = caption_style(config)["stroke_mode"]
+    if m == "none":
+        return 0
+    if m == "bold":
+        return max(5, base_size // 9)
+    return max(4, base_size // 14)
+CAPTION_UPCOMING = (255, 255, 255)   # words not reached yet stay SOLID white (user style)
 CAPTION_HIGHLIGHT = (35, 209, 96)    # signature green box behind the active word (ref style)
 # pipeline v0.2 color-coded captions: hook keywords (NEVER/BANNED/FORCED class) light up in
 # rotating colors even when not the active word; filler words stay white.
@@ -709,10 +746,49 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
                 cursor += span_d
     if not spans:
         return []
+    # Chunk sizes are planned so no chunk ends up as a lone leftover word (user rule:
+    # short words like "by"/"the" never stand alone - "by the" groups together instead).
+    # A trailing remainder of 1 is avoided by splitting the last max_words+1 as 2 + rest.
+    mw = max(1, max_words)
+    sizes = []
+    n = len(spans)
+    while n > 0:
+        if n == mw + 1 and mw >= 2:
+            sizes += [2, n - 2]
+            n = 0
+        elif n <= mw:
+            sizes.append(n)
+            n = 0
+        else:
+            sizes.append(mw)
+            n -= mw
     chunks = []
-    for i in range(0, len(spans), max(1, max_words)):
-        group = spans[i:i + max_words]
+    i = 0
+    for size in sizes:
+        group = spans[i:i + size]
+        i += size
         chunks.append({"start": group[0]["start"], "end": group[-1]["end"], "words": group})
+    # Safety net: a single SHORT word (<=4 chars) as its own chunk still reads broken -
+    # merge it into the previous chunk (or the next when it is the first).
+    merged = []
+    for ch in chunks:
+        alone = len(ch["words"]) == 1 and len(ch["words"][0]["text"].strip(".,!?…\"'")) <= 4
+        if alone and merged:
+            merged[-1].pop("_swallow_next", None)
+            merged[-1]["words"] += ch["words"]
+            merged[-1]["end"] = ch["end"]
+        elif alone and not merged and len(chunks) > 1:
+            merged.append(ch)          # first chunk: swallow the NEXT chunk into it instead
+            merged[-1]["_swallow_next"] = True
+        else:
+            if merged and merged[-1].pop("_swallow_next", None):
+                merged[-1]["words"] += ch["words"]
+                merged[-1]["end"] = ch["end"]
+            else:
+                merged.append(ch)
+    chunks = merged
+    for ch in chunks:
+        ch.pop("_swallow_next", None)
     if not chunks:
         return []
     # First chunk visible from the very start; no gaps between chunks; last lingers.
@@ -775,15 +851,21 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     if is_hook:
         base_size = int(base_size * 1.12)
     font = get_font(base_size, True)
-    stroke = max(5, base_size // 9)
+    stroke = caption_stroke_px(base_size, config)
+    _style = caption_style(config)
     line_h = int(base_size * 1.16)
-    max_text_width = width * 0.86
+    # 0.82: leave real side margins - the active-word pop (1.16x) and the highlight
+    # box padding both grow past the measured text, so 0.86 put edge words off-screen.
+    max_text_width = width * 0.82
     center_rel = float(config.get("caption_center_y", 0.55 if is_hook else 0.60))
     center_y = int(height * center_rel)
 
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     space_w = draw.textlength(" ", font=font)
+    # In box mode the highlight box pads ~0.18em into each neighbouring gap; reserve
+    # that in the layout so the box can never cover the word next to it.
+    word_gap = space_w + (int(base_size * 0.22) if _style["mode"] == "box" else 0)
 
     # Reference captions are bold UPPERCASE; uppercase once so wrap + draw widths agree.
     chunk_words = [dict(w, text=str(w.get("text", "")).upper()) for w in chunk["words"]]
@@ -794,7 +876,7 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     current_w = 0.0
     for word in chunk_words:
         ww = draw.textlength(word["text"], font=font)
-        add = ww if not current else ww + space_w
+        add = ww if not current else ww + word_gap
         if current and current_w + add > max_text_width:
             lines.append(current)
             current = [word]
@@ -816,29 +898,49 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     top = center_y - total_h // 2 + y_slide
 
     for li, line in enumerate(lines):
-        widths = [draw.textlength(w["text"], font=font) for w in line]
-        line_w = sum(widths) + space_w * (len(line) - 1)
+        # A line can still be wider than the safe width (one very long word, or a
+        # 2-word line the wrapper couldn't split further): shrink THAT line's font
+        # until it fits instead of letting words run off the screen edge.
+        line_font, line_size, line_gap = font, base_size, word_gap
+        widths = [draw.textlength(w["text"], font=line_font) for w in line]
+        line_w = sum(widths) + line_gap * (len(line) - 1)
+        if line_w > max_text_width:
+            scale = max(0.55, max_text_width / line_w)
+            line_size = max(28, int(base_size * scale))
+            line_font = get_font(line_size, True)
+            line_gap = draw.textlength(" ", font=line_font) + \
+                (int(line_size * 0.22) if _style["mode"] == "box" else 0)
+            widths = [draw.textlength(w["text"], font=line_font) for w in line]
+            line_w = sum(widths) + line_gap * (len(line) - 1)
         x = (width - line_w) / 2.0
         cy = top + li * line_h + line_h // 2
         for word, ww in zip(line, widths):
             cx = x + ww / 2.0
-            color = _caption_color_for(word, local)
-            word_font = font
-            is_active = color is CAPTION_ACCENT
+            is_active = word["start"] <= local < word["end"]
+            # NO keyword coloring (user 2026-07-23: "mach die colored captions weg") - the only
+            # color difference comes from the user's own caption style (active word setting).
+            color = _style["active"] if is_active else _style["base"]
+            if is_active and _style["mode"] == "none":
+                color = _style["base"]
+            word_font = line_font
             # Active word "pop": briefly larger right after it becomes spoken.
             if is_active:
                 pop_age = local - word["start"]
                 pop = 1.0 + 0.16 * max(0.0, 1.0 - pop_age / 0.18)
+                # Cap the pop so the grown word stays inside its gaps and can't
+                # overlap neighbouring words (long words grow a lot at 1.16x).
+                room = line_gap - (int(line_size * 0.22) if _style["mode"] == "box" else 0)
+                # growth per side = ww*(pop-1)/2; keep it under ~45% of the free gap
+                pop = min(pop, 1.0 + 0.9 * max(room, 0.0) / max(ww, 1.0))
                 if pop > 1.01:
-                    word_font = get_font(int(base_size * pop), True)
-            a = int(255 * block_alpha * (1.0 if color is not CAPTION_UPCOMING else 0.82))
-            if is_active and bool(config.get("caption_active_box", True)):
-                # signature green highlight box + white word
+                    word_font = get_font(int(line_size * pop), True)
+            a = int(255 * block_alpha)
+            if is_active and _style["mode"] == "box":
                 _draw_caption_word_boxed(draw, word["text"], int(cx), int(cy), word_font,
-                                         CAPTION_HIGHLIGHT, (255, 255, 255), a, stroke)
+                                         _style["box"], _style["base"], a, stroke)
             else:
                 _draw_caption_word(draw, word["text"], int(cx), int(cy), word_font, color, a, stroke)
-            x += ww + space_w
+            x += ww + line_gap
 
     return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
@@ -849,9 +951,10 @@ def render_caption_overlay(chunk, width, height, config, is_hook=False):
     if is_hook:
         base_size = int(base_size * 1.12)
     font = get_font(base_size, True)
-    stroke = max(5, base_size // 9)
+    stroke = caption_stroke_px(base_size, config)
+    _style = caption_style(config)
     line_h = int(base_size * 1.16)
-    max_text_width = width * 0.86
+    max_text_width = width * 0.82
     center_rel = float(config.get("caption_center_y", 0.50 if is_hook else 0.72))
     center_y = int(height * center_rel)
 
@@ -873,13 +976,21 @@ def render_caption_overlay(chunk, width, height, config, is_hook=False):
 
     top = center_y - (len(lines) * line_h) // 2
     for li, line in enumerate(lines):
-        widths = [draw.textlength(w["text"], font=font) for w in line]
-        line_w = sum(widths) + space_w * (len(line) - 1)
+        # Shrink over-wide lines (single very long word) to fit the safe width.
+        line_font, line_gap = font, space_w
+        widths = [draw.textlength(w["text"], font=line_font) for w in line]
+        line_w = sum(widths) + line_gap * (len(line) - 1)
+        if line_w > max_text_width:
+            scale = max(0.55, max_text_width / line_w)
+            line_font = get_font(max(28, int(base_size * scale)), True)
+            line_gap = draw.textlength(" ", font=line_font)
+            widths = [draw.textlength(w["text"], font=line_font) for w in line]
+            line_w = sum(widths) + line_gap * (len(line) - 1)
         x = (width - line_w) / 2.0
         cy = top + li * line_h + line_h // 2
         for word, ww in zip(line, widths):
-            _draw_caption_word(draw, word["text"], int(x + ww / 2.0), int(cy), font, CAPTION_BODY, 255, stroke)
-            x += ww + space_w
+            _draw_caption_word(draw, word["text"], int(x + ww / 2.0), int(cy), line_font, CAPTION_BODY, 255, stroke)
+            x += ww + line_gap
     return overlay
 
 
@@ -1761,11 +1872,28 @@ def poll_wavespeed(prediction_id, key, timeout_s=420, interval_s=2, cancel_event
         time.sleep(interval_s)
 
 
+WAVESPEED_ASSETS_DIR = Path(__file__).resolve().parent / "wavespeed assets"
+
+
 def download_file(url, path):
     req = urllib.request.Request(url, headers={"User-Agent": "shorts-ai-agent-app/1.0"})
     with urllib.request.urlopen(req, timeout=240) as resp:
         content = resp.read()
     path.write_bytes(content)
+    # USER RULE (2026-07-22): every file downloaded from WaveSpeed is archived into
+    # "wavespeed assets" IMMEDIATELY and is NEVER deleted - whatever happens to the
+    # working copy later (overwrites, cleanups, failed runs), the original survives.
+    try:
+        WAVESPEED_ASSETS_DIR.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dest = WAVESPEED_ASSETS_DIR / f"{stamp}_{path.name}"
+        n = 1
+        while dest.exists():
+            dest = WAVESPEED_ASSETS_DIR / f"{stamp}_{n}_{path.name}"
+            n += 1
+        shutil.copyfile(path, dest)
+    except Exception:
+        pass
     return len(content)
 
 

@@ -14,6 +14,7 @@ The classification is cached to that folder so the scan only re-runs when files 
 import hashlib
 import json
 import math
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -412,14 +413,29 @@ def classify(stem, feats):
     return ("disabled_by_default", "disabled_by_default")
 
 
+_RINGY_RE = re.compile(r"gong|bong|bell|boom|riser|reveal|ding|impact|hit|chime|drone|swell", re.I)
+
+
 def _prepare(src, dst, category, feats, ffmpeg):
-    """Make a clean working copy: cut leading silence (audio starts immediately), cap length to
-    <= ~2s, normalize the peak (so per-category dB volumes are consistent), tiny in/out fades.
-    Returns (path, trim_start, trim_len) or None on failure."""
+    """Make a clean working copy: cut leading silence (audio starts immediately), cap length,
+    normalize the peak (so per-category dB volumes are consistent), tiny in/out fades.
+    Returns (path, trim_start, trim_len) or None on failure.
+
+    RING FIX (user: "der death gong ist nichmal fertig und wird abgehackt"): sounds with a
+    natural decay tail (gongs/bells/booms/impacts/risers...) are NEVER length-capped - the
+    old <=2s cap amputated the ring inside the working copy itself. They keep their full
+    duration (up to 6s sanity limit) and get NO early fade."""
     start = max(0.0, feats["onset"] - 0.02)            # keep a 20ms pre-roll for the attack
-    cap = min(2.0, CAT_MAXLEN.get(category, 1.2))
+    ringy = bool(_RINGY_RE.search(Path(str(src)).stem)) or category in (
+        "impact_hit", "low_impact", "notification_ding", "idea_reveal", "school_bell",
+        "payment_ding", "short_riser", "downer")
+    if ringy:
+        cap = 6.0
+    else:
+        cap = min(2.0, CAT_MAXLEN.get(category, 1.2))
     length = min(cap, max(0.12, feats["duration"] - start))
-    fade_out = min(0.06, length * 0.25)
+    full_tail = length >= (feats["duration"] - start) - 0.05   # nothing cut -> no early fade
+    fade_out = 0.012 if full_tail else min(0.06, length * 0.25)
     norm = min(8.0, 0.92 / max(0.02, feats["peak"]))    # normalize toward -0.7 dBFS peak
     dst.parent.mkdir(parents=True, exist_ok=True)
     af = (f"volume={norm:.3f},afade=t=in:st=0:d=0.004,"
@@ -458,7 +474,8 @@ def build_library(status_cb=None, meme_enabled=False, force=False):
     files = _scan_files()
     TRIM_DIR.mkdir(parents=True, exist_ok=True)
     cache = TRIM_DIR / "sfx_index.json"
-    sig = sorted((p.name, int(p.stat().st_mtime), p.stat().st_size) for p in files)
+    sig = [["_trim_version", 2, 0]] + sorted(
+        [p.name, int(p.stat().st_mtime), p.stat().st_size] for p in files)
     if cache.exists() and not force:
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))

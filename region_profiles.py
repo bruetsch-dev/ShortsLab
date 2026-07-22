@@ -108,14 +108,14 @@ PROFILES = {
 MULTI_SEARCH_LANGS = ["en", "ja", "zh", "es"]
 
 _LANG_NAMES = {"ja": "Japanese", "en": "English", "de": "German",
-               "zh": "Chinese", "es": "Spanish"}
+               "zh": "Chinese", "es": "Spanish", "ko": "Korean"}
 
 
 def lang_name(code):
     return _LANG_NAMES.get(str(code or "").lower(), str(code or "").upper())
 
 
-def get_profile(region=None, multi_language=False):
+def get_profile(region=None, multi_language=False, languages=None):
     """Return a copy of the profile for ``region`` (unknown -> DEFAULT_REGION).
 
     With ``multi_language`` the search_langs widen to the region's own languages plus
@@ -126,6 +126,17 @@ def get_profile(region=None, multi_language=False):
         key = DEFAULT_REGION
     profile = dict(PROFILES[key])
     profile["region"] = key
+    # Explicit per-language checkboxes (2026-07-22, replaces the single multi-language
+    # toggle): the user's picks BECOME the search languages, region-native codes first.
+    picked = [str(c).strip().lower() for c in (languages or []) if str(c).strip()]
+    if picked:
+        native = [c for c in profile["search_langs"] if c in picked]
+        rest = [c for c in picked if c not in native]
+        profile["search_langs"] = native + rest
+        if profile["search_langs"] != list(PROFILES[key]["search_langs"]):
+            profile["legacy_japan_prompt"] = False
+        profile["multi_language"] = len(profile["search_langs"]) > 1
+        return profile
     if multi_language:
         langs = list(profile["search_langs"])
         for code in MULTI_SEARCH_LANGS:

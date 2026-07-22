@@ -759,6 +759,38 @@ def download_raw(url, out_dir, index, status_cb=None):
     return None
 
 
+def download_full(url, out_dir, name="discover_src", status_cb=None):
+    """Download the WHOLE video (no 16s range cap) for Discovery mode, where one long
+    source TikTok is recut to a generated voiceover. Returns the path or None."""
+    if yt_dlp is None:
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    template = str(out_dir / f"{name}.%(ext)s")
+    fmt = (
+        "bestvideo[height>=720][height<=1920]+bestaudio/"
+        "best[height>=720][height<=1920]/"
+        "bestvideo[height<=1920]+bestaudio/best[height<=1920]/best"
+    )
+    opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "outtmpl": template, "format": fmt, "merge_output_format": "mp4",
+        "max_filesize": 300 * 1024 * 1024,
+        "ignoreerrors": True,
+    }
+    _apply_cookies(opts)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:  # noqa: BLE001
+        _status(status_cb, f"Discovery: full download failed ({exc.__class__.__name__}).")
+        return None
+    for cand in sorted(out_dir.glob(f"{name}.*")):
+        if cand.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm") and cand.stat().st_size > 4096:
+            return cand
+    return None
+
+
 def _probe_dims(path, ffprobe):
     if not ffprobe:
         return None

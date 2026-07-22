@@ -96,6 +96,10 @@ const DEFAULT_VALUES = () => {
   if (!v.sfx_amount) v.sfx_amount = "medium";
   if (!v.vfx_amount) v.vfx_amount = "medium";
   if (st.add_visual_effects === undefined) v.add_visual_effects = true;   // arrows on by default
+  if (st.out_captions === undefined) v.out_captions = true;        // captions ON by default
+  if (st.out_sfx === undefined) v.out_sfx = true;                  // sound effects ON by default
+  if (st.out_transition_sfx === undefined) v.out_transition_sfx = true;
+  if (st.halt_after_speech === undefined) v.halt_after_speech = false;
   if (!v.pipeline_version) v.pipeline_version = "v0.2";   // version chooser removed; always v0.2
   if (!v.clip_short_format) v.clip_short_format = "standard";
   if (!v.script_token_limit) v.script_token_limit = "";
@@ -150,6 +154,7 @@ const FLOW_STEPS = {
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
 function isVisualsFromScript() { return S.flow === "script" && !!S.values.visuals_from_script_mode; }
 function isMiniStory() { return isCultureFacts() && S.values.clip_short_format === "mini_story"; }
+function isDiscovery() { return isCultureFacts() && S.values.clip_short_format === "discovery"; }
 function estimatedScriptTokens(text) {
   const chunks = String(text || "").trim().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) || [];
   return chunks.length;
@@ -165,6 +170,9 @@ function applyCultureFactsPreset() {
   S.values.out_wikimedia = false;
   S.values.out_gpt_images = false;
   S.values.out_video_clips = true;
+  if (S.values.out_captions === undefined || S.values.out_captions === false) S.values.out_captions = true;
+  if (S.values.out_sfx === undefined || S.values.out_sfx === false) S.values.out_sfx = true;
+  if (isDiscovery()) S.values.halt_after_speech = false;   // discovery has no speech gate
 }
 function stepsFor(flow) {
   if (flow === "script" && isCultureFacts()) return ["format", "script", "source", "reasoning", "outputs", "review"];
@@ -339,7 +347,11 @@ function stepCopy(step) {
     // not the "enhancement intensity" the SFX/Visual/Caption masters set there.
     script: isLongform()
       ? ["SCRIPT", "Paste your script", "The full narration, start to finish - it sets the length of the video."]
-      : ["STORY", "Add your script", "Paste it or generate a fresh one."],
+      : isDiscovery()
+        ? ["DISCOVERY", "Set the direction", "Optional topic + narrator - the agent finds the material and writes the script."]
+        : isMiniStory()
+          ? ["STORY", "Topic or script", "Give a topic (the agent writes from real material) or paste a mini script."]
+          : ["STORY", "Add your script", "Paste it or generate a fresh one."],
     hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
     version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
     source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
@@ -808,21 +820,47 @@ function renderScriptFlow() {
     const mini = el("button", "clip-format-choice mini");
     mini.innerHTML = `<small>20–25 SECONDS</small><strong>Mini Story</strong><span>One real event, one coherent footage cluster, a fast hook and a clear payoff.</span><em>Native 9:16 only · maximum 130 tokens</em>`;
     mini.addEventListener("click", () => choose("mini_story"));
-    grid.appendChild(standard); grid.appendChild(mini); c.appendChild(grid);
+    const disc = el("button", "clip-format-choice mini");
+    disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>The agent hunts one long, fascinating process TikTok (a craft, a build, a dish), writes the script itself and recuts the source to the voiceover.</span><em>Topic optional · one long 9:16 source</em>`;
+    disc.addEventListener("click", () => choose("discovery"));
+    grid.appendChild(standard); grid.appendChild(mini); grid.appendChild(disc); c.appendChild(grid);
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.back, resetToMode, "ghost")); c.appendChild(foot);
     setComposer("off"); return;
   }
 
   // step: script
-  msgA(esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
+  msgA(isDiscovery()
+    ? "Set the direction for the Discovery agent."
+    : isMiniStory()
+      ? "Give a topic, or paste a mini script."
+      : esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
   if (done("script")) {
     const sc = S.values.script || "";
     msgU(esc(sc.length > 220 ? sc.slice(0, 220) + "…" : sc), "script");
   } else if (S.step === "script") {
     const c = card("script-config-card");
+    if (isDiscovery() || isMiniStory()) {
+      c.appendChild(el("div", "card-note", isDiscovery()
+        ? "Discovery mode: the agent finds one long Asian craft/process TikTok, writes the "
+          + "narration itself and cuts the source to match it. Give an optional topic direction:"
+        : "Mini Story needs no script: give a TOPIC (e.g. 'old noodle vending machine') — the "
+          + "agent finds real footage of that ONE subject first and then writes a script the "
+          + "material can actually show. Pasting your own script below still works."));
+      const ti = document.createElement("input");
+      ti.type = "text";
+      ti.placeholder = isDiscovery()
+        ? "Topic (optional) — e.g. bamboo chopsticks, sword forging, tea roasting…"
+        : "Topic — e.g. old noodle vending machine, capsule hotel, rural train station…";
+      ti.style.cssText = "width:100%; margin:6px 0 4px;";
+      ti.value = S.values.gen_topic || "";
+      ti.addEventListener("input", () => { S.values.gen_topic = ti.value; persist(); });
+      c.appendChild(ti);
+    }
     const ta = el("textarea", "script-box"); ta.id = "script-edit";
-    ta.placeholder = T.script_placeholder; ta.value = S.values.script || "";
+    ta.placeholder = T.script_placeholder;
+    ta.value = S.values.script || "";
+    if (isDiscovery()) { ta.style.display = "none"; ta.value = ""; }
     c.appendChild(ta);
     const sizeScriptBox = () => {
       ta.style.height = "auto";
@@ -844,7 +882,8 @@ function renderScriptFlow() {
     }
     // Hook + impact-word are marked RIGHT HERE on the same script field (no separate step, so the
     // text can never desync). Select text in the box above, then Mark hook / Mark impact.
-    {
+    // Discovery has no user script -> no hook marking, no Script Creator column.
+    if (!isDiscovery()) {
       let selRange = null;
       const capture = () => {
         if (ta.selectionStart != null && ta.selectionEnd > ta.selectionStart)
@@ -882,7 +921,7 @@ function renderScriptFlow() {
     // Script Creator: topic -> gemini writes a reference-style script into the field
     // (empty topic = the model picks its own viral topic). The generated script always stays
     // here for review/edit - the run never starts from this step, so a halt toggle is noise.
-    {
+    if (!isDiscovery()) {
       const row = el("div", "script-gen-row");
       const ti = document.createElement("input");
       ti.type = "text"; ti.placeholder = T.gen_topic_ph; ti.style.flex = "1";
@@ -966,7 +1005,7 @@ function renderScriptFlow() {
       S.values.tts_voice = vsel.value;
       vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
       nrow.appendChild(vsel);
-      nrow.appendChild(btn("▶", () => {
+      nrow.appendChild(btn('<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true" style="vertical-align:-2px"><path d="M8 5v14l11-7z"/></svg> Preview', () => {
         const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.values.tts_voice || "");
         a.play().catch(() => {});
       }, "ghost small"));
@@ -980,31 +1019,55 @@ function renderScriptFlow() {
       // Region: drives the scrape search language/framing (japan = the original JP-first search).
       // A <japan>-style tag typed in the script still wins server-side; these chips just make the
       // choice visible. Default: japan for the culture-facts preset, general otherwise.
+      // Discovery is Asia-locked -> region chips are noise there (languages row stays).
       {
         if (!S.values.region) S.values.region = isCultureFacts() ? "japan" : "general";
-        const rrow = el("div", "script-region");
-        rrow.appendChild(el("span", "sn-lbl", "Region"));
-        const REGIONS = [["japan", "🇯🇵 Japan"], ["general", "🌍 General"],
-                         ["switzerland", "🇨🇭 Switzerland"], ["history", "🏛 History"]];
-        REGIONS.forEach(([val, label]) => {
-          const b = btn(label, () => {
-            S.values.region = val; persist();
-            rrow.querySelectorAll("button").forEach(x => x.classList.toggle(
-              "region-on", x.dataset.region === val));
-          }, "ghost small");
-          b.dataset.region = val;
-          if (S.values.region === val) b.classList.add("region-on");
-          rrow.appendChild(b);
-        });
-        const ml = document.createElement("label");
-        ml.className = "region-multilang";
-        const cb = document.createElement("input");
-        cb.type = "checkbox"; cb.checked = !!S.values.multi_language_search;
-        cb.addEventListener("change", () => { S.values.multi_language_search = cb.checked; persist(); });
-        ml.appendChild(cb);
-        ml.appendChild(document.createTextNode(" Multi-language search"));
-        rrow.appendChild(ml);
-        c.appendChild(rrow);
+        if (!isDiscovery()) {
+          const rrow = el("div", "script-region");
+          rrow.appendChild(el("span", "sn-lbl", "Region"));
+          const REGIONS = [["japan", "🇯🇵 Japan"], ["general", "🌍 General"],
+                           ["switzerland", "🇨🇭 Switzerland"], ["history", "🏛 History"]];
+          REGIONS.forEach(([val, label]) => {
+            const b = btn(label, () => {
+              S.values.region = val; persist();
+              rrow.querySelectorAll("button").forEach(x => x.classList.toggle(
+                "region-on", x.dataset.region === val));
+            }, "ghost small");
+            b.dataset.region = val;
+            if (S.values.region === val) b.classList.add("region-on");
+            rrow.appendChild(b);
+          });
+          c.appendChild(rrow);
+        }
+        // Search languages: one checkbox per language (replaces the old single
+        // "multi-language search" toggle). Defaults follow the picked region.
+        {
+          const lrow = el("div", "script-region");
+          lrow.appendChild(el("span", "sn-lbl", "Search languages"));
+          const LANGS = [["ja", "🇯🇵 Japanese"], ["en", "🇬🇧 English"], ["zh", "🇨🇳 Chinese"],
+                         ["ko", "🇰🇷 Korean"], ["es", "🇪🇸 Spanish"], ["de", "🇩🇪 German"]];
+          const regionDefaults = { japan: "ja,en", general: "en", switzerland: "de,en", history: "en" };
+          const selected = () => String(S.values.search_languages
+            || regionDefaults[S.values.region] || "en").split(",").filter(Boolean);
+          LANGS.forEach(([code, label]) => {
+            const ml = document.createElement("label");
+            ml.className = "region-multilang";
+            const cb = document.createElement("input");
+            cb.type = "checkbox"; cb.dataset.lang = code;
+            cb.checked = selected().includes(code);
+            cb.addEventListener("change", () => {
+              let cur = selected().filter(x => x !== code);
+              if (cb.checked) cur.push(code);
+              if (!cur.length) { cur = [code]; cb.checked = true; }   // at least one language
+              S.values.search_languages = cur.join(",");
+              persist();
+            });
+            ml.appendChild(cb);
+            ml.appendChild(document.createTextNode(" " + label));
+            lrow.appendChild(ml);
+          });
+          c.appendChild(lrow);
+        }
       }
       // optional talking-head speaker hook (non-scrape only) - a compact toggle; gallery on demand
       if (!isCultureFacts()) {
@@ -1030,8 +1093,8 @@ function renderScriptFlow() {
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
-      if (!v) { ta.focus(); return; }
-      if (isMiniStory() && estimatedScriptTokens(v) > 130) {
+      if (!v && !isDiscovery() && !(isMiniStory() && (S.values.gen_topic || "").trim())) { ta.focus(); return; }
+      if (v && isMiniStory() && estimatedScriptTokens(v) > 130) {
         tokenMeter.classList.add("over");
         tokenMeter.textContent = `${estimatedScriptTokens(v)} / 130 estimated tokens — shorten the script to continue`;
         ta.focus(); return;
@@ -1398,16 +1461,108 @@ function renderOutputsCard() {
   // Sound
   section("Sound", grid([["out_sfx", "Sound effects"], ["out_transition_sfx", "Transition SFX"]]),
     amountSliderField("Amount", S.values.sfx_amount, v => S.values.sfx_amount = v));
-  // Captions
-  section("Captions", grid([["out_captions", "Word-by-word captions"]]));
-  // Speech approval
-  const halt = toggleField(T.halt_after_speech, S.values.halt_after_speech, v => S.values.halt_after_speech = v);
-  section("Speech", halt, el("div", "out-sec-hint", "Pause to approve or re-do the voice before the run finishes."));
+  // Captions — word-by-word toggle + the fully user-customizable style (live preview)
+  section("Captions", grid([["out_captions", "Word-by-word captions"]]), captionStylePanel());
+  // Speech approval (not in Discovery - its approval moment is the material pick)
+  if (!isDiscovery()) {
+    const halt = toggleField(T.halt_after_speech, S.values.halt_after_speech, v => S.values.halt_after_speech = v);
+    section("Speech", halt, el("div", "out-sec-hint", "Pause to approve or re-do the voice before the run finishes."));
+  }
   const foot = el("div", "card-foot");
   foot.appendChild(btn(T.back, () => editStep("reasoning"), "ghost"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => completeStep("outputs", "review"), "primary"));
   c.appendChild(foot);
+}
+
+function captionStylePanel() {
+  // Fully user-customizable caption style (applies to every clip-short mode; the render
+  // reads the same keys, and the timeline editor mirrors them from project.json).
+  const V = S.values;
+  if (!V.caption_active_style) V.caption_active_style = "color";
+  const wrap = el("div", "capstyle");
+  // live preview
+  const prev = el("div", "capstyle-preview");
+  const paintPreview = () => {
+    const up = (V.caption_uppercase_choice || "upper") !== "normal";
+    const base = V.caption_base_color || "#ffffff";
+    const act = V.caption_active_color || "#ffffff";
+    const box = V.caption_box_color || "#23d160";
+    const strokeMode = V.caption_stroke || "thin";
+    const sz = Math.max(13, Math.round((+V.caption_size || 84) * 0.28));
+    const shadow = strokeMode === "none" ? "none"
+      : strokeMode === "bold"
+        ? "-2px 0 0 #000, 2px 0 0 #000, 0 -2px 0 #000, 0 2px 0 #000, 2px 3px 3px rgba(0,0,0,.6)"
+        : "-1px 0 0 #000, 1px 0 0 #000, 0 -1px 0 #000, 0 1px 0 #000, 1px 2px 2px rgba(0,0,0,.5)";
+    const w = (t) => `<span style="color:${base}; font-weight:800; font-size:${sz}px; text-shadow:${shadow};">${t}</span>`;
+    const at = up ? "WORD" : "word";
+    let activeHtml;
+    if (V.caption_active_style === "box") {
+      activeHtml = `<span style="background:${box}; color:${base}; font-weight:800; font-size:${sz}px; padding:1px 7px; border-radius:6px;">${at}</span>`;
+    } else if (V.caption_active_style === "none") {
+      activeHtml = w(at);
+    } else {
+      activeHtml = `<span style="color:${act}; font-weight:800; font-size:${sz}px; text-shadow:${shadow};">${at}</span>`;
+    }
+    prev.innerHTML = w(up ? "EVERY" : "every") + activeHtml + w(up ? "POPS" : "pops");
+  };
+  wrap.appendChild(prev);
+  // segmented highlight control
+  const seg = el("div", "capstyle-seg");
+  [["color", "Colored word"], ["box", "Highlight box"], ["none", "Plain"]].forEach(([val, label]) => {
+    const b = el("button", "capstyle-seg-btn", esc(label));
+    b.type = "button";
+    b.dataset.capstyle = val;
+    b.addEventListener("click", () => {
+      V.caption_active_style = val; persist(); paintSeg(); paintFields(); paintPreview();
+    });
+    seg.appendChild(b);
+  });
+  const paintSeg = () => seg.querySelectorAll("button").forEach(x =>
+    x.classList.toggle("on", x.dataset.capstyle === V.caption_active_style));
+  wrap.appendChild(seg);
+  // labeled control grid
+  const grid = el("div", "capstyle-grid");
+  const field = (label, control) => {
+    const f = el("div", "capstyle-field");
+    f.appendChild(el("span", "capstyle-lbl", esc(label)));
+    f.appendChild(control);
+    grid.appendChild(f);
+    return f;
+  };
+  const colorInput = (key, fallback) => {
+    const inp = document.createElement("input");
+    inp.type = "color"; inp.value = V[key] || fallback;
+    inp.className = "capstyle-color";
+    inp.addEventListener("input", () => { V[key] = inp.value; persist(); paintPreview(); });
+    return inp;
+  };
+  const fldActive = field("Active word", colorInput("caption_active_color", "#ffffff"));
+  field("Text", colorInput("caption_base_color", "#ffffff"));
+  const fldBox = field("Box", colorInput("caption_box_color", "#23d160"));
+  // only show the controls the chosen highlight mode actually uses
+  const paintFields = () => {
+    fldActive.style.display = V.caption_active_style === "color" ? "" : "none";
+    fldBox.style.display = V.caption_active_style === "box" ? "" : "none";
+  };
+  const strokeSel = el("select");
+  [["thin", "Thin outline"], ["bold", "Bold outline"], ["none", "No outline"]].forEach(([v, l]) => strokeSel.appendChild(new Option(l, v)));
+  strokeSel.value = V.caption_stroke || "thin";
+  strokeSel.addEventListener("change", () => { V.caption_stroke = strokeSel.value; persist(); paintPreview(); });
+  field("Outline", strokeSel);
+  const caseSel = el("select");
+  [["upper", "UPPERCASE"], ["normal", "Normal case"]].forEach(([v, l]) => caseSel.appendChild(new Option(l, v)));
+  caseSel.value = V.caption_uppercase_choice || "upper";
+  caseSel.addEventListener("change", () => { V.caption_uppercase_choice = caseSel.value; persist(); paintPreview(); });
+  field("Case", caseSel);
+  const size = document.createElement("input");
+  size.type = "range"; size.min = "54"; size.max = "120"; size.step = "2";
+  size.value = String(+V.caption_size || 84);
+  size.addEventListener("input", () => { V.caption_size = size.value; persist(); paintPreview(); });
+  field("Size", size);
+  wrap.appendChild(grid);
+  paintSeg(); paintFields(); paintPreview();
+  return wrap;
 }
 
 function renderEnhanceFlow() {
@@ -2336,6 +2491,44 @@ async function pollJob() {
     }
   } else if (lfp && lfp.dataset.lfSig && d.status !== "awaiting_approval") {
     lfp.innerHTML = ""; delete lfp.dataset.lfSig;
+  }
+  // Discovery mode: pick ONE of the found topic/material candidates
+  const dpHost = $("job-speech");
+  if (dpHost) {
+    const cands = d.discovery_review || [];
+    if (d.status === "awaiting_approval" && cands.length && !dpHost.dataset.discDone) {
+      dpHost.dataset.discDone = "1"; dpHost.innerHTML = "";
+      const c = el("div", "chat-card speech-approve-card"); dpHost.appendChild(c);
+      c.appendChild(el("div", "sa-head",
+        `<div class="sa-title"><b>🔍 Pick the topic & material</b><em>Discovery found ${cands.length} long source videos. Pick ONE — only then the script and voiceover are produced.</em></div>`));
+      const grid = el("div", "");
+      grid.style.cssText = "display:flex; gap:12px; flex-wrap:wrap; margin-top:10px;";
+      cands.forEach(cd => {
+        const card = el("div", "");
+        card.style.cssText = "flex:1 1 240px; max-width:300px; border:1px solid var(--line-strong); border-radius:12px; padding:10px; background:var(--bg-input);";
+        card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
+        card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
+        if (cd.sheet_url) {
+          const im = document.createElement("img");
+          im.src = cd.sheet_url; im.style.cssText = "width:100%; border-radius:8px; margin:6px 0;";
+          card.appendChild(im);
+        }
+        const ol = el("ol", "");
+        ol.style.cssText = "margin:4px 0 8px 16px; color:var(--muted); font-size:11.5px;";
+        (cd.stages || []).slice(0, 6).forEach(s => ol.appendChild(el("li", "", esc(s))));
+        card.appendChild(ol);
+        card.appendChild(btn("✓ Use candidate " + ((+cd.index || 0) + 1), async () => {
+          await fetch("/approve-discovery?id=" + encodeURIComponent(S.jobId)
+                      + "&action=pick&choice=" + (+cd.index || 0), { method: "POST" });
+          dpHost.innerHTML = ""; delete dpHost.dataset.discDone;
+        }, "primary"));
+        grid.appendChild(card);
+      });
+      c.appendChild(grid);
+      scrollDown();
+    } else if (dpHost.dataset.discDone && d.status !== "awaiting_approval") {
+      dpHost.innerHTML = ""; delete dpHost.dataset.discDone;
+    }
   }
   // speech approval
   const sp = $("job-speech");
