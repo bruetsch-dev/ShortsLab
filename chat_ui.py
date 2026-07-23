@@ -300,7 +300,7 @@ RUN_MANIFEST = {
         "scrape_platforms",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
-        "tts_voice", "tts_model", "speaker_image_path", "region",
+        "tts_voice", "tts_model", "speaker_image_path", "region", "candidate_url",
         "caption_active_style", "caption_active_color", "caption_base_color",
         "caption_box_color", "caption_stroke", "caption_size", "caption_uppercase_choice",
         "search_languages",

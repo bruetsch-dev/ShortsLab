@@ -26,6 +26,77 @@ MAX_CANDIDATES_TRIED = 12
 
 # Curated fallback queries when the user gives no topic hint AND the query LLM fails
 # in a non-fatal way. ASIAN craft/process topics only (user rule: Chinese/Japanese style).
+CANDIDATE_LIBRARY_DIR = Path(__file__).parent / "candidate library"
+
+
+def _record_candidates(accepted, style):
+    """CANDIDATE LIBRARY (user 2026-07-23): persist EVERY candidate that was ever shown
+    as a pick - across all runs - so the mini/discovery UI can browse them later and
+    start a run directly from a saved candidate. Keyed by TikTok video id; sheets are
+    copied out of the tmp dir before it is cleaned."""
+    import shutil
+    sheets = CANDIDATE_LIBRARY_DIR / "sheets"
+    sheets.mkdir(parents=True, exist_ok=True)
+    fp = CANDIDATE_LIBRARY_DIR / "candidates.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        data = {}
+    now = time.strftime("%Y-%m-%d %H:%M")
+    for a in accepted:
+        c, info = a["cand"], a["info"]
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        dst = sheets / f"{cid}.jpg"
+        try:
+            if a.get("sheet") and Path(a["sheet"]).exists() and not dst.exists():
+                shutil.copy2(a["sheet"], dst)
+        except OSError:
+            pass
+        prev = data.get(cid) or {}
+        data[cid] = {
+            "id": cid, "url": str(c.get("url") or ""), "author": str(c.get("author") or ""),
+            "likes": int(c.get("likes") or 0), "dur": int(c.get("dur") or 0),
+            "desc": str(c.get("desc") or ""),
+            "title": str(info.get("topic_title") or prev.get("title") or ""),
+            "premise": str(info.get("premise") or prev.get("premise") or ""),
+            "appeal": info.get("appeal") or prev.get("appeal"),
+            "style": style,
+            "stages": [f"{st['start']:.0f}-{st['end']:.0f}s: {st['action']}"
+                       for st in (info.get("stages") or [])][:8],
+            "first_seen": prev.get("first_seen") or now, "last_seen": now,
+            "picked": bool(prev.get("picked")), "project": prev.get("project") or "",
+            "sheet": f"sheets/{cid}.jpg" if dst.exists() else str(prev.get("sheet") or ""),
+        }
+    fp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def _mark_candidate_picked(cand_id, project_slug):
+    fp = CANDIDATE_LIBRARY_DIR / "candidates.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        entry = data.get(str(cand_id))
+        if entry is not None:
+            entry["picked"] = True
+            entry["project"] = str(project_slug)
+            fp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def load_candidate_library():
+    """All candidates ever shown, newest first (for the UI library)."""
+    fp = CANDIDATE_LIBRARY_DIR / "candidates.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    rows = list(data.values())
+    rows.sort(key=lambda r: str(r.get("last_seen") or ""), reverse=True)
+    return rows
+
+
 _FALLBACK_QUERIES = [
     "手工 竹筷子 制作", "伝統工芸 職人", "japanese knife making process", "古法制作",
     "中国 传统 手艺", "japanese sword forging", "和菓子 職人", "chinese street food process",
@@ -368,12 +439,17 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
             "\"impact_word\": \"the single most gripping word of sentence 1\"}.\n"
             "HARD RULES:\n"
             "1. VOICE = VIDEO: every sentence may ONLY describe what its assigned beat "
-            "literally shows (per the beat description). Never invent dialogue, names, "
-            "thoughts or events that are not visible.\n"
-            "2. HOOK: sentence 1 states the situation's stake in one breath, anchored to "
-            "beat 0. Patterns: 'Her brother checks every single outfit before she can "
-            "leave.' / 'This couple runs the strangest cafe act in Tokyo.' NEVER open with "
-            "'Watch what happens...' or 'This video shows...'.\n"
+            "literally shows (per the beat description). Describe the STATE the beat shows "
+            "('she sits in the classroom'), never a movement you assume happened before or "
+            "between shots ('she rushes into the classroom' is WRONG if the beat shows her "
+            "seated). Never invent dialogue, names, thoughts or events that are not "
+            "visible.\n"
+            "2. HOOK: sentence 1 must ORIENT the viewer instantly - who, where, and the "
+            "situation's rule or stake in one breath, anchored to beat 0. A confused viewer "
+            "swipes; after sentence 1 they must know exactly what game is being played. "
+            "Patterns: 'Her brother checks every single outfit before she can leave.' / "
+            "'This couple runs the strangest cafe act in Tokyo.' NEVER open with 'Watch "
+            "what happens...' or 'This video shows...'.\n"
             "3. PAYOFF: the LAST sentence lands on the punchline/resolution beat when one "
             "exists, wording matched to that shot.\n"
             "4. Third person, present tense, warm playful tone, 6-10 sentences, 80-110 "
@@ -481,9 +557,27 @@ def run_discovery_short(form, status_cb=None, style="process"):
                     "DISCOVERY MODE: no script given - the agent hunts a long process TikTok ")
                    + (f"about '{hint}'." if hint else "on its own."))
 
-    queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
-    _check_cancel()
-    candidates = _search_long(queries, status_cb, min_seconds=40 if style == "story" else None)
+    pinned_url = str(form.get("candidate_url") or "").strip()
+    if pinned_url:
+        # CANDIDATE LIBRARY start: the user already chose this exact video - no search,
+        # no 5-candidate gate, straight to analysis/build.
+        entry = next((r for r in load_candidate_library() if r.get("url") == pinned_url), None)
+        m_url = re.match(r"https?://www\.tiktok\.com/@([^/]+)/video/(\d+)", pinned_url)
+        candidates = [{
+            "id": str((entry or {}).get("id") or (m_url.group(2) if m_url else "pinned")),
+            "author": str((entry or {}).get("author") or (m_url.group(1) if m_url else "")),
+            "likes": int((entry or {}).get("likes") or 0),
+            "dur": int((entry or {}).get("dur") or 0),
+            "desc": str((entry or {}).get("desc") or ""), "query": "library",
+            "url": pinned_url,
+        }]
+        log(status_cb, f"Discovery: using the saved library candidate "
+                       f"@{candidates[0]['author']} - no search needed.")
+    else:
+        queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
+        _check_cancel()
+        candidates = _search_long(queries, status_cb,
+                                  min_seconds=40 if style == "story" else None)
     if not candidates:
         raise RuntimeError("Discovery: no long TikTok candidates found - try a different topic.")
 
@@ -494,7 +588,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
     # Collect up to 5 vision-approved candidates - the USER then picks ONE of them.
     accepted = []
     for cand in candidates[:MAX_CANDIDATES_TRIED]:
-        if len(accepted) >= 5:
+        if len(accepted) >= (1 if pinned_url else 5):
             break
         _check_cancel()
         log(status_cb, f"Discovery: trying @{cand['author']} ({cand['dur']}s, "
@@ -506,8 +600,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
             continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
-        _min_appeal = 7 if style == "story" else 6   # stories must be CATCHY, not just valid
-        if not info.get("is_process") or float(info.get("appeal") or 0) < _min_appeal                 or len(info["stages"]) < 3:
+        _min_appeal = 0 if pinned_url else (7 if style == "story" else 6)
+        if (not pinned_url and not info.get("is_process"))                 or float(info.get("appeal") or 0) < _min_appeal                 or len(info["stages"]) < 3:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
         accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet})
@@ -518,12 +612,13 @@ def run_discovery_short(form, status_cb=None, style="process"):
                            "rerun or give a topic hint.")
     # Show the CATCHIEST finds first (user: "die ersten 5 sind uninteressant und uncatchy").
     accepted.sort(key=lambda a: -float(a["info"].get("appeal") or 0))
+    _record_candidates(accepted, style)   # persistent candidate library (every pick ever shown)
 
     # USER APPROVAL GATE: the user must PICK ONE of the found candidates on the run page
     # (frame sheets + stages shown) before any script/TTS money is spent.
     sel = 0
     gate = form.get("_discovery_gate")
-    if callable(gate):
+    if callable(gate) and not pinned_url:
         decision = gate({"candidates": [{
             "index": i,
             "title": str(a["info"].get("topic_title") or ""),
@@ -549,6 +644,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
     project_dir = agent_core.PROJECTS_DIR / slug
     (project_dir / "input").mkdir(parents=True, exist_ok=True)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
+    _mark_candidate_picked(chosen.get("id"), slug)
     clip_dir = project_dir / "seedance 2.0"
     clip_dir.mkdir(exist_ok=True)
     (project_dir / "input" / "script.txt").write_text(script, encoding="utf-8")
@@ -859,6 +955,7 @@ def run_mini_topic_short(form, status_cb=None):
     clip_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "input").mkdir(exist_ok=True)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
+    _mark_candidate_picked(chosen.get("id"), slug)
 
     seen, picked = set(), []
     for q in queries:

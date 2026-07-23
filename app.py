@@ -13919,6 +13919,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self.send_bytes(json.dumps(project_media_payload(project_dir)).encode("utf-8"), "application/json; charset=utf-8")
+        elif parsed.path == "/candidate-library":
+            import discovery_short
+            rows = []
+            for r in discovery_short.load_candidate_library():
+                row = dict(r)
+                sheet_rel = str(r.get("sheet") or "")
+                sp = discovery_short.CANDIDATE_LIBRARY_DIR / sheet_rel if sheet_rel else None
+                row["sheet_url"] = link_for(sp) if (sp is not None and sp.exists()) else ""
+                rows.append(row)
+            self.send_bytes(json.dumps({"ok": True, "candidates": rows}).encode("utf-8"),
+                            "application/json; charset=utf-8")
         elif parsed.path == "/timeline-library":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             if not safe_project_dir(slug):

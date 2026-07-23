@@ -857,6 +857,27 @@ function renderScriptFlow() {
       ti.value = S.values.gen_topic || "";
       ti.addEventListener("input", () => { S.values.gen_topic = ti.value; persist(); });
       c.appendChild(ti);
+      // CANDIDATE LIBRARY (user 2026-07-23): every candidate ever shown as a pick,
+      // browsable here; "Use" pins the run to that exact video (no search, no gate).
+      const libRow = el("div", "");
+      libRow.style.cssText = "display:flex; align-items:center; gap:8px; margin:2px 0 6px; flex-wrap:wrap;";
+      c.appendChild(libRow);
+      const renderPinned = () => {
+        libRow.innerHTML = "";
+        libRow.appendChild(btn("📚 Candidate library", () => openCandidateLibrary(c, renderPinned), "ghost small"));
+        if (S.values.candidate_url) {
+          const chip = el("span", "");
+          chip.style.cssText = "font-size:11.5px; color:var(--p-green,#39ff14); border:1px solid var(--line-strong); border-radius:8px; padding:3px 8px; display:inline-flex; align-items:center; gap:6px;";
+          chip.appendChild(el("span", "", "Using saved candidate"));
+          const x = el("button", "", "×");
+          x.type = "button";
+          x.style.cssText = "border:0; background:transparent; color:inherit; cursor:pointer; font-size:14px; line-height:1; padding:0;";
+          x.addEventListener("click", () => { S.values.candidate_url = ""; persist(); renderPinned(); });
+          chip.appendChild(x);
+          libRow.appendChild(chip);
+        }
+      };
+      renderPinned();
     }
     const ta = el("textarea", "script-box"); ta.id = "script-edit";
     ta.placeholder = T.script_placeholder;
@@ -1474,6 +1495,52 @@ function renderOutputsCard() {
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn(T.continue, () => completeStep("outputs", "review"), "primary"));
   c.appendChild(foot);
+}
+
+async function openCandidateLibrary(host, onPick) {
+  document.querySelectorAll(".cand-lib-card").forEach(x => x.remove());
+  let d = null;
+  try { d = await jget("/candidate-library"); } catch (e) { d = null; }
+  const card = el("div", "chat-card cand-lib-card");
+  if (host.parentElement) host.parentElement.insertBefore(card, host.nextSibling);
+  else chat.appendChild(card);
+  const head = el("div", "");
+  head.style.cssText = "display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;";
+  head.appendChild(el("h3", "", "📚 Candidate library"));
+  head.appendChild(btn("Close", () => card.remove(), "ghost small"));
+  card.appendChild(head);
+  const rows = (d && d.candidates) || [];
+  if (!rows.length) {
+    card.appendChild(el("div", "card-note", "No saved candidates yet — every discovery/mini run stores the candidates it shows here."));
+    return;
+  }
+  card.appendChild(el("div", "card-note", rows.length + " candidates from past runs. Pick one to build a short directly from it (no search)."));
+  const grid = el("div", "");
+  grid.style.cssText = "display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; max-height:520px; overflow-y:auto;";
+  card.appendChild(grid);
+  rows.forEach(r => {
+    const it = el("div", "");
+    it.style.cssText = "flex:1 1 210px; max-width:250px; border:1px solid var(--line-strong); border-radius:10px; padding:9px; background:var(--bg-input);";
+    it.appendChild(el("strong", "", esc(r.title || r.desc || "Candidate")));
+    const meta = `@${esc(r.author || "")} · ${r.dur}s · ${(+r.likes || 0).toLocaleString()} likes`
+      + (r.appeal ? ` · appeal ${r.appeal}/10` : "") + (r.picked ? " · ✓ used" : "");
+    it.appendChild(el("div", "card-note", meta));
+    if (r.premise) it.appendChild(el("div", "card-note", "“" + esc(r.premise) + "”"));
+    if (r.sheet_url) {
+      const im = document.createElement("img");
+      im.src = r.sheet_url; im.loading = "lazy";
+      im.style.cssText = "width:100%; border-radius:7px; margin:5px 0;";
+      it.appendChild(im);
+    }
+    it.appendChild(el("div", "card-note", esc(r.last_seen || "")));
+    it.appendChild(btn("Use this candidate", () => {
+      S.values.candidate_url = r.url || "";
+      persist();
+      card.remove();
+      if (typeof onPick === "function") onPick();
+    }, "primary small"));
+    grid.appendChild(it);
+  });
 }
 
 function captionStylePanel() {
