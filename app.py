@@ -12971,11 +12971,15 @@ def job_page(job_id):
             stages_html = "".join(f"<li>{esc(s)}</li>" for s in (c.get("stages") or [])[:6])
             meta = (f"@{esc(str(c.get('author') or ''))} &middot; {c.get('dur')}s &middot; "
                     f"{int(c.get('likes') or 0):,} likes &middot; appeal {c.get('appeal')}/10")
+            premise_html = (f'<div class="hint" style="margin-bottom:4px;">'
+                            f'&ldquo;{esc(str(c.get("premise") or ""))}&rdquo;</div>'
+                            if c.get("premise") else "")
             cards += f"""
             <div style="flex:1 1 260px; max-width:320px; border:1px solid var(--line-strong);
                         border-radius:12px; padding:12px; background:var(--bg-input);">
               <strong style="display:block; margin-bottom:2px;">{esc(str(c.get('title') or ''))}</strong>
               <div class="hint" style="margin-bottom:4px;">{meta}</div>
+              {premise_html}
               {img_html}
               <ol style="margin:4px 0 10px 18px; color:var(--muted); font-size:12px;">{stages_html}</ol>
               <form class="inline-form" method="post"

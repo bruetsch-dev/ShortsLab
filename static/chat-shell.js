@@ -2504,6 +2504,7 @@ async function pollJob() {
         card.style.cssText = "flex:1 1 240px; max-width:300px; border:1px solid var(--line-strong); border-radius:12px; padding:10px; background:var(--bg-input);";
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
+        if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
         if (cd.sheet_url) {
           const im = document.createElement("img");
           im.src = cd.sheet_url; im.style.cssText = "width:100%; border-radius:8px; margin:6px 0;";

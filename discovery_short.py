@@ -40,14 +40,21 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
         sys_p = ("You find LONG TikTok videos (40s-10min) that tell ONE complete little STORY "
                  "or skit with several scenes, ALWAYS featuring "
                  + ("Japanese" if jp else "Japanese/Korean/Chinese")
-                 + " WOMEN or COUPLES (or similar: sisters, families, models): couple skits, "
-                 "sibling skits (e.g. overprotective brother checks his sister's outfit), "
-                 "cafe/restaurant couple pranks, model training days, girl group daily life, "
-                 "family comedy. The viewer must be able to FOLLOW THE STORY visually across "
-                 "scenes - lots of usable material, clear beats, a punchline or resolution. "
+                 + " WOMEN or COUPLES (or similar: sisters, families, models). "
+                 "CATCHINESS IS EVERYTHING: every query must target a video with a one-line "
+                 "PREMISE that creates instant tension or comedy - a rule being enforced, a "
+                 "prank escalating, a strict test, a role reversal. Proven formats to hunt: "
+                 "overprotective brother inspects his sister's outfits, girlfriend checks the "
+                 "boyfriend's phone, strict model/idol bootcamp, couple prank that backfires, "
+                 "mother-in-law surprise visit, jealous couple test, waiter/waitress crush "
+                 "skit, sisters swap identities. AVOID: calm daily-life vlogs, cooking, GRWM, "
+                 "shopping hauls, dance-only - those are boring. "
                  "Return JSON: {\"queries\": [8 search strings]}. Mix English with "
                  + ("Japanese" if jp else "Japanese, Korean and Chinese")
-                 + " queries - native-language queries find the authentic uploads. "
+                 + " queries using native skit/prank words ("
+                 + ("ドッキリ, コント, 兄妹, カップル 喧嘩" if jp else
+                    "ドッキリ, コント, 情侣 恶搞, 姐妹 剧情, 몰카, 커플 장난")
+                 + ") - native-language queries find the authentic uploads. "
                  "No hashtags, no Western creators.")
         user_p = (f"The user wants a video about: {hint}" if hint else
                   "No topic given - vary the story types (couple, siblings, models, family, "
@@ -255,8 +262,13 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
             "men-only content). 4-8 stages = the STORY BEATS in time order; `action` describes "
             "ONLY what is literally on screen (people, expressions, places, actions) - the "
             "narration is written from these, so anything invented desyncs voice and video. "
-            "Mark is_reveal=true on the beat with the punchline/resolution. Appeal honestly: "
-            "9-10 exceptional, 7-8 good, 6 usable, below reject.")
+            "Mark is_reveal=true on the beat with the punchline/resolution. Also return "
+            "\"premise\": the story in ONE punchy line (e.g. 'brother rejects every outfit "
+            "until she dresses like a lawyer'). Appeal = SCROLL-STOPPING catchiness, judged "
+            "hard: 9-10 = instantly gripping premise, expressive faces, clear escalation and "
+            "payoff; 7-8 = solid tension or comedy; 6 = watchable but flat; below 6 = calm "
+            "daily-life vlog, cooking, GRWM, unclear story - reject. If you cannot state a "
+            "one-line premise with tension or humor, appeal is at most 5.")
         data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
                                       reasoning_model=reasoning_model)
         stages = []
@@ -494,7 +506,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
             continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
-        if not info.get("is_process") or float(info.get("appeal") or 0) < 6 or len(info["stages"]) < 3:
+        _min_appeal = 7 if style == "story" else 6   # stories must be CATCHY, not just valid
+        if not info.get("is_process") or float(info.get("appeal") or 0) < _min_appeal                 or len(info["stages"]) < 3:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
         accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet})
@@ -503,6 +516,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
     if not accepted:
         raise RuntimeError("Discovery: no candidate survived the vision review - "
                            "rerun or give a topic hint.")
+    # Show the CATCHIEST finds first (user: "die ersten 5 sind uninteressant und uncatchy").
+    accepted.sort(key=lambda a: -float(a["info"].get("appeal") or 0))
 
     # USER APPROVAL GATE: the user must PICK ONE of the found candidates on the run page
     # (frame sheets + stages shown) before any script/TTS money is spent.
@@ -515,6 +530,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
             "author": a["cand"]["author"], "likes": a["cand"]["likes"],
             "dur": a["cand"]["dur"], "url": a["cand"]["url"],
             "appeal": a["info"].get("appeal"), "sheet": str(a["sheet"]),
+            "premise": str(a["info"].get("premise") or ""),
             "stages": [f"{s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
                        for s in a["info"]["stages"]],
         } for i, a in enumerate(accepted)]})
