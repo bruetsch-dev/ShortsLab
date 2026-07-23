@@ -54,6 +54,15 @@ def _record_candidates(accepted, style):
                 shutil.copy2(a["sheet"], dst)
         except OSError:
             pass
+        prev_dir = CANDIDATE_LIBRARY_DIR / "previews"
+        prev_dir.mkdir(parents=True, exist_ok=True)
+        pdst = prev_dir / f"{cid}.mp4"
+        try:
+            pv = Path(str(a.get("preview") or ""))
+            if a.get("preview") and pv.exists() and not pdst.exists():
+                shutil.copy2(pv, pdst)
+        except OSError:
+            pass
         prev = data.get(cid) or {}
         data[cid] = {
             "id": cid, "url": str(c.get("url") or ""), "author": str(c.get("author") or ""),
@@ -68,8 +77,26 @@ def _record_candidates(accepted, style):
             "first_seen": prev.get("first_seen") or now, "last_seen": now,
             "picked": bool(prev.get("picked")), "project": prev.get("project") or "",
             "sheet": f"sheets/{cid}.jpg" if dst.exists() else str(prev.get("sheet") or ""),
+            "preview": f"previews/{cid}.mp4" if pdst.exists() else str(prev.get("preview") or ""),
         }
     fp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def _browser_preview(src, dst, ff):
+    """TikTok downloads are HEVC - browsers without an H.265 license show a BLACK video
+    with working audio (user bug 2026-07-23). Transcode a small H.264 preview for the
+    picker/library players; pass-through when the source is already H.264."""
+    ffp = pipeline.find_ffprobe(ff)
+    r = subprocess.run([ffp, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=codec_name", "-of", "csv=p=0", str(src)],
+                       capture_output=True, text=True)
+    if (r.stdout or "").strip().lower() == "h264":
+        return Path(src)
+    subprocess.run([ff, "-y", "-loglevel", "error", "-i", str(src),
+                    "-vf", "scale=480:-2", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-crf", "27", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
+                    "-movflags", "+faststart", str(dst)], check=True)
+    return Path(dst)
 
 
 def _mark_candidate_picked(cand_id, project_slug):
@@ -635,6 +662,18 @@ def run_discovery_short(form, status_cb=None, style="process"):
                            "rerun or give a topic hint.")
     # Show the CATCHIEST finds first (user: "die ersten 5 sind uninteressant und uncatchy").
     accepted.sort(key=lambda a: -float(a["info"].get("appeal") or 0))
+    _ffprev = pipeline.find_ffmpeg()
+
+    def _mk_prev(a):
+        try:
+            dst = work / f"prev_{a['cand']['id']}.mp4"
+            a["preview"] = str(_browser_preview(a["src"], dst, _ffprev))
+        except Exception:  # noqa: BLE001
+            a["preview"] = ""
+    from concurrent.futures import ThreadPoolExecutor
+    log(status_cb, f"Discovery: building {len(accepted)} browser previews (H.264)...")
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        list(_ex.map(_mk_prev, accepted))
     _record_candidates(accepted, style)   # persistent candidate library (every pick ever shown)
 
     # USER APPROVAL GATE: the user must PICK ONE of the found candidates on the run page
@@ -648,7 +687,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
             "author": a["cand"]["author"], "likes": a["cand"]["likes"],
             "dur": a["cand"]["dur"], "url": a["cand"]["url"],
             "appeal": a["info"].get("appeal"), "sheet": str(a["sheet"]),
-            "video": str(a["src"] or ""),
+            "video": str(a.get("preview") or ""),
             "premise": str(a["info"].get("premise") or ""),
             "stages": [f"{s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
                        for s in a["info"]["stages"]],

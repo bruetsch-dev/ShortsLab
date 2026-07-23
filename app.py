@@ -13935,8 +13935,11 @@ class Handler(BaseHTTPRequestHandler):
                 sheet_rel = str(r.get("sheet") or "")
                 sp = discovery_short.CANDIDATE_LIBRARY_DIR / sheet_rel if sheet_rel else None
                 row["sheet_url"] = link_for(sp) if (sp is not None and sp.exists()) else ""
-                vf = Path(str(r.get("file") or "")) if r.get("file") else None
-                row["video_url"] = link_for(vf) if (vf is not None and vf.exists()) else ""
+                # playback uses the H.264 PREVIEW only - the original "file" is often
+                # HEVC, which browsers render as a black frame with audio.
+                prev_rel = str(r.get("preview") or "")
+                pv = discovery_short.CANDIDATE_LIBRARY_DIR / prev_rel if prev_rel else None
+                row["video_url"] = link_for(pv) if (pv is not None and pv.exists()) else ""
                 rows.append(row)
             self.send_bytes(json.dumps({"ok": True, "candidates": rows}).encode("utf-8"),
                             "application/json; charset=utf-8")
