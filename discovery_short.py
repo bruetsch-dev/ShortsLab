@@ -32,9 +32,34 @@ _FALLBACK_QUERIES = [
 ]
 
 
-def _plan_queries(hint, reasoning_model, status_cb=None):
+def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region=""):
     """LLM: turn 'find something fascinating' (or the user's rough hint) into TikTok
-    search queries that surface LONG process/craft videos."""
+    search queries that surface LONG process/craft videos (or story skits in mini mode)."""
+    if style == "story":
+        jp = region == "japan"
+        sys_p = ("You find LONG TikTok videos (40s-10min) that tell ONE complete little STORY "
+                 "or skit with several scenes, ALWAYS featuring "
+                 + ("Japanese" if jp else "Japanese/Korean/Chinese")
+                 + " WOMEN or COUPLES (or similar: sisters, families, models): couple skits, "
+                 "sibling skits (e.g. overprotective brother checks his sister's outfit), "
+                 "cafe/restaurant couple pranks, model training days, girl group daily life, "
+                 "family comedy. The viewer must be able to FOLLOW THE STORY visually across "
+                 "scenes - lots of usable material, clear beats, a punchline or resolution. "
+                 "Return JSON: {\"queries\": [8 search strings]}. Mix English with "
+                 + ("Japanese" if jp else "Japanese, Korean and Chinese")
+                 + " queries - native-language queries find the authentic uploads. "
+                 "No hashtags, no Western creators.")
+        user_p = (f"The user wants a video about: {hint}" if hint else
+                  "No topic given - vary the story types (couple, siblings, models, family, "
+                  "cafe skit, school...).")
+        data = agent_core._post_llm_json(reasoning_model, [
+            {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+            max_tokens=600, temperature=0.6)
+        queries = [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()]
+        if not queries:
+            raise RuntimeError("Discovery: the query planner returned no queries.")
+        log(status_cb, "Mini discovery queries: " + " | ".join(queries[:8]))
+        return queries[:8]
     sys_p = ("You find LONG TikTok videos (45s-10min) that show a complete fascinating process "
              "from EAST ASIA (China/Japan, also Korea/Taiwan/SE Asia): traditional crafts, "
              "old-school manufacturing, cooking from raw ingredients, restoration, temple/village "
@@ -56,7 +81,7 @@ def _plan_queries(hint, reasoning_model, status_cb=None):
     return queries[:8]
 
 
-def _search_long(queries, status_cb=None):
+def _search_long(queries, status_cb=None, min_seconds=None):
     """Search TikTok (logged-in session) and keep only LONG candidates, best first."""
     import tiktok_login
     seen, out = set(), []
@@ -79,7 +104,7 @@ def _search_long(queries, status_cb=None):
                 dur = int((it.get("video") or {}).get("duration") or 0)
             except (TypeError, ValueError):
                 pass
-            if not author or dur < MIN_SRC_SECONDS or dur > MAX_SRC_SECONDS:
+            if not author or dur < (min_seconds or MIN_SRC_SECONDS) or dur > MAX_SRC_SECONDS:
                 continue
             likes = 0
             try:
@@ -212,9 +237,42 @@ def _verify_recut(scenes, sentences, stages, src_final, clip_dir, work_dir,
         else "Discovery: cut verification passed - all clips match their sentences.")
 
 
-def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None):
-    """Vision: rate the candidate + segment the process into ordered stages with times."""
+def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="process"):
+    """Vision: rate the candidate + segment the process (or story beats) into stages."""
     import scrape_v2
+    if style == "story":
+        prompt = (
+            "You see a frame sheet (rows in time order) of ONE long TikTok video; each frame is "
+            f"labeled with its timestamp (video length {total:.0f}s). Caption: \"{cand['desc']}\".\n"
+            "Task: judge whether this tells a COMPLETE little STORY/skit with clear beats, "
+            "prominently featuring Japanese/Korean/Chinese women or couples (or sisters, "
+            "families, models). Return JSON: {\"appeal\": 1-10, \"is_process\": true/false, "
+            "\"topic_title\": \"short English title of the story\", "
+            "\"stages\": [{\"start\": sec, \"end\": sec, \"action\": \"what visibly happens\", "
+            "\"is_reveal\": true/false}, ...]}.\n"
+            "Rules: is_process=true ONLY for a followable multi-scene story with women/couples "
+            "on screen (false for: single talking head, dance-only, slideshow, text cards, "
+            "men-only content). 4-8 stages = the STORY BEATS in time order; `action` describes "
+            "ONLY what is literally on screen (people, expressions, places, actions) - the "
+            "narration is written from these, so anything invented desyncs voice and video. "
+            "Mark is_reveal=true on the beat with the punchline/resolution. Appeal honestly: "
+            "9-10 exceptional, 7-8 good, 6 usable, below reject.")
+        data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
+                                      reasoning_model=reasoning_model)
+        stages = []
+        for st in (data.get("stages") or []):
+            try:
+                a, b = float(st.get("start")), float(st.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if b > a >= 0:
+                stages.append({"start": a, "end": min(b, total),
+                               "action": str(st.get("action") or "").strip(),
+                               "is_reveal": bool(st.get("is_reveal"))})
+        data["stages"] = stages
+        log(status_cb, f"Mini discovery vision: appeal {data.get('appeal')}/10, "
+                       f"{len(stages)} story beats - {data.get('topic_title')}")
+        return data
     prompt = (
         "You see a frame sheet (4 columns, rows in time order) of ONE long TikTok video; each frame is labeled with its "
         f"timestamp (video length {total:.0f}s). Caption of the post: \"{cand['desc']}\".\n"
@@ -250,7 +308,7 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None):
     return data
 
 
-def _write_script(analysis, hint, reasoning_model, status_cb=None):
+def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process"):
     """LLM: write the mini-short narration; every sentence is tied to one visual stage."""
     stages = analysis["stages"]
     stage_lines = "\n".join(f"[{i}] {s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
@@ -284,9 +342,38 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None):
            else "\nNo reveal stage exists: never describe the finished product's look."))
     user_p = (f"Video: {analysis.get('topic_title')}\nStages:\n{stage_lines}"
               + (f"\nUser's direction: {hint}" if hint else ""))
+    if style == "story":
+        # Mini-mode auto discovery: STORYTELLING narration over a skit/story with Asian
+        # women/couples (user 2026-07-23) - same JSON contract, different voice.
+        sys_p = (
+            "You write narrations for viral 25-40s STORYTELLING mini shorts (TikTok). "
+            "You get the story beats of ONE source video (a skit/story featuring Asian women "
+            "or couples); the short shows these beats in order while your narration tells the "
+            "little story with charm and drama.\n"
+            "Return JSON: {\"title\": str, \"slug\": \"kebab-case-slug\", "
+            "\"sentences\": [{\"text\": \"one sentence\", \"stage\": beat_index}, ...], "
+            "\"hook_keywords\": [4-8 UPPERCASE words from the text], "
+            "\"impact_word\": \"the single most gripping word of sentence 1\"}.\n"
+            "HARD RULES:\n"
+            "1. VOICE = VIDEO: every sentence may ONLY describe what its assigned beat "
+            "literally shows (per the beat description). Never invent dialogue, names, "
+            "thoughts or events that are not visible.\n"
+            "2. HOOK: sentence 1 states the situation's stake in one breath, anchored to "
+            "beat 0. Patterns: 'Her brother checks every single outfit before she can "
+            "leave.' / 'This couple runs the strangest cafe act in Tokyo.' NEVER open with "
+            "'Watch what happens...' or 'This video shows...'.\n"
+            "3. PAYOFF: the LAST sentence lands on the punchline/resolution beat when one "
+            "exists, wording matched to that shot.\n"
+            "4. Third person, present tense, warm playful tone, 6-10 sentences, 80-110 "
+            "words, beats strictly non-decreasing, every beat index must exist, no dashes "
+            "(use commas), no emojis, no hashtags, every sentence ends with . ! or ?"
+            + (f"\nThe punchline beat is index {reveal_idx}." if reveal_idx is not None
+               else "\nNo punchline beat exists: end on the last calm beat instead."))
+        user_p = (f"Video: {analysis.get('topic_title')}\nStory beats:\n{stage_lines}"
+                  + (f"\nUser's direction: {hint}" if hint else ""))
     data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        max_tokens=1200, temperature=0.5)
+        max_tokens=1200, temperature=0.6 if style == "story" else 0.5)
     sentences = []
     for s in (data.get("sentences") or []):
         txt = re.sub(r"\s+", " ", str(s.get("text") or "")).strip()
@@ -363,8 +450,11 @@ def _auto_phrases(counts):
     return sizes
 
 
-def run_discovery_short(form, status_cb=None):
-    """Entry point for a Clip Short run WITHOUT a script (Discovery mode)."""
+def run_discovery_short(form, status_cb=None, style="process"):
+    """Entry point for a Clip Short run WITHOUT a script. style="process" = classic
+    Discovery (craft/process docs); style="story" = the MINI mode's automatic discovery
+    (user 2026-07-23): skits/stories with Japanese/Korean/Chinese women or couples,
+    activated when the mini script AND topic are empty (never a selectable option)."""
     cancel_event = form.get("_cancel_event")
 
     def _check_cancel():
@@ -372,13 +462,16 @@ def run_discovery_short(form, status_cb=None):
             raise pipeline.PipelineCancelled("Run cancelled by user.")
 
     hint = str(form.get("gen_topic") or "").strip()
+    region = str(form.get("region") or "").strip().lower()
     reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
-    log(status_cb, "DISCOVERY MODE: no script given - the agent hunts a long process TikTok "
+    log(status_cb, ("MINI DISCOVERY: empty script - hunting a story/skit TikTok with Asian "
+                    "women or couples " if style == "story" else
+                    "DISCOVERY MODE: no script given - the agent hunts a long process TikTok ")
                    + (f"about '{hint}'." if hint else "on its own."))
 
-    queries = _plan_queries(hint, reasoning_model, status_cb)
+    queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
     _check_cancel()
-    candidates = _search_long(queries, status_cb)
+    candidates = _search_long(queries, status_cb, min_seconds=40 if style == "story" else None)
     if not candidates:
         raise RuntimeError("Discovery: no long TikTok candidates found - try a different topic.")
 
@@ -400,7 +493,7 @@ def run_discovery_short(form, status_cb=None):
             log(status_cb, "Discovery: skipped (download failed or not portrait 9:16).")
             continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
-        info = _vision_stages(sheet, total, cand, reasoning_model, status_cb)
+        info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
         if not info.get("is_process") or float(info.get("appeal") or 0) < 6 or len(info["stages"]) < 3:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
@@ -432,7 +525,7 @@ def run_discovery_short(form, status_cb=None):
                        f"{accepted[sel]['info'].get('topic_title')}")
     chosen, src, analysis = accepted[sel]["cand"], accepted[sel]["src"], accepted[sel]["info"]
 
-    plan = _write_script(analysis, hint, reasoning_model, status_cb)
+    plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style)
     script = plan["script"]
     slug = re.sub(r"[^a-z0-9_]+", "_", str(plan.get("slug") or plan.get("title") or "discovery")
                   .lower()).strip("_")[:48] or "discovery"

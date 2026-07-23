@@ -844,9 +844,10 @@ function renderScriptFlow() {
       c.appendChild(el("div", "card-note", isDiscovery()
         ? "Discovery mode: the agent finds one long Asian craft/process TikTok, writes the "
           + "narration itself and cuts the source to match it. Give an optional topic direction:"
-        : "Mini Story needs no script: give a TOPIC (e.g. 'old noodle vending machine') — the "
-          + "agent finds real footage of that ONE subject first and then writes a script the "
-          + "material can actually show. Pasting your own script below still works."));
+        : "Mini Story needs no script: give a TOPIC (e.g. 'old noodle vending machine') and the "
+          + "agent finds real footage of that ONE subject first. Leave BOTH empty and it hunts a "
+          + "story/skit TikTok (Asian women/couples) on its own and tells its story. Pasting "
+          + "your own script below still works."));
       const ti = document.createElement("input");
       ti.type = "text";
       ti.placeholder = isDiscovery()
@@ -1093,7 +1094,7 @@ function renderScriptFlow() {
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
-      if (!v && !isDiscovery() && !(isMiniStory() && (S.values.gen_topic || "").trim())) { ta.focus(); return; }
+      if (!v && !isDiscovery() && !isMiniStory()) { ta.focus(); return; }
       if (v && isMiniStory() && estimatedScriptTokens(v) > 130) {
         tokenMeter.classList.add("over");
         tokenMeter.textContent = `${estimatedScriptTokens(v)} / 130 estimated tokens — shorten the script to continue`;

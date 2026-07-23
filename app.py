@@ -4225,6 +4225,12 @@ def start_job(fields, files):
                 # write a script the material can actually show.
                 import discovery_short
                 result = discovery_short.run_mini_topic_short(fields, status_cb)
+            elif _fmt == "mini_story" and _no_script:
+                # Mini Story AUTO-DISCOVERY (user 2026-07-23, never a selectable option):
+                # empty script AND empty topic -> hunt a story/skit TikTok with Asian
+                # women/couples (japan region = Japanese-first) and tell its story.
+                import discovery_short
+                result = discovery_short.run_discovery_short(fields, status_cb, style="story")
             else:
                 result = agent_core.run_project(fields, status_cb)
             with JOB_LOCK:
