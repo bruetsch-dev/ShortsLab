@@ -467,38 +467,52 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
     user_p = (f"Video: {analysis.get('topic_title')}\nStages:\n{stage_lines}"
               + (f"\nUser's direction: {hint}" if hint else ""))
     if style == "story":
-        # Mini-mode auto discovery: STORYTELLING narration over a skit/story with Asian
-        # women/couples (user 2026-07-23) - same JSON contract, different voice.
+        # Mini-mode auto discovery: DUBBING-style voiceover over a skit/story with Asian
+        # women/couples (user prompt 2026-07-24: professional voiceover writer + video
+        # localization expert; direct speech, exact pacing, planned pauses).
+        transcript = str(analysis.get("transcript") or "").strip()
         sys_p = (
-            "You write narrations for viral 25-40s STORYTELLING mini shorts (TikTok). "
-            "You get the story beats of ONE source video (a skit/story featuring Asian women "
-            "or couples); the short shows these beats in order while your narration tells the "
-            "little story with charm and drama.\n"
+            "You are a professional voiceover writer and video localization expert. You "
+            "write the English voiceover for a viral 25-40s skit mini short (TikTok). You "
+            "get the story beats of ONE source video (a skit featuring Asian women or "
+            "couples) plus a timestamped translation of what the characters ACTUALLY say. "
+            "The voiceover must feel 100% natural and perfectly synchronized with the "
+            "visuals and the original audio (which stays audible quietly underneath).\n"
             "Return JSON: {\"title\": str, \"slug\": \"kebab-case-slug\", "
-            "\"sentences\": [{\"text\": \"one sentence\", \"stage\": beat_index}, ...], "
+            "\"sentences\": [{\"text\": \"one sentence\", \"stage\": beat_index, "
+            "\"pause_after\": seconds}, ...], "
             "\"hook_keywords\": [4-8 UPPERCASE words from the text], "
             "\"impact_word\": \"the single most gripping word of sentence 1\"}.\n"
             "HARD RULES:\n"
-            "1. VOICE = VIDEO: every sentence may ONLY describe what its assigned beat "
-            "literally shows (per the beat description). Describe the STATE the beat shows "
-            "('she sits in the classroom'), never a movement you assume happened before or "
-            "between shots ('she rushes into the classroom' is WRONG if the beat shows her "
-            "seated). Never invent dialogue, names, thoughts or events that are not "
-            "visible.\n"
-            "2. HOOK: sentence 1 must ORIENT the viewer instantly - who, where, and the "
-            "situation's rule or stake in one breath, anchored to beat 0. A confused viewer "
-            "swipes; after sentence 1 they must know exactly what game is being played. "
-            "Patterns: 'Her brother checks every single outfit before she can leave.' / "
-            "'This couple runs the strangest cafe act in Tokyo.' NEVER open with 'Watch "
-            "what happens...' or 'This video shows...'.\n"
-            "3. PAYOFF: the LAST sentence lands on the punchline/resolution beat when one "
-            "exists, wording matched to that shot.\n"
-            "4. Third person, present tense, warm playful tone, 6-10 sentences, 80-110 "
-            "words, beats strictly non-decreasing, every beat index must exist, no dashes "
-            "(use commas), no emojis, no hashtags, every sentence ends with . ! or ?"
+            "1. HONOR THE ORIGINAL DIALOGUE: never contradict or invent what characters "
+            "say - use the transcript's names, pleas and punchlines. If the transcript "
+            "says a name, use THAT name.\n"
+            "2. DIRECT SPEECH over summary: when a character speaks, dub it as direct "
+            "speech instead of narrating about it. WRONG: 'The father begs for an "
+            "answer.' RIGHT: 'Please, pick me!' Mix short dubbed lines with minimal "
+            "narration glue.\n"
+            "3. EXACT PACING: every sentence may ONLY cover what its assigned beat "
+            "literally shows RIGHT THEN - never describe actions that have not happened "
+            "yet or are already over. Describe the visible STATE ('she sits in the "
+            "classroom'), never assumed movement ('she rushes in' is WRONG if the beat "
+            "shows her seated).\n"
+            "4. PAUSES: do NOT talk wall-to-wall. Set \"pause_after\" (0 to 1.5 seconds) "
+            "after sentences where a visual punchline, an original reaction or a funny "
+            "original sound should breathe; use 0 elsewhere. Plan 2-4 real pauses per "
+            "short.\n"
+            "5. TONE: this is comedy - dynamic, playful, alive; never a dry documentary. "
+            "Sentence 1 must still ORIENT the viewer (who, where, the rule/stake) in one "
+            "breath, anchored to beat 0; NEVER open with 'Watch what happens...'.\n"
+            "6. FORM: the LAST sentence lands on the punchline beat when one exists. "
+            "6-10 sentences, 70-100 words, present tense, beats strictly non-decreasing, "
+            "every beat index must exist, no dashes (use commas), no emojis, no hashtags, "
+            "every sentence ends with . ! or ?"
             + (f"\nThe punchline beat is index {reveal_idx}." if reveal_idx is not None
                else "\nNo punchline beat exists: end on the last calm beat instead."))
         user_p = (f"Video: {analysis.get('topic_title')}\nStory beats:\n{stage_lines}"
+                  + (f"\nOriginal dialogue (timestamped English translation):\n{transcript}"
+                     if transcript else "\n(No usable dialogue transcript - rely on the "
+                                        "beats and keep dubbing to visible reactions.)")
                   + (f"\nUser's direction: {hint}" if hint else ""))
     data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
@@ -513,7 +527,12 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
         if txt:
             if not re.search(r"[.!?]$", txt):
                 txt += "."
-            sentences.append({"text": txt, "stage": max(0, min(idx, len(stages) - 1))})
+            try:
+                _pa = max(0.0, min(1.5, float(s.get("pause_after") or 0.0)))
+            except (TypeError, ValueError):
+                _pa = 0.0
+            sentences.append({"text": txt, "stage": max(0, min(idx, len(stages) - 1)),
+                              "pause_after": _pa})
     if len(sentences) < 4:
         raise RuntimeError("Discovery: the script writer returned too few sentences.")
     # stages must be non-decreasing so the recut plays forward through the source
@@ -529,6 +548,85 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
     data["script"] = " ".join(s["text"] for s in sentences)
     log(status_cb, f"Discovery script ({len(sentences)} sentences): {data.get('title')}")
     return data
+
+
+def _transcribe_source(src, status_cb=None):
+    """Timestamped transcript of the ORIGINAL source audio (user prompt 2026-07-24:
+    the writer must know what the characters ACTUALLY say - names, pleas, punchlines -
+    so the dub never invents dialogue). Auto language (Chinese/Japanese/Korean), local
+    faster-whisper; returns lines like "[0:18] ..." or "" when nothing usable."""
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segs, info = model.transcribe(str(src), task="translate", vad_filter=True)
+        # Whisper hallucinates these on music/ambient-only passages - never real dialogue.
+        _hallu = ("thank you for watching", "thanks for watching", "please subscribe",
+                  "see you next time", "subscribe to", "like and subscribe")
+        lines = []
+        for seg in segs:
+            txt = str(seg.text or "").strip()
+            if not txt or any(h in txt.lower() for h in _hallu):
+                continue
+            m, sec = divmod(int(seg.start), 60)
+            lines.append(f"[{m}:{sec:02d}] {txt}")
+            if len(lines) >= 60:
+                break
+        out = "\n".join(lines)
+        log(status_cb, f"Discovery: transcribed the source dialogue "
+                       f"({len(lines)} lines, lang={getattr(info, 'language', '?')}).")
+        return out
+    except Exception as exc:  # noqa: BLE001 - transcript is a quality boost, not a gate
+        log(status_cb, f"Discovery: source transcription skipped ({exc}).")
+        return ""
+
+
+def _apply_voice_pauses(wav, words, sentences, status_cb=None):
+    """Insert the writer's planned pauses (sentence['pause_after']) as real SILENCE into
+    the one-take voiceover, shifting all later word timings. Pauses let the original
+    audio bed (dual audio) and visual punchlines breathe instead of wall-to-wall talk."""
+    counts = [len(s["text"].split()) for s in sentences]
+    if sum(counts) != len(words):
+        return wav, words
+    pauses, cum = [], 0
+    for i, sent in enumerate(sentences):
+        cum += counts[i]
+        p = 0.0
+        try:
+            p = float(sent.get("pause_after") or 0.0)
+        except (TypeError, ValueError):
+            p = 0.0
+        p = max(0.0, min(1.5, p))
+        if p >= 0.15 and i < len(sentences) - 1:
+            pauses.append((cum - 1, round(p, 2)))
+    total_added = sum(p for _, p in pauses)
+    if not pauses or total_added > 8.0:
+        return wav, words
+    ff = pipeline.find_ffmpeg()
+    dur = _video_duration(wav)
+    bounds = [round(float(words[idx]["end"]) + 0.03, 3) for idx, _ in pauses]
+    fc, parts, prev = [], [], 0.0
+    for k, b in enumerate(bounds):
+        fc.append(f"[0:a]atrim={prev}:{b},asetpts=PTS-STARTPTS[c{k}]")
+        fc.append(f"aevalsrc=0:d={pauses[k][1]}:s=48000[p{k}]")
+        parts += [f"[c{k}]", f"[p{k}]"]
+        prev = b
+    fc.append(f"[0:a]atrim={prev}:{dur + 0.5},asetpts=PTS-STARTPTS[c{len(bounds)}]")
+    parts.append(f"[c{len(bounds)}]")
+    fc.append("".join(parts) + f"concat=n={len(parts)}:v=0:a=1,aresample=48000[a]")
+    out = Path(wav).with_name(Path(wav).stem + "_paused.wav")
+    subprocess.run([ff, "-y", "-loglevel", "error", "-i", str(wav),
+                    "-filter_complex", ";".join(fc), "-map", "[a]",
+                    "-c:a", "pcm_s16le", str(out)], check=True)
+    shifted, offset, bi = [], 0.0, 0
+    for wi, w in enumerate(words):
+        shifted.append({**w, "start": round(float(w["start"]) + offset, 3),
+                        "end": round(float(w["end"]) + offset, 3)})
+        if bi < len(pauses) and wi == pauses[bi][0]:
+            offset += pauses[bi][1]
+            bi += 1
+    log(status_cb, f"Discovery: inserted {len(pauses)} voiceover pause(s) "
+                   f"(+{total_added:.1f}s) so punchlines and original audio can breathe.")
+    return out, shifted
 
 
 def _align_words(wav, script, status_cb=None):
@@ -699,6 +797,9 @@ def run_discovery_short(form, status_cb=None, style="process"):
                        f"{accepted[sel]['info'].get('topic_title')}")
     chosen, src, analysis = accepted[sel]["cand"], accepted[sel]["src"], accepted[sel]["info"]
 
+    if style == "story":
+        # the writer dubs the ACTUAL dialogue - transcribe the chosen source first
+        analysis["transcript"] = _transcribe_source(src, status_cb)
     plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style)
     script = plan["script"]
     slug = re.sub(r"[^a-z0-9_]+", "_", str(plan.get("slug") or plan.get("title") or "discovery")
@@ -750,6 +851,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
     if not wav:
         raise RuntimeError("Discovery: voiceover generation failed (TTS disabled or errored).")
     words = _align_words(wav, script, status_cb)
+    if style == "story":
+        wav, words = _apply_voice_pauses(wav, words, plan["sentences"], status_cb)
     (project_dir / "input" / "word_timings.json").write_text(json.dumps(words), encoding="utf-8")
     total_vo = _video_duration(wav)
 
