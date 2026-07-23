@@ -2042,8 +2042,14 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .lf-nle-labels { flex:0 0 82px; display:grid; grid-template-rows:24px 76px 42px; gap:6px; }
 .lf-nle-labels>b { display:flex; align-items:center; color:var(--text-muted); font:700 10px/1 var(--mono,monospace);
   letter-spacing:.08em; text-transform:uppercase; }
-.lf-nle-scroll { flex:1; min-width:0; overflow-x:auto; overflow-y:hidden; padding-bottom:5px; scrollbar-width:thin;
-  scrollbar-color:color-mix(in srgb,var(--brand) 24%,transparent) transparent; }
+.lf-nle-scroll { flex:1; min-width:0; overflow-x:scroll; overflow-y:hidden; padding-bottom:6px;
+  scrollbar-color:color-mix(in srgb,var(--brand) 60%,#666) color-mix(in srgb,var(--bg,#080b09) 60%,#222);
+  cursor:grab; }
+.lf-nle-scroll.panning { cursor:grabbing; user-select:none; }
+.lf-nle-scroll::-webkit-scrollbar { height:11px; }
+.lf-nle-scroll::-webkit-scrollbar-track { background:color-mix(in srgb,var(--bg,#080b09) 60%,#222); border-radius:6px; }
+.lf-nle-scroll::-webkit-scrollbar-thumb { background:color-mix(in srgb,var(--brand) 60%,#666); border-radius:6px; }
+.lf-nle-scroll::-webkit-scrollbar-thumb:hover { background:var(--brand); }
 .lf-nle-canvas { position:relative; height:154px; min-width:100%; }
 .lf-nle-ruler { position:absolute; left:0; right:0; top:0; height:24px; border-bottom:1px solid var(--border); cursor:pointer; }
 .lf-nle-tick { position:absolute; top:0; height:24px; padding:3px 0 0 5px; border-left:1px solid color-mix(in srgb,var(--text-muted) 28%,transparent);
@@ -2105,7 +2111,7 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .lf-unused-copy small { display:block; margin-bottom:7px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   color:color-mix(in srgb,var(--text-muted) 72%,transparent); font-size:9px; }
 .lf-empty-state,.lf-empty-inline { padding:20px; border:1px dashed var(--border); border-radius:10px; color:var(--text-muted); font-size:12px; }
-.lf-render-foot { position:sticky; bottom:8px; z-index:5; margin-top:14px; padding:12px 14px; border:1px solid var(--border);
+.lf-render-foot { position:static; margin-top:16px; padding:12px 14px; border:1px solid var(--border);
   border-radius:13px; background:color-mix(in srgb,var(--bg,#080b09) 92%,transparent); backdrop-filter:blur(16px); }
 .lf-render-copy { display:flex; flex-direction:column; gap:2px; }
 .lf-render-copy span { color:var(--text-muted); font-size:11px; }

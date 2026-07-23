@@ -2797,7 +2797,7 @@ async function openLongformPreRenderEditor(slug) {
   const timeline = el("section", "lf-section lf-timeline-section"); root.appendChild(timeline);
   const unused = el("section", "lf-section lf-unused-section"); root.appendChild(unused);
   const audio = el("audio", "lf-voice-player"); audio.controls = true; audio.preload = "metadata";
-  let swapFrom = null, armedUnused = null, selectedFrame = 0, timelineScale = 28;
+  let swapFrom = null, armedUnused = null, selectedFrame = 0, timelineScale = 4, zoomChoice = "4";
 
   async function refresh() {
     const next = await jget("/longform-frames?slug=" + encodeURIComponent(data.slug));
@@ -2884,25 +2884,40 @@ async function openLongformPreRenderEditor(slug) {
     updatePreview(chosen());
 
     const tools = el("div", "lf-nle-toolbar"); timeline.appendChild(tools);
-    tools.appendChild(el("span", "lf-track-help", swapFrom!==null ? "Choose another image slot to complete the swap." : armedUnused ? "Choose an image slot for the unused asset." : "Drag clips to swap / click to inspect"));
+    tools.appendChild(el("span", "lf-track-help", swapFrom!==null ? "Choose another image slot to complete the swap." : armedUnused ? "Choose an image slot for the unused asset." : "Scroll / drag the timeline to move through the video - drag clips to swap, click to inspect"));
     const zoomLabel=el("label","lf-zoom-control","Zoom");
-    const zoom=el("select"); [[14,"Compact"],[28,"Normal"],[46,"Detailed"]].forEach(([v,n])=>zoom.appendChild(new Option(n,String(v))));
-    zoom.value=String(timelineScale); zoom.addEventListener("change",()=>{timelineScale=Number(zoom.value);paintTimeline();});
+    const zoom=el("select"); [["fit","Fit whole video"],["4","Overview"],["14","Normal"],["28","Detailed"]].forEach(([v,n])=>zoom.appendChild(new Option(n,v)));
+    zoom.value=String(zoomChoice); zoom.addEventListener("change",()=>{zoomChoice=zoom.value;paintTimeline();});
     zoomLabel.appendChild(zoom); tools.appendChild(zoomLabel);
 
     const rows=el("div","lf-nle-rows"); timeline.appendChild(rows);
     const labels=el("div","lf-nle-labels","<span></span><b>Images</b><b>Voiceover</b>"); rows.appendChild(labels);
     const scroll=el("div","lf-nle-scroll"); rows.appendChild(scroll);
-    const duration=Math.max(Number(data.audio_duration||0),Number(frames[frames.length-1].end||0));
-    const width=Math.max(900,Math.ceil(duration*timelineScale));
+    const duration=Math.max(Number(data.audio_duration||0),Number(frames[frames.length-1].end||0),1);
+    // "fit" shows the ENTIRE video without scrolling; numeric presets are px per second.
+    const availW=Math.max(320,(timeline.clientWidth||900)-120);
+    timelineScale=zoomChoice==="fit"?Math.max(0.3,(availW-10)/duration):Number(zoomChoice);
+    const width=zoomChoice==="fit"?availW-10:Math.max(900,Math.ceil(duration*timelineScale));
     const canvas=el("div","lf-nle-canvas"); canvas.style.width=width+"px"; scroll.appendChild(canvas);
+    // Mouse navigation (user 2026-07-23: "ich kann nicht weiter ruebergehen"): a plain
+    // wheel scrolls the timeline horizontally, and dragging the background pans it -
+    // the thin scrollbar is no longer the only way to move through a 20-minute video.
+    let suppressSeek=0;
+    scroll.addEventListener("wheel",ev=>{ if(Math.abs(ev.deltaY)>Math.abs(ev.deltaX)){ ev.preventDefault(); scroll.scrollLeft+=ev.deltaY; } },{passive:false});
+    let panStart=null;
+    scroll.addEventListener("pointerdown",ev=>{ if(ev.button!==0||ev.target.closest(".lf-nle-clip"))return; panStart={x:ev.clientX,left:scroll.scrollLeft,moved:false}; });
+    scroll.addEventListener("pointermove",ev=>{ if(!panStart)return; const dx=ev.clientX-panStart.x;
+      if(!panStart.moved&&Math.abs(dx)>4){panStart.moved=true;scroll.classList.add("panning");}
+      if(panStart.moved) scroll.scrollLeft=panStart.left-dx; });
+    const endPan=()=>{ if(panStart&&panStart.moved) suppressSeek=Date.now(); panStart=null; scroll.classList.remove("panning"); };
+    scroll.addEventListener("pointerup",endPan); scroll.addEventListener("pointerleave",endPan);
     const ruler=el("div","lf-nle-ruler"); canvas.appendChild(ruler);
     const imageTrack=el("div","lf-nle-track lf-nle-image-track"); canvas.appendChild(imageTrack);
     const voiceTrack=el("div","lf-nle-track lf-nle-voice-track"); canvas.appendChild(voiceTrack);
     const playhead=el("div","lf-nle-playhead"); canvas.appendChild(playhead);
     const tickStep=timelineScale<=14?60:timelineScale<=28?30:10;
     for(let t=0;t<=duration;t+=tickStep){const tick=el("span","lf-nle-tick",`${Math.floor(t/60)}:${String(Math.floor(t%60)).padStart(2,"0")}`);tick.style.left=(t*timelineScale)+"px";ruler.appendChild(tick);}
-    const seekAt=ev=>{const rect=canvas.getBoundingClientRect();const t=Math.max(0,Math.min(duration,(ev.clientX-rect.left)/timelineScale));if(data.voiceover)audio.currentTime=t;playhead.style.left=(t*timelineScale)+"px";const f=frames.find(x=>t>=Number(x.start)&&t<Number(x.end));if(f){imageTrack.querySelectorAll(".selected").forEach(x=>x.classList.remove("selected"));const node=imageTrack.querySelector(`[data-idx="${f.idx}"]`);if(node)node.classList.add("selected");updatePreview(f);}};
+    const seekAt=ev=>{if(Date.now()-suppressSeek<250)return;const rect=canvas.getBoundingClientRect();const t=Math.max(0,Math.min(duration,(ev.clientX-rect.left)/timelineScale));if(data.voiceover)audio.currentTime=t;playhead.style.left=(t*timelineScale)+"px";const f=frames.find(x=>t>=Number(x.start)&&t<Number(x.end));if(f){imageTrack.querySelectorAll(".selected").forEach(x=>x.classList.remove("selected"));const node=imageTrack.querySelector(`[data-idx="${f.idx}"]`);if(node)node.classList.add("selected");updatePreview(f);}};
     ruler.addEventListener("click",seekAt); imageTrack.addEventListener("click",ev=>{if(ev.target===imageTrack)seekAt(ev);}); voiceTrack.addEventListener("click",seekAt);
     audio.ontimeupdate=()=>{const t=Number(audio.currentTime||0);playhead.style.left=(t*timelineScale)+"px";const f=frames.find(x=>t>=Number(x.start)&&t<Number(x.end));if(f&&f.idx!==selectedFrame)updatePreview(f);};
 
