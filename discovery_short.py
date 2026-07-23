@@ -85,6 +85,20 @@ def _mark_candidate_picked(cand_id, project_slug):
         pass
 
 
+def _update_candidate_file(cand_id, abs_path):
+    """Remember where a candidate's video file finally lives (project folder), so the
+    library can PLAY it and a pinned re-run can reuse it without re-downloading."""
+    fp = CANDIDATE_LIBRARY_DIR / "candidates.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        entry = data.get(str(cand_id))
+        if entry is not None:
+            entry["file"] = str(abs_path)
+            fp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def load_candidate_library():
     """All candidates ever shown, newest first (for the UI library)."""
     fp = CANDIDATE_LIBRARY_DIR / "candidates.json"
@@ -570,6 +584,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
             "dur": int((entry or {}).get("dur") or 0),
             "desc": str((entry or {}).get("desc") or ""), "query": "library",
             "url": pinned_url,
+            "local_file": str((entry or {}).get("file") or ""),
         }]
         log(status_cb, f"Discovery: using the saved library candidate "
                        f"@{candidates[0]['author']} - no search needed.")
@@ -593,8 +608,16 @@ def run_discovery_short(form, status_cb=None, style="process"):
         _check_cancel()
         log(status_cb, f"Discovery: trying @{cand['author']} ({cand['dur']}s, "
                        f"{cand['likes']:,} likes) - {cand['desc'][:80]}")
-        path = clip_scraper.download_full(cand["url"], work, name=f"cand_{cand['id']}",
-                                          status_cb=status_cb)
+        _lf = Path(str(cand.get("local_file") or ""))
+        if cand.get("local_file") and _lf.exists():
+            # pinned library candidate whose video already lives in a project folder
+            import shutil as _sh
+            path = work / f"cand_{cand['id']}.mp4"
+            _sh.copy2(_lf, path)
+            log(status_cb, "Discovery: reusing the saved candidate video (no download).")
+        else:
+            path = clip_scraper.download_full(cand["url"], work, name=f"cand_{cand['id']}",
+                                              status_cb=status_cb)
         if not path or not _is_portrait(path):
             log(status_cb, "Discovery: skipped (download failed or not portrait 9:16).")
             continue
@@ -625,6 +648,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
             "author": a["cand"]["author"], "likes": a["cand"]["likes"],
             "dur": a["cand"]["dur"], "url": a["cand"]["url"],
             "appeal": a["info"].get("appeal"), "sheet": str(a["sheet"]),
+            "video": str(a["src"] or ""),
             "premise": str(a["info"].get("premise") or ""),
             "stages": [f"{s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
                        for s in a["info"]["stages"]],
@@ -665,6 +689,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
         entry["chosen"] = (j == sel)
         if j == sel:
             entry["file"] = "seedance 2.0/_discovery_source.mp4"
+            _update_candidate_file(a["cand"].get("id"), str(src_final))
         else:
             p = Path(a["src"])
             if p.exists():
@@ -673,6 +698,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
                 try:
                     p.replace(dest)
                     entry["file"] = f"initial downloads/{dest.name}"
+                    _update_candidate_file(a["cand"].get("id"), str(dest))
                 except OSError:
                     entry["file"] = str(p)
         sources.append(entry)
@@ -728,6 +754,12 @@ def run_discovery_short(form, status_cb=None, style="process"):
     stages = analysis["stages"]
     stage_cursor = {}
     scenes = []
+    # story mode keeps the source's own audio as a quiet bed under the voiceover
+    ffp = pipeline.find_ffprobe(ff)
+    _probe = subprocess.run([ffp, "-v", "error", "-select_streams", "a", "-show_entries",
+                             "stream=codec_type", "-of", "csv=p=0", str(src_final)],
+                            capture_output=True, text=True)
+    _src_has_audio = style == "story" and "audio" in (_probe.stdout or "")
     for i, sent in enumerate(sentences):
         _check_cancel()
         a, b = spans[i]
@@ -750,23 +782,74 @@ def run_discovery_short(form, status_cb=None, style="process"):
         else:
             rate = max(0.5, round(avail / d, 3))
             take = avail
-        stage_cursor[sent["stage"]] = t0 + take
-        vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-        if rate < 0.999:
-            vf += f",setpts=PTS/{rate}"
-        vf += ",fps=30"
-        out_len = take / rate
-        if out_len < d - 0.05:
-            vf += f",tpad=stop_mode=clone:stop_duration={d - out_len + 0.2:.2f}"
         name = f"disc_{i:02d}.mp4"
-        subprocess.run([ff, "-y", "-loglevel", "error", "-ss", str(round(t0, 2)),
-                        "-t", str(round(take + 0.1, 2)), "-i", str(src_final),
-                        "-vf", vf, "-t", str(d + 0.05),
-                        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
-                        str(clip_dir / name)], check=True)
-        if rate < 0.999:
-            log(status_cb, f"Discovery: stage {sent['stage']} shorter than its sentence - "
-                           f"clip {i} slowed to {rate:.2f}x to stay inside the stage.")
+        # RETENTION EDIT for story mode (user 2026-07-23, reference-video analysis):
+        # a 4-7s sentence over ONE static cut feels slow - split it into ~2s JUMP CUTS
+        # that leap forward through the beat (skipping dead air between sub-cuts), and
+        # keep the ORIGINAL AUDIO in the clip so the mixer can lay it quietly under the
+        # voiceover (dual audio). Falls back to the single slowed cut when the beat is
+        # too short to jump around in.
+        did_subcuts = False
+        if style == "story" and d >= 2.4 and avail >= d + 1.0:
+            n_sub = max(2, min(4, int(round(d / 2.2))))
+            base = d / n_sub
+            gap = min(1.2, max(0.0, (avail - d) / max(1, n_sub - 1)))
+            subs, t = [], t0
+            for k in range(n_sub):
+                sd = round(base, 2) if k < n_sub - 1 else round(d - base * (n_sub - 1), 2)
+                subs.append((round(t, 2), max(0.4, sd)))
+                t += sd + gap
+            stage_cursor[sent["stage"]] = min(t, st_end)
+            cmd = [ff, "-y", "-loglevel", "error"]
+            for (sa, sd) in subs:
+                cmd += ["-ss", str(sa), "-t", str(round(sd + 0.05, 2)), "-i", str(src_final)]
+            vparts, aparts, fc = [], [], []
+            for k in range(n_sub):
+                fc.append(f"[{k}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                          f"crop=1080:1920,fps=30,setpts=PTS-STARTPTS[v{k}]")
+                if _src_has_audio:
+                    fc.append(f"[{k}:a]aresample=48000,asetpts=PTS-STARTPTS[a{k}]")
+                vparts.append(f"[v{k}]")
+                aparts.append(f"[a{k}]")
+            if _src_has_audio:
+                fc.append("".join(v + a for v, a in zip(vparts, aparts))
+                          + f"concat=n={n_sub}:v=1:a=1[v][a]")
+            else:
+                fc.append("".join(vparts) + f"concat=n={n_sub}:v=1:a=0[v]")
+            cmd += ["-filter_complex", ";".join(fc), "-map", "[v]"]
+            if _src_has_audio:
+                cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            cmd += ["-t", str(d + 0.05), "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "19", str(clip_dir / name)]
+            try:
+                subprocess.run(cmd, check=True)
+                did_subcuts = True
+                log(status_cb, f"Discovery: clip {i} retention-cut into {n_sub} jump cuts.")
+            except subprocess.CalledProcessError:
+                log(status_cb, f"Discovery: jump-cut build failed for clip {i} - "
+                               "falling back to a single cut.")
+        if not did_subcuts:
+            stage_cursor[sent["stage"]] = t0 + take
+            vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+            if rate < 0.999:
+                vf += f",setpts=PTS/{rate}"
+            vf += ",fps=30"
+            out_len = take / rate
+            if out_len < d - 0.05:
+                vf += f",tpad=stop_mode=clone:stop_duration={d - out_len + 0.2:.2f}"
+            cmd = [ff, "-y", "-loglevel", "error", "-ss", str(round(t0, 2)),
+                   "-t", str(round(take + 0.1, 2)), "-i", str(src_final),
+                   "-vf", vf, "-t", str(d + 0.05)]
+            if style == "story" and _src_has_audio and rate >= 0.999:
+                cmd += ["-c:a", "aac", "-b:a", "128k"]   # dual audio: keep the original bed
+            else:
+                cmd += ["-an"]
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                    str(clip_dir / name)]
+            subprocess.run(cmd, check=True)
+            if rate < 0.999:
+                log(status_cb, f"Discovery: stage {sent['stage']} shorter than its sentence - "
+                               f"clip {i} slowed to {rate:.2f}x to stay inside the stage.")
         scenes.append({"id": f"{i+1:02d}", "name": f"Stage {sent['stage']}",
                        "script": sent["text"], "exact_voice_text": sent["text"],
                        "start": round(a, 2), "end": round(b, 2),
@@ -797,6 +880,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
         "sfx_enabled": True, "render_sfx_enabled": True, "custom_sfx": [],
         "hook_riser_file": "hook_riser3", "hook_riser_full_hook": True,
         "background_music_enabled": False,
+        # DUAL AUDIO (story style, reference-video analysis): the cut clips keep the
+        # source's own sound and the mixer lays it quietly under the voiceover.
+        "mix_seedance_audio_with_speech": _src_has_audio,
+        "seedance_audio_volume_with_speech": 0.12,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
     }

@@ -1526,7 +1526,12 @@ async function openCandidateLibrary(host, onPick) {
       + (r.appeal ? ` · appeal ${r.appeal}/10` : "") + (r.picked ? " · ✓ used" : "");
     it.appendChild(el("div", "card-note", meta));
     if (r.premise) it.appendChild(el("div", "card-note", "“" + esc(r.premise) + "”"));
-    if (r.sheet_url) {
+    if (r.video_url) {
+      const vp = document.createElement("video");
+      vp.src = r.video_url; vp.controls = true; vp.preload = "metadata";
+      vp.style.cssText = "width:100%; border-radius:7px; margin:5px 0; max-height:340px; background:#000;";
+      it.appendChild(vp);
+    } else if (r.sheet_url) {
       const im = document.createElement("img");
       im.src = r.sheet_url; im.loading = "lazy";
       im.style.cssText = "width:100%; border-radius:7px; margin:5px 0;";
@@ -2572,7 +2577,12 @@ async function pollJob() {
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
         if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
-        if (cd.sheet_url) {
+        if (cd.video_url) {
+          const vp = document.createElement("video");
+          vp.src = cd.video_url; vp.controls = true; vp.preload = "metadata";
+          vp.style.cssText = "width:100%; border-radius:8px; margin:6px 0; max-height:420px; background:#000;";
+          card.appendChild(vp);
+        } else if (cd.sheet_url) {
           const im = document.createElement("img");
           im.src = cd.sheet_url; im.style.cssText = "width:100%; border-radius:8px; margin:6px 0;";
           card.appendChild(im);

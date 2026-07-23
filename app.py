@@ -12964,8 +12964,13 @@ def job_page(job_id):
         cards = ""
         for c in (info.get("candidates") or []):
             sheet_path = str(c.get("sheet") or "")
+            video_path = str(c.get("video") or "")
             img_html = ""
-            if sheet_path and Path(sheet_path).exists():
+            if video_path and Path(video_path).exists():
+                # user 2026-07-23: show the WHOLE candidate video, not just the frame sheet
+                img_html = (f'<video src="{link_for(Path(video_path))}" controls preload="metadata" '
+                            f'style="width:100%; border-radius:8px; margin:8px 0; max-height:420px; background:#000;"></video>')
+            elif sheet_path and Path(sheet_path).exists():
                 img_html = (f'<img src="{link_for(Path(sheet_path))}" alt="Frame sheet" '
                             f'style="width:100%; border-radius:8px; margin:8px 0;">')
             stages_html = "".join(f"<li>{esc(s)}</li>" for s in (c.get("stages") or [])[:6])
@@ -13256,8 +13261,11 @@ def job_status_payload(job_id):
                              if status == "awaiting_approval" and job.get("speech_audio") else ""),
         "speech_speed": (_speech_current_speed(job) if status == "awaiting_approval" else 0),
         # Discovery mode: the pick-one-of-N topic/material approval (sheet paths -> URLs)
-        "discovery_review": ([{**c, "sheet_url": (link_for(Path(c["sheet"]))
-                                                  if c.get("sheet") and Path(c["sheet"]).exists() else "")}
+        "discovery_review": ([{**c,
+                               "sheet_url": (link_for(Path(c["sheet"]))
+                                             if c.get("sheet") and Path(c["sheet"]).exists() else ""),
+                               "video_url": (link_for(Path(c["video"]))
+                                             if c.get("video") and Path(c["video"]).exists() else "")}
                               for c in (job.get("discovery_review") or {}).get("candidates", [])]
                              if status == "awaiting_approval" and job.get("discovery_review") else []),
         # longform per-part speech approval ("Halt after speech" in the longform creator)
@@ -13927,6 +13935,8 @@ class Handler(BaseHTTPRequestHandler):
                 sheet_rel = str(r.get("sheet") or "")
                 sp = discovery_short.CANDIDATE_LIBRARY_DIR / sheet_rel if sheet_rel else None
                 row["sheet_url"] = link_for(sp) if (sp is not None and sp.exists()) else ""
+                vf = Path(str(r.get("file") or "")) if r.get("file") else None
+                row["video_url"] = link_for(vf) if (vf is not None and vf.exists()) else ""
                 rows.append(row)
             self.send_bytes(json.dumps({"ok": True, "candidates": rows}).encode("utf-8"),
                             "application/json; charset=utf-8")
