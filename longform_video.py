@@ -1717,6 +1717,45 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
         if not black.exists():
             raise LongformError("Could not create the black fallback frame.")
     lst = work / "concat.txt"
+    # The concat demuxer silently DROPS frames when image dimensions change mid-stream
+    # (decoder reinit) - a replaced/uploaded image with a different size made its scene
+    # (and neighbours) vanish while the previous image kept showing. Normalize any
+    # odd-sized image to the majority size once, into the assembly workspace.
+    from PIL import Image as _PILImage
+    sizes = {}
+    for i in range(len(lines)):
+        p = results.get(i)
+        if not p:
+            continue
+        try:
+            with _PILImage.open(p) as im:
+                sizes[i] = im.size
+        except Exception:
+            sizes[i] = None
+    counts = {}
+    for s in sizes.values():
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+    base_size = max(counts, key=counts.get) if counts else (1280, 720)
+    for i, s in sizes.items():
+        if not s or s == base_size:
+            continue
+        src = Path(results[i])
+        norm = work / f"norm_{i:03d}_{src.stem[:40]}.png"
+        try:
+            with _PILImage.open(src) as im:
+                im = im.convert("RGB")
+                ratio = min(base_size[0] / im.width, base_size[1] / im.height)
+                nw, nh = max(1, round(im.width * ratio)), max(1, round(im.height * ratio))
+                canvas = _PILImage.new("RGB", base_size, (0, 0, 0))
+                canvas.paste(im.resize((nw, nh), _PILImage.LANCZOS),
+                             ((base_size[0] - nw) // 2, (base_size[1] - nh) // 2))
+                canvas.save(norm)
+            results[i] = str(norm)
+            _log(status_cb, f"Scene {i + 1}: normalized {s[0]}x{s[1]} image to "
+                            f"{base_size[0]}x{base_size[1]} for a glitch-free concat.")
+        except Exception as exc:  # noqa: BLE001 - keep the original rather than fail the render
+            _log(status_cb, f"Scene {i + 1}: could not normalize image size ({exc}).")
     entries = []
     for i in range(len(lines)):
         img = results.get(i) or str(black)
