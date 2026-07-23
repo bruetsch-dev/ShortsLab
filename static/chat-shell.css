@@ -1971,10 +1971,10 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .lf-frame-menu { position:absolute; inset:auto 6px 6px 6px; display:flex; gap:6px; }
 
 /* Sketch Explainer pre-render review: a real editing surface, not a thumbnail grid. */
-.lf-prerender { width:min(1500px, calc(100vw - 52px)); max-width:none; margin-inline:auto;
+.lf-prerender { width:100%; max-width:1500px; min-width:0; margin-inline:auto;
   padding:22px; border-color:color-mix(in srgb, var(--brand) 22%, var(--border));
   background:linear-gradient(155deg, color-mix(in srgb, var(--bg-elev, #121713) 95%, var(--brand) 5%), var(--bg, #080b09)); }
-.lf-thumbnail-results { width:min(1320px,calc(100vw - 52px)); max-width:none; margin-inline:auto; padding:22px;
+.lf-thumbnail-results { width:100%; max-width:1320px; min-width:0; margin-inline:auto; padding:22px;
   border-color:color-mix(in srgb,var(--brand) 28%,var(--border));
   background:linear-gradient(155deg,color-mix(in srgb,var(--bg-elev,#121713) 94%,var(--brand) 6%),var(--bg,#080b09)); }
 .lf-thumbnail-results .lf-editor-head { margin-bottom:16px; }
@@ -2015,7 +2015,9 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .lf-thumbnail-copy p { margin:0 0 9px; color:var(--text-muted); font:650 10px/1.2 var(--mono,monospace); }
 .lf-transport { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
 .lf-voice-player { width:min(680px,100%); height:40px; accent-color:var(--brand); }
-.lf-nle-workspace { display:grid; grid-template-columns:minmax(420px,1.35fr) minmax(300px,.65fr); gap:14px; margin-bottom:14px; }
+.lf-nle-workspace { display:grid; grid-template-columns:minmax(320px,1.35fr) minmax(260px,.65fr); gap:14px; margin-bottom:14px; }
+.lf-nle-workspace > * { min-width:0; }
+@media (max-width: 900px) { .lf-nle-workspace { grid-template-columns:1fr; } }
 .lf-nle-preview { position:relative; overflow:hidden; min-height:0; aspect-ratio:16/9; border:1px solid var(--border);
   border-radius:13px; background:#050605; box-shadow:inset 0 0 0 1px rgba(255,255,255,.025); }
 .lf-nle-preview>img { display:block; width:100%; height:100%; object-fit:contain; background:#050605; }
@@ -2108,7 +2110,7 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .lf-render-copy { display:flex; flex-direction:column; gap:2px; }
 .lf-render-copy span { color:var(--text-muted); font-size:11px; }
 @media (max-width:900px) {
-  .lf-prerender,.lf-thumbnail-results { width:calc(100vw - 20px); padding:13px; }
+  .lf-prerender,.lf-thumbnail-results { width:100%; padding:13px; }
   .lf-thumbnail-options { grid-template-columns:1fr; }
   .lf-postrender-grid { grid-template-columns:1fr; }
   .lf-editor-head,.lf-section-head { align-items:flex-start; }
