@@ -804,7 +804,7 @@ def write_transcript(lines, out_path):
 # Bump when the STAGE-3 doodle-prompt FORMAT changes (e.g. the mandatory ALL-CAPS top caption).
 # A resumed project whose saved prompts predate this version regenerates ALL prompts - and the
 # images made from them - in the new style instead of reusing the old-format cache.
-PROMPT_FORMAT_VERSION = 2
+PROMPT_FORMAT_VERSION = 3
 
 STAGE3_PROMPT = """## STAGE 3 - GENERATE IMAGE PROMPTS FOR EVERY TIMESTAMP
 
@@ -816,7 +816,7 @@ Once the user pastes their timestamped script, generate one detailed text-to-ima
 2. Every prompt must open with the style anchor: "Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines,"
 3. Every prompt must end with the style lock: "no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style."
 4. Be specific inside each prompt - describe what characters are present and what they are doing, their exact expression, what objects are in the scene, what background color is used
-5. MANDATORY on-screen caption: every prompt MUST include a bold black ALL CAPS marker text at the top of the frame reading a short punchy 1-4 word caption that captures the essence of that line - phrase it exactly as: `bold black ALL CAPS marker text at the top reading "CHEERS"`. Pick the caption from the narration of that line (a key word, reaction, or label), like the on-screen words in a viral doodle explainer (CHEERS, WAR!, SORRY!, MOST COUNTRIES, 2 KM UNNOTICED, MILLIONS OF YEARS). Keep captions varied and specific to each line; hold the same caption only while the same beat is held across consecutive timestamps.
+5. MANDATORY on-screen caption: every prompt MUST include a bold black ALL CAPS marker text at the top of the frame reading a short punchy 1-3 word caption that captures the essence of that line - phrase it exactly as: `bold black ALL CAPS marker text at the top reading "CHEERS"`. Pick THE key word/reaction/label of the narration, like the on-screen words in a viral doodle explainer (CHEERS, WAR!, SORRY!, MOST COUNTRIES, 2 KM UNNOTICED, MILLIONS OF YEARS). NEVER use the whole sentence or a long phrase as the caption - a caption longer than 3 words is wrong. Keep captions varied and specific to each line; hold the same caption only while the same beat is held across consecutive timestamps.
 6. Translate abstract narration into concrete visuals - if the script says "your body doesn't know the difference", show a confused stick figure looking at two identical objects; if it says "millions of years", show a large hourglass with the top caption reading "MILLIONS OF YEARS"
 
 GOLD-STANDARD EXAMPLE (match this exact shape - style anchor, then a rich concrete scene, then the mandatory top caption, then background, then the style lock):
@@ -984,6 +984,7 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
         _log(status_cb, f"Image prompts: built a safe local fallback for slot {idx + 1}.")
         save_checkpoint()
     prompts = prompts[:len(lines)]
+    enforce_short_captions(prompts, lines, status_cb=status_cb)
     mismatch = sum(1 for l, p in zip(lines, prompts) if p["timestamp"] != fmt_ts(l["start"]))
     if mismatch:
         _log(status_cb, f"Note: {mismatch} prompt timestamp(s) differ from the transcript - "
@@ -1014,6 +1015,53 @@ def image_key(index, line, duration):
     """Filename stem: index + timestamp + on-screen DURATION (user rule: length visible)."""
     ts = fmt_ts(line["start"]).replace(":", "-").replace(".", "-").strip("[]")
     return f"img{index:03d}_[{ts}]_dur{duration:.2f}s"
+
+
+_CAPTION_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with", "at", "by",
+    "from", "your", "you", "it", "its", "is", "are", "was", "were", "be", "been", "will",
+    "would", "that", "this", "these", "those", "into", "as", "than", "then", "when", "while",
+    "have", "has", "had", "not", "no", "so", "if", "before", "after", "even", "just", "very",
+    "there", "here", "they", "them", "their", "he", "she", "his", "her", "we", "our", "all",
+    "any", "some", "can", "could", "do", "does", "did", "what", "who", "how", "why", "where",
+}
+
+
+def enforce_short_captions(prompts, lines, status_cb=None):
+    """Mechanically guarantee the SHORT viral caption contract (user 2026-07-23: 'nur einzelne
+    woerter, das wichtige'): every prompt carries a `reading "X"` caption of AT MOST 3 words.
+    Models sometimes drift and omit the phrasing entirely - the image model then bakes the WHOLE
+    narration sentence onto the frame. Missing captions are derived from the line's key content
+    words; overlong ones are trimmed. Mutates `prompts` in place."""
+    fixed_missing = fixed_long = 0
+    for i, p in enumerate(prompts):
+        if not isinstance(p, dict):
+            continue
+        text = str(p.get("prompt") or "")
+        if not text:
+            continue
+        m = _CAPTION_RE.search(text)
+        if m:
+            words = m.group(1).split()
+            if len(words) > 3:
+                new_cap = " ".join(words[:3]).upper().strip(" ,.")
+                p["prompt"] = text.replace(m.group(0), f'reading "{new_cap}"', 1)
+                fixed_long += 1
+            continue
+        line_text = str((lines[i] or {}).get("text") or "") if i < len(lines) else ""
+        tokens = re.findall(r"[A-Za-z0-9']+", line_text)
+        content = [w for w in tokens if w.lower() not in _CAPTION_STOPWORDS and len(w) >= 3]
+        cap = " ".join((content or tokens)[:2]).upper()
+        if not cap:
+            cap = f"SCENE {i + 1}"
+        p["prompt"] = (text.rstrip(" .") +
+                       f', bold black ALL CAPS marker text at the top reading "{cap}".')
+        fixed_missing += 1
+    if fixed_missing or fixed_long:
+        _log(status_cb, f"Caption contract enforced: {fixed_missing} prompt(s) had NO caption "
+                        f"instruction (injected a key-word caption), {fixed_long} overlong "
+                        "caption(s) trimmed to 3 words.")
+    return fixed_missing + fixed_long
 
 
 def caption_cut_starts(lines, prompts, audio_duration, lead=0.15):
