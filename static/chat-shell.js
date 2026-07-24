@@ -864,7 +864,7 @@ function renderScriptFlow() {
       c.appendChild(libRow);
       const renderPinned = () => {
         libRow.innerHTML = "";
-        libRow.appendChild(btn("📚 Candidate library", () => openCandidateLibrary(c, renderPinned), "ghost small"));
+        libRow.appendChild(btn("Candidate library", () => openCandidateLibrary(c, renderPinned), "ghost small"));
         if (S.values.candidate_url) {
           const chip = el("span", "");
           chip.style.cssText = "font-size:11.5px; color:var(--p-green,#39ff14); border:1px solid var(--line-strong); border-radius:8px; padding:3px 8px; display:inline-flex; align-items:center; gap:6px;";
@@ -1506,7 +1506,7 @@ async function openCandidateLibrary(host, onPick) {
   else chat.appendChild(card);
   const head = el("div", "");
   head.style.cssText = "display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;";
-  head.appendChild(el("h3", "", "📚 Candidate library"));
+  head.appendChild(el("h3", "", "Candidate library"));
   head.appendChild(btn("Close", () => card.remove(), "ghost small"));
   card.appendChild(head);
   const rows = (d && d.candidates) || [];
@@ -2278,6 +2278,83 @@ function renderJobSection() {
   pollJob(); pollTimer = setInterval(pollJob, 2500);
   setComposer("off");
 }
+// LIVE SCREENING PANEL: during a discovery run more than half the viewport sat empty
+// while the user waited minutes on a single log line (UI review 2026-07-25). The run's
+// own log already carries every verdict, so parse it and show the material as it is
+// judged - accepted picks first, rejects with their reason underneath.
+const SCREEN_RE = {
+  trying: /Discovery: trying @([^\s(]+)\s*\((\d+)s,\s*([\d,]+) likes\)\s*-\s*(.*)$/,
+  accept: /Discovery: candidate (\d+)\/(\d+) accepted - (.+?)(?:\s*\[([\d.]+) cuts\/min\])?$/,
+  skip:   /Discovery: skipped @([^\s]+) - (.+)$/,
+  reject: /Discovery: rejected by vision review/,
+  vision: /(?:Mini d|D)iscovery vision: appeal (\d+)\/10, (\d+) story beats - (.+)$/,
+};
+function parseScreening(logText) {
+  const lines = String(logText || "").split("\n");
+  const items = []; let cur = null;
+  for (const raw of lines) {
+    const line = raw.trim(); let m;
+    if ((m = line.match(SCREEN_RE.trying))) {
+      cur = { author: m[1], dur: +m[2], likes: m[3], desc: m[4], state: "checking" };
+      items.push(cur); continue;
+    }
+    if ((m = line.match(SCREEN_RE.vision)) && cur) { cur.appeal = +m[1]; cur.title = m[3]; continue; }
+    if ((m = line.match(SCREEN_RE.accept))) {
+      if (cur) { cur.state = "accepted"; cur.title = m[3]; if (m[4]) cur.cuts = m[4]; }
+      continue;
+    }
+    if ((m = line.match(SCREEN_RE.skip))) {
+      if (cur) { cur.state = "rejected"; cur.reason = m[2].replace(/\.$/, ""); }
+      continue;
+    }
+    if (SCREEN_RE.reject.test(line) && cur) { cur.state = "rejected"; cur.reason = "vision review"; continue; }
+  }
+  return items;
+}
+function renderScreeningPanel(d) {
+  const host = $("job-progress"); if (!host) return;
+  const items = parseScreening(d && d.log_text);
+  let panel = $("job-screening");
+  if (!items.length) { if (panel) panel.remove(); return; }
+  if (!panel) {
+    panel = el("section", "scr-panel"); panel.id = "job-screening";
+    panel.setAttribute("aria-live", "polite");
+    panel.innerHTML = '<div class="scr-head"><h4>Material screening</h4><span class="scr-count"></span></div><div class="scr-list"></div>';
+    host.parentNode.insertBefore(panel, host.nextSibling);
+  }
+  const accepted = items.filter(i => i.state === "accepted");
+  panel.querySelector(".scr-count").textContent =
+    `${accepted.length} kept / ${items.length} checked`;
+  const list = panel.querySelector(".scr-list");
+  // only append what is new -> no flicker, no re-layout of what the user is reading
+  const have = list.children.length;
+  items.slice(have).forEach((it, k) => {
+    const row = el("article", "scr-row scr-" + it.state);
+    row.style.animationDelay = Math.min(k, 6) * 40 + "ms";   // staggered entrance
+    row.innerHTML =
+      '<span class="scr-dot" aria-hidden="true"></span>' +
+      '<div class="scr-body"><b>' + esc(it.title || it.desc || ("@" + it.author)) + "</b>" +
+      '<span>@' + esc(it.author) + " &middot; " + it.dur + "s &middot; " + esc(it.likes) + " likes" +
+      (it.appeal ? " &middot; appeal " + it.appeal + "/10" : "") +
+      (it.cuts ? " &middot; " + it.cuts + " cuts/min" : "") + "</span></div>" +
+      '<span class="scr-verdict">' +
+      (it.state === "accepted" ? "KEPT" : it.state === "rejected"
+        ? esc(String(it.reason || "rejected").slice(0, 34)) : "checking\u2026") + "</span>";
+    list.appendChild(row);
+  });
+  for (let i = 0; i < list.children.length && i < items.length; i++) {
+    const want = "scr-row scr-" + items[i].state;
+    if (list.children[i].className !== want) {
+      list.children[i].className = want;
+      const v = list.children[i].querySelector(".scr-verdict");
+      if (v) v.textContent = items[i].state === "accepted" ? "KEPT"
+        : items[i].state === "rejected" ? String(items[i].reason || "rejected").slice(0, 34)
+        : "checking\u2026";
+    }
+  }
+  list.scrollTop = list.scrollHeight;
+}
+
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if(scrapePreviewTimer){clearInterval(scrapePreviewTimer);scrapePreviewTimer=null;} }
 
 function setScrapePreviewPolling(enabled) {
@@ -2495,6 +2572,7 @@ async function pollJob() {
   if (prog && d.progress_html !== lastProgressHTML) { prog.innerHTML = d.progress_html || ""; lastProgressHTML = d.progress_html; }
   const lg = $("job-log");
   if (lg && d.log_text != null && lg.textContent !== d.log_text) { lg.textContent = d.log_text; lg.scrollTop = lg.scrollHeight; }
+  renderScreeningPanel(d);
   // (phase-message chat bubbles removed - the user follows progress in the run box / tech log)
   // longform per-part speech approval ("Halt after speech" in the longform creator)
   const lfp = $("job-speech");
@@ -2562,27 +2640,32 @@ async function pollJob() {
   }
   // Discovery mode: pick ONE of the found topic/material candidates
   const dpHost = $("job-speech");
+  // (screening panel renders above; picker below)
   if (dpHost) {
     const cands = d.discovery_review || [];
     if (d.status === "awaiting_approval" && cands.length && !dpHost.dataset.discDone) {
       dpHost.dataset.discDone = "1"; dpHost.innerHTML = "";
       const c = el("div", "chat-card speech-approve-card"); dpHost.appendChild(c);
       c.appendChild(el("div", "sa-head",
-        `<div class="sa-title"><b>🔍 Pick the topic & material</b><em>Discovery found ${cands.length} long source videos. Pick ONE — only then the script and voiceover are produced.</em></div>`));
+        `<div class="sa-title"><b>Pick the topic &amp; material</b><em>Discovery found ${cands.length} long source videos. Pick ONE — only then the script and voiceover are produced.</em></div>`));
+      const rail = el("div", "cand-rail-wrap");
       const grid = el("div", "");
       // grid (not flex-wrap): every candidate column is the SAME height, so the pick
       // buttons sit on one baseline instead of three (user UI review 2026-07-25)
-      grid.style.cssText = "display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:12px; margin-top:10px; align-items:stretch;";
+      // ONE scrolling row instead of two stacked rows (UI review 2026-07-25): a peeking
+      // next card is the affordance that the row scrolls, and scroll-snap keeps a card
+      // aligned after every swipe / arrow click.
+      grid.className = "cand-rail";
       cands.forEach(cd => {
         const card = el("div", "");
-        card.style.cssText = "display:flex; flex-direction:column; min-width:0; border:1px solid var(--line-strong); border-radius:12px; padding:10px; background:var(--bg-input);";
+        card.className = "cand-card";
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
         if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
         if (cd.video_url) {
           const vp = document.createElement("video");
           vp.src = cd.video_url; vp.controls = true; vp.preload = "metadata";
-          vp.style.cssText = "width:100%; border-radius:8px; margin:6px 0; max-height:300px; object-fit:contain; background:#000;";
+          vp.className = "cand-video";
           card.appendChild(vp);
         } else if (cd.sheet_url) {
           const im = document.createElement("img");
@@ -2593,7 +2676,7 @@ async function pollJob() {
         ol.style.cssText = "margin:4px 0 8px 16px; color:var(--muted); font-size:11.5px; max-height:104px; overflow-y:auto;";
         (cd.stages || []).slice(0, 6).forEach(s => ol.appendChild(el("li", "", esc(s))));
         card.appendChild(ol);
-        const pickBtn = btn("✓ Use candidate " + ((+cd.index || 0) + 1), async () => {
+        const pickBtn = btn("Use candidate " + ((+cd.index || 0) + 1), async () => {
           await fetch("/approve-discovery?id=" + encodeURIComponent(S.jobId)
                       + "&action=pick&choice=" + (+cd.index || 0), { method: "POST" });
           dpHost.innerHTML = ""; delete dpHost.dataset.discDone;
@@ -2603,7 +2686,27 @@ async function pollJob() {
         card.appendChild(pickBtn);
         grid.appendChild(card);
       });
-      c.appendChild(grid);
+      rail.appendChild(grid);
+      [["prev", "Scroll to previous candidates", "M15 6l-6 6 6 6"],
+       ["next", "Scroll to more candidates", "M9 6l6 6-6 6"]].forEach(([dir, label, path]) => {
+        const b = el("button", "cand-nav cand-nav-" + dir);
+        b.type = "button"; b.setAttribute("aria-label", label); b.title = label;
+        b.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="' + path + '"/></svg>';
+        b.addEventListener("click", () => {
+          const step = (grid.querySelector(".cand-card") || {}).offsetWidth || 240;
+          grid.scrollBy({ left: (dir === "next" ? 1 : -1) * (step + 12),
+                          behavior: REDUCED ? "auto" : "smooth" });
+        });
+        rail.appendChild(b);
+      });
+      const syncNav = () => {
+        const max = grid.scrollWidth - grid.clientWidth - 2;
+        rail.querySelector(".cand-nav-prev").hidden = grid.scrollLeft <= 2;
+        rail.querySelector(".cand-nav-next").hidden = grid.scrollLeft >= max;
+      };
+      grid.addEventListener("scroll", syncNav, { passive: true });
+      requestAnimationFrame(syncNav);
+      c.appendChild(rail);
       scrollDown();
     } else if (dpHost.dataset.discDone && d.status !== "awaiting_approval") {
       dpHost.innerHTML = ""; delete dpHost.dataset.discDone;

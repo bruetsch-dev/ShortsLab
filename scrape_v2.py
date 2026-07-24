@@ -397,6 +397,11 @@ def _vision_json(prompt_text, sheet_path, max_tokens=4000, temperature=0.1, reas
             "response_format": {"type": "json_object"},
         }, timeout=240)
         return ac.extract_json_object(data["choices"][0]["message"]["content"]) or {}
+    except ac.WaveSpeedBalanceError:
+        # An empty account 403s EVERY call. Swallowing that into {} made a discovery run
+        # spend 20 minutes rejecting every candidate "by vision review" instead of saying
+        # the credit ran out (2026-07-25), so this one error always propagates.
+        raise
     except Exception:
         return {}
 

@@ -535,40 +535,54 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
     """Vision: rate the candidate + segment the process (or story beats) into stages."""
     import scrape_v2
     if style == "story":
+        # The output schema must be the LAST thing in this prompt. When the numbered
+        # judging steps came after it, the model answered with only the key named in the
+        # final step ({"stages": []}) and every candidate lost its appeal/title, which
+        # failed a whole run with "no candidate survived the vision review" (2026-07-25).
         prompt = (
             "You see a frame sheet (rows in time order) of ONE long TikTok video; each frame is "
             f"labeled with its timestamp (video length {total:.0f}s). Caption: \"{cand['desc']}\".\n"
-            "Task: judge whether this tells a COMPLETE little STORY/skit with clear beats, "
+            "Judge whether this tells a COMPLETE little STORY/skit with clear beats, "
             "prominently featuring Japanese/Korean/Chinese women or couples (or sisters, "
-            "families, models). Return JSON: {\"appeal\": 1-10, \"is_process\": true/false, "
+            "families, models).\n"
+            "REJECT (is_process=false, appeal at most 4) when ANY of these applies: the people "
+            "are WESTERN/non-East-Asian, or the burned-in text is fluent creator-written "
+            "English; it is one person talking to the camera, or everything happens in ONE "
+            "spot with no real change of scene; the plot only works through spoken dialogue or "
+            "on-screen text (the recut carries a NEW narration, so the visuals alone must tell "
+            "it); dance-only, slideshow, text cards, men-only, product ad; heavy black bars, "
+            "tiny inset video or a screen-recording layout. Be strict - a rejected candidate "
+            "costs nothing, a bad one ruins the short.\n"
+            "STAGES: 4-8 story beats in time order. `action` describes ONLY the STATE that is "
+            "verifiably visible in the frames (who is where, doing what, which expression) - "
+            "NEVER infer motion between frames ('rushes in', 'arrives') unless a frame "
+            "literally shows it; anything invented desyncs voice and video. Set is_reveal=true "
+            "on the beat carrying the punchline.\n"
+            "APPEAL, as a harsh critic - the scores must SPREAD, not cluster: 9-10 = you would "
+            "stop scrolling instantly, unusual situation, visible escalation and a payoff "
+            "(rare, ~1 in 10); 7-8 = a clear premise with real tension or comedy; 5-6 = "
+            "watchable but ordinary, the kind of clip everyone has seen; 4 or less = generic "
+            "or rejected above. Never give 8 just because a video is fine - 'fine' is a 6. If "
+            "you cannot state a one-line premise with tension or humor, appeal is at most 5.\n"
+            "Reply with ONE JSON object and no other text, containing ALL of these keys:\n"
+            "{\"appeal\": 1-10, \"is_process\": true/false, "
             "\"topic_title\": \"short English title of the story\", "
-            "\"stages\": [{\"start\": sec, \"end\": sec, \"action\": \"what visibly happens\", "
-            "\"is_reveal\": true/false}, ...]}.\n"
-            "STEP 1 - HARD REJECTS. Set is_process=false (and appeal<=4) when ANY applies: "
-            "(a) the people are WESTERN/non-East-Asian, or the burned-in text is fluent "
-            "English written by the creator; (b) it is one person talking to the camera, or "
-            "everything happens in ONE spot with no real change of scene; (c) the plot only "
-            "works through spoken dialogue or on-screen text (the recut carries a NEW "
-            "narration, so the visuals alone must tell it); (d) dance-only, slideshow, text "
-            "cards, men-only, product ad; (e) heavy black bars, tiny inset video, or a "
-            "screen-recording layout. Be strict - a rejected candidate costs nothing, a bad "
-            "one ruins the short.\n"
-            "STEP 2 - if it survives: 4-8 stages = the STORY BEATS in time order; `action` "
-            "describes ONLY the STATE that is verifiably visible in the frames (who is "
-            "where, doing what, which expression) - NEVER infer motion between frames "
-            "('rushes in', 'arrives') unless a frame literally shows it; anything invented "
-            "desyncs voice and video. Mark is_reveal=true on the beat with the punchline. "
-            "Return \"premise\": the story in ONE punchy line (e.g. 'brother rejects every "
-            "outfit until she dresses like a lawyer').\n"
-            "STEP 3 - APPEAL, as a harsh critic. Most videos are mediocre; the scores must "
-            "SPREAD, not cluster: 9-10 = you would stop scrolling instantly, unusual "
-            "situation, visible escalation and a payoff (rare, ~1 in 10); 7-8 = a clear "
-            "premise with real tension or comedy; 5-6 = watchable but ordinary, the kind of "
-            "clip everyone has seen; <=4 = generic or rejected above. Never give 8 just "
-            "because a video is fine - 'fine' is a 6. If you cannot state a one-line premise "
-            "with tension or humor, appeal is at most 5.")
+            "\"premise\": \"the story in one punchy line\", "
+            "\"stages\": [{\"start\": sec, \"end\": sec, \"action\": \"what is visible\", "
+            "\"is_reveal\": true/false}, ...]}")
         data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
                                       reasoning_model=reasoning_model)
+        if data.get("appeal") is None:
+            # One malformed answer must never cost the candidate: ask again, schema only.
+            log(status_cb, "Discovery: vision answer incomplete - retrying with a plain schema.")
+            data = scrape_v2._vision_json(
+                prompt.split("Reply with ONE JSON object")[0]
+                + "Reply with ONE JSON object and nothing else: {\"appeal\": 1-10, "
+                  "\"is_process\": true/false, \"topic_title\": \"short English title\", "
+                  "\"premise\": \"one line\", \"stages\": [{\"start\": sec, \"end\": sec, "
+                  "\"action\": \"what is visible\", \"is_reveal\": true/false}]}",
+                str(sheet), max_tokens=1500, temperature=0.1,
+                reasoning_model=reasoning_model) or data
         stages = []
         for st in (data.get("stages") or []):
             try:
