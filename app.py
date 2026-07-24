@@ -6762,6 +6762,7 @@ TIMELINE_SKELETON = """
       <div class="hint" id="tl-insp-empty">Click a clip, visual, transition or sound effect to edit it.</div>
       <div class="tl-insp-pane" id="tl-insp-clip" hidden>
         <div class="tl-insp-name" id="tl-insp-name"></div>
+        <div class="tl-insp-sec">Playback</div>
         <label>Duration (seconds)</label>
         <input type="number" id="tl-insp-dur" min="0.5" max="20" step="0.1">
         <label id="tl-insp-range-lbl">Clip range (in / out) <span id="tl-insp-range-val"></span></label>
@@ -6772,6 +6773,10 @@ TIMELINE_SKELETON = """
         </div>
         <label>Speed <span id="tl-insp-speed-val"></span></label>
         <input type="range" id="tl-insp-speed" min="0.5" max="2" step="0.05">
+        <div class="tl-insp-sec">Audio</div>
+        <label>Clip audio <span id="tl-insp-clipvol-val"></span></label>
+        <input type="range" id="tl-insp-clipvol" min="0" max="0.6" step="0.01" title="This clip's own sound under the voiceover. Until you move it, the clip follows the TikTok-audio master.">
+        <div class="tl-insp-sec">Transform</div>
         <div class="tl-clip-transform-controls">
           <label class="tl-chk"><input type="checkbox" id="tl-insp-mirror"> Mirror horizontally</label>
           <label class="tl-chk"><input type="checkbox" id="tl-insp-scale-mode"> Free scale</label>
@@ -6781,6 +6786,7 @@ TIMELINE_SKELETON = """
           </div>
           <div class="hint">Free scale selects the clip in the player. Drag its corner handle or use the slider.</div>
         </div>
+        <div class="tl-insp-sec">Captions</div>
         <label class="tl-chk" id="tl-insp-blur-row"><input type="checkbox" id="tl-insp-blurcap"> Blur burned-in captions</label>
         <div class="hint" id="tl-insp-blur-hint" hidden>OCR finds the caption letters in this clip and blurs only those. Applied on Save / Render (can take ~20s per clip the first time). Only blur added here can be toggled off again &mdash; blur baked in by an older scrape run is part of the footage itself (right-click the clip and replace the media instead).</div>
         <div class="tl-insp-actions">
@@ -6879,6 +6885,8 @@ TIMELINE_SKELETON = """
     <h2>Audio mixer</h2>
     <div class="tl-mixer">
       <div class="tl-slider"><label>Voice <span id="tl-v-voice"></span></label><input type="range" id="tl-voice-vol" min="0" max="1.5" step="0.05"></div>
+      <div class="tl-slider"><label title="Original clip sound under the voiceover. Only affects clips whose own volume you have NOT set individually.">TikTok audio <span id="tl-v-tiktok"></span></label><input type="range" id="tl-tiktok-vol" min="0" max="0.6" step="0.01"></div>
+      <div class="tl-slider"><label title="Master gain for auto-placed SFX. Only affects sounds whose volume you have NOT set individually.">SFX <span id="tl-v-sfx"></span></label><input type="range" id="tl-sfx-vol" min="0" max="1.5" step="0.05"></div>
       <div class="tl-slider"><label>Music <span id="tl-v-music"></span></label><input type="range" id="tl-music-vol" min="0" max="0.6" step="0.01"></div>
     </div>
   </div>
@@ -7081,6 +7089,8 @@ TIMELINE_ASSETS = """
   .tl-ruler { position:relative; height:22px; cursor:pointer; }
   .tl-tick { position:absolute; top:0; height:22px; border-left:1px solid rgba(255,255,255,.2); padding-left:5px; font-size:10px; color:rgba(255,255,255,.6); }
   .tl-rubber { position:absolute; top:4px; bottom:4px; background:var(--accent-subtle); border:1px solid var(--accent); border-radius:5px; z-index:9; pointer-events:none; }
+  .tl-insp-sec { margin:12px 0 4px; font:700 9.5px/1.2 var(--mono, ui-monospace); letter-spacing:.14em; text-transform:uppercase; color:var(--accent); border-top:1px solid var(--line-strong); padding-top:8px; }
+  .tl-insp-pane .tl-insp-sec:first-of-type { border-top:0; padding-top:0; margin-top:6px; }
   .tl-playhead { position:absolute; top:0; bottom:12px; width:2px; background:#ff5d5d; z-index:8; pointer-events:none; box-shadow:0 0 6px rgba(255,93,93,.8); }
   .tl-playhead::before { content:''; position:absolute; top:0; left:-5px; border-left:6px solid transparent; border-right:6px solid transparent; border-top:8px solid #ff5d5d; }
   /* #119 - voiceover-length marker: a dashed line across all tracks where the voice ends */
@@ -8175,6 +8185,9 @@ TIMELINE_ASSETS = """
     showPane('clip');
     document.getElementById('tl-insp-name').textContent=chosen.length>1?(chosen.length+' clips selected'):s.label;
     var durInput=document.getElementById('tl-insp-dur'); durInput.disabled=chosen.length>1; durInput.value=chosen.length>1?'':s.dur;
+    var _cv=(s.seedance_audio_volume!=null&&s.seedance_audio_volume!=='')?+s.seedance_audio_volume:((volumes.tiktok!=null)?+volumes.tiktok:0.12);
+    document.getElementById('tl-insp-clipvol').value=_cv;
+    document.getElementById('tl-insp-clipvol-val').textContent=Math.round(_cv*100)+'%'+((s.seedance_audio_volume==null)?' (master)':'');
     durInput.max=clipMaxDur(s);   // #117 - reflect the per-clip stretch ceiling in the number field
     var durHint=document.getElementById('tl-insp-note');
     if(durHint){ var cm=clipMaxDur(s); durHint.textContent=(s.clip&&+(s.source_full||0)>0.01)
@@ -8340,6 +8353,14 @@ TIMELINE_ASSETS = """
   if(rngThB) rngThB.addEventListener('pointerdown', rangeDrag('b'));
 
   document.getElementById('tl-insp-dur').addEventListener('input', function(){ if(selectedClipIds.length!==1)return; var s=scenes.filter(function(x){return x.id===selectedClipIds[0];})[0]; if(s){ s.dur=Math.max(0.5,Math.min(clipMaxDur(s), parseFloat(this.value)||s.dur)); syncRangeFromClip(s); layout(); markDirty(); } });
+  document.getElementById('tl-insp-clipvol').addEventListener('input', function(){
+    var v=Math.max(0,Math.min(0.6,parseFloat(this.value)||0));
+    document.getElementById('tl-insp-clipvol-val').textContent=Math.round(v*100)+'%';
+    var chosen=scenes.filter(function(x){return selectedClipIds.indexOf(x.id)!==-1;});
+    chosen.forEach(function(sc){ sc.seedance_audio_volume=+v.toFixed(3); });   // user-set: master no longer applies
+    if(activeSceneInfo && chosen.indexOf(activeSceneInfo.scene)!==-1) applyClipAudio(pvid, activeSceneInfo.scene);
+    markDirty();
+  });
   document.getElementById('tl-insp-speed').addEventListener('input', function(){
     var speed=Math.max(0.5,Math.min(2,parseFloat(this.value)||1));
     var chosen=scenes.filter(function(x){return !x.removed&&selectedClipIds.indexOf(x.id)!==-1;});
@@ -8375,7 +8396,7 @@ TIMELINE_ASSETS = """
       if(typeof stop==='function'&&playing)stop(); if(activeSceneInfo)applyClipPreviewTransform(activeSceneInfo.scene); markDirty(); }
   });
   document.getElementById('tl-fx-enabled').addEventListener('change', function(){ var fx=currentFx(); if(fx){ fx.enabled=this.checked; layout(); markDirty(); } });
-  document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); markDirty(); } });
+  document.getElementById('tl-fx-vol').addEventListener('input', function(){ var fx=currentFx(); if(fx){ fx.volume=parseFloat(this.value); fx.volume_user=true; document.getElementById('tl-fx-vol-val').textContent=Math.round(fx.volume*100)+'%'; layout(); markDirty(); } });
   document.getElementById('tl-fx-trim').addEventListener('change', function(){
     var fx=currentFx(); if(!fx) return;
     var trim=Math.max(0, parseFloat(this.value)||0);
@@ -8679,6 +8700,20 @@ TIMELINE_ASSETS = """
   function onPvMeta(e){ if(e.target===pvid && activeSceneInfo && activeSceneInfo.scene.clip) syncPreviewVideo(activeSceneInfo,true); }
   pvid.addEventListener('loadedmetadata', onPvMeta);
   pvidB.addEventListener('loadedmetadata', onPvMeta);
+  // The RENDER mixes each clip's own sound under the voiceover - the preview must too
+  // (user 2026-07-24: editor was silent while the render had original audio).
+  // Per-clip volume wins; otherwise the TikTok-audio master applies.
+  function clipVol(s){
+    if(!s) return 0;
+    var v = (s.seedance_audio_volume!=null && s.seedance_audio_volume!=='')
+      ? +s.seedance_audio_volume
+      : (volumes.tiktok!=null ? +volumes.tiktok : 0.12);
+    return Math.max(0, Math.min(1, v));
+  }
+  function applyClipAudio(v, s){
+    if(RENDER_MODE || !v) return;
+    try{ v.muted=false; v.removeAttribute('muted'); v.volume=clipVol(s); }catch(e){}
+  }
   function showScene(info, forceSync){
     renderPreviewCaption(clock);
     if(!info){ pvBehind(pvid); pvBehind(pvidB); try{pvid.pause();pvidB.pause();}catch(e){} pimg.style.display='none'; pempty.style.display='block'; renderPreviewOverlays(null); applyClipPreviewTransform(null); activeSceneInfo=null; return; }
@@ -8694,7 +8729,7 @@ TIMELINE_ASSETS = """
         ? (pvid.getAttribute('src')===info.scene.clip)
         : (pimg.style.display!=='none' && pimg.getAttribute('src')===(info.scene.poster||''));
       if(sameMedia){
-        if(info.scene.clip){ syncPreviewVideo(info,!!forceSync); if(!pvidB.getAttribute('src')||pvidB.getAttribute('src')===pvid.getAttribute('src')) preloadClipInto(pvidB, nextScene); }
+        if(info.scene.clip){ applyClipAudio(pvid, info.scene); syncPreviewVideo(info,!!forceSync); if(!pvidB.getAttribute('src')||pvidB.getAttribute('src')===pvid.getAttribute('src')) preloadClipInto(pvidB, nextScene); }
         return;
       }
     }
@@ -8704,6 +8739,7 @@ TIMELINE_ASSETS = """
       if(pvidB.getAttribute('src')===s.clip && pvidB.readyState>=2){
         // the buffer already holds this exact clip, decoded -> INSTANT swap, no reload hitch
         var _t=pvid; pvid=pvidB; pvidB=_t;
+        try{ pvidB.muted=true; }catch(e){}
       } else {
         // not preloaded (first clip, or right after a seek) -> load into the on-screen element.
         // Setting .src already kicks off the load; no .load() (that aborts+restarts = a stutter).
@@ -8711,6 +8747,7 @@ TIMELINE_ASSETS = """
         if(pvid.getAttribute('src')!==s.clip){ try{ pvid.src=s.clip; }catch(e){} }
       }
       pvOnTop(pvid); pvBehind(pvidB);
+      applyClipAudio(pvid, s);
       syncPreviewVideo(info,true);
       try{ pvidB.pause(); }catch(e){}
       preloadClipInto(pvidB, nextScene);   // warm the NEXT clip so its boundary is seamless too
@@ -8966,7 +9003,12 @@ TIMELINE_ASSETS = """
     el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; markDirty(); });
   }
   bindVol('tl-voice-vol','voice','tl-v-voice');
+  bindVol('tl-tiktok-vol','tiktok','tl-v-tiktok');
+  bindVol('tl-sfx-vol','sfx','tl-v-sfx');
   bindVol('tl-music-vol','music','tl-v-music');
+  document.getElementById('tl-tiktok-vol').addEventListener('input', function(){
+    if(activeSceneInfo) applyClipAudio(pvid, activeSceneInfo.scene);
+  });
   var capToggle=document.getElementById('tl-captions');
   // #109: "render with captions" defaults ON, but is only available when the project has a real
   // (still-unrendered) caption track. A baked-in-captions upload has none -> grey it out.
@@ -8986,7 +9028,7 @@ TIMELINE_ASSETS = """
   function collectEdits(){
     var vis=visible();
     return {
-      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, mirror:!!s.timeline_mirror, scale_enabled:!!s.timeline_free_scale, scale:+(+(s.timeline_clip_scale||1)).toFixed(3), source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined};}),
+      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, mirror:!!s.timeline_mirror, scale_enabled:!!s.timeline_free_scale, scale:+(+(s.timeline_clip_scale||1)).toFixed(3), source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined, seedance_audio_volume:((s.seedance_audio_volume!=null&&s.seedance_audio_volume!=='')?+(+s.seedance_audio_volume).toFixed(3):undefined)};}),
       order: vis.map(function(s){return s.id;}),
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
       added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
@@ -8997,7 +9039,7 @@ TIMELINE_ASSETS = """
       captions: captionsOn,
       sfx_on: sfxOn,
       transitions: transitions.map(function(t){return {id:t.id, volume:t.volume, enabled:(t.deleted?false:t.enabled), start_abs:(t.start_abs!=null?t.start_abs:null), path_override:t.path_override||null, source_trim:+(+(t.source_trim||0)).toFixed(3)};}),
-      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, enabled:(f.deleted?false:f.enabled), added:!!f.added, is_transition:!!f.is_transition, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, duration:+(+(f.duration||1)).toFixed(3), source_duration:+(+(f.source_duration||0)).toFixed(3), playback_rate:+(+(f.playback_rate||1)).toFixed(6), start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null, source_trim:+(+(f.source_trim||0)).toFixed(3)};})
+      sfx: sfx.filter(function(f){return !(f.added&&f.deleted);}).map(function(f){return {id:f.id, volume:f.volume, volume_user:!!f.volume_user, enabled:(f.deleted?false:f.enabled), added:!!f.added, is_transition:!!f.is_transition, path:f.path, label:f.label||'', scene_id:f.scene_id, offset:f.offset, duration:+(+(f.duration||1)).toFixed(3), source_duration:+(+(f.source_duration||0)).toFixed(3), playback_rate:+(+(f.playback_rate||1)).toFixed(6), start_abs:(f.start_abs!=null?f.start_abs:null), path_override:f.path_override||null, source_trim:+(+(f.source_trim||0)).toFixed(3)};})
     };
   }
 
@@ -11879,6 +11921,7 @@ def timeline_model(slug):
             "start": round(start, 3),
             "speed": spd,
             "blur_captions": bool(scene.get("blur_captions")),
+            "seedance_audio_volume": scene.get("seedance_audio_volume"),
             "timeline_mirror": bool(scene.get("timeline_mirror")),
             "timeline_free_scale": bool(scene.get("timeline_free_scale")),
             "timeline_clip_scale": round(clip_scale, 3),
@@ -12013,6 +12056,8 @@ def timeline_model(slug):
     volumes = {
         "voice": float(config.get("audio_master_gain", 1.0) or 1.0),
         "music": float(config.get("background_music_volume", 0.0) or 0.0),
+        "tiktok": float(config.get("seedance_audio_volume_with_speech", 0.12) or 0.0),
+        "sfx": float(config.get("sfx_master_gain", 1.0) or 1.0),
     }
     # The actual last render (captions + voice + SFX all baked in) so the preview is EXACTLY what
     # was rendered, not a silent scene-by-scene reconstruction.

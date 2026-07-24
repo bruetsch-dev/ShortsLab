@@ -814,6 +814,24 @@ def run_discovery_short(form, status_cb=None, style="process"):
     (project_dir / "input" / "script.txt").write_text(script, encoding="utf-8")
     src_final = clip_dir / "_discovery_source.mp4"
     Path(src).replace(src_final)
+    # TikTok sources are HEVC - unplayable (black) in the timeline editor's player.
+    # Re-encode the project source to full-quality H.264 once; all cutting and the
+    # editor work from this file afterwards.
+    try:
+        ffp0 = pipeline.find_ffprobe(pipeline.find_ffmpeg())
+        _c = subprocess.run([ffp0, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                             "stream=codec_name", "-of", "csv=p=0", str(src_final)],
+                            capture_output=True, text=True)
+        if (_c.stdout or "").strip().lower() != "h264":
+            _tmp = src_final.with_name("_discovery_source_h264.mp4")
+            subprocess.run([pipeline.find_ffmpeg(), "-y", "-loglevel", "error",
+                            "-i", str(src_final), "-c:v", "libx264", "-preset", "veryfast",
+                            "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+                            "-movflags", "+faststart", str(_tmp)], check=True)
+            _tmp.replace(src_final)
+            log(status_cb, "Discovery: source re-encoded to H.264 (playable in the editor).")
+    except Exception as exc:  # noqa: BLE001
+        log(status_cb, f"Discovery: H.264 source conversion skipped ({exc}).")
     (project_dir / "input" / "discovery_report.json").write_text(json.dumps({
         "source": chosen, "analysis": analysis, "plan": plan}, indent=2, ensure_ascii=False),
         encoding="utf-8")

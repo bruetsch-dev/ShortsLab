@@ -2456,7 +2456,9 @@ def seedance_audio_segments(config, clip_paths, ffprobe=None):
         segment = {"path": Path(path), "start": start, "duration": duration, "source_start": source_start}
         if scene.get("seedance_audio_volume") is not None:
             try:
-                segment["volume"] = max(0.0, min(float(scene.get("seedance_audio_volume")), 0.35))
+                # user-set per-clip volume: allow up to full level (the 0.35 cap only
+                # protects the AUTO default from drowning the voiceover)
+                segment["volume"] = max(0.0, min(float(scene.get("seedance_audio_volume")), 1.0))
             except (TypeError, ValueError):
                 pass
         segments.append(segment)
@@ -2949,6 +2951,17 @@ def build_sfx_segments(config, has_speech=False):
             ]
         result.extend(content_segments)
     result.extend(explicit_segments)
+    try:
+        _master = float(config.get("sfx_master_gain", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        _master = 1.0
+    if abs(_master - 1.0) > 0.01:
+        for seg in result:
+            if not seg.get("volume_user"):
+                try:
+                    seg["volume"] = max(0.0, min(1.0, float(seg.get("volume", 0.3)) * _master))
+                except (TypeError, ValueError):
+                    pass
     return sorted(result, key=lambda e: e["start"])
 
 
@@ -3498,7 +3511,8 @@ def render_video(config, basename=None):
                 delay_ms = int(round(segment["start"] * 1000))
                 source_start = float(segment.get("source_start", 0.0))
                 source_end = source_start + float(segment["duration"])
-                segment_volume = min(float(segment.get("volume", seedance_volume)), 0.35)
+                segment_volume = min(float(segment.get("volume", seedance_volume)),
+                                     1.0 if "volume" in segment else 0.35)
                 filters.append(
                     f"[{input_index}:a:0]atrim={source_start:.3f}:{source_end:.3f},"
                     f"asetpts=PTS-STARTPTS,adelay={delay_ms}:all=1,"

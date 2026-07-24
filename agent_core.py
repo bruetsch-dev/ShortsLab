@@ -6206,8 +6206,13 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             # A short riser uniformly slowed to a far beat sounds mushy - and one that stops
             # EARLY sounds chopped (user 2026-07-23). Progressive stretch: crisp 1x attack,
             # progressively slower tail, total length EXACTLY beat, played at rate 1.0.
-            if beat > rlen + 0.12:
-                stretched = sfx_library.build_progressive_riser(item["path"], beat, rlen)
+            # Stretch cap 1.5x (user 2026-07-24 "was ist falsch mit dem hook riser"):
+            # smearing a 2s riser across a 5s+ hook drops the tail chunks to ~0.25x
+            # atempo = audible time-stretch garbage. Cap the stretch and SLIDE the riser
+            # instead - it starts later and still DROPS exactly on the beat (first cut).
+            target = min(beat, rlen * 1.5)
+            if target > rlen + 0.12:
+                stretched = sfx_library.build_progressive_riser(item["path"], target, rlen)
                 if stretched:
                     # atempo chunk rounding makes the built file land slightly short of the
                     # target; measure it and close the gap with a mild uniform rate so the
@@ -6217,10 +6222,13 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                     except Exception:  # noqa: BLE001
                         actual = 0.0
                     item = dict(item, path=str(stretched))
-                    rlen = actual if actual > 0.1 else beat
-                    playback_rate = (rlen / beat) if beat > 0 else 1.0
-            dur = beat
-            start = 0.0
+                    rlen = actual if actual > 0.1 else target
+                    playback_rate = (rlen / target) if target > 0 else 1.0
+            elif rlen > beat:
+                playback_rate = rlen / beat
+                target = beat
+            dur = round(target, 3)
+            start = round(max(0.0, beat - target), 3)
             source_trim = 0.0
         else:
             item = pool[len(riser_peaks) % len(pool)]
@@ -8149,6 +8157,8 @@ def apply_timeline_edits_to_config(config, edits, slug):
         if rid and src:
             replaced_by_id[rid] = r
     dur_by_id = {str(d.get("id")): d.get("duration") for d in (edits.get("scenes") or []) if d.get("duration") is not None}
+    clipvol_by_id = {str(d.get("id")): d.get("seedance_audio_volume") for d in (edits.get("scenes") or [])
+                     if d.get("seedance_audio_volume") is not None}
     speed_by_id = {str(d.get("id")): d.get("speed") for d in (edits.get("scenes") or [])
                    if d.get("speed") is not None}
     blur_by_id = {str(d.get("id")): bool(d.get("blur_captions")) for d in (edits.get("scenes") or [])
@@ -8423,6 +8433,11 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 scene["clip"] = orig
                 scene["asset"] = orig
             scene["timeline_speed"] = speed
+        if sid in clipvol_by_id:
+            try:
+                scene["seedance_audio_volume"] = max(0.0, min(1.0, float(clipvol_by_id[sid])))
+            except (TypeError, ValueError):
+                pass
         scene["start"] = round(t, 3)
         scene["end"] = round(t + dur, 3)
         t += dur
@@ -8431,6 +8446,19 @@ def apply_timeline_edits_to_config(config, edits, slug):
         raise RuntimeError("Timeline has no scenes left to render.")
     config["scenes"] = new_scenes
     config["duration"] = round(t, 3)
+    # NEVER cut the voiceover (user 2026-07-24, long-standing "die letzten Sekunden
+    # fehlen"): when the edited clips end before the speech does, extend the last
+    # scene to the full voice length - a held tail beats chopped words every time.
+    if config.get("speech_audio_in_final") and config.get("audio_path"):
+        try:
+            _adur = float(probe_audio_duration(str(config["audio_path"])) or 0.0)
+        except Exception:  # noqa: BLE001
+            _adur = 0.0
+        if _adur > t + 0.05:
+            new_scenes[-1]["end"] = round(_adur, 3)
+            config["duration"] = round(_adur, 3)
+            log(None, f"Timeline render: clips ended {(_adur - t):.2f}s before the voiceover - "
+                      "extended the last scene so no speech is cut.")
     if "overlays" in edits:
         config["smart_overlays"] = any(scene.get("overlays") for scene in new_scenes)
         config["timeline_overlays_managed"] = True
@@ -8445,6 +8473,17 @@ def apply_timeline_edits_to_config(config, edits, slug):
 
     if "voice" in volumes:
         set_volume("audio_master_gain", volumes["voice"])
+    if "tiktok" in volumes:
+        # TikTok-audio master: default clip-sound level under the voiceover; clips with a
+        # user-set seedance_audio_volume keep their own value (segment volume wins).
+        set_volume("seedance_audio_volume_with_speech", volumes["tiktok"])
+        try:
+            config["mix_seedance_audio_with_speech"] = float(volumes["tiktok"]) > 0.001
+        except (TypeError, ValueError):
+            pass
+    if "sfx" in volumes:
+        # SFX master: pipeline scales every sfx event that has NO volume_user flag.
+        set_volume("sfx_master_gain", volumes["sfx"])
     if "music" in volumes:
         set_volume("background_music_volume", volumes["music"])
         set_volume("background_music_volume_with_speech", volumes["music"])
@@ -8485,9 +8524,12 @@ def apply_timeline_edits_to_config(config, edits, slug):
                 "enabled": item.get("enabled") is not False,
                 "label": item.get("label") or "Sound",
                 "is_transition": bool(item.get("is_transition")),
+                "volume_user": bool(item.get("volume_user")),
             })
             continue
         entry = {}
+        if item.get("volume_user"):
+            entry["volume_user"] = True
         if item.get("volume") is not None:
             try:
                 entry["volume"] = max(0.0, min(0.6, float(item["volume"])))

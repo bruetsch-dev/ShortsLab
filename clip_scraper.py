@@ -1610,7 +1610,7 @@ def blur_caption_regions(path, ffmpeg, seconds=DEFAULT_CLIP_SECONDS, status_cb=N
     # NO "-loop 1" on the mask (an endless input makes the graph run forever). The single-frame
     # mask is repeated by framesync and the graph ends with the primary video.
     graph = ("[0:v]split=2[base][blur_src];"
-             "[blur_src]gblur=sigma=22[blurred];"
+             "[blur_src]gblur=sigma=40[blurred];"
              "[1:v]format=gray[mask];"
              "[base][blurred][mask]maskedmerge[v]")
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
