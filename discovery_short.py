@@ -23,6 +23,7 @@ MIN_SRC_SECONDS = 45          # "long" TikTok: a real process, not a 10s clip
 MAX_SRC_SECONDS = 600
 SHEET_FRAMES = 24
 MAX_CANDIDATES_TRIED = 12
+MAX_CANDIDATES_TRIED_STORY = 26   # story mode screens a much wider pool (user: may take longer)
 
 # Curated fallback queries when the user gives no topic hint AND the query LLM fails
 # in a non-fatal way. ASIAN craft/process topics only (user rule: Chinese/Japanese style).
@@ -149,36 +150,50 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
     search queries that surface LONG process/craft videos (or story skits in mini mode)."""
     if style == "story":
         jp = region == "japan"
+        # WIDE + SPECIFIC search (user 2026-07-25 "es müssen special videos sein, nicht 0815"):
+        # one query per ANGLE FAMILY so the pool is not five variations of the same prank,
+        # and every query must name a concrete unusual SITUATION, never a genre word.
+        families = ("1 hidden-camera prank that ESCALATES, 2 a strict rule being enforced on "
+                    "someone, 3 a confrontation/interrogation (phone, messages, lies), "
+                    "4 an unusual JOB or PLACE with a woman at its centre (host club, maid "
+                    "cafe, idol training, night shift, family restaurant), 5 a physical "
+                    "challenge/competition/test, 6 a role reversal or identity swap, "
+                    "7 a family clash (mother-in-law, siblings, parents meeting the partner), "
+                    "8 a transformation the camera SHOWS (before/after, makeover, training "
+                    "over days), 9 a public-place reaction with a twist, 10 an eccentric "
+                    "person doing something with visible consequences")
         sys_p = ("You find LONG TikTok videos (40s-10min) that tell ONE complete little STORY "
                  "or skit with several scenes, ALWAYS featuring "
                  + ("Japanese" if jp else "Japanese/Korean/Chinese")
-                 + " WOMEN or COUPLES (or similar: sisters, families, models). "
-                 "CATCHINESS IS EVERYTHING: every query must target a video with a one-line "
-                 "PREMISE that creates instant tension or comedy - a rule being enforced, a "
-                 "prank escalating, a strict test, a role reversal. Proven formats to hunt: "
-                 "overprotective brother inspects his sister's outfits, girlfriend checks the "
-                 "boyfriend's phone, strict model/idol bootcamp, couple prank that backfires, "
-                 "mother-in-law surprise visit, jealous couple test, waiter/waitress crush "
-                 "skit, sisters swap identities. AVOID: calm daily-life vlogs, cooking, GRWM, "
-                 "shopping hauls, dance-only - those are boring. "
-                 "Return JSON: {\"queries\": [8 search strings]}. Mix English with "
-                 + ("Japanese" if jp else "Japanese, Korean and Chinese")
-                 + " queries using native skit/prank words ("
-                 + ("ドッキリ, コント, 兄妹, カップル 喧嘩" if jp else
-                    "ドッキリ, コント, 情侣 恶搞, 姐妹 剧情, 몰카, 커플 장난")
-                 + ") - native-language queries find the authentic uploads. "
-                 "No hashtags, no Western creators.")
+                 + " WOMEN or COUPLES (or similar: sisters, families, models, hosts).\n"
+                 "The user is TIRED of generic clips. A good target video is SPECIFIC and "
+                 "unusual: it has a place, a rule, a job or an escalation you could describe "
+                 "in one sentence and someone would want to watch. A bad target is a person "
+                 "talking to the camera in one room.\n"
+                 f"Cover these ANGLE FAMILIES, one or two queries each: {families}.\n"
+                 "Every query must name a CONCRETE situation (people + place or rule or "
+                 "action). NEVER submit bare genre words like 'couple prank', 'funny skit', "
+                 "'japanese comedy' - those return the same mainstream clips everyone sees. "
+                 "AVOID: calm daily-life vlogs, cooking, GRWM, hauls, dance-only, "
+                 "single-person talking heads.\n"
+                 "Return JSON: {\"queries\": [16 search strings]}. About half in "
+                 + ("Japanese" if jp else "Japanese, Korean or Chinese")
+                 + " using native words ("
+                 + ("ドッキリ, コント, 兄妹, 姑, ホスト, メイド喫茶, 検証, 大食い" if jp else
+                    "ドッキリ, コント, 検証, 情侣 恶搞, 姐妹 剧情, 몰카, 커플 장난, 실험")
+                 + "), the rest in English. No hashtags, no Western creators.")
         user_p = (f"The user wants a video about: {hint}" if hint else
-                  "No topic given - vary the story types (couple, siblings, models, family, "
-                  "cafe skit, school...).")
+                  "No topic given - make the 16 queries as DIFFERENT from each other as "
+                  "possible; each one should surface a different kind of video.")
         data = agent_core._post_llm_json(reasoning_model, [
             {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-            max_tokens=600, temperature=0.6)
+            max_tokens=1000, temperature=0.85)
         queries = [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()]
         if not queries:
             raise RuntimeError("Discovery: the query planner returned no queries.")
-        log(status_cb, "Mini discovery queries: " + " | ".join(queries[:8]))
-        return queries[:8]
+        log(status_cb, f"Mini discovery: {len(queries)} angle-diverse queries planned.")
+        log(status_cb, "  " + " | ".join(queries[:16]))
+        return queries[:16]
     sys_p = ("You find LONG TikTok videos (45s-10min) that show a complete fascinating process "
              "from EAST ASIA (China/Japan, also Korea/Taiwan/SE Asia): traditional crafts, "
              "old-school manufacturing, cooking from raw ingredients, restoration, temple/village "
@@ -200,13 +215,18 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
     return queries[:8]
 
 
-def _search_long(queries, status_cb=None, min_seconds=None):
-    """Search TikTok (logged-in session) and keep only LONG candidates, best first."""
+def _search_long(queries, status_cb=None, min_seconds=None, want=12, per_author=99):
+    """Search TikTok (logged-in session) and keep only LONG candidates, best first.
+
+    `want` controls how deep each query is scrolled and `per_author` caps how many clips
+    one creator may contribute - without that cap a single prolific account floods the
+    pool and every candidate looks the same (user 2026-07-25)."""
     import tiktok_login
     seen, out = set(), []
+    by_author = {}
     for q in queries:
         try:
-            items = tiktok_login.search_sync(q, want=12, status_cb=status_cb,
+            items = tiktok_login.search_sync(q, want=want, status_cb=status_cb,
                                              sort="MOST_LIKED", timeout_s=240)
         except Exception as exc:  # noqa: BLE001
             log(status_cb, f"Discovery search '{q}' failed: {exc.__class__.__name__}")
@@ -230,6 +250,9 @@ def _search_long(queries, status_cb=None, min_seconds=None):
                 likes = int((it.get("stats") or {}).get("diggCount") or 0)
             except (TypeError, ValueError):
                 pass
+            if by_author.get(author.lower(), 0) >= per_author:
+                continue
+            by_author[author.lower()] = by_author.get(author.lower(), 0) + 1
             desc = str(it.get("desc") or "")[:180]
             out.append({"id": vid, "author": author, "likes": likes, "dur": dur,
                         "desc": desc, "query": q,
@@ -237,6 +260,158 @@ def _search_long(queries, status_cb=None, min_seconds=None):
     out.sort(key=lambda c: -(c["likes"] * math.log(max(c["dur"], 46))))
     log(status_cb, f"Discovery: {len(out)} long candidates "
                    f"({MIN_SRC_SECONDS}-{MAX_SRC_SECONDS}s) across {len(queries)} queries.")
+    return out
+
+
+_WESTERN_HINT = re.compile(
+    r"\b(the|and|with|my|his|her|our|your|prank|boyfriend|girlfriend|husband|wife|mom|dad|"
+    r"guys|omg|lol|funny|reaction|challenge|couple|family|vlog|pov)\b", re.I)
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
+def _looks_western(desc):
+    """Caption heuristic: no CJK characters plus several English function words."""
+    d = str(desc or "")
+    if _CJK.search(d):
+        return False
+    return len(_WESTERN_HINT.findall(d)) >= 2 or bool(
+        re.search(r"\b(USA|America|San Diego|New York|London|LA|Texas|California)\b", d, re.I))
+
+
+def _fallback_pool(cands, keep):
+    """Used when the LLM prescreen fails: never hand back the raw like-ranked list (that put a
+    San Diego ramen contest first) - drop obvious Western captions and spread the creators."""
+    out, per_author = [], {}
+    for c in cands:
+        if _looks_western(c.get("desc") or ""):
+            continue
+        a = str(c.get("author") or "").lower()
+        if per_author.get(a, 0) >= 1:
+            continue
+        per_author[a] = per_author.get(a, 0) + 1
+        out.append(c)
+        if len(out) >= keep:
+            break
+    return out or cands[:keep]
+
+
+def _prescreen_story(cands, reasoning_model, status_cb=None, keep=22):
+    """ONE cheap text pass over the WHOLE candidate pool before any download.
+
+    Ranking by likes alone returns the same mainstream clips every time (user 2026-07-25:
+    "es müssen special videos sein, nicht 0815"). This scores every candidate's caption for
+    how SPECIFIC/unusual it is, drops obviously Western uploads, and returns a diverse,
+    ranked shortlist so the expensive download+vision work is spent on the best material."""
+    if not cands:
+        return []
+    lines = []
+    for i, c in enumerate(cands):
+        lines.append(f"[{i}] @{c['author']} ({c['dur']}s, {c['likes']:,} likes): "
+                     + (c.get("desc") or "")[:140].replace("\n", " "))
+    # Compact CSV, sent in BATCHES: one JSON answer for 140 entries overran max_tokens and
+    # came back truncated, so the whole prescreen silently kept nothing (2026-07-25 bug).
+    BATCH = 45
+    sys_p = (
+        "You pre-screen TikTok search results for a viral story-short factory. The videos "
+        "must show JAPANESE / KOREAN / CHINESE women or couples in a little STORY with "
+        "several scenes.\n"
+        "For every entry rate how SPECIAL it looks: a concrete unusual situation (a rule, a "
+        "job, a place, an escalation, a test, a confrontation) scores high; a generic clip "
+        "that could be any account scores low.\n"
+        "Answer COMPACTLY as JSON: {\"items\": [{\"i\": index, \"s\": special 0-10, "
+        "\"c\": \"prank|rule|confront|job|challenge|swap|family|transform|public|other\", "
+        "\"w\": 1 if Western else 0}, ...]} - one entry per index, no other keys, no prose.\n"
+        "Rules: w=1 for Western/English-language creators (captions read as native English, "
+        "or the place is in the US/Europe) - disqualified. s<=3 for pure vlog, cooking, "
+        "GRWM, haul, dance, single talking head, or a caption too vague to picture. "
+        "Be harsh: at most a quarter may score 8 or higher.")
+    rows = []
+    for start in range(0, min(len(lines), 180), BATCH):
+        chunk = lines[start:start + BATCH]
+        try:
+            data = agent_core._post_llm_json(reasoning_model, [
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": "\n".join(chunk)}],
+                max_tokens=3000, temperature=0.2)
+            got = data.get("items") or []
+            rows.extend(got)
+            log(status_cb, f"Discovery: prescreen batch {start//BATCH + 1} "
+                           f"-> {len(got)}/{len(chunk)} rated.")
+        except Exception as exc:  # noqa: BLE001 - a bad batch must not kill the pass
+            log(status_cb, f"Discovery: prescreen batch {start//BATCH + 1} failed ({exc}).")
+    if not rows:
+        log(status_cb, "Discovery: text prescreen returned nothing - using the raw pool.")
+        return _fallback_pool(cands, keep)
+    scored = []
+    for r in rows:
+        try:
+            idx = int(r.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(cands)):
+            continue
+        c = dict(cands[idx])
+        try:
+            c["special"] = float(r.get("s", r.get("special")) or 0)
+        except (TypeError, ValueError):
+            c["special"] = 0.0
+        c["category"] = str(r.get("c") or r.get("category") or "other")
+        desc = c.get("desc") or ""
+        western = bool(r.get("w") or r.get("western")) or _looks_western(desc)
+        if western or c["special"] < 5:
+            continue
+        scored.append(c)
+    if not scored:
+        log(status_cb, "Discovery: prescreen kept nothing - using the filtered raw pool.")
+        return _fallback_pool(cands, keep)
+    scored.sort(key=lambda c: (-c["special"], -c["likes"]))
+    # category spread: never let one story type own the shortlist
+    out, per_cat = [], {}
+    for c in scored:
+        cat = c["category"]
+        if per_cat.get(cat, 0) >= 4:
+            continue
+        per_cat[cat] = per_cat.get(cat, 0) + 1
+        out.append(c)
+        if len(out) >= keep:
+            break
+    log(status_cb, f"Discovery: text prescreen kept {len(out)}/{len(cands)} "
+                   f"(categories: {', '.join(f'{k}x{v}' for k, v in per_cat.items())}).")
+    return out
+
+
+def _probe_technical(path, status_cb=None):
+    """Objective, LLM-free quality probe: letterbox share + real scene changes per minute.
+
+    Catches two failures the vision pass kept waving through: videos that are mostly black
+    bars (unusable as a 9:16 short) and single-shot talking heads (no visual story)."""
+    ff = pipeline.find_ffmpeg()
+    out = {"letterbox": 0.0, "cuts_per_min": 0.0}
+    try:
+        r = subprocess.run([ff, "-hide_banner", "-t", "40", "-i", str(path),
+                            "-vf", "cropdetect=24:2:0", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=180)
+        crops = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", r.stderr or "")
+        if crops:
+            w, h, _x, _y = (int(v) for v in crops[-1])
+            probe = subprocess.run([pipeline.find_ffprobe(ff), "-v", "error", "-select_streams",
+                                    "v:0", "-show_entries", "stream=width,height",
+                                    "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+            fw, fh = (int(v) for v in probe.stdout.strip().split(",")[:2])
+            if fw and fh:
+                out["letterbox"] = round(1.0 - (w * h) / float(fw * fh), 3)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        r = subprocess.run([ff, "-hide_banner", "-t", "60", "-i", str(path),
+                            "-vf", "select='gt(scene,0.32)',metadata=print",
+                            "-an", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=180)
+        cuts = len(re.findall(r"lavfi\.scene_score", r.stderr or ""))
+        secs = min(60.0, _video_duration(path) or 60.0)
+        out["cuts_per_min"] = round(cuts * 60.0 / max(1.0, secs), 1)
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -369,18 +544,29 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
             "\"topic_title\": \"short English title of the story\", "
             "\"stages\": [{\"start\": sec, \"end\": sec, \"action\": \"what visibly happens\", "
             "\"is_reveal\": true/false}, ...]}.\n"
-            "Rules: is_process=true ONLY for a followable multi-scene story with women/couples "
-            "on screen (false for: single talking head, dance-only, slideshow, text cards, "
-            "men-only content). 4-8 stages = the STORY BEATS in time order; `action` describes "
-            "ONLY what is literally on screen (people, expressions, places, actions) - the "
-            "narration is written from these, so anything invented desyncs voice and video. "
-            "Mark is_reveal=true on the beat with the punchline/resolution. Also return "
-            "\"premise\": the story in ONE punchy line (e.g. 'brother rejects every outfit "
-            "until she dresses like a lawyer'). Appeal = SCROLL-STOPPING catchiness, judged "
-            "hard: 9-10 = instantly gripping premise, expressive faces, clear escalation and "
-            "payoff; 7-8 = solid tension or comedy; 6 = watchable but flat; below 6 = calm "
-            "daily-life vlog, cooking, GRWM, unclear story - reject. If you cannot state a "
-            "one-line premise with tension or humor, appeal is at most 5.")
+            "STEP 1 - HARD REJECTS. Set is_process=false (and appeal<=4) when ANY applies: "
+            "(a) the people are WESTERN/non-East-Asian, or the burned-in text is fluent "
+            "English written by the creator; (b) it is one person talking to the camera, or "
+            "everything happens in ONE spot with no real change of scene; (c) the plot only "
+            "works through spoken dialogue or on-screen text (the recut carries a NEW "
+            "narration, so the visuals alone must tell it); (d) dance-only, slideshow, text "
+            "cards, men-only, product ad; (e) heavy black bars, tiny inset video, or a "
+            "screen-recording layout. Be strict - a rejected candidate costs nothing, a bad "
+            "one ruins the short.\n"
+            "STEP 2 - if it survives: 4-8 stages = the STORY BEATS in time order; `action` "
+            "describes ONLY the STATE that is verifiably visible in the frames (who is "
+            "where, doing what, which expression) - NEVER infer motion between frames "
+            "('rushes in', 'arrives') unless a frame literally shows it; anything invented "
+            "desyncs voice and video. Mark is_reveal=true on the beat with the punchline. "
+            "Return \"premise\": the story in ONE punchy line (e.g. 'brother rejects every "
+            "outfit until she dresses like a lawyer').\n"
+            "STEP 3 - APPEAL, as a harsh critic. Most videos are mediocre; the scores must "
+            "SPREAD, not cluster: 9-10 = you would stop scrolling instantly, unusual "
+            "situation, visible escalation and a payoff (rare, ~1 in 10); 7-8 = a clear "
+            "premise with real tension or comedy; 5-6 = watchable but ordinary, the kind of "
+            "clip everyone has seen; <=4 = generic or rejected above. Never give 8 just "
+            "because a video is fine - 'fine' is a 6. If you cannot state a one-line premise "
+            "with tension or humor, appeal is at most 5.")
         data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
                                       reasoning_model=reasoning_model)
         stages = []
@@ -716,8 +902,15 @@ def run_discovery_short(form, status_cb=None, style="process"):
     else:
         queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
         _check_cancel()
+        # story mode searches WIDE (deeper scroll, max 2 clips per creator) and then
+        # text-prescreens the whole pool - special beats popular (user 2026-07-25).
         candidates = _search_long(queries, status_cb,
-                                  min_seconds=40 if style == "story" else None)
+                                  min_seconds=40 if style == "story" else None,
+                                  want=25 if style == "story" else 12,
+                                  per_author=2 if style == "story" else 99)
+        if style == "story":
+            _check_cancel()
+            candidates = _prescreen_story(candidates, reasoning_model, status_cb)
     if not candidates:
         raise RuntimeError("Discovery: no long TikTok candidates found - try a different topic.")
 
@@ -725,10 +918,13 @@ def run_discovery_short(form, status_cb=None, style="process"):
     work = agent_core.PROJECTS_DIR / f"_discovery_tmp_{stamp}"
     work.mkdir(parents=True, exist_ok=True)
 
-    # Collect up to 5 vision-approved candidates - the USER then picks ONE of them.
+    # Screen a WIDE pool and rank it; the user then picks ONE of the best five.
     accepted = []
-    for cand in candidates[:MAX_CANDIDATES_TRIED]:
-        if len(accepted) >= (1 if pinned_url else 5):
+    _tried_cap = 1 if pinned_url else (MAX_CANDIDATES_TRIED_STORY if style == "story"
+                                       else MAX_CANDIDATES_TRIED)
+    _want_accepted = 1 if pinned_url else (10 if style == "story" else 5)
+    for cand in candidates[:_tried_cap]:
+        if len(accepted) >= _want_accepted:
             break
         _check_cancel()
         log(status_cb, f"Discovery: trying @{cand['author']} ({cand['dur']}s, "
@@ -746,20 +942,63 @@ def run_discovery_short(form, status_cb=None, style="process"):
         if not path or not _is_portrait(path):
             log(status_cb, "Discovery: skipped (download failed or not portrait 9:16).")
             continue
+        tech = {}
+        if style == "story" and not pinned_url:
+            # objective gate BEFORE paying for a vision call: black bars = unusable as a
+            # 9:16 short, no scene changes = a talking head with no visual story.
+            tech = _probe_technical(path, status_cb)
+            if tech.get("letterbox", 0) > 0.22:
+                log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                               f"{tech['letterbox']*100:.0f}% letterbox/black bars.")
+                continue
+            # Calibrated on the real 2026-07-25 pool: a one-camera prank with strong
+            # reactions measures ~2 cuts/min and is still good, so cuts are a RANKING
+            # signal, not a gate. Only a literally single-shot video is rejected here.
+            if tech.get("cuts_per_min", 0) < 1.0:
+                log(status_cb, f"Discovery: skipped @{cand['author']} - single static shot "
+                               "(no scene change in the first minute).")
+                continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
         _min_appeal = 0 if pinned_url else (7 if style == "story" else 6)
         if (not pinned_url and not info.get("is_process"))                 or float(info.get("appeal") or 0) < _min_appeal                 or len(info["stages"]) < 3:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
-        accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet})
-        log(status_cb, f"Discovery: candidate {len(accepted)}/5 accepted - "
-                       f"{info.get('topic_title')}")
+        accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet,
+                         "tech": tech})
+        log(status_cb, f"Discovery: candidate {len(accepted)}/{_want_accepted} accepted - "
+                       f"{info.get('topic_title')}"
+                       + (f" [{tech.get('cuts_per_min')} cuts/min]" if tech else ""))
     if not accepted:
         raise RuntimeError("Discovery: no candidate survived the vision review - "
                            "rerun or give a topic hint.")
-    # Show the CATCHIEST finds first (user: "die ersten 5 sind uninteressant und uncatchy").
-    accepted.sort(key=lambda a: -float(a["info"].get("appeal") or 0))
+    # FINAL RANKING (user 2026-07-25): vision appeal alone was flat (everything scored 8),
+    # so combine it with the text "special" score and the measured scene density, then keep
+    # the best FIVE with a category spread so the picks are not five of the same thing.
+    def _rank(a):
+        appeal = float(a["info"].get("appeal") or 0)
+        special = float(a["cand"].get("special") or 0)
+        cuts = float((a.get("tech") or {}).get("cuts_per_min") or 0)
+        return appeal + special + min(cuts, 25.0) / 5.0
+    accepted.sort(key=_rank, reverse=True)
+    if not pinned_url and style == "story" and len(accepted) > 5:
+        picked, per_cat = [], {}
+        for a in accepted:
+            cat = str(a["cand"].get("category") or "other")
+            if per_cat.get(cat, 0) >= 2:
+                continue
+            per_cat[cat] = per_cat.get(cat, 0) + 1
+            picked.append(a)
+            if len(picked) >= 5:
+                break
+        for a in accepted:               # top up if the spread left gaps
+            if len(picked) >= 5:
+                break
+            if a not in picked:
+                picked.append(a)
+        accepted = picked
+        log(status_cb, "Discovery: shortlist = " + ", ".join(
+            f"{a['info'].get('topic_title')} (rank {_rank(a):.1f})" for a in accepted))
     _ffprev = pipeline.find_ffmpeg()
 
     def _mk_prev(a):

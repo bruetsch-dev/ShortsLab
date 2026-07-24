@@ -2570,17 +2570,19 @@ async function pollJob() {
       c.appendChild(el("div", "sa-head",
         `<div class="sa-title"><b>🔍 Pick the topic & material</b><em>Discovery found ${cands.length} long source videos. Pick ONE — only then the script and voiceover are produced.</em></div>`));
       const grid = el("div", "");
-      grid.style.cssText = "display:flex; gap:12px; flex-wrap:wrap; margin-top:10px;";
+      // grid (not flex-wrap): every candidate column is the SAME height, so the pick
+      // buttons sit on one baseline instead of three (user UI review 2026-07-25)
+      grid.style.cssText = "display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:12px; margin-top:10px; align-items:stretch;";
       cands.forEach(cd => {
         const card = el("div", "");
-        card.style.cssText = "flex:1 1 240px; max-width:300px; border:1px solid var(--line-strong); border-radius:12px; padding:10px; background:var(--bg-input);";
+        card.style.cssText = "display:flex; flex-direction:column; min-width:0; border:1px solid var(--line-strong); border-radius:12px; padding:10px; background:var(--bg-input);";
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
         if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
         if (cd.video_url) {
           const vp = document.createElement("video");
           vp.src = cd.video_url; vp.controls = true; vp.preload = "metadata";
-          vp.style.cssText = "width:100%; border-radius:8px; margin:6px 0; max-height:420px; background:#000;";
+          vp.style.cssText = "width:100%; border-radius:8px; margin:6px 0; max-height:300px; object-fit:contain; background:#000;";
           card.appendChild(vp);
         } else if (cd.sheet_url) {
           const im = document.createElement("img");
@@ -2588,14 +2590,17 @@ async function pollJob() {
           card.appendChild(im);
         }
         const ol = el("ol", "");
-        ol.style.cssText = "margin:4px 0 8px 16px; color:var(--muted); font-size:11.5px;";
+        ol.style.cssText = "margin:4px 0 8px 16px; color:var(--muted); font-size:11.5px; max-height:104px; overflow-y:auto;";
         (cd.stages || []).slice(0, 6).forEach(s => ol.appendChild(el("li", "", esc(s))));
         card.appendChild(ol);
-        card.appendChild(btn("✓ Use candidate " + ((+cd.index || 0) + 1), async () => {
+        const pickBtn = btn("✓ Use candidate " + ((+cd.index || 0) + 1), async () => {
           await fetch("/approve-discovery?id=" + encodeURIComponent(S.jobId)
                       + "&action=pick&choice=" + (+cd.index || 0), { method: "POST" });
           dpHost.innerHTML = ""; delete dpHost.dataset.discDone;
-        }, "primary"));
+        }, "primary");
+        pickBtn.style.marginTop = "auto";     // bottom-aligned in every column
+        pickBtn.style.width = "100%";
+        card.appendChild(pickBtn);
         grid.appendChild(card);
       });
       c.appendChild(grid);

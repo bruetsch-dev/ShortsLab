@@ -5567,6 +5567,32 @@ CAPTION_STEPS = [
 # When the run scrapes real TikTok/X footage there is no web-image search, no AI image
 # generation and no post-render review pass, so those step chips just sit dead. Drop them.
 SCRAPE_RUN_STEPS = [s for s in RUN_STEPS if s[0] not in ("Web search", "Images", "Review")]
+
+# A DISCOVERY / story run has a completely different order than a scripted run: it first
+# searches TikTok, screens candidates, waits for the USER's pick and only then writes the
+# script and records the voice. Showing the scripted chips there made step 1 read
+# "Voiceover" while the agent was still searching (user 2026-07-25).
+DISCOVERY_RUN_STEPS = [
+    ("Search", ("Discovery queries", "Mini discovery queries", "TikTok search", "long candidates")),
+    ("Screening", ("Discovery: trying @", "-frame sheet of the", "vision: appeal",
+                   "/5 accepted", "browser previews")),
+    ("Your pick", ("user picked candidate", "saved library candidate")),
+    ("Script", ("transcribed the source dialogue", "Discovery script (", "Mini topic script")),
+    ("Voiceover", ("Generating voiceover", "Voiceover generated", "voiceover pause")),
+    ("Cutting", ("recut the source into", "retention-cut", "cut verification", "re-cut at",
+                 "stage-matched segments")),
+    ("Sound", ("local SFX", "transition whooshes only", "hook riser")),
+    ("Render", ("Rendering final", "Rendering frames", "Mixing audio", "Encoding final MP4",
+                "render complete")),
+]
+_DISCOVERY_LOG_MARKERS = ("discovery mode:", "mini discovery:", "discovery queries",
+                          "mini discovery queries")
+
+
+def _is_discovery_run(logs):
+    blob = " ".join(str(x) for x in (logs or [])[:60]).lower()
+    return any(m in blob for m in _DISCOVERY_LOG_MARKERS)
+
 _SCRAPE_LOG_MARKERS = ("scrape v2", "scrape v1", "social search", "searching tiktok",
                        "tiktok search", "building social search", "relevance-first")
 
@@ -5595,6 +5621,7 @@ def compute_step_view(status, logs, log_times=None, job_kind=None, clip_source=N
     is_scrape = (str(clip_source or "").lower() == "scrape") or _is_scrape_run(logs)
     steps = (SFX_STEPS if job_kind == "sfx"
              else CAPTION_STEPS if job_kind == "caption"
+             else DISCOVERY_RUN_STEPS if _is_discovery_run(logs)
              else SCRAPE_RUN_STEPS if is_scrape else RUN_STEPS)
     log_times = log_times or []
     start_times = [None] * len(steps)
