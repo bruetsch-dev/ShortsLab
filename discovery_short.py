@@ -888,6 +888,11 @@ def run_discovery_short(form, status_cb=None, style="process"):
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Run cancelled by user.")
 
+    # An empty account 403s every LLM call, and without this the run still searched,
+    # downloaded 21 videos and screened for 20 minutes before failing with "no candidate
+    # survived the vision review" (2026-07-25). Two seconds here saves all of it.
+    agent_core.assert_wavespeed_balance(status_cb=status_cb)
+
     hint = str(form.get("gen_topic") or "").strip()
     region = str(form.get("region") or "").strip().lower()
     reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
