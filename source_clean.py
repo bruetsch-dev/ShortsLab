@@ -9,6 +9,15 @@ Two passes, both local (ffmpeg + RapidOCR, no API):
 
 * `strip_top_watermark` CROPS a fixed watermark away and re-frames to 9:16. Blurring a
   logo leaves a smudge in every single frame; cutting it off leaves nothing.
+VERDICT after rendering the maid-cafe Short both ways (2026-07-25): only the crop is
+good enough to ship. Removing burned-in subtitles is an inpainting problem, and every
+ffmpeg-only approach measured here leaves the video looking WORSE than untouched -
+the subtitles stay readable AND the frame gains smears. `blur_burned_captions` is kept
+for cases where a smudge beats a readable foreign subtitle, but it is deliberately NOT
+wired into the pipeline. The real fix is upstream: reject candidates whose footage
+carries burned-in subtitles, the way the scrape path already does and discovery does
+not.
+
 * `blur_burned_captions` blurs the subtitles through a mask that CHANGES OVER TIME.
   clip_scraper.blur_caption_regions builds one static mask from 8 samples, which is
   right for a 2s scrape clip but wrong here: a recut runs for seconds and swaps its
