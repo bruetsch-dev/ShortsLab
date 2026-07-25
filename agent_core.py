@@ -3045,7 +3045,12 @@ def post_json_url(url, payload, timeout=75):
     # answer survives after the thinking. GPT/Opus are left untouched.
     if isinstance(payload, dict) and payload.get("max_tokens"):
         model = str(payload.get("model", "")).lower()
-        if any(token in model for token in ("gemini", "glm", "qwen", "deepseek", "thinking")):
+        # "kimi"/"moonshot" were missing here, so Kimi K3 got the caller's 1200-token
+        # ceiling, spent all of it inside reasoning_content and returned message.content
+        # EMPTY with finish_reason=length. Every Kimi run died at the script step with
+        # "returned NoneType" (2026-07-25) while the model itself was working fine.
+        if any(token in model for token in ("gemini", "glm", "qwen", "deepseek", "thinking",
+                                            "kimi", "moonshot")):
             try:
                 if int(payload["max_tokens"]) < 8000:
                     payload = dict(payload)
