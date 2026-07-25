@@ -3933,10 +3933,7 @@ def longform_page():
 
         <div class="panel">
           <label>Mascot {help_tip("Hides the same little yellow blob somewhere in EVERY generated image - small and off to the side, never the subject. Its pose reacts to whatever the frame shows, so it reads as part of the scene rather than a sticker.")}</label>
-          <label class="checkline">
-            <input type="checkbox" name="mascot_enabled" value="1">
-            <span>Hide the blob in every image</span>
-          </label>
+          <label class="otoggle"><input type="checkbox" name="mascot_enabled" value="1"><span>Hide the Blob in every image</span></label>
           <div class="hint">Same character in all frames: round yellow body, dark outline, two big
             offset eyes. It stays small and unobtrusive and its action matches the frame's mood.</div>
         </div>
