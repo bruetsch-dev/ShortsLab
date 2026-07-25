@@ -2199,6 +2199,14 @@ DUAL_CRITIC_MODEL = "anthropic/claude-opus-4.8"  # the critic ("criticises and c
 def _post_llm_json(model, messages, max_tokens, temperature, timeout=180):
     payload = {"model": model, "messages": messages, "temperature": temperature,
                "max_tokens": max_tokens, "response_format": {"type": "json_object"}}
+    # A thinking model on a LONG prompt needs more than the 180s default: the 111s
+    # mother-in-law source (41 transcript lines) timed out twice in a row with Kimi at
+    # exactly 180s, after the download, vision pass and transcription were already paid
+    # for (2026-07-26). Same models that get the raised token ceiling get the raised wait.
+    _m = str(model or "").lower()
+    if any(t in _m for t in ("gemini", "glm", "qwen", "deepseek", "thinking",
+                             "kimi", "moonshot")):
+        timeout = max(timeout, 420)
     data = post_json_url(WAVESPEED_LLM_API, payload, timeout=timeout)
     return extract_json_object(data["choices"][0]["message"]["content"])
 
