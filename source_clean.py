@@ -160,8 +160,8 @@ def _boxes_in_band(bgr, band, min_conf=0.30):
     return out
 
 
-def blur_burned_captions(path, ffmpeg, status_cb=None, band=(0.26, 0.97),
-                         step=0.25, sigma=90, pad=26, reach=2):
+def blur_burned_captions(path, ffmpeg, status_cb=None, band=(0.18, 0.97),
+                         step=0.25, sigma=90, pad=30, reach=2, mode="blur"):
     """Blur the source's own subtitles through a time-varying mask.
 
     Samples the clip every `step` seconds, OCRs each sample, and paints a feathered
@@ -195,6 +195,46 @@ def blur_burned_captions(path, ffmpeg, status_cb=None, band=(0.26, 0.97),
             per_sample.append(_boxes_in_band(bgr, band) if bgr is not None else [])
         hits = sum(1 for b in per_sample if b)
         if not hits:
+            return 0
+
+        if mode == "blur":
+            # Heavy frosted patch, timed per frame. Used when the goal is "make the
+            # foreign subtitle unreadable" rather than "make it vanish": pixelize first
+            # so no letter shape survives, then blur so the patch does not read as a
+            # deliberate mosaic. A plain gaussian at sigma 90 was NOT enough - the
+            # letters stayed legible inside an obvious grey box.
+            n_frames = max(1, int(round(dur * fps)))
+            for k in range(n_frames):
+                i = min(len(per_sample) - 1, int((k / fps) / step))
+                mask = np.zeros((h, w), dtype=np.uint8)
+                for j in range(i - reach, i + reach + 1):
+                    if 0 <= j < len(per_sample):
+                        for (x, y, bw, bh) in per_sample[j]:
+                            bx, by = int(x * sx), int(y * sx)
+                            bw2, bh2 = int(bw * sx), int(bh * sx)
+                            cv2.rectangle(mask, (max(0, bx - pad), max(0, by - pad)),
+                                          (min(w, bx + bw2 + pad),
+                                           min(h, by + int(bh2 * 2.2) + pad)), 255, -1)
+                if mask.any():
+                    mask = cv2.GaussianBlur(mask, (0, 0), pad * 0.5)
+                cv2.imwrite(str(work / f"m_{k + 1:05d}.png"), mask)
+            out = path.with_name(path.stem + "_capclean" + path.suffix)
+            graph = (f"[0:v]split=2[base][src];"
+                     f"[src]pixelize=w=28:h=28,gblur=sigma=22:steps=3[frosted];"
+                     f"[1:v]format=gray[mask];"
+                     f"[base][frosted][mask]maskedmerge[v]")
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                   "-framerate", f"{fps:.6f}", "-i", str(work / "m_%05d.png"),
+                   "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
+                   "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                   "-c:a", "copy", "-movflags", "+faststart", str(out)]
+            subprocess.run(cmd, capture_output=True, timeout=1800)
+            if out.exists() and out.stat().st_size > 4096:
+                os.replace(str(out), str(path))
+                _log(status_cb, f"Frosted {path.name}: subtitles covered in "
+                                f"{hits}/{len(samples)} samples.")
+                return hits
+            out.unlink(missing_ok=True)
             return 0
 
         # 2) delogo per detected line, switched on for the window that line is visible.

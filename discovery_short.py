@@ -540,6 +540,32 @@ def _verify_recut(scenes, sentences, stages, src_final, clip_dir, work_dir,
         else "Discovery: cut verification passed - all clips match their sentences.")
 
 
+_INVENTED_MOTION = re.compile(
+    r"\b(rush(es|ed|ing)?|storm(s|ed|ing)?|arriv(e|es|ed|ing)|enter(s|ed|ing)|"
+    r"walk(s|ed|ing)?\s+(in|into|up|away|off)|run(s|ning)?\s+(in|into|up|away|off)|"
+    r"burst(s|ing)?|hurr(y|ies|ied)|dash(es|ed|ing)?|leav(e|es|ing)|"
+    r"com(e|es|ing)\s+(in|into)|walks?\s+over|steps?\s+(in|into|out))\b", re.I)
+
+
+def flag_invented_motion(stages, status_cb=None):
+    """Report stage actions that claim motion the frames cannot show.
+
+    A contact sheet is a set of STILLS. The prompt forbids inferring movement between
+    them, but the model still writes it, and the script then narrates a run that never
+    appears under it. Real case (lipstick Short, 2026-07-25): stage 0 read "a schoolgirl
+    rushes into a classroom and looks relieved to make it on time" while the frames show
+    her SITTING - and the source's own on-screen text says she did NOT make it. The
+    caller can re-ask the vision for the flagged stages, or at minimum log them so a
+    wrong narration is not silently shipped. Returns the flagged indices.
+    """
+    bad = [i for i, s in enumerate(stages or [])
+           if _INVENTED_MOTION.search(str((s or {}).get("action") or ""))]
+    for i in bad:
+        log(status_cb, f"Discovery WARNING: stage {i} claims motion a still frame cannot "
+                       f"show - \"{stages[i].get('action')}\"")
+    return bad
+
+
 def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="process"):
     """Vision: rate the candidate + segment the process (or story beats) into stages."""
     import scrape_v2
