@@ -1033,7 +1033,12 @@ def run_discovery_short(form, status_cb=None, style="process"):
         appeal = float(a["info"].get("appeal") or 0)
         special = float(a["cand"].get("special") or 0)
         cuts = float((a.get("tech") or {}).get("cuts_per_min") or 0)
-        return appeal + special + min(cuts, 25.0) / 5.0
+        # Scene density is only good up to a point. Rewarding it linearly picked sources
+        # cutting 43 and 62 times a MINUTE - shots under a second, nothing readable in the
+        # hook (user 2026-07-25, "man checkt doch garnichts und swiped direkt weg"). Peak
+        # the bonus around 15/min and take it away again above 30.
+        pace = (min(cuts, 15.0) / 5.0) - max(0.0, cuts - 30.0) / 6.0
+        return appeal + special + pace
     accepted.sort(key=_rank, reverse=True)
     if not pinned_url and style == "story" and len(accepted) > 5:
         picked, per_cat = [], {}
@@ -1243,7 +1248,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
         # voiceover (dual audio). Falls back to the single slowed cut when the beat is
         # too short to jump around in.
         did_subcuts = False
-        if style == "story" and d >= 2.4 and avail >= d + 1.0:
+        # NEVER jump-cut the hook. The first sentence has to be understood or the viewer
+        # swipes; source footage is already fast (the maid-cafe hook ran 6 shots in 4.6s,
+        # 0.77s each, and only one of those cuts was ours). Sentence 0 stays one take.
+        if style == "story" and i > 0 and d >= 2.4 and avail >= d + 1.0:
             n_sub = max(2, min(4, int(round(d / 2.2))))
             base = d / n_sub
             gap = min(1.2, max(0.0, (avail - d) / max(1, n_sub - 1)))
