@@ -3553,7 +3553,28 @@ def render_video(config, basename=None):
                 )
                 labels.append(bg_label)
             if audio_path:
-                filters.append("[1:a:0]volume=1.0[speech]")
+                # DUCKING (user 2026-07-25, from the reference edits): the original sound
+                # should be AUDIBLE and only step back while the narrator talks - not sit
+                # at a permanent whisper. A fixed low volume made the source dialogue
+                # inaudible even in the narrator's planned pauses. Keyed off the voice
+                # track, so the moment the narrator stops the scene comes up on its own.
+                sd_labels = [lb for lb in labels if lb.startswith("sd")]
+                duck = bool(config.get("duck_original_under_voice", True)) and sd_labels
+                if duck:
+                    filters.append("[1:a:0]asplit=2[speech][duckkey]")
+                    if len(sd_labels) == 1:
+                        filters.append(f"[{sd_labels[0]}]anull[srcmix]")
+                    else:
+                        filters.append("".join(f"[{lb}]" for lb in sd_labels)
+                                       + f"amix=inputs={len(sd_labels)}:duration=longest:"
+                                         "dropout_transition=0:normalize=0[srcmix]")
+                    duck_ratio = float(config.get("duck_ratio", 12.0))
+                    filters.append(
+                        f"[srcmix][duckkey]sidechaincompress=threshold=0.015:"
+                        f"ratio={duck_ratio:.1f}:attack=12:release=320:makeup=1[srcduck]")
+                    labels = ["srcduck"] + [lb for lb in labels if not lb.startswith("sd")]
+                else:
+                    filters.append("[1:a:0]volume=1.0[speech]")
                 mix_inputs = ["speech"] + labels
             else:
                 mix_inputs = labels

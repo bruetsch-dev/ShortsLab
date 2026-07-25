@@ -566,6 +566,44 @@ def flag_invented_motion(stages, status_cb=None):
     return bad
 
 
+def _source_cut_times(path, ffmpeg, threshold=0.30):
+    """Times of the SOURCE's own hard cuts, so the recut can avoid the busiest stretches."""
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path), "-filter_complex",
+                            f"select='gt(scene,{threshold})',metadata=print:file=-",
+                            "-an", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=900)
+    except Exception:  # noqa: BLE001 - pacing help is optional, never fatal
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        if "pts_time:" in line:
+            try:
+                out.append(float(line.split("pts_time:")[1].split()[0]))
+            except (IndexError, ValueError):
+                pass
+    return sorted(t for t in out if t > 0.1)
+
+
+def _calmest_start(cuts, lo, hi, need, step=0.2):
+    """Start time in [lo, hi-need] whose `need`-second window crosses the fewest cuts.
+
+    Ties go to the EARLIEST window so the hook still opens near the start of its beat.
+    """
+    if hi - lo < need + 0.05:
+        return None
+    best_t, best_n = None, None
+    t = lo
+    while t + need <= hi + 1e-6:
+        n = sum(1 for c in cuts if t < c < t + need)
+        if best_n is None or n < best_n:
+            best_t, best_n = round(t, 2), n
+            if n == 0:
+                break
+        t += step
+    return best_t
+
+
 def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="process"):
     """Vision: rate the candidate + segment the process (or story beats) into stages."""
     import scrape_v2
@@ -1218,6 +1256,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
                              "stream=codec_type", "-of", "csv=p=0", str(src_final)],
                             capture_output=True, text=True)
     _src_has_audio = style == "story" and "audio" in (_probe.stdout or "")
+    _src_cuts = _source_cut_times(src_final, ff) if style == "story" else []
+    if _src_cuts:
+        log(status_cb, f"Discovery: source cuts {len(_src_cuts)} times "
+                       f"({len(_src_cuts) / max(1.0, total) * 60:.0f}/min).")
     for i, sent in enumerate(sentences):
         _check_cancel()
         a, b = spans[i]
@@ -1240,6 +1282,15 @@ def run_discovery_short(form, status_cb=None, style="process"):
         else:
             rate = max(0.5, round(avail / d, 3))
             take = avail
+        if i == 0 and style == "story" and _src_cuts and avail >= d - 0.01:
+            # HOOK: take the CALMEST stretch of the stage, not simply its opening. These
+            # sources cut 40-60 times a minute, so the first seconds of a stage can hold
+            # five shots in three seconds and the viewer reads nothing before swiping
+            # (user 2026-07-25). Measured on the maid-cafe source, this drops the hook
+            # from 5 shots to 3 without leaving the stage.
+            calm = _calmest_start(_src_cuts, st_start, st_end, d)
+            if calm is not None:
+                t0 = calm
         name = f"disc_{i:02d}.mp4"
         # RETENTION EDIT for story mode (user 2026-07-23, reference-video analysis):
         # a 4-7s sentence over ONE static cut feels slow - split it into ~2s JUMP CUTS
