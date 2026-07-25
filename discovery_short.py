@@ -709,8 +709,17 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
 def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process"):
     """LLM: write the mini-short narration; every sentence is tied to one visual stage."""
     stages = analysis["stages"]
-    stage_lines = "\n".join(f"[{i}] {s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
-                            for i, s in enumerate(stages))
+    # Stages whose description claims movement a contact sheet cannot prove. Marking them
+    # here costs nothing - this LLM call happens anyway - and it is the only place the
+    # invention can still be stopped: warn-only let "a schoolgirl rushes into a classroom"
+    # reach the narration over footage of her sitting (user 2026-07-25, "warum").
+    suspect = set(flag_invented_motion(stages))
+    stage_lines = "\n".join(
+        f"[{i}] {s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
+        + ("   <-- UNRELIABLE: the movement in this line was inferred, not seen. Describe "
+           "only the people, place and mood here; never narrate the motion or its outcome."
+           if i in suspect else "")
+        for i, s in enumerate(stages))
     reveal_idx = next((i for i, s in enumerate(stages) if s.get("is_reveal")), None)
     sys_p = (
         "You write narrations for viral 30-40s documentary mini shorts (TikTok/YouTube Shorts). "
