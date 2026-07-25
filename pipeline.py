@@ -690,10 +690,25 @@ def _caption_display_word(word):
     return (word or "").strip(_CAPTION_EDGE_PUNCT)
 
 
-def caption_chunk_sizes(tokens):
-    """Chunk-size plan for word-by-word captions (user rule 2026-07-23): 4+ char words
-    single; consecutive 1-3 char words group (max 4); a lone short word joins the next
-    word (or the previous chunk at the very end). `tokens` = display word strings."""
+def caption_chunk_sizes(tokens, timings=None, config=None):
+    """Chunk-size plan for the caption cards.
+
+    Two strategies. The default is the 2026-07-23 rule: 4+ char words stand alone,
+    consecutive short words group. With `dynamic_caption_grouping` on AND word timings
+    supplied, editing.captions.group_words takes over and sizes cards by READING TIME,
+    which is what keeps "extraordinary transformation" from flashing past in the same
+    0.4s as "is a". Falls back to the old rule if the timings are missing or unusable.
+    """
+    if timings and (config or {}).get("dynamic_caption_grouping", False):
+        try:
+            from editing.captions import group_words
+            cards = group_words(timings, uppercase=False)
+            sizes = [len(c.words) for c in cards if c.words]
+            if sum(sizes) == len(tokens):
+                return sizes
+        except Exception:  # noqa: BLE001 - captions must never fail the render
+            pass
+
     def _core(t):
         return str(t or "").strip(".,!?…\"'")
     sizes, i, n = [], 0, len(tokens)
@@ -3363,6 +3378,16 @@ def render_video(config, basename=None):
                 zoom = zoom_start + (zoom_end - zoom_start) * ease_in_out(shot_p)
                 zoom += scene_punch_zoom(config, scene, p)
                 zoom += extra_zoom
+                # editing.timeline jump cuts: the cutter marks the second half of a split
+                # shot (or a repeated angle) with punch_scale > 1.0. Held flat for the whole
+                # cut on purpose - it is a different FRAMING, not a move, so animating it
+                # would read as a slow push instead of a hard reframe.
+                try:
+                    _ps = float(scene.get("punch_scale") or 1.0)
+                except (TypeError, ValueError):
+                    _ps = 1.0
+                if _ps > 1.001:
+                    zoom += _ps - 1.0
                 offset = (int((shot_p - 0.5) * pan_x), int((shot_p - 0.5) * pan_y))
                 base_asset = assets[scene_id]
                 if shot_index is not None and (scene_id, shot_index) in shot_assets:

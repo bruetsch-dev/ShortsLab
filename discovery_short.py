@@ -1389,6 +1389,33 @@ def run_discovery_short(form, status_cb=None, style="process"):
                        "seedance_start_trim": 0.0, "render_caption": False,
                        "overlays": [], "blur_captions": False, "timeline_speed": 1.0})
     scenes[-1]["end"] = round(total_vo, 2)
+    # editing.timeline overlay: the stage recut decides WHICH footage each sentence gets;
+    # this pass decides how it is CUT. It marks repeated angles and over-long holds with a
+    # punch_scale the renderer now honours, so a 5s sentence stops sitting on one static
+    # frame. Opt-in via timeline_engine so the stage mapping stays the source of truth.
+    if form.get("timeline_engine", True):
+        try:
+            from editing.timeline import ClipSource, build_timeline
+            srcs = []
+            for sc in scenes:
+                fp = clip_dir / sc["clip"]
+                if fp.exists():
+                    srcs.append(ClipSource(path=str(fp),
+                                           duration=float(sc["end"]) - float(sc["start"])))
+            tl = build_timeline(words, srcs, audio_duration=total_vo,
+                                target_shot=2.6) if srcs else None
+            if tl:
+                marked = 0
+                for sc in scenes:
+                    mid = (float(sc["start"]) + float(sc["end"])) / 2.0
+                    hit = next((c for c in tl.cuts if c.start <= mid < c.end), None)
+                    if hit and hit.scale > 1.001:
+                        sc["punch_scale"] = round(hit.scale, 3)
+                        marked += 1
+                log(status_cb, f"Discovery: timeline engine marked {marked}/{len(scenes)} "
+                               f"segment(s) for a punch-in ({len(tl.cuts)} cut plan).")
+        except Exception as exc:  # noqa: BLE001 - pacing help never blocks a run
+            log(status_cb, f"Discovery: timeline engine skipped ({exc}).")
     log(status_cb, f"Discovery: recut the source into {len(scenes)} stage-matched segments.")
     _check_cancel()
     _verify_recut(scenes, sentences, stages, src_final, clip_dir, work,
