@@ -90,6 +90,18 @@ _EXEC_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- helpers
 
+# Reference images attached to EVERY generation of the current run (FLUX.2 takes up to 8).
+# Set by the caller before generation starts; empty means text-only prompts as before.
+REFERENCE_IMAGES = []
+
+
+def set_reference_images(paths):
+    """Pin reference images for this run. Pass [] to go back to text-only prompts."""
+    global REFERENCE_IMAGES
+    REFERENCE_IMAGES = [str(p) for p in (paths or []) if Path(str(p)).exists()][:8]
+    return list(REFERENCE_IMAGES)
+
+
 def _status(cb, msg):
     if cb:
         try:
@@ -408,6 +420,69 @@ class Session:
                 page.wait_for_timeout(250)
             except Exception:
                 pass
+
+    def apply_reference_images(self, page, paths):
+        """Re-attach the run's reference images for the NEXT frame (clear, then attach)."""
+        if not paths:
+            return False
+        self._clear_reference_images(page)
+        return self.attach_reference_images(page, paths)
+
+    def attach_reference_images(self, page, paths):
+        """Attach reference images to the prompt bar. FLUX.2 accepts up to 8.
+
+        Higgsfield hides its file input behind a "+" button, so the input is queried
+        directly: Playwright can set files on a hidden input without opening the OS
+        dialog. A visible add-button plus file-chooser is the fallback for layouts where
+        the input only exists after the click. Returns True when files were handed over.
+        """
+        files = []
+        for raw in (paths or []):
+            fp = Path(str(raw))
+            if fp.exists() and fp.stat().st_size > 128:
+                files.append(str(fp.resolve()))
+        files = files[:8]                      # FLUX.2 takes at most 8 reference images
+        if not files:
+            return False
+        self._dismiss_overlays(page)
+        for sel in ("input[type='file'][accept*='image']", "input[type='file']"):
+            for el in self._elements(page, sel):
+                try:
+                    el.set_input_files(files, timeout=5000)
+                    return True
+                except Exception:
+                    continue
+        # The control is the small "+" at the LEFT EDGE of the prompt bar (user screenshot
+        # 2026-07-25) and carries no aria-label, so plain-text matching comes first.
+        for sel in ("button:text-is('+')", "button:has-text('+')",
+                    "button[aria-label*='image' i]", "button[aria-label*='upload' i]",
+                    "button[aria-label*='attach' i]", "button[aria-label*='add' i]",
+                    "[data-testid*='upload' i]", "[data-testid*='attach' i]"):
+            for el in self._elements(page, sel):
+                try:
+                    if not el.is_visible():
+                        continue
+                    with page.expect_file_chooser(timeout=5000) as fc:
+                        el.click(timeout=3000)
+                    fc.value.set_files(files)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def _clear_reference_images(self, page):
+        """Remove already-attached references so a frame cannot inherit the previous one."""
+        removed = 0
+        for sel in ("button[aria-label*='remove' i]", "button[aria-label*='delete' i]",
+                    "[data-testid*='remove' i]"):
+            for el in self._elements(page, sel):
+                try:
+                    if el.is_visible():
+                        el.click(timeout=1500)
+                        removed += 1
+                except Exception:
+                    continue
+        return removed
 
     def _type_prompt(self, page, prompt):
         """Type the prompt into the most likely prompt field. Returns True if it landed text."""
@@ -993,6 +1068,8 @@ class Session:
                         on_done(idx, None)
                     continue
                 idx, prompt, path = queue[0]
+                if REFERENCE_IMAGES:
+                    self.apply_reference_images(page, REFERENCE_IMAGES)
                 if not self._type_prompt(page, prompt):
                     queue.pop(0)
                     results[idx] = None

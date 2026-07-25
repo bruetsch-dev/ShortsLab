@@ -810,6 +810,7 @@ PROMPT_FORMAT_VERSION = 3
 # has no upload control wired up here, and the look has to survive hundreds of frames anyway.
 # A short, rigid description keeps it recognisable; the last line is what makes it feel part of
 # the drawing instead of a sticker (user 2026-07-25: "seine aktionen sollen zum bild passen").
+MASCOT_ART = Path(__file__).resolve().parent / "assets" / "mascot" / "blob.png"
 MASCOT_NAME = "Blob"
 MASCOT_LOOK = (
     "a small mascot called Blob: one rounded blob-shaped body in warm mustard yellow with a "
@@ -1340,7 +1341,8 @@ def write_timeline_manifest(lines, durations, results, audio_duration, out_path,
     return out_path
 
 
-def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_event=None):
+def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_event=None,
+                    mascot=False):
     """FLUX.2 Pro (unlimited) 16:9 on the user's Higgsfield session.
 
     Slot scheduler: up to IMAGE_CONCURRENCY prompts in flight; a new prompt is only submitted
@@ -1355,6 +1357,15 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
     import higgsfield_login
     if not higgsfield_login.is_ready():
         raise LongformError("Higgsfield is not connected - click Connect Higgsfield first.")
+    # FLUX.2 takes up to 8 reference images (user 2026-07-25). Handing it the actual artwork
+    # keeps the Blob identical across hundreds of frames in a way no description can; the
+    # prompt clause still does the placing and the reaction.
+    if mascot and MASCOT_ART.exists():
+        pinned = higgsfield_login.set_reference_images([MASCOT_ART])
+        _log(status_cb, f"Mascot: {MASCOT_ART.name} attached as a reference image "
+                        f"({len(pinned)}/8 slots) for every frame.")
+    else:
+        higgsfield_login.set_reference_images([])
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2349,7 +2360,7 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
 
     durations = line_durations(lines, audio_duration)
     results = generate_images(prompts, lines, durations, out_dir / "images",
-                              status_cb=status_cb, cancel_event=cancel_event)
+                              status_cb=status_cb, cancel_event=cancel_event, mascot=mascot)
 
     # Thumbnail generation is user-triggered from the pre-render editor. It deliberately is not
     # hidden inside the already long image run: the editor always exposes Generate thumbnails,
