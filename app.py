@@ -3932,6 +3932,16 @@ def longform_page():
         </div>
 
         <div class="panel">
+          <label>Mascot {help_tip("Hides the same little yellow blob somewhere in EVERY generated image - small and off to the side, never the subject. Its pose reacts to whatever the frame shows, so it reads as part of the scene rather than a sticker.")}</label>
+          <label class="checkline">
+            <input type="checkbox" name="mascot_enabled" value="1">
+            <span>Hide the blob in every image</span>
+          </label>
+          <div class="hint">Same character in all frames: round yellow body, dark outline, two big
+            offset eyes. It stays small and unobtrusive and its action matches the frame's mood.</div>
+        </div>
+
+        <div class="panel">
           <label>Higgsfield account {help_tip("Images are rendered on YOUR logged-in Higgsfield account (FLUX.2 Pro, unlimited on your plan) - no API key. Click Connect, a browser window opens, log in to Higgsfield once, and the session is saved for future runs.")}</label>
           <div class="tiktok-connect" id="hf-connect">
             <span class="tt-status {'on' if hf_ready else 'off'}" id="hf-status-dot"></span>
@@ -5101,6 +5111,7 @@ def start_longform_video_job(fields):
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
     reasoning_mode = fields.get("reasoning_mode")
     halt_after_speech = agent_core.form_flag(fields, "halt_after_speech", False)
+    mascot_enabled = agent_core.form_flag(fields, "mascot_enabled", False)
     # narrator: only honour a voice the TTS layer actually knows, else keep pipeline's default
     tts_voice = (fields.get("tts_voice") or "").strip()
     if tts_voice and tts_voice not in set(pipeline.GEMINI_TTS_VOICES):
@@ -5263,7 +5274,7 @@ def start_longform_video_job(fields):
                 status_cb=status_cb, cancel_event=cancel_event,
                 speech_gate=lf_speech_gate if halt_after_speech else None,
                 mix_gate=lf_mix_gate if halt_after_speech else None,
-                voice=tts_voice or None)
+                voice=tts_voice or None, mascot=mascot_enabled)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result

@@ -806,6 +806,50 @@ def write_transcript(lines, out_path):
 # images made from them - in the new style instead of reusing the old-format cache.
 PROMPT_FORMAT_VERSION = 3
 
+# The mascot is described in WORDS, not attached as a reference image: Higgsfield's page
+# has no upload control wired up here, and the look has to survive hundreds of frames anyway.
+# A short, rigid description keeps it recognisable; the last line is what makes it feel part of
+# the drawing instead of a sticker (user 2026-07-25: "seine aktionen sollen zum bild passen").
+MASCOT_NAME = "Blob"
+MASCOT_LOOK = (
+    "a small mascot called Blob: one rounded blob-shaped body in warm mustard yellow with a "
+    "thick dark charcoal outline, a wide flat bottom, no arms or legs, and two oversized "
+    "white circular eyes of different sizes sitting high and off-centre with small dark "
+    "pupils. Always this exact character, same colours, same thick outline, drawn in the same "
+    "flat doodle style as the rest of the frame")
+MASCOT_RULE = (
+    "MASCOT: hide {name} somewhere in this frame - {look}. Keep it SMALL (roughly a tenth of "
+    "the frame height) and place it off to one side, in a corner, behind or peeking around "
+    "something. It must never be the subject, never overlap the main action, and never carry "
+    "the caption. Give it ONE small reaction that fits what this frame shows - watching, "
+    "hiding, leaning in, looking away, mimicking the subject - so it belongs to the scene.")
+
+
+def mascot_clause():
+    """The sentence appended to every image prompt when the mascot option is on."""
+    return MASCOT_RULE.format(name=MASCOT_NAME, look=MASCOT_LOOK)
+
+
+def add_mascot(prompts):
+    """Append the mascot instruction to every prompt row (idempotent).
+
+    Rows are {"timestamp": ..., "prompt": ...}; only the prompt text is touched, so the
+    positional line mapping and the timestamp check downstream stay intact.
+    """
+    clause = mascot_clause()
+    out = []
+    for row in prompts:
+        if not isinstance(row, dict):
+            txt = str(row or "").strip()
+            out.append(txt if "MASCOT:" in txt else (txt.rstrip(". ") + ". " + clause))
+            continue
+        txt = str(row.get("prompt") or "").strip()
+        if txt and "MASCOT:" not in txt:
+            row = dict(row, prompt=txt.rstrip(". ") + ". " + clause)
+        out.append(row)
+    return out
+
+
 STAGE3_PROMPT = """## STAGE 3 - GENERATE IMAGE PROMPTS FOR EVERY TIMESTAMP
 
 Once the user pastes their timestamped script, generate one detailed text-to-image prompt for every single timestamp line.
@@ -876,7 +920,7 @@ def parse_prompt_batch(text):
 
 
 def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_event=None,
-                           checkpoint_path=None):
+                           checkpoint_path=None, mascot=False):
     """Transcript lines -> one doodle prompt per line, via the STAGE-3 conversation.
     The app itself replies "next" until every timestamp is covered. Mapping is POSITIONAL
     (prompt N belongs to line N) with a timestamp sanity check. Raises on shortfall."""
@@ -989,6 +1033,9 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
     if mismatch:
         _log(status_cb, f"Note: {mismatch} prompt timestamp(s) differ from the transcript - "
                         "using positional order (prompt N = line N).")
+    if mascot:
+        prompts = add_mascot(prompts)
+        _log(status_cb, f"Mascot: {MASCOT_NAME} hidden in all {len(prompts)} image prompts.")
     _log(status_cb, f"All {len(prompts)} image prompts delivered.")
     return prompts
 
@@ -2160,7 +2207,7 @@ def rebuild_from_disk(project_dir, status_cb=None):
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
                        status_cb=None, cancel_event=None, speech_gate=None, resume=True,
-                       voice=None, speaker=None, mix_gate=None):
+                       voice=None, speaker=None, mix_gate=None, mascot=False):
     """The whole pipeline. Returns a result dict for the job UI.
 
     RESUME (default on): re-running the SAME script continues the existing project instead of
@@ -2292,7 +2339,7 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
         prompt_checkpoint = out_dir / "image_prompts_checkpoint.json"
         prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
                                          status_cb=status_cb, cancel_event=cancel_event,
-                                         checkpoint_path=prompt_checkpoint)
+                                         checkpoint_path=prompt_checkpoint, mascot=mascot)
         save_state(out_dir, script=script, lines=lines, prompts=prompts, tts_parts=tts_parts,
                    voice=voice or "", audio_duration=round(audio_duration, 3),
                    prompt_format=PROMPT_FORMAT_VERSION)
