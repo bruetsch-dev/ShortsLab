@@ -800,6 +800,16 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
     data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
         max_tokens=1200, temperature=0.6 if style == "story" else 0.5)
+    # A model sometimes answers with the BARE sentence ARRAY instead of the object, and
+    # the run then died on data.get() after the transcription had already been paid for
+    # (gemini-3.5-flash, 2026-07-25). Accept both shapes.
+    if isinstance(data, list):
+        log(status_cb, "Discovery: script writer returned a bare list - reading it as the "
+                       "sentence array.")
+        data = {"sentences": data}
+    elif not isinstance(data, dict):
+        raise RuntimeError(f"Discovery: script writer returned {type(data).__name__}, "
+                           "expected a JSON object.")
     sentences = []
     for s in (data.get("sentences") or []):
         txt = re.sub(r"\s+", " ", str(s.get("text") or "")).strip()
