@@ -667,6 +667,7 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
                                "action": str(st.get("action") or "").strip(),
                                "is_reveal": bool(st.get("is_reveal"))})
         data["stages"] = stages
+        flag_invented_motion(stages, status_cb)
         log(status_cb, f"Mini discovery vision: appeal {data.get('appeal')}/10, "
                        f"{len(stages)} story beats - {data.get('topic_title')}")
         return data
