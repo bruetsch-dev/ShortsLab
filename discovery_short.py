@@ -1395,25 +1395,31 @@ def run_discovery_short(form, status_cb=None, style="process"):
     # frame. Opt-in via timeline_engine so the stage mapping stays the source of truth.
     if form.get("timeline_engine", True):
         try:
-            from editing.timeline import ClipSource, build_timeline
-            srcs = []
+            from editing.timeline import MAX_STATIC, PUNCH_SCALES
+            # SPLIT the long holds. Building a parallel timeline here marked nothing
+            # (0/8, 0/9, 0/7 on the first three live runs): every scene is its own file,
+            # so "same source twice" never fired, and 2.6s slots never crossed the 3.0s
+            # threshold. The scene list itself is the timeline - so apply the jump-cut
+            # rule TO IT: a hold over MAX_STATIC becomes two scenes, the second punched
+            # in and reading further into the same clip.
+            split, out = 0, []
             for sc in scenes:
-                fp = clip_dir / sc["clip"]
-                if fp.exists():
-                    srcs.append(ClipSource(path=str(fp),
-                                           duration=float(sc["end"]) - float(sc["start"])))
-            tl = build_timeline(words, srcs, audio_duration=total_vo,
-                                target_shot=2.6) if srcs else None
-            if tl:
-                marked = 0
-                for sc in scenes:
-                    mid = (float(sc["start"]) + float(sc["end"])) / 2.0
-                    hit = next((c for c in tl.cuts if c.start <= mid < c.end), None)
-                    if hit and hit.scale > 1.001:
-                        sc["punch_scale"] = round(hit.scale, 3)
-                        marked += 1
-                log(status_cb, f"Discovery: timeline engine marked {marked}/{len(scenes)} "
-                               f"segment(s) for a punch-in ({len(tl.cuts)} cut plan).")
+                a, b = float(sc["start"]), float(sc["end"])
+                if b - a <= MAX_STATIC:
+                    out.append(sc)
+                    continue
+                mid = round(a + (b - a) / 2.0, 2)
+                first = dict(sc, end=mid)
+                second = dict(sc, start=mid, id=f"{sc['id']}b",
+                              punch_scale=PUNCH_SCALES[split % len(PUNCH_SCALES)],
+                              seedance_start_trim=round(
+                                  float(sc.get("seedance_start_trim") or 0.0) + (mid - a), 2))
+                out.append(first)
+                out.append(second)
+                split += 1
+            scenes = out
+            log(status_cb, f"Discovery: timeline engine split {split} hold(s) over "
+                           f"{MAX_STATIC:.0f}s into jump cuts -> {len(scenes)} segments.")
         except Exception as exc:  # noqa: BLE001 - pacing help never blocks a run
             log(status_cb, f"Discovery: timeline engine skipped ({exc}).")
     log(status_cb, f"Discovery: recut the source into {len(scenes)} stage-matched segments.")
