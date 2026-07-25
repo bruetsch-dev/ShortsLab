@@ -519,12 +519,21 @@ def _verify_recut(scenes, sentences, stages, src_final, clip_dir, work_dir,
             continue
         d = round(float(sc["end"]) - float(sc["start"]), 2)
         t0 = min(max(0.0, t0), max(0.0, total - d - 0.2))
-        subprocess.run([ff, "-y", "-loglevel", "error", "-ss", str(round(t0, 2)),
-                        "-t", str(d + 0.05), "-i", str(src_final),
-                        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
-                               "crop=1080:1920,fps=30",
-                        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
-                        str(Path(clip_dir) / sc["clip"])], check=True)
+        # Keep the source's own audio. This pass re-cuts clips the vision review found
+        # mismatched, and it used to force -an: every corrected clip lost its audio bed,
+        # so a story that had dual audio ended up part silent with no warning.
+        keep_audio = "audio" in (subprocess.run(
+            [pipeline.find_ffprobe(ff), "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(src_final)],
+            capture_output=True, text=True).stdout or "")
+        cmd = [ff, "-y", "-loglevel", "error", "-ss", str(round(t0, 2)),
+               "-t", str(d + 0.05), "-i", str(src_final),
+               "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
+                      "crop=1080:1920,fps=30"]
+        cmd += ["-c:a", "aac", "-b:a", "128k"] if keep_audio else ["-an"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                str(Path(clip_dir) / sc["clip"])]
+        subprocess.run(cmd, check=True)
         fixed += 1
         log(status_cb, f"Discovery: clip {i} did not match its sentence - re-cut at {t0:.0f}s.")
     log(status_cb, f"Discovery: cut verification done ({fixed} clip(s) re-cut)." if fixed
