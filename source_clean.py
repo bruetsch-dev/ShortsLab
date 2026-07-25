@@ -95,6 +95,59 @@ def strip_top_watermark(path, ffmpeg, drop_px, status_cb=None):
     return False
 
 
+def reduce_flicker(path, ffmpeg, status_cb=None):
+    """Even out the frame-to-frame brightness swing of re-uploaded phone footage.
+
+    Reposts are lit by mains-powered LEDs and re-encoded at least twice, so the
+    luminance beats from frame to frame. Measured on the maid-cafe source: mean
+    frame-to-frame luminance delta 1.27 raw, 0.84 with deflicker alone, 0.70 with a
+    light temporal denoise behind it (a locked-off shot sits below 0.3). Returns True
+    when the file was rewritten.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.stem + "_steady" + path.suffix)
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-vf", "deflicker=size=7:mode=pm,hqdn3d=1.5:1.5:6:6",
+           "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+           "-c:a", "copy", "-movflags", "+faststart", str(tmp)]
+    subprocess.run(cmd, capture_output=True, timeout=900)
+    if tmp.exists() and tmp.stat().st_size > 4096:
+        os.replace(str(tmp), str(path))
+        _log(status_cb, f"Steadied {path.name}: deflicker + light temporal denoise.")
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
+
+
+def add_ending_tail(path, ffmpeg, hold=0.45, fade=0.25, status_cb=None):
+    """Hold the last frame briefly and fade the audio out.
+
+    Without this the video ends on the narrator's final syllable at full level: the
+    render is cut to the voiceover length, the last word finishes 0.19s before the
+    end and any SFX still ringing is chopped mid-tail. It reads as "the last
+    milliseconds are missing" even though no word is lost.
+    """
+    path = Path(path)
+    w, h, dur, fps = _probe(path)
+    if not dur:
+        return False
+    tmp = path.with_name(path.stem + "_tail" + path.suffix)
+    graph = (f"[0:v]tpad=stop_mode=clone:stop_duration={hold}[v];"
+             f"[0:a]apad=pad_dur={hold},afade=t=out:st={max(0.0, dur + hold - fade):.3f}:d={fade}[a]")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+           "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+           "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+           "-movflags", "+faststart", str(tmp)]
+    subprocess.run(cmd, capture_output=True, timeout=900)
+    if tmp.exists() and tmp.stat().st_size > 4096:
+        os.replace(str(tmp), str(path))
+        _log(status_cb, f"Ending: held the last frame {hold}s and faded the audio out.")
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
+
+
 def _boxes_in_band(bgr, band, min_conf=0.30):
     """OCR text boxes inside the caption band, in FULL-frame pixel coordinates."""
     import clip_scraper as cs
