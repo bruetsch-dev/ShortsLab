@@ -5906,13 +5906,18 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     _hook_end = float(scenes[1].get("start", 0.0) or 0.0) if len(scenes) > 1 else 0.0
     _hook_beat = _hook_end
     _iw = str(config.get("impact_word") or "").strip()
-    # hook_riser_full_hook (discovery/mini, user 2026-07-23): with no impact hit placed,
-    # a riser that stops on the impact word mid-hook sounds CHOPPED - run it through the
-    # whole hook instead so it drops exactly on the first cut (with its whoosh).
-    if _iw and not config.get("hook_riser_full_hook"):
-        hit = _find_word_time(_iw, 0.0, (_hook_end + 1.5) if _hook_end > 0 else None)
-        if hit:
-            _hook_beat = hit[0]          # riser peaks ON the word onset; impact fires there
+    # The riser peaks ON the impact word whenever we can find one. hook_riser_full_hook
+    # used to skip this lookup and stretch the riser to the first CUT instead, which
+    # sounded wrong for a different reason than the chop it was meant to cure: on the
+    # maid-cafe Short the build-up landed 1.2s past "angry", dropping on the filler word
+    # "in" (user 2026-07-25, "der hookriser is kacke"). A riser that peaks on nothing is
+    # worse than one that ends slightly bare, so full_hook is now only the FALLBACK for
+    # when the impact word cannot be located in the hook.
+    hit = _find_word_time(_iw, 0.0, (_hook_end + 1.5) if _hook_end > 0 else None) if _iw else None
+    if hit:
+        _hook_beat = hit[0]              # riser peaks ON the word onset; impact fires there
+    elif config.get("hook_riser_full_hook") and _hook_end > 0:
+        _hook_beat = _hook_end           # no impact word found - run it to the first cut
     # Script-to-Visuals semantic-vision mode: the multimodal Audio Director adds hook riser,
     # impacts, reactions and callout sounds AFTER the render (it watches the finished video).
     # Here we then place ONLY the frame-accurate cut transitions - everything else is skipped
@@ -6210,25 +6215,16 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             # smearing a 2s riser across a 5s+ hook drops the tail chunks to ~0.25x
             # atempo = audible time-stretch garbage. Cap the stretch and SLIDE the riser
             # instead - it starts later and still DROPS exactly on the beat (first cut).
-            target = min(beat, rlen * 1.5)
-            if target > rlen + 0.12:
-                stretched = sfx_library.build_progressive_riser(item["path"], target, rlen)
-                if stretched:
-                    # atempo chunk rounding makes the built file land slightly short of the
-                    # target; measure it and close the gap with a mild uniform rate so the
-                    # riser's drop hits EXACTLY on the beat (first cut) - never early silence.
-                    try:
-                        actual = float(probe_audio_duration(str(stretched)) or 0.0)
-                    except Exception:  # noqa: BLE001
-                        actual = 0.0
-                    item = dict(item, path=str(stretched))
-                    rlen = actual if actual > 0.1 else target
-                    playback_rate = (rlen / target) if target > 0 else 1.0
-            elif rlen > beat:
-                playback_rate = rlen / beat
-                target = beat
+            # RULE (user 2026-07-25): the hook riser starts at 0.00s and plays UNTOUCHED.
+            # Everything clever here made it worse - stretching a 2s riser across a 4.6s
+            # hook warbled the pitch sweep ("lass das mit dem hookriser verzerren"), and
+            # sliding it so its drop hit a beat left the video opening in silence. It now
+            # simply runs from the first frame at its own speed, trimmed only if the hook
+            # is shorter than the file.
+            target = min(rlen, beat) if beat > 0 else rlen
+            playback_rate = 1.0
             dur = round(target, 3)
-            start = round(max(0.0, beat - target), 3)
+            start = 0.0
             source_trim = 0.0
         else:
             item = pool[len(riser_peaks) % len(pool)]
