@@ -1057,10 +1057,10 @@ def split_hook_from_script(script, hook_text):
     return matched.strip(), body
 
 
-# Narration pace, baked into the voiceover at generation. Scrape was 1.20x for a long time;
-# raised to 1.30x (user call, 2026-07-10). The user can pick a different speed at the
-# speech-approval gate ("Halt after generating speech") before the audio flows on.
-SCRAPE_VOICE_SPEED = 1.30
+# Narration pace, baked into the voiceover at generation. The strongest manually-reviewed
+# Clip Shorts use 1.10x: fast enough for retention without the clipped, synthetic delivery
+# and micro-stutter impression produced by the former 1.30x default.
+SCRAPE_VOICE_SPEED = 1.10
 GENERATE_VOICE_SPEED = 1.15
 VOICE_SPEED_MIN, VOICE_SPEED_MAX = 1.0, 1.6
 
@@ -3076,36 +3076,50 @@ def post_json_url(url, payload, timeout=75):
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            ctype = str(response.headers.get("Content-Type") or "")
-            if "text/event-stream" in ctype or raw.lstrip().startswith("data:"):
-                # WaveSpeed streams SSE even without stream=true (behavior change 2026-07)
-                result = _parse_sse_chat_stream(raw)
-            else:
-                result = json.loads(raw)
-            if endpoint == "responses" and "choices" not in result:
-                text = str(result.get("output_text") or "")
-                if not text:
-                    for item in result.get("output", []) or []:
-                        for content in item.get("content", []) or []:
-                            if content.get("type") in ("output_text", "text"):
-                                text += str(content.get("text") or "")
-                result["choices"] = [{"message": {"role": "assistant", "content": text}}]
-            return result
-    except urllib.error.HTTPError as exc:
-        body = ""
+    attempt = 0
+    retries = 2
+    while True:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                ctype = str(response.headers.get("Content-Type") or "")
+                if "text/event-stream" in ctype or raw.lstrip().startswith("data:"):
+                    # WaveSpeed streams SSE even without stream=true (behavior change 2026-07)
+                    result = _parse_sse_chat_stream(raw)
+                else:
+                    result = json.loads(raw)
+                if endpoint == "responses" and "choices" not in result:
+                    text = str(result.get("output_text") or "")
+                    if not text:
+                        for item in result.get("output", []) or []:
+                            for content in item.get("content") or []:
+                                if content.get("type") in ("output_text", "text"):
+                                    text += str(content.get("text") or "")
+                    result["choices"] = [{"message": {"role": "assistant", "content": text}}]
+                return result
+        except urllib.error.HTTPError as exc:
             body = ""
-        if exc.code in (402, 403) and "balance" in body.lower():
-            raise WaveSpeedBalanceError(
-                "WaveSpeed account balance is EMPTY - the API rejects every request "
-                "(HTTP 403 'balance not enough'). Top up your credit at "
-                "https://wavespeed.ai and start the run again.") from exc
-        raise
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            if exc.code in (402, 403) and "balance" in body.lower():
+                raise WaveSpeedBalanceError(
+                    "WaveSpeed account balance is EMPTY - the API rejects every request "
+                    "(HTTP 403 'balance not enough'). Top up your credit at "
+                    "https://wavespeed.ai and start the run again.") from exc
+            if exc.code in (429, 502, 503) and attempt < retries:
+                retry_after = 0.0
+                try:
+                    if exc.headers:
+                        retry_after = float(exc.headers.get("Retry-After") or 0.0)
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+                delay = max(retry_after, 1.5 * (2 ** attempt))
+                time.sleep(min(delay, 12.0))
+                attempt += 1
+                continue
+            raise
 
 
 def assert_wavespeed_balance(status_cb=None):
@@ -5931,6 +5945,95 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
         _hook_beat = hit[0]              # riser peaks ON the word onset; impact fires there
     elif config.get("hook_riser_full_hook") and _hook_end > 0:
         _hook_beat = _hook_end           # no impact word found - run it to the first cut
+
+    # CLIP SHORT REFERENCE PROFILE: no semantic/topic sounds, impacts, bells or ambient beds.
+    # Use one hook riser from exactly 0.0 to the hook/body boundary, then one quiet editorial
+    # sound at every cut, rotating through whoosh, swish, bubble-pop and mouse-click families.
+    if bool(config.get("scrape_transition_only_sfx")):
+        events, sfx_events_report = [], []
+        cut_categories = [c for c in (
+            "bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"
+        ) if lib.get(c)]
+        cut_index = 0
+        for i, start in cuts:
+            if i == 0 or not cut_categories:
+                continue
+            # The riser already resolves the hook/body transition. Do not stack a second
+            # click/whoosh on the same frame and turn the most important cut into a loud hit.
+            riser_target = (_hook_end if config.get("hook_riser_full_hook") and _hook_end > 0
+                            else _hook_beat)
+            if riser_target > 0 and abs(float(start) - riser_target) <= 0.12:
+                continue
+            cat = cut_categories[cut_index % len(cut_categories)]
+            path = pick(cat)
+            if not path:
+                # Stay inside the approved transition family when a file hits its reuse cap.
+                for offset in range(1, len(cut_categories) + 1):
+                    cat = cut_categories[(cut_index + offset) % len(cut_categories)]
+                    path = pick(cat)
+                    if path:
+                        break
+            cut_index += 1
+            if not path:
+                continue
+            rec = rec_by_path.get(str(path), {})
+            is_motion = cat in ("bright_whoosh", "swipe_whoosh", "whoosh_hit_combo")
+            at = max(0.0, float(start) - (0.06 if is_motion else 0.0))
+            if any(abs(at - onset) <= 0.10 for onset in existing_onsets):
+                continue
+            max_dur = 0.45 if is_motion else (0.28 if cat == "caption_pop" else 0.22)
+            dur = min(float(rec.get("trim_len") or max_dur), max_dur)
+            db = {"bright_whoosh": -10, "swipe_whoosh": -10,
+                  "caption_pop": -13, "ui_click": -14}.get(cat, -12)
+            events.append({"path": str(path), "start": round(at, 3),
+                           "duration": round(max(0.08, dur), 3),
+                           "volume": round(min(0.85, sfx_library.db_to_gain(db)), 3),
+                           "category": cat, "id": f"sfx-{len(events):02d}", "sfx_type": cat})
+            sfx_events_report.append({
+                "time": round(at, 2), "scene_id": i, "type": cat,
+                "asset_file": Path(rec.get("file") or path).name,
+                "used_trimmed_version": bool(rec.get("requires_trim")), "volume_db": db,
+                "reason": "clip_short_transition", "linked_cut_time": round(float(start), 2),
+                "linked_word": None, "linked_visual_event": None, "allowed_by_policy": True})
+
+        hook_risers = data.get("hook_risers") or []
+        riser_target = (_hook_end if config.get("hook_riser_full_hook") and _hook_end > 0
+                        else _hook_beat)
+        if hook_risers and riser_target > 0.8:
+            want = str(config.get("hook_riser_file") or "").lower()
+            riser_pool = [it for it in hook_risers
+                          if want and want in Path(str(it.get("path") or "")).name.lower()] or hook_risers
+            item, source_len, _ = sfx_library.choose_riser_for_target(riser_pool, riser_target)
+            if item and source_len > 0:
+                playback_rate = source_len / riser_target
+                events.append({"path": str(item["path"]), "start": 0.0,
+                               "duration": round(riser_target, 3), "source_trim": 0.0,
+                               "source_duration": round(source_len, 3),
+                               "playback_rate": round(playback_rate, 6),
+                               "volume": round(min(0.85, sfx_library.db_to_gain(-5.5)), 3),
+                               "category": "hook_riser", "id": f"sfx-{len(events):02d}",
+                               "sfx_type": "hook_riser"})
+                sfx_events_report.append({
+                    "time": 0.0, "scene_id": 0, "type": "hook_riser",
+                    "asset_file": Path(str(item["path"])).name, "used_trimmed_version": False,
+                    "volume_db": -5.5, "reason": "clip_short_hook_riser",
+                    "linked_cut_time": round(riser_target, 2), "linked_word": _iw or None,
+                    "linked_visual_event": None, "allowed_by_policy": True})
+
+        events.sort(key=lambda event: float(event.get("start") or 0.0))
+        config["ai_content_sfx"] = events
+        summary = {
+            "total_sfx": len(events),
+            "hook_riser": sum(1 for e in events if e.get("category") == "hook_riser"),
+            "transition_only": sum(1 for e in events if e.get("category") != "hook_riser"),
+            "content_sfx": 0,
+        }
+        config["sfx_report"] = {**data["report"], "sfx_summary": summary,
+                                "sfx_events": sfx_events_report,
+                                "sfx_validation": {"passed": True, "issues": []}}
+        log(status_cb, f"Clip Short SFX: {summary['hook_riser']} hook riser + "
+                       f"{summary['transition_only']} quiet cut transition(s); no content SFX.")
+        return len(events)
     # Script-to-Visuals semantic-vision mode: the multimodal Audio Director adds hook riser,
     # impacts, reactions and callout sounds AFTER the render (it watches the finished video).
     # Here we then place ONLY the frame-accurate cut transitions - everything else is skipped
@@ -8390,8 +8493,8 @@ def apply_timeline_edits_to_config(config, edits, slug):
             except Exception:
                 pass
         # CLIP SPEED: applied as a safe PRE-PASS - the source clip is re-encoded once into a
-        # speed_<sid>_<x>.mp4 (setpts, no audio) and the scene points at that file. The normal
-        # per-scene trim then cuts it to the scene duration, so the render graph is untouched.
+        # speed_v2_<sid>_<x>.mp4 (setpts + motion interpolation, no audio) and the scene points
+        # at that file. The normal per-scene trim then cuts it to the scene duration.
         try:
             speed = float(speed_by_id.get(sid)) if sid in speed_by_id else float(scene.get("timeline_speed") or 1.0)
         except (TypeError, ValueError):
@@ -8413,17 +8516,20 @@ def apply_timeline_edits_to_config(config, edits, slug):
                     # different replaced sources for long scene ids, so a re-speed reused the stale
                     # (old-clip) speed file. The tag keeps distinct speeds distinct.
                     _sk = hashlib.sha1(src_name.encode("utf-8", "ignore")).hexdigest()[:10]
-                    dest = clip_dir / f"speed_{sid}_{tag}_{_sk}.mp4"
+                    # v2 intentionally invalidates old fps=30 caches, which could contain an
+                    # uneven duplicate/drop cadence and make the final render appear to lag.
+                    dest = clip_dir / f"speed_v2_{sid}_{tag}_{_sk}.mp4"
                     if not dest.exists():
                         ffm = pipeline.find_ffmpeg()
-                        # setpts alone only rewrites timestamps, so the output inherits a SCALED
-                        # framerate (0.9x on 30fps -> 27fps, 1.1x on 29.97 -> 32.97...). The
-                        # renderer then samples every clip at a fixed 30fps, which duplicates the
-                        # frames of a non-30 source in an uneven pattern. fps=30 resamples to
-                        # constant 30 here, where the speed is known.
+                        # Generate a true CFR30 retime. A plain fps=30 filter merely duplicated or
+                        # dropped frames after setpts and created recurring micro-stutters.
+                        retime_filter = (
+                            f"setpts=PTS/{speed:.4f},"
+                            "minterpolate=fps=30:mi_mode=mci:mc_mode=aobmc:"
+                            "me_mode=bidir:vsbmc=1:scd=fdiff")
                         subprocess.run([ffm, "-y", "-hide_banner", "-loglevel", "error",
-                                        "-i", str(src), "-vf", f"setpts=PTS/{speed:.4f},fps=30",
-                                        "-r", "30",
+                                        "-i", str(src), "-vf", retime_filter,
+                                        "-fps_mode", "cfr",
                                         "-an", "-c:v", "libx264", "-crf", "19",
                                         "-preset", "veryfast", str(dest)],
                                        capture_output=True, timeout=300)
@@ -8654,6 +8760,57 @@ def rework_project_sfx(slug, mode="add", reasoning_model=None, sfx_amount="mediu
     mode = str(mode or "add").lower()
     if mode not in ("add", "redo"):
         raise RuntimeError("Unknown SFX rework mode.")
+    # Real-footage Clip Shorts always keep the proven editorial-only sound profile, including
+    # timeline Redo/Add runs. Do not hand these projects to the general multimodal SFX Master:
+    # it would reintroduce word-triggered impacts, foley and ambience.
+    if config.get("clip_source") == "scrape":
+        if cancel_event is not None:
+            config["_cancel_event"] = cancel_event
+        config["_status_cb"] = status_cb
+        config["sfx_enabled"] = True
+        config["sfx_content_enabled"] = False
+        config["transition_sfx_enabled"] = True
+        config["scrape_transition_only_sfx"] = True
+        config["hook_riser_full_hook"] = True
+        config["sfx_generation_enabled"] = False
+        config["allow_ambient_sfx"] = False
+        ensure_timeline_voice(config, project_dir, status_cb=status_cb)
+        existing = pipeline.build_sfx_segments(config, has_speech=bool(config.get("audio_path")))
+        existing_times = sorted(float(row.get("start") or 0.0) for row in existing)
+        if mode == "add" and not existing_times:
+            raise RuntimeError("Add SFX is only available when the timeline already contains SFX.")
+
+        planned_config = copy.deepcopy(config)
+        planned_config["custom_sfx"] = []
+        planned_config["ai_content_sfx"] = []
+        planned_config["sfx_overrides"] = {}
+        place_editor_sfx(planned_config, reasoning_model=reasoning_model, status_cb=status_cb)
+        planned = list(planned_config.get("ai_content_sfx") or [])
+        if mode == "redo":
+            config["custom_sfx"] = []
+            config["sfx_overrides"] = {}
+            config["ai_content_sfx"] = planned
+            added = planned
+            log(status_cb, f"Redo SFX: replaced the old track with {len(added)} editorial event(s).")
+        else:
+            # A 100ms guard prevents an added cut accent from doubling an existing sound while
+            # still allowing nearby, deliberately separate beats.
+            added = [row for row in planned if all(
+                abs(float(row.get("start") or 0.0) - old) > 0.1001 for old in existing_times)]
+            config["ai_content_sfx"] = list(config.get("ai_content_sfx") or []) + added
+            log(status_cb, f"Add SFX: added {len(added)} editorial event(s); existing sounds kept.")
+        if not added:
+            raise RuntimeError("No free cut positions remained for additional editorial SFX.")
+        config["render_sfx_enabled"] = True
+        config["output_basename"] = (
+            f"{slug}_{'redo' if mode == 'redo' else 'more'}_sfx_{time.strftime('%Y%m%d_%H%M%S')}")
+        config_path = project_dir / "config" / "project.json"
+        config_path.write_text(json.dumps(config_for_json(config), indent=2,
+                                          ensure_ascii=False), encoding="utf-8")
+        output = pipeline.render_video(config)
+        return {"title": config.get("title", slug), "project_dir": str(project_dir),
+                "video": str(output), "added_sfx": len(added), "mode": mode,
+                "sfx_profile": "editorial_transitions_only"}
     # Fail fast BEFORE the expensive clean-base render if the multimodal Audio Director can't run.
     if not os.environ.get("WAVESPEED_API_KEY"):
         raise RuntimeError("Redo SFX needs WAVESPEED_API_KEY (the multimodal Audio Director). "
@@ -9570,7 +9727,7 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
             if key == "tts_voice" and value not in pipeline.GEMINI_TTS_VOICES:
                 log(status_cb, f"Unknown TTS voice {value!r} - keeping the saved one.")
                 continue
-            if key == "tts_model" and value not in ("flash", "pro"):
+            if key == "tts_model" and value not in ("flash", "pro", "gemini-3.1-flash"):
                 continue
             if str(run_form.get(key) or "") != value:
                 log(status_cb, f"Narrator setting changed: {key} -> {value}")
@@ -9973,9 +10130,9 @@ def run_project(form, status_cb=None):
     if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
         before_n = len(scenes_override)
         scenes_override = enforce_reference_pacing(
-            scenes_override, max_s=(3.4 if mini_story_mode else 2.4))
+            scenes_override, max_s=1.5)
         if len(scenes_override) != before_n:
-            log(status_cb, f"Pacing: split long beats for reference cut rate ({before_n} -> {len(scenes_override)} beats, ~1 cut/2s).")
+            log(status_cb, f"Pacing: split long beats for reference cut rate ({before_n} -> {len(scenes_override)} beats, ~1 cut/1.5s).")
         canonical_words = word_timeline_cache or estimated_word_timeline_from_scenes(base_scenes)
         if canonical_words:
             scenes_override = sync_scenes_to_voice_timeline(
@@ -10058,7 +10215,7 @@ def run_project(form, status_cb=None):
         "normal",
     )
     recut_mode = loaded_project_mode if loaded_project_mode != "normal" and requested_slug else "normal"
-    speaker_hook_enabled = form_flag(form, "enable_speaker_hook", False) or recut_mode == "recut_recreate_speaker_clip"
+    speaker_hook_enabled = form_flag(form, "enable_speaker_hook", False)
     speaker_hook_recreate = recut_mode == "recut_recreate_speaker_clip"
     if speaker_hook_enabled and not allow_seedance:
         allow_seedance = True
@@ -10166,9 +10323,9 @@ def run_project(form, status_cb=None):
     if scrape_sort not in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "RELEVANCE", "ALL"}:
         scrape_sort = "ALL"
     try:
-        script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 70)))))
+        script_relevancy = max(0, min(100, int(float(form.get("script_relevancy", 90)))))
     except (TypeError, ValueError):
-        script_relevancy = 70
+        script_relevancy = 90
     if clip_source == "scrape":
         # Scraped real footage becomes the moving-video layer: it is dropped into the
         # project's "seedance 2.0" folder so the planner/renderer treat it exactly like
@@ -10370,10 +10527,9 @@ def run_project(form, status_cb=None):
             # normal vision matching, so a trains script opens on trains, a school script on a
             # school visual. The generic dance/cute-influencer hook (dedicated search bucket +
             # presenter scorer, scene 0 reserved) only runs when explicitly enabled.
-            # Found-footage mode always opens with the requested 20K+ cute/dance creator hook.
-            # The UI submits this explicitly; defaulting on also keeps programmatic scrape runs
-            # consistent with the product contract.
-            use_influencer_hook = form_flag(form, "influencer_hook", True)
+            # The topic-matched opener is the quality default. A separate 20K+ cute/dance
+            # presenter search only runs when the user explicitly enables its switch.
+            use_influencer_hook = form_flag(form, "influencer_hook", False)
             if not use_influencer_hook:
                 log(status_cb, "Hook: topic-matched (scene 0 joins normal matching); "
                                "influencer/dance hook is OFF.")
@@ -10393,7 +10549,9 @@ def run_project(form, status_cb=None):
                     _v2cfg = {"title": title, "voice_speed": resolve_voice_speed(form, "scrape"),
                               "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE"),
                               "pipeline_version": str(form.get("pipeline_version") or "v0.2"),
-                              "clip_short_format": clip_short_format}
+                              "clip_short_format": clip_short_format,
+                              "influencer_hook": use_influencer_hook,
+                              "script_relevancy": script_relevancy}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
                         _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
@@ -11199,6 +11357,12 @@ def run_project(form, status_cb=None):
                 seedance_clip_count = 0
                 log(status_cb, "Scrape: no usable TikTok clips found after all search rounds.")
             unmatched_scenes = [i for i, sc in enumerate(scenes_override) if not sc.get("clip")]
+            if unmatched_scenes and _v2:
+                details = ", ".join(str(i) for i in unmatched_scenes[:12])
+                raise RuntimeError(
+                    f"Scrape V2 could not find a sufficiently relevant native 9:16 clip for "
+                    f"{len(unmatched_scenes)} scene(s) ({details}). The run kept all gathered media, "
+                    "but refused to fill the timeline with unrelated or repeated footage.")
             if unmatched_scenes and placed:
                 source_scene = next((sc for sc in scenes_override if sc.get("clip")), None)
                 source_path = seedance_target_dir / source_scene["clip"] if source_scene else None
@@ -11209,7 +11373,8 @@ def run_project(form, status_cb=None):
                         sc = scenes_override[scene_index]
                         sc["clip"] = dst.name
                         sc["seedance"] = True
-                        sc["visual_role"] = "hook_influencer" if scene_index == 0 else "body"
+                        sc["visual_role"] = ("hook_influencer" if use_influencer_hook else "hook_topic") \
+                            if scene_index == 0 else "body"
                         sc["scrape_source"] = source_scene.get("scrape_source", "tiktok")
                         sc["scrape_clip_id"] = source_scene.get("scrape_clip_id")
                         sc["match_class"] = "RELAXED_CONTINUITY"
@@ -11239,8 +11404,8 @@ def run_project(form, status_cb=None):
                 pass
 
             # finalize the social-search report with the enforcement evidence
-            hook_first = bool(best_hook is not None and scenes_override
-                              and scenes_override[0].get("visual_role") == "hook_influencer")
+            hook_first = bool(scenes_override and scenes_override[0].get("visual_role") == (
+                "hook_influencer" if use_influencer_hook else "hook_topic"))
             social_search_report.update({
                 "search_mode": "bucket_based_social_search",
                 "old_style_query_path_used": False,
@@ -11277,6 +11442,7 @@ def run_project(form, status_cb=None):
                                 "script_match_score": sc.get("script_match_score"),
                                 "black_bar_score": sc.get("black_bar_score"),
                                 "is_fake_vertical": sc.get("is_fake_vertical"),
+                                "native_9_16": sc.get("native_9_16"),
                                 "scrape_source": sc.get("scrape_source"),
                                 "has_clip": bool(sc.get("clip"))}
                                for sc in scenes_override],
@@ -11336,6 +11502,9 @@ def run_project(form, status_cb=None):
     _sfx_amount = str(form.get("sfx_amount", "") or "").strip().lower()
     if _sfx_amount in ("low", "medium", "high"):
         config["sfx_amount"] = _sfx_amount
+    _impact_word_early = clean_text(form.get("impact_word", "") or "").strip()
+    if _impact_word_early:
+        config["impact_word"] = _impact_word_early
     # Real video footage (scraped clips) is cut hard — a whoosh on every boundary looks
     # cheap on found-footage. Force transition SFX off for video; keep content/ambient SFX.
     # Also never use the TikTok clips' own audio (only narration + ambient SFX + music).
@@ -11356,8 +11525,15 @@ def run_project(form, status_cb=None):
             background_music_enabled = False
             config["background_music_enabled"] = False
             config["background_music_user_enabled"] = False
-        config["transition_sfx_enabled"] = False
-        config["sfx_enabled"] = bool(out_sfx)
+        # A Clip Short has one approved sound profile only: a hook riser from exactly 0.0
+        # through the hook/body cut plus quiet whoosh/swish/pop/click cut accents. The broad
+        # "Sound effects" checkbox must never re-enable semantic impacts, foley or ambience.
+        editorial_sfx_on = bool(out_sfx or out_tr_sfx)
+        config["transition_sfx_enabled"] = editorial_sfx_on
+        config["sfx_content_enabled"] = False
+        config["sfx_enabled"] = editorial_sfx_on
+        config["scrape_transition_only_sfx"] = editorial_sfx_on
+        config["hook_riser_full_hook"] = True
         # Reference edits use SHORT, real edited hits only - never a synthesized ambient bed and
         # never Kling-generated SFX. Hard-disable all SFX generation for scrape runs so the only
         # sounds are the short library impacts/whooshes placed on cuts by place_editor_sfx.
@@ -11412,6 +11588,7 @@ def run_project(form, status_cb=None):
                 _cs["script_match_score"] = _sm[_i].get("script_match_score")
                 _cs["black_bar_score"] = _sm[_i].get("black_bar_score")
                 _cs["is_fake_vertical"] = _sm[_i].get("is_fake_vertical")
+                _cs["native_9_16"] = _sm[_i].get("native_9_16")
                 _cs["scrape_source"] = _sm[_i].get("scrape_source")
     config["use_seedance_clips"] = bool(out_clips) and config.get("use_seedance_clips", True)
     config["render_captions"] = bool(out_caps)
@@ -11422,6 +11599,7 @@ def run_project(form, status_cb=None):
     config["scrape_terms"] = scrape_terms
     config["scrape_sort"] = scrape_sort
     config["script_relevancy"] = script_relevancy
+    config["influencer_hook"] = bool(use_influencer_hook) if clip_source == "scrape" else False
     log(status_cb, f"Seedance model selected: {seedance_model_choice}.")
     log(status_cb, f"Background music: {'enabled' if background_music_enabled else 'disabled'}.")
     log(status_cb, f"SFX generation fallback: {'enabled' if config['sfx_generation_enabled'] else 'disabled'}.")
@@ -11673,7 +11851,7 @@ def run_project(form, status_cb=None):
         and config.get("sfx_content_enabled", True)
         and os.environ.get("WAVESPEED_API_KEY")
         and not os.environ.get("SHORTSLAB_NO_PAID_API"))
-    if config.get("sfx_content_enabled", True):
+    if config.get("sfx_enabled", True):
         try:
             place_editor_sfx(config, status_cb=status_cb)
         except pipeline.PipelineCancelled:

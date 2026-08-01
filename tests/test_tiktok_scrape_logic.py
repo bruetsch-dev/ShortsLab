@@ -17,6 +17,102 @@ import instagram_login
 
 
 class TikTokScrapeLogicTests(unittest.TestCase):
+    def test_clip_short_quality_profile_defaults(self):
+        import chat_ui
+        self.assertAlmostEqual(agent_core.SCRAPE_VOICE_SPEED, 1.10)
+        self.assertNotIn("influencer_hook", chat_ui.RUN_MANIFEST["always"])
+        self.assertIn("influencer_hook", chat_ui.RUN_MANIFEST["check"])
+        self.assertEqual(scrape_v2.match_thresholds_for_relevancy("concrete", 70),
+                         {"script_floor": 5.8, "overall": 6.5})
+        strict = scrape_v2.match_thresholds_for_relevancy("concrete", 90)
+        self.assertGreater(strict["script_floor"], 5.8)
+        self.assertGreater(strict["overall"], 6.5)
+
+    def test_v2_validation_accepts_topic_or_optional_influencer_hook(self):
+        base = {"voice_speed": 1.10, "scenes": [
+            {"clip": "a.mp4", "visual_role": "hook_topic", "match_class": "A_MATCH",
+             "assignment_type": "exact", "black_bar_score": 0, "native_9_16": True},
+            {"clip": "b.mp4", "visual_role": "body", "match_class": "B_MATCH",
+             "assignment_type": "exact", "black_bar_score": 0, "native_9_16": True},
+        ]}
+        self.assertTrue(scrape_v2.validate_scrape_render_v2(base))
+        cute = json.loads(json.dumps(base))
+        cute["influencer_hook"] = True
+        cute["scenes"][0]["visual_role"] = "hook_influencer"
+        self.assertTrue(scrape_v2.validate_scrape_render_v2(cute))
+
+    def test_transition_only_profile_places_no_semantic_sfx(self):
+        records = []
+        library = {}
+        for cat in ("bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"):
+            path = f"{cat}.wav"
+            library[cat] = [path]
+            records.append({"use_path": path, "file": path, "trim_len": 0.35})
+        fake = {"library": library, "records": records, "reactions": {}, "risers": [],
+                "hook_risers": [{"path": "hook_riser2.wav", "dur": 2.4}], "report": {}}
+        config = {"sfx_enabled": True, "scrape_transition_only_sfx": True,
+                  "duration": 8.0, "scenes": [
+                      {"start": 0.0, "end": 2.0, "exact_voice_text": "Hook"},
+                      {"start": 2.0, "end": 4.0, "exact_voice_text": "Body"},
+                      {"start": 4.0, "end": 6.0, "exact_voice_text": "More"},
+                  ]}
+        with mock.patch.object(sfx_library, "build_library", return_value=fake):
+            agent_core.place_editor_sfx(config)
+        events = config["ai_content_sfx"]
+        self.assertEqual(events[0]["category"], "hook_riser")
+        self.assertEqual(events[0]["start"], 0.0)
+        self.assertAlmostEqual(events[0]["duration"], 2.0)
+        self.assertAlmostEqual(events[0]["source_duration"] / events[0]["playback_rate"], 2.0)
+        self.assertTrue(all(e["category"] in {
+            "hook_riser", "bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"
+        } for e in events))
+
+    def test_clip_short_riser_uses_full_hook_and_does_not_stack_first_cut(self):
+        records = []
+        library = {}
+        for cat in ("bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"):
+            path = f"{cat}.wav"
+            library[cat] = [path]
+            records.append({"use_path": path, "file": path, "trim_len": 0.35})
+        fake = {"library": library, "records": records, "reactions": {}, "risers": [],
+                "hook_risers": [{"path": "hook_riser3.wav", "dur": 2.1}], "report": {}}
+        config = {
+            "sfx_enabled": True, "scrape_transition_only_sfx": True,
+            "hook_riser_full_hook": True, "impact_word": "angry", "duration": 5.0,
+            "canonical_words": [{"word": "angry", "start": 0.8, "end": 1.1}],
+            "scenes": [
+                {"start": 0.0, "end": 2.5, "exact_voice_text": "An angry hook"},
+                {"start": 2.5, "end": 5.0, "exact_voice_text": "The body"},
+            ],
+        }
+        with mock.patch.object(sfx_library, "build_library", return_value=fake):
+            agent_core.place_editor_sfx(config)
+        events = config["ai_content_sfx"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["category"], "hook_riser")
+        self.assertEqual(events[0]["start"], 0.0)
+        self.assertAlmostEqual(events[0]["duration"], 2.5)
+
+    def test_transition_toggle_renders_planned_riser_when_content_sfx_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            riser = Path(tmp) / "riser.wav"
+            riser.touch()
+            config = {
+                "sfx_enabled": True, "sfx_content_enabled": False,
+                "transition_sfx_enabled": True, "clip_source": "scrape",
+                "scrape_transition_only_sfx": True,
+                "duration": 5.0, "scenes": [{"start": 0, "end": 5}],
+                "ai_content_sfx": [{"path": str(riser), "start": 0.0, "duration": 2.5,
+                                    "source_duration": 2.0, "playback_rate": 0.8,
+                                    "volume": 0.2, "category": "hook_riser", "id": "hook"},
+                                   {"path": str(riser), "start": 1.0, "duration": 0.4,
+                                    "volume": 0.2, "category": "subtle_impacts", "id": "stale"}],
+            }
+            segments = pipeline.build_sfx_segments(config, has_speech=True)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["category"], "hook_riser")
+        self.assertAlmostEqual(segments[0]["playback_rate"], 0.8)
+
     def test_v2_queries_are_platform_scoped_and_preserve_x_disambiguator(self):
         intent = scrape_v2.VisualIntent(
             scene_id=3, scene_text="Women were ordered off the sumo ring.",

@@ -281,7 +281,6 @@ RUN_MANIFEST = {
     # constant hidden fields the legacy form always posts
     "always": {
         "ui_form": "1",
-        "influencer_hook": "on",
         "mix_voice_in_final": "on",
         "use_visual_direction": "on",
     },
@@ -310,6 +309,7 @@ RUN_MANIFEST = {
         "out_web_images", "out_wikimedia", "out_gpt_images", "out_video_clips",
         "out_sfx", "out_transition_sfx", "out_background_music", "out_captions",
         "halt_after_speech", "force_regenerate", "enable_speaker_hook",
+        "influencer_hook",
         "add_visual_effects", "add_meme_reactions", "add_neko_reactions",
         "multi_language_search",
     ],

@@ -69,6 +69,7 @@ def make_prompt_safe(prompt):
 GEMINI_TTS_MODELS = {
     "flash": "google/gemini-2.5-flash/text-to-speech",
     "pro": "google/gemini-2.5-pro/text-to-speech",
+    "gemini-3.1-flash": "google/gemini-3.1-flash/text-to-speech",
 }
 # THE hiss fix (measured): the Flash TTS model generates noise-like HF grain (spectral flatness
 # ~0.205, near white noise) that reads as a constant hiss riding on the voice - no EQ/denoise
@@ -903,12 +904,17 @@ def draw_animated_caption(base, chunks, local, width, height, config, is_hook=Fa
     if current:
         lines.append(current)
 
-    # Entrance (slide-up + fade) and gentle exit fade.
+    # Entrance (slide-up + fade) and gentle exit fade. Keep these configurable: very short
+    # social edits need a much snappier caption response than longform narration. The old fixed
+    # 140 ms entrance visibly trailed rapid speech, especially when chunks changed twice a second.
     chunk_age = local - chunk["start"]
-    enter = clamp(chunk_age / 0.14, 0.0, 1.0)
-    exit_fade = clamp((chunk["end"] - local) / 0.10, 0.0, 1.0)
+    enter_seconds = max(0.01, float(config.get("caption_enter_seconds", 0.08) or 0.08))
+    exit_seconds = max(0.01, float(config.get("caption_exit_seconds", 0.06) or 0.06))
+    slide_px = max(0, int(config.get("caption_slide_px", 14) or 0))
+    enter = clamp(chunk_age / enter_seconds, 0.0, 1.0)
+    exit_fade = clamp((chunk["end"] - local) / exit_seconds, 0.0, 1.0)
     block_alpha = enter * exit_fade
-    y_slide = int((1.0 - ease_in_out(enter)) * 26)
+    y_slide = int((1.0 - ease_in_out(enter)) * slide_px)
 
     total_h = len(lines) * line_h
     top = center_y - total_h // 2 + y_slide
@@ -2176,10 +2182,14 @@ def generate_clips(config, force=False, status_cb=None):
         status_log(status_cb, f"Seedance clip {index}/{len(scenes)}: uploading source image {image_path.name}...")
         media_url, upload_response = upload_media(image_path, key)
         print(f"  Seedance request for {out_path.name}")
+        # Request enough footage for both the visible scene and the configured opening trim.
+        # Without this reserve an exactly-N-second generation was trimmed by 0.5s and the
+        # renderer had to repeat its last frames to fill the scene, which looked like lag.
+        requested_duration = scene_duration + seedance_clip_start_trim(config, scene) + 0.1
         prediction_id, submit_response, payload = submit_wavespeed_clip(
             media_url,
             prompt,
-            scene_duration,
+            requested_duration,
             config,
             scene,
             key,
@@ -2334,6 +2344,28 @@ class SceneClip:
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 24.0)
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.duration = self.frame_count / self.fps if self.frame_count and self.fps else 0.0
+        self.last_frame_index = -1
+        self.last_frame = None
+
+    def _frame_index(self, frame_index):
+        frame_index = int(clamp(frame_index, 0, max(0, self.frame_count - 1)))
+        if frame_index == self.last_frame_index and self.last_frame is not None:
+            return self.last_frame
+        if self.last_frame_index != -1 and self.last_frame_index < frame_index <= self.last_frame_index + 5:
+            for _ in range(frame_index - self.last_frame_index - 1):
+                self.cap.grab()
+        else:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = self.cap.read()
+        if not ok:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.cap.read()
+        if not ok:
+            raise RuntimeError(f"Could not read frame from video clip: {self.path}")
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        self.last_frame_index = frame_index
+        self.last_frame = img
+        return img
 
     def frame(self, t, hold_last=False):
         if self.duration > 0:
@@ -2345,15 +2377,28 @@ class SceneClip:
                 t = clamp(float(t), 0.0, max(0.0, self.duration - 1.0 / max(self.fps, 1.0)))
             else:
                 t = t % self.duration
-        frame_index = int(clamp(round(t * self.fps), 0, max(0, self.frame_count - 1)))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ok, frame = self.cap.read()
-        if not ok:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = self.cap.read()
-        if not ok:
-            raise RuntimeError(f"Could not read frame from video clip: {self.path}")
-        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        return self._frame_index(round(t * self.fps))
+
+    def frame_interpolated(self, t, hold_last=False):
+        """Sample fractional source time without uneven duplicate-frame cadence.
+
+        Timeline speed changes and 29.97->30 conversion otherwise round to the same source
+        frame on irregular output frames, which is perceived as recurring micro-stutter.
+        """
+        if self.duration > 0:
+            if hold_last:
+                t = clamp(float(t), 0.0, max(0.0, self.duration - 1.0 / max(self.fps, 1.0)))
+            else:
+                t = float(t) % self.duration
+        pos = clamp(float(t) * self.fps, 0.0, max(0.0, self.frame_count - 1))
+        lo = int(math.floor(pos))
+        hi = min(lo + 1, max(0, self.frame_count - 1))
+        alpha = float(pos - lo)
+        first = self._frame_index(lo)
+        if hi == lo or alpha <= 0.001:
+            return first
+        second = self._frame_index(hi)
+        return Image.blend(first, second, alpha)
 
     def frame_trimmed(self, t, start_trim=0.0, hold_last=False):
         if self.duration > 0 and start_trim > 0:
@@ -2366,8 +2411,95 @@ class SceneClip:
             return self.frame(t)   # already inside [start_trim, start_trim+usable]
         return self.frame(t, hold_last=hold_last)
 
+    def frame_trimmed_smooth(self, t, start_trim=0.0, hold_last=False):
+        if self.duration > 0 and start_trim > 0:
+            start_trim = min(float(start_trim), max(0.0, self.duration - (1.0 / max(self.fps, 1.0))))
+            usable = max(1.0 / max(self.fps, 1.0), self.duration - start_trim)
+            if hold_last:
+                t = start_trim + clamp(float(t), 0.0, max(0.0, usable - 1.0 / max(self.fps, 1.0)))
+            else:
+                t = start_trim + (float(t) % usable)
+            return self.frame_interpolated(t)
+        return self.frame_interpolated(t, hold_last=hold_last)
+
     def release(self):
         self.cap.release()
+
+
+def repeated_frame_stall_seconds(path, start=0.0, end=None, pixel_delta=0.12):
+    """Longest near-identical frame run in the used source window."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return 0.0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        fps = fps if 5.0 <= fps <= 120.0 else 30.0
+        full_duration = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / fps
+        start = max(0.0, float(start or 0.0))
+        end = full_duration if end is None else min(full_duration, max(start, float(end)))
+        cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+        limit = max(1, int(math.ceil((end - start) * fps)) + 2)
+        previous = None
+        current = longest = 0
+        for _ in range(limit):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                delta = float(np.mean(cv2.absdiff(previous, gray)))
+                if delta <= float(pixel_delta):
+                    current += 1
+                    longest = max(longest, current)
+                else:
+                    current = 0
+            previous = gray
+        return longest / fps
+    except Exception:
+        return 0.0
+    finally:
+        cap.release()
+
+
+def micro_stutter_events(path, start=0.0, end=None, ratio=0.25):
+    """Find isolated near-duplicate frames hidden inside otherwise moving footage.
+
+    A one-frame cadence hitch is too short for a normal freeze detector, but it is visible as
+    motion -> near-duplicate -> motion. Compare each frame delta with the median of its four
+    neighbours so slow camera shots are not rejected merely for moving slowly.
+    """
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return []
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        fps = fps if 5.0 <= fps <= 120.0 else 30.0
+        full_duration = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / fps
+        start = max(0.0, float(start or 0.0))
+        end = full_duration if end is None else min(full_duration, max(start, float(end)))
+        cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+        limit = max(1, int(math.ceil((end - start) * fps)) + 2)
+        previous = None
+        deltas = []
+        for _ in range(limit):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (96, 170)), cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                deltas.append(float(np.mean(cv2.absdiff(previous, gray))))
+            previous = gray
+        events = []
+        for index in range(2, len(deltas) - 2):
+            neighbours = deltas[index - 2:index] + deltas[index + 1:index + 3]
+            baseline = float(np.median(neighbours))
+            if baseline > 1.0 and deltas[index] < baseline * float(ratio):
+                events.append(round(start + (index + 1) / fps, 3))
+        return events
+    except Exception:
+        return []
+    finally:
+        cap.release()
 
 
 def find_ffmpeg():
@@ -2949,8 +3081,23 @@ def build_sfx_segments(config, has_speech=False):
     other_events = [e for e in events if e.get("category") != "analog_transitions"]
     allowed_other = max(0, max_events - len(transition_events))
     result = transition_events + sorted(other_events, key=lambda e: e["start"])[:allowed_other]
-    if content_on:
-        content_segments = ai_content_sfx_segments(config)
+    planned_segments = ai_content_sfx_segments(config)
+    if config.get("scrape_transition_only_sfx") and not config.get("timeline_editor_render"):
+        approved_editorial = {
+            "hook_riser", "bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click",
+        }
+        # Defense in depth for reruns of older projects: even if their saved config still
+        # contains impacts/foley/ambient events, a fresh Clip Short render cannot mix them.
+        planned_segments = [segment for segment in planned_segments
+                            if segment.get("category") in approved_editorial]
+    transition_categories = {
+        "hook_riser", "bright_whoosh", "swipe_whoosh",
+        "caption_pop", "ui_click", "analog_transitions",
+    }
+    content_segments = [segment for segment in planned_segments
+                        if ((segment.get("category") in transition_categories and transition_on)
+                            or (segment.get("category") not in transition_categories and content_on))]
+    if content_segments:
         # The ~2s cap keeps a FRESH scrape render from picking up a stale generated room tone/drone.
         # It must NOT apply to a timeline-editor render: there every ai_content_sfx event is
         # user-curated (shown, kept, moved and tuned in the editor), so capping it silently drops a
@@ -2962,7 +3109,8 @@ def build_sfx_segments(config, has_speech=False):
             # never a stale generated room tone/drone. Cap each at ~2s so nothing long sneaks in.
             content_segments = [
                 segment for segment in content_segments
-                if float(segment.get("duration") or 0) <= 2.1
+                if segment.get("category") == "hook_riser"
+                or float(segment.get("duration") or 0) <= 2.1
             ]
         result.extend(content_segments)
     result.extend(explicit_segments)
@@ -3254,6 +3402,8 @@ def render_video(config, basename=None):
     use_clips = bool(config.get("use_seedance_clips", True))
     clips = {}
     clip_continuity_offsets = {}
+    clip_start_trims = {}
+    checked_clip_windows = {}
     if use_clips:
         manifest_map = seedance_manifest_map(clip_dir)
         previous_identity = None
@@ -3266,13 +3416,50 @@ def render_video(config, basename=None):
             path = scene_clip_path(config, scene, i, clip_dir=clip_dir, manifest_map=manifest_map)
             if path and path.exists():
                 scene_id = scene.get("id", str(i))
-                clips[scene_id] = SceneClip(path)
+                clip_obj = SceneClip(path)
                 identity = str(scene.get("scrape_clip_id") or path.resolve())
                 if config.get("clip_source") == "scrape" and identity == previous_identity:
                     offset = previous_offset + previous_duration
                 else:
                     offset = 0.0
                 clip_continuity_offsets[scene_id] = offset
+                start_trim = seedance_clip_start_trim(config, scene)
+                scene_duration = max(0.1, float(scene.get("end", 0)) - float(scene.get("start", 0)))
+                usable_duration = max(0.0, clip_obj.duration - start_trim - offset)
+                # Never stretch or loop a too-short video into a frozen/glitchy tail.
+                if usable_duration + 0.08 < scene_duration:
+                    clip_obj.release()
+                    for existing_clip in clips.values():
+                        existing_clip.release()
+                    raise RuntimeError(
+                        f"Render blocked: clip for scene {scene_id} has only "
+                        f"{usable_duration:.2f}s available for a {scene_duration:.2f}s scene.")
+                window_start = max(0.0, start_trim + offset)
+                window_end = min(clip_obj.duration, window_start + scene_duration)
+                window_key = (str(path.resolve()).lower(), round(window_start, 3), round(window_end, 3))
+                if window_key not in checked_clip_windows:
+                    checked_clip_windows[window_key] = repeated_frame_stall_seconds(
+                        path, window_start, window_end)
+                stall = checked_clip_windows[window_key]
+                if stall >= 0.15:
+                    clip_obj.release()
+                    for existing_clip in clips.values():
+                        existing_clip.release()
+                    raise RuntimeError(
+                        f"Render blocked: scene {scene_id} contains a {stall:.2f}s repeated-frame "
+                        "stall. Replace or retrim this clip; the app will not render visible lag.")
+                cadence_hitches = micro_stutter_events(path, window_start, window_end)
+                if cadence_hitches:
+                    clip_obj.release()
+                    for existing_clip in clips.values():
+                        existing_clip.release()
+                    shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
+                    raise RuntimeError(
+                        f"Render blocked: scene {scene_id} contains isolated duplicate-frame "
+                        f"hitches at source time {shown}. Replace or retrim this clip; the app "
+                        "will not render recurring micro-lag.")
+                clips[scene_id] = clip_obj
+                clip_start_trims[scene_id] = start_trim
                 previous_identity = identity
                 previous_offset = offset
                 previous_duration = max(0.0, float(scene.get("end", 0)) - float(scene.get("start", 0)))
@@ -3333,11 +3520,19 @@ def render_video(config, basename=None):
             manual_mirror = bool(scene.get("timeline_mirror"))
             if use_clip_frame:
                 fx = scene.get("fx") or {}
-                source_time = local + clip_continuity_offsets.get(scene_id, 0.0)
+                clip_obj = clips[scene_id]
+                speed_factor = 1.0
+                
+                source_time = (local * speed_factor) + clip_continuity_offsets.get(scene_id, 0.0)
+                
                 # freeze-frame emphasis: briefly hold the scene's first frame on a reveal beat
-                if fx.get("freeze_frame") and local < min(0.4, scene_duration * 0.3):
+                if (fx.get("freeze_frame") and bool(config.get("allow_freeze_frame_fx", False))
+                        and local < min(0.4, scene_duration * 0.3)):
                     source_time = clip_continuity_offsets.get(scene_id, 0.0)
-                _hold_last = config.get("clip_source") == "scrape"
+                
+                # The user specifically requested that clips should NEVER freeze into a static image
+                # (Standbild), even for scraped footage. We always loop it instead.
+                _hold_last = False
                 # target-anchored punch-in zoom + smart reframe (keeps the proof subject in frame)
                 punch = fx.get("punch_in") if isinstance(fx.get("punch_in"), dict) else None
                 if punch and punch.get("enabled", True):
@@ -3355,8 +3550,8 @@ def render_video(config, basename=None):
                     if fno < 6:
                         amp = 11.0 * (1.0 - fno / 6.0)
                         ox += int(amp * math.sin(frame_no * 2.3)); oy += int(amp * math.cos(frame_no * 1.9))
-                clip_frame = clips[scene_id].frame_trimmed(
-                    source_time, seedance_clip_start_trim(config, scene), hold_last=_hold_last)
+                clip_frame = clips[scene_id].frame_trimmed_smooth(
+                    source_time, clip_start_trims.get(scene_id, 0.0), hold_last=_hold_last)
                 if manual_mirror:
                     clip_frame = ImageOps.mirror(clip_frame)
                 img = image_fit_cover(clip_frame, (width, height), zoom=zoom_c, offset=(ox, oy))

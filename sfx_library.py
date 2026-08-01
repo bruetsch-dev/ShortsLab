@@ -28,6 +28,9 @@ TRIM_DIR = ROOT / "generated_assets" / "sfx_trimmed"
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 SCAN_DIRS = ["soundeffects", "assets/sfx", "public/sfx", "project_assets/sfx",
              "uploaded_sfx", "reference_sfx", "sfx"]
+# Permanently excluded from every automatic SFX pool after listening review. Keep the original
+# files on disk for provenance, but never classify, trim, route or auto-place them again.
+AUTO_NEVER_USE = {"whoosh-sfx.mp3", "swoosh-sound-effects.mp3"}
 
 # The 16-category viral-documentary map (order = report order).
 SFX_CATEGORIES = ["bright_whoosh", "swipe_whoosh", "whoosh_hit_combo", "impact_hit", "low_impact",
@@ -289,7 +292,8 @@ def route_by_labels(data, meme_enabled=False):
 
 # Manual filename hints from the user (stem without extension) -> (category, policy).
 SFX_HINTS = {
-    "swoosh-sound-effects": ("swipe_whoosh", "core"),
+    "swoosh-sound-effects": ("disabled_by_default", "disabled_by_default"),
+    "whoosh-sfx": ("disabled_by_default", "disabled_by_default"),
     "woosh-sound-effect": ("bright_whoosh", "core"),
     "bubble-hitsound": ("caption_pop", "core"),
     "pop-sfx": ("caption_pop", "core"),
@@ -456,7 +460,9 @@ def _scan_files():
         if not folder.exists():
             continue
         for p in sorted(folder.rglob("*")):
-            if p.is_file() and p.suffix.lower() in AUDIO_EXTS and "sfx_trimmed" not in p.parts:
+            if (p.is_file() and p.suffix.lower() in AUDIO_EXTS
+                    and "sfx_trimmed" not in p.parts
+                    and p.name.lower() not in AUTO_NEVER_USE):
                 found.append(p)
     # de-dupe by name (first folder wins)
     seen, uniq = set(), []

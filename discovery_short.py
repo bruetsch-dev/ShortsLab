@@ -19,7 +19,7 @@ import pipeline
 
 log = agent_core.log
 
-MIN_SRC_SECONDS = 45          # "long" TikTok: a real process, not a 10s clip
+MIN_SRC_SECONDS = 60          # "long" TikTok: a real process, not a 10s clip
 MAX_SRC_SECONDS = 600
 SHEET_FRAMES = 24
 MAX_CANDIDATES_TRIED = 12
@@ -245,6 +245,8 @@ def _search_long(queries, status_cb=None, min_seconds=None, want=12, per_author=
                 pass
             if not author or dur < (min_seconds or MIN_SRC_SECONDS) or dur > MAX_SRC_SECONDS:
                 continue
+            if it.get("imagePost"):
+                continue
             likes = 0
             try:
                 likes = int((it.get("stats") or {}).get("diggCount") or 0)
@@ -381,12 +383,13 @@ def _prescreen_story(cands, reasoning_model, status_cb=None, keep=22):
 
 
 def _probe_technical(path, status_cb=None):
-    """Objective, LLM-free quality probe: letterbox share + real scene changes per minute.
+    """Objective, LLM-free quality probe: letterbox, cadence and repeated-frame stalls.
 
     Catches two failures the vision pass kept waving through: videos that are mostly black
     bars (unusable as a 9:16 short) and single-shot talking heads (no visual story)."""
     ff = pipeline.find_ffmpeg()
-    out = {"letterbox": 0.0, "cuts_per_min": 0.0}
+    out = {"letterbox": 0.0, "cuts_per_min": 0.0, "frozen_run_seconds": 0.0,
+           "micro_stutter_count": 0}
     try:
         r = subprocess.run([ff, "-hide_banner", "-t", "40", "-i", str(path),
                             "-vf", "cropdetect=24:2:0", "-f", "null", "-"],
@@ -412,17 +415,28 @@ def _probe_technical(path, status_cb=None):
         out["cuts_per_min"] = round(cuts * 60.0 / max(1.0, secs), 1)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        # Reuse the frame-cadence detector from Scrape V2. Discovery downloads a complete
+        # source, so inspect at most its first minute before paying for a vision review.
+        import scrape_v2
+        scan = min(60.0, _video_duration(path) or 60.0)
+        out["frozen_run_seconds"] = round(
+            float(scrape_v2._detect_duplicate_frame_run(path, 0.0, scan)), 3)
+        out["micro_stutter_count"] = len(pipeline.micro_stutter_events(path, 0.0, scan))
+    except Exception:  # noqa: BLE001 - objective QA is best effort
+        pass
     return out
 
 
 def _is_portrait(path):
+    """Require a genuine native 9:16 source, not merely any portrait-shaped upload."""
     ffp = pipeline.find_ffprobe(pipeline.find_ffmpeg())
     r = subprocess.run([ffp, "-v", "error", "-select_streams", "v:0", "-show_entries",
                         "stream=width,height", "-of", "csv=p=0", str(path)],
                        capture_output=True, text=True)
     try:
         w, h = (int(x) for x in r.stdout.strip().split(",")[:2])
-        return h > w
+        return h > w and abs((w / float(h)) - (9.0 / 16.0)) <= 0.04
     except (ValueError, AttributeError):
         return False
 
@@ -685,9 +699,11 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
         "on screen in that window (objects, materials, colors, hands) - the narration will be "
         "written from these descriptions, so anything you invent will desync voice and video. "
         "Mark is_reveal=true on the stage that shows the FINISHED product (the payoff shot); "
-        "if the finished product never appears, mark none. Calibrate appeal honestly: 9-10 = "
-        "exceptional and rare, 7-8 = good, 6 = usable, below = reject (static, text-card, "
-        "talking head, unclear).")
+        "if the finished product never appears, mark none. Calibrate appeal honestly and be EXTREMELY STRICT: "
+        "9-10 = highly exciting, visually stunning, action-packed or unusually fascinating, you would stop scrolling instantly. "
+        "8 = great material, very engaging. "
+        "7 or below = reject (boring, static, text-card, talking head, generic, slow). "
+        "We ONLY want candidates that will make an EXCITING video.")
     data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
                                   reasoning_model=reasoning_model)
     stages = []
@@ -706,7 +722,7 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
     return data
 
 
-def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process"):
+def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process", feedback=None):
     """LLM: write the mini-short narration; every sentence is tied to one visual stage."""
     stages = analysis["stages"]
     # Stages whose description claims movement a contact sheet cannot prove. Marking them
@@ -748,7 +764,8 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
         + (f"\nThe reveal stage is index {reveal_idx}." if reveal_idx is not None
            else "\nNo reveal stage exists: never describe the finished product's look."))
     user_p = (f"Video: {analysis.get('topic_title')}\nStages:\n{stage_lines}"
-              + (f"\nUser's direction: {hint}" if hint else ""))
+              + (f"\nUser's direction: {hint}" if hint else "")
+              + (f"\nCRITICAL FEEDBACK FROM PREVIOUS RUN: {feedback} YOU MUST MAKE THE OFFENDING SENTENCES SIGNIFICANTLY SHORTER OR REWRITE THEM ENTIRELY TO FIT!" if feedback else ""))
     if style == "story":
         # Mini-mode auto discovery: DUBBING-style voiceover over a skit/story with Asian
         # women/couples (user prompt 2026-07-24: professional voiceover writer + video
@@ -796,7 +813,8 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
                   + (f"\nOriginal dialogue (timestamped English translation):\n{transcript}"
                      if transcript else "\n(No usable dialogue transcript - rely on the "
                                         "beats and keep dubbing to visible reactions.)")
-                  + (f"\nUser's direction: {hint}" if hint else ""))
+                  + (f"\nUser's direction: {hint}" if hint else "")
+                  + (f"\nCRITICAL FEEDBACK FROM PREVIOUS RUN: {feedback} YOU MUST MAKE THE OFFENDING SENTENCES SIGNIFICANTLY SHORTER!" if feedback else ""))
     data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
         max_tokens=1200, temperature=0.6 if style == "story" else 0.5)
@@ -975,6 +993,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
     Discovery (craft/process docs); style="story" = the MINI mode's automatic discovery
     (user 2026-07-23): skits/stories with Japanese/Korean/Chinese women or couples,
     activated when the mini script AND topic are empty (never a selectable option)."""
+    # Discovery bypasses agent_core.run_project, so it must establish the same proven
+    # scrape voice profile itself. Preserve an explicit user override.
+    form.setdefault("clip_source", "scrape")
+    form.setdefault("voice_speed", agent_core.SCRAPE_VOICE_SPEED)
     cancel_event = form.get("_cancel_event")
 
     def _check_cancel():
@@ -1000,6 +1022,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
         # no 5-candidate gate, straight to analysis/build.
         entry = next((r for r in load_candidate_library() if r.get("url") == pinned_url), None)
         m_url = re.match(r"https?://www\.tiktok\.com/@([^/]+)/video/(\d+)", pinned_url)
+        _local = pinned_url if pinned_url.lower().endswith(".mp4") and Path(pinned_url).exists() else ""
+        
         candidates = [{
             "id": str((entry or {}).get("id") or (m_url.group(2) if m_url else "pinned")),
             "author": str((entry or {}).get("author") or (m_url.group(1) if m_url else "")),
@@ -1007,10 +1031,9 @@ def run_discovery_short(form, status_cb=None, style="process"):
             "dur": int((entry or {}).get("dur") or 0),
             "desc": str((entry or {}).get("desc") or ""), "query": "library",
             "url": pinned_url,
-            "local_file": str((entry or {}).get("file") or ""),
+            "local_file": str((entry or {}).get("file") or _local),
         }]
-        log(status_cb, f"Discovery: using the saved library candidate "
-                       f"@{candidates[0]['author']} - no search needed.")
+        log(status_cb, f"Discovery: using pinned candidate (local_file={candidates[0]['local_file']})")
     else:
         queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
         _check_cancel()
@@ -1054,15 +1077,25 @@ def run_discovery_short(form, status_cb=None, style="process"):
         if not path or not _is_portrait(path):
             log(status_cb, "Discovery: skipped (download failed or not portrait 9:16).")
             continue
-        tech = {}
+        # Objective gate BEFORE paying for a vision call. This applies to BOTH discovery
+        # variants; the old process mode only checked the dimensions and could accept a
+        # technically broken portrait upload.
+        tech = _probe_technical(path, status_cb)
+        if tech.get("letterbox", 0) > 0.22:
+            log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                           f"{tech['letterbox']*100:.0f}% letterbox/black bars.")
+            continue
+        if tech.get("frozen_run_seconds", 0) >= 0.15:
+            log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                           f"{tech['frozen_run_seconds']:.2f}s repeated-frame stall.")
+            continue
+        if tech.get("micro_stutter_count", 0):
+            log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                           f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es).")
+            continue
         if style == "story" and not pinned_url:
-            # objective gate BEFORE paying for a vision call: black bars = unusable as a
-            # 9:16 short, no scene changes = a talking head with no visual story.
-            tech = _probe_technical(path, status_cb)
-            if tech.get("letterbox", 0) > 0.22:
-                log(status_cb, f"Discovery: skipped @{cand['author']} - "
-                               f"{tech['letterbox']*100:.0f}% letterbox/black bars.")
-                continue
+            # No scene changes = a talking head with no visual story. Process footage may
+            # legitimately contain a long uninterrupted craft shot, so this is story-only.
             # Calibrated on the real 2026-07-25 pool: a one-camera prank with strong
             # reactions measures ~2 cuts/min and is still good, so cuts are a RANKING
             # signal, not a gate. Only a literally single-shot video is rejected here.
@@ -1072,8 +1105,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
                 continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
-        _min_appeal = 0 if pinned_url else (7 if style == "story" else 6)
-        if (not pinned_url and not info.get("is_process"))                 or float(info.get("appeal") or 0) < _min_appeal                 or len(info["stages"]) < 3:
+        _min_appeal = 0 if pinned_url else 8
+        if (not pinned_url and not info.get("is_process")) \
+                or float(info.get("appeal") or 0) < _min_appeal \
+                or len(info["stages"]) < 3:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
         accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet,
@@ -1153,117 +1188,139 @@ def run_discovery_short(form, status_cb=None, style="process"):
                        f"{accepted[sel]['info'].get('topic_title')}")
     chosen, src, analysis = accepted[sel]["cand"], accepted[sel]["src"], accepted[sel]["info"]
 
-    if style == "story":
-        # the writer dubs the ACTUAL dialogue - transcribe the chosen source first
-        analysis["transcript"] = _transcribe_source(src, status_cb)
-    plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style)
-    script = plan["script"]
-    slug = re.sub(r"[^a-z0-9_]+", "_", str(plan.get("slug") or plan.get("title") or "discovery")
-                  .lower()).strip("_")[:48] or "discovery"
-    slug = f"{slug}_{stamp}"
-    project_dir = agent_core.PROJECTS_DIR / slug
-    (project_dir / "input").mkdir(parents=True, exist_ok=True)
-    log(status_cb, f"PROJECT_DIR|{project_dir}")
-    _mark_candidate_picked(chosen.get("id"), slug)
-    clip_dir = project_dir / "seedance 2.0"
-    clip_dir.mkdir(exist_ok=True)
-    (project_dir / "input" / "script.txt").write_text(script, encoding="utf-8")
-    src_final = clip_dir / "_discovery_source.mp4"
-    Path(src).replace(src_final)
-    # TikTok sources are HEVC - unplayable (black) in the timeline editor's player.
-    # Re-encode the project source to full-quality H.264 once; all cutting and the
-    # editor work from this file afterwards.
-    try:
-        ffp0 = pipeline.find_ffprobe(pipeline.find_ffmpeg())
-        _c = subprocess.run([ffp0, "-v", "error", "-select_streams", "v:0", "-show_entries",
-                             "stream=codec_name", "-of", "csv=p=0", str(src_final)],
-                            capture_output=True, text=True)
-        if (_c.stdout or "").strip().lower() != "h264":
-            _tmp = src_final.with_name("_discovery_source_h264.mp4")
-            subprocess.run([pipeline.find_ffmpeg(), "-y", "-loglevel", "error",
-                            "-i", str(src_final), "-c:v", "libx264", "-preset", "veryfast",
-                            "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
-                            "-movflags", "+faststart", str(_tmp)], check=True)
-            _tmp.replace(src_final)
-            log(status_cb, "Discovery: source re-encoded to H.264 (playable in the editor).")
-    except Exception as exc:  # noqa: BLE001
-        log(status_cb, f"Discovery: H.264 source conversion skipped ({exc}).")
-    (project_dir / "input" / "discovery_report.json").write_text(json.dumps({
-        "source": chosen, "analysis": analysis, "plan": plan}, indent=2, ensure_ascii=False),
-        encoding="utf-8")
+    import shutil
+    feedback = None
+    for attempt in range(3):
+        if style == "story" and "transcript" not in analysis:
+            analysis["transcript"] = _transcribe_source(src, status_cb)
+        plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style, feedback=feedback)
+        script = plan["script"]
+        slug = re.sub(r"[^a-z0-9_]+", "_", str(plan.get("slug") or plan.get("title") or "discovery")
+                      .lower()).strip("_")[:48] or "discovery"
+        slug = f"{slug}_{stamp}"
+        project_dir = agent_core.PROJECTS_DIR / slug
+        (project_dir / "input").mkdir(parents=True, exist_ok=True)
+        if attempt == 0:
+            log(status_cb, f"PROJECT_DIR|{project_dir}")
+        _mark_candidate_picked(chosen.get("id"), slug)
+        clip_dir = project_dir / "seedance 2.0"
+        clip_dir.mkdir(exist_ok=True)
+        (project_dir / "input" / "script.txt").write_text(script, encoding="utf-8")
+        src_final = clip_dir / "_discovery_source.mp4"
+        if not src_final.exists():
+            shutil.copy(src, src_final)
+        # TikTok sources are HEVC - unplayable (black) in the timeline editor's player.
+        # Re-encode the project source to full-quality H.264 once; all cutting and the
+        # editor work from this file afterwards.
+        try:
+            ffp0 = pipeline.find_ffprobe(pipeline.find_ffmpeg())
+            _c = subprocess.run([ffp0, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                 "stream=codec_name", "-of", "csv=p=0", str(src_final)],
+                                capture_output=True, text=True)
+            if (_c.stdout or "").strip().lower() != "h264":
+                _tmp = src_final.with_name("_discovery_source_h264.mp4")
+                subprocess.run([pipeline.find_ffmpeg(), "-y", "-loglevel", "error",
+                                "-i", str(src_final), "-c:v", "libx264", "-preset", "veryfast",
+                                "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+                                "-movflags", "+faststart", str(_tmp)], check=True)
+                _tmp.replace(src_final)
+                log(status_cb, "Discovery: source re-encoded to H.264 (playable in the editor).")
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Discovery: H.264 source conversion skipped ({exc}).")
+        (project_dir / "input" / "discovery_report.json").write_text(json.dumps({
+            "source": chosen, "analysis": analysis, "plan": plan}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
 
-    # Keep ALL initial downloads + where they came from (user rule 2026-07-23: "die
-    # initial downloads, also woher die clips kommen, sollen gesaved bleiben").
-    dl_dir = project_dir / "initial downloads"
-    dl_dir.mkdir(exist_ok=True)
-    sources = []
-    for j, a in enumerate(accepted):
-        entry = {k: a["cand"].get(k) for k in ("id", "url", "author", "likes", "dur", "desc")}
-        entry["title"] = str(a["info"].get("topic_title") or "")
-        entry["chosen"] = (j == sel)
-        if j == sel:
-            entry["file"] = "seedance 2.0/_discovery_source.mp4"
-            _update_candidate_file(a["cand"].get("id"), str(src_final))
-        else:
-            p = Path(a["src"])
-            if p.exists():
-                safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(entry.get("author") or "cand"))[:40]
-                dest = dl_dir / f"cand_{j}_{safe}.mp4"
-                try:
-                    p.replace(dest)
-                    entry["file"] = f"initial downloads/{dest.name}"
-                    _update_candidate_file(a["cand"].get("id"), str(dest))
-                except OSError:
-                    entry["file"] = str(p)
-        sources.append(entry)
-    (dl_dir / "sources.json").write_text(
-        json.dumps(sources, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Keep ALL initial downloads + where they came from (user rule 2026-07-23: "die
+        # initial downloads, also woher die clips kommen, sollen gesaved bleiben").
+        dl_dir = project_dir / "initial downloads"
+        dl_dir.mkdir(exist_ok=True)
+        sources = []
+        for j, a in enumerate(accepted):
+            entry = {k: a["cand"].get(k) for k in ("id", "url", "author", "likes", "dur", "desc")}
+            entry["title"] = str(a["info"].get("topic_title") or "")
+            entry["chosen"] = (j == sel)
+            if j == sel:
+                entry["file"] = "seedance 2.0/_discovery_source.mp4"
+                _update_candidate_file(a["cand"].get("id"), str(src_final))
+            else:
+                p = Path(a["src"])
+                if p.exists():
+                    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(entry.get("author") or "cand"))[:40]
+                    dest = dl_dir / f"cand_{j}_{safe}.mp4"
+                    try:
+                        p.replace(dest)
+                        entry["file"] = f"initial downloads/{dest.name}"
+                        _update_candidate_file(a["cand"].get("id"), str(dest))
+                    except OSError:
+                        entry["file"] = str(p)
+            sources.append(entry)
+        (dl_dir / "sources.json").write_text(
+            json.dumps(sources, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # ---- voiceover + word timings (same recipe as the hand-build factory)
-    _check_cancel()
-    wav = agent_core.generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
-    if not wav:
-        raise RuntimeError("Discovery: voiceover generation failed (TTS disabled or errored).")
-    words = _align_words(wav, script, status_cb)
-    if style == "story":
-        wav, words = _apply_voice_pauses(wav, words, plan["sentences"], status_cb)
-    (project_dir / "input" / "word_timings.json").write_text(json.dumps(words), encoding="utf-8")
-    total_vo = _video_duration(wav)
+        # ---- voiceover + word timings (same recipe as the hand-build factory)
+        _check_cancel()
+        wav = agent_core.generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
+        if not wav:
+            raise RuntimeError("Discovery: voiceover generation failed (TTS disabled or errored).")
+        words = _align_words(wav, script, status_cb)
+        if style == "story":
+            wav, words = _apply_voice_pauses(wav, words, plan["sentences"], status_cb)
+        (project_dir / "input" / "word_timings.json").write_text(json.dumps(words), encoding="utf-8")
+        total_vo = _video_duration(wav)
 
-    # ---- sentence spans over the voiceover (gapless; each ends where the next starts)
-    sentences = plan["sentences"]
-    counts = [len(s["text"].split()) for s in sentences]
-    aligned = sum(counts) == len(words)
-    bounds, wi = [], 0
-    if aligned:
-        for c in counts:
-            bounds.append((float(words[wi]["start"]), float(words[wi + c - 1]["end"])))
-            wi += c
-    else:  # fallback: split the voiceover evenly across sentences
-        step = total_vo / len(sentences)
-        bounds = [(i * step, (i + 1) * step) for i in range(len(sentences))]
-    spans = [(bounds[i][0] if i else 0.0,
-              bounds[i + 1][0] if i + 1 < len(bounds) else total_vo)
-             for i in range(len(bounds))]
+        # ---- sentence spans over the voiceover (gapless; each ends where the next starts)
+        sentences = plan["sentences"]
+        counts = [len(s["text"].split()) for s in sentences]
+        aligned = sum(counts) == len(words)
+        bounds, wi = [], 0
+        if aligned:
+            for c in counts:
+                bounds.append((float(words[wi]["start"]), float(words[wi + c - 1]["end"])))
+                wi += c
+        else:  # fallback: split the voiceover evenly across sentences
+            step = total_vo / len(sentences)
+            bounds = [(i * step, (i + 1) * step) for i in range(len(sentences))]
+        spans = [(bounds[i][0] if i else 0.0,
+                  bounds[i + 1][0] if i + 1 < len(bounds) else total_vo)
+                 for i in range(len(bounds))]
 
-    # ---- caption track (word timings RELATIVE to the row start - render re-anchors them).
-    # Built from whatever word list we have: script-aligned tokens normally, raw whisper
-    # tokens on a mismatch - the short must never render caption-less.
-    caption_track = []
-    # word-by-word rule (user 2026-07-23): 4+ char words alone, short words grouped
-    sizes = pipeline.caption_chunk_sizes([w["word"] for w in words])
-    wi = 0
-    for n in sizes:
-        ch = words[wi:wi + n]
-        wi += n
-        if not ch:
+        # ---- caption track (word timings RELATIVE to the row start - render re-anchors them).
+        # Built from whatever word list we have: script-aligned tokens normally, raw whisper
+        # tokens on a mismatch - the short must never render caption-less.
+        caption_track = []
+        # word-by-word rule (user 2026-07-23): 4+ char words alone, short words grouped
+        sizes = pipeline.caption_chunk_sizes([w["word"] for w in words])
+        wi = 0
+        for n in sizes:
+            ch = words[wi:wi + n]
+            wi += n
+            if not ch:
+                continue
+            s0 = float(ch[0]["start"])
+            caption_track.append({
+                "start": round(s0, 3), "end": round(float(ch[-1]["end"]) + 0.04, 3),
+                "text": " ".join(w["word"] for w in ch),
+                "word_timings": [{"word": w["word"], "start": round(float(w["start"]) - s0, 3),
+                                  "end": round(float(w["end"]) - s0, 3)} for w in ch]})
+
+        # ---- Check if script is too long for the video material
+        stages = analysis["stages"]
+        offending = []
+        for i, sent in enumerate(sentences):
+            a, b = spans[i]
+            d = round(b - a, 2)
+            st = stages[sent["stage"]]
+            avail = max(0.5, float(st["end"]) - float(st["start"]))
+            if d > avail + 0.05:
+                offending.append(f"Sentence {i} ('{sent['text']}') took {d}s to speak, but stage {sent['stage']} only has {avail}s of video.")
+        
+        if offending and attempt < 2:
+            feedback = " ".join(offending)
+            log(status_cb, f"Discovery: Script too long for video material! Retrying ({attempt+1}/3)...")
             continue
-        s0 = float(ch[0]["start"])
-        caption_track.append({
-            "start": round(s0, 3), "end": round(float(ch[-1]["end"]) + 0.04, 3),
-            "text": " ".join(w["word"] for w in ch),
-            "word_timings": [{"word": w["word"], "start": round(float(w["start"]) - s0, 3),
-                              "end": round(float(w["end"]) - s0, 3)} for w in ch]})
+        else:
+            break
 
     # ---- recut the long source: each sentence gets footage from ITS process stage
     ff = pipeline.find_ffmpeg()
@@ -1275,8 +1332,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
     _probe = subprocess.run([ffp, "-v", "error", "-select_streams", "a", "-show_entries",
                              "stream=codec_type", "-of", "csv=p=0", str(src_final)],
                             capture_output=True, text=True)
-    _src_has_audio = style == "story" and "audio" in (_probe.stdout or "")
-    _src_cuts = _source_cut_times(src_final, ff) if style == "story" else []
+    # Match the proven Clip Short mix: no source/ambient bed under the narration. Keeping
+    # random TikTok room sound made otherwise clean renders feel noisy and inconsistent.
+    _src_has_audio = False
+    _src_cuts = _source_cut_times(src_final, ff)
     if _src_cuts:
         log(status_cb, f"Discovery: source cuts {len(_src_cuts)} times "
                        f"({len(_src_cuts) / max(1.0, total) * 60:.0f}/min).")
@@ -1302,13 +1361,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
         else:
             rate = max(0.5, round(avail / d, 3))
             take = avail
-        if i == 0 and style == "story" and _src_cuts and avail >= d - 0.01:
-            # HOOK: take the CALMEST stretch of the stage, not simply its opening. These
-            # sources cut 40-60 times a minute, so the first seconds of a stage can hold
-            # five shots in three seconds and the viewer reads nothing before swiping
-            # (user 2026-07-25). Measured on the maid-cafe source, this drops the hook
-            # from 5 shots to 3 without leaving the stage.
-            calm = _calmest_start(_src_cuts, st_start, st_end, d)
+        if _src_cuts and avail >= d - 0.01:
+            # FIND A CALM STRETCH: search forward from the current cursor (t0) for a window 
+            # with the fewest cuts, to avoid playing through a flurry of rapid original cuts.
+            calm = _calmest_start(_src_cuts, t0, st_end, d)
             if calm is not None:
                 t0 = calm
         name = f"disc_{i:02d}.mp4"
@@ -1364,7 +1420,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
             stage_cursor[sent["stage"]] = t0 + take
             vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
             if rate < 0.999:
-                vf += f",setpts=PTS/{rate}"
+                vf += f",setpts=PTS/{rate},minterpolate=mi_mode=blend"
             vf += ",fps=30"
             out_len = take / rate
             if out_len < d - 0.05:
@@ -1393,7 +1449,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
     # this pass decides how it is CUT. It marks repeated angles and over-long holds with a
     # punch_scale the renderer now honours, so a 5s sentence stops sitting on one static
     # frame. Opt-in via timeline_engine so the stage mapping stays the source of truth.
-    if form.get("timeline_engine", True):
+    if form.get("timeline_engine", False):
         try:
             from editing.timeline import MAX_STATIC, PUNCH_SCALES
             # SPLIT the long holds. Building a parallel timeline here marked nothing
@@ -1443,10 +1499,12 @@ def run_discovery_short(form, status_cb=None, style="process"):
         "caption_max_words": 3, "caption_uppercase": True,
         "canonical_words": words, "impact_word": str(plan.get("impact_word") or ""),
         "sfx_enabled": True, "render_sfx_enabled": True, "custom_sfx": [],
+        "sfx_content_enabled": False, "transition_sfx_enabled": True,
+        "scrape_transition_only_sfx": True,
         "hook_riser_file": "hook_riser3", "hook_riser_full_hook": True,
+        "voice_speed": agent_core.resolve_voice_speed(form, "scrape"),
         "background_music_enabled": False,
-        # DUAL AUDIO (story style, reference-video analysis): the cut clips keep the
-        # source's own sound and the mixer lays it quietly under the voiceover.
+        # Source audio is deliberately off: no uncontrolled TikTok ambient bed.
         "mix_seedance_audio_with_speech": _src_has_audio,
         "seedance_audio_volume_with_speech": 0.12,
         "smart_overlays": [], "timeline_overlays_managed": True,
@@ -1456,25 +1514,10 @@ def run_discovery_short(form, status_cb=None, style="process"):
     (project_dir / "config").mkdir(exist_ok=True)
     n_sfx = agent_core.place_editor_sfx(config, reasoning_model=reasoning_model,
                                         status_cb=status_cb)
-    # User rule 2026-07-23: discovery SFX = ONLY transition sounds (transition library:
-    # swipe/bright whoosh; combos swapped for a clean whoosh first) + the hook riser
-    # (pinned to hook_riser3 via config). Everything else (reactions, impacts, dings,
-    # pops, body risers...) is dropped completely.
-    events = list(config.get("ai_content_sfx") or [])
-    plain = [e for e in events if e.get("category") in ("swipe_whoosh", "bright_whoosh")]
-    for i, e in enumerate(events):
-        if e.get("category") == "whoosh_hit_combo" and plain:
-            donor = plain[i % len(plain)]
-            e["path"] = donor["path"]
-            e["category"] = donor["category"]
-            e["duration"] = donor["duration"]
-            e["source_trim"] = donor.get("source_trim", 0)
-            e["playback_rate"] = donor.get("playback_rate", 1)
-    _KEEP = {"swipe_whoosh", "bright_whoosh", "hook_riser"}
-    events = [e for e in events if str(e.get("category") or "") in _KEEP]
-    config["ai_content_sfx"] = events
+    # place_editor_sfx's transition-only profile now owns the whitelist: hook riser at
+    # exactly 0.0 plus restrained whoosh/swish/pop/click cut sounds, never semantic foley.
     log(status_cb, f"Discovery: placed {len(config['ai_content_sfx'])} local SFX "
-                   "(hook riser #3 + transition whooshes only).")
+                   "(hook riser + transition sounds only).")
     (project_dir / "config" / "project.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     _check_cancel()
@@ -1583,6 +1626,8 @@ def _mini_script(subject, descs, reasoning_model, status_cb=None):
 
 def run_mini_topic_short(form, status_cb=None):
     """Mini Story from a TOPIC only: material-first scripting over one subject cluster."""
+    form.setdefault("clip_source", "scrape")
+    form.setdefault("voice_speed", agent_core.SCRAPE_VOICE_SPEED)
     cancel_event = form.get("_cancel_event")
 
     def _check_cancel():
@@ -1607,8 +1652,6 @@ def run_mini_topic_short(form, status_cb=None):
     clip_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "input").mkdir(exist_ok=True)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
-    _mark_candidate_picked(chosen.get("id"), slug)
-
     seen, picked = set(), []
     for q in queries:
         try:
@@ -1749,7 +1792,10 @@ def run_mini_topic_short(form, status_cb=None):
         "caption_max_words": 3, "caption_uppercase": True,
         "canonical_words": words, "impact_word": str(plan.get("impact_word") or ""),
         "sfx_enabled": True, "render_sfx_enabled": True, "custom_sfx": [],
+        "sfx_content_enabled": False, "transition_sfx_enabled": True,
+        "scrape_transition_only_sfx": True,
         "hook_riser_file": "hook_riser3", "hook_riser_full_hook": True,
+        "voice_speed": agent_core.resolve_voice_speed(form, "scrape"),
         "background_music_enabled": False,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
@@ -1757,20 +1803,6 @@ def run_mini_topic_short(form, status_cb=None):
     agent_core.apply_caption_style_from_form(config, form)
     (project_dir / "config").mkdir(exist_ok=True)
     agent_core.place_editor_sfx(config, reasoning_model=reasoning_model, status_cb=status_cb)
-    # Same SFX whitelist as discovery (user rule 2026-07-23): ONLY transition whooshes
-    # (combos swapped for a clean whoosh first) + the pinned hook riser #3.
-    events = list(config.get("ai_content_sfx") or [])
-    plain = [e for e in events if e.get("category") in ("swipe_whoosh", "bright_whoosh")]
-    for i, e in enumerate(events):
-        if e.get("category") == "whoosh_hit_combo" and plain:
-            donor = plain[i % len(plain)]
-            e.update({"path": donor["path"], "category": donor["category"],
-                      "duration": donor["duration"],
-                      "source_trim": donor.get("source_trim", 0),
-                      "playback_rate": donor.get("playback_rate", 1)})
-    events = [e for e in events
-              if str(e.get("category") or "") in ("swipe_whoosh", "bright_whoosh", "hook_riser")]
-    config["ai_content_sfx"] = events
     (project_dir / "config" / "project.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     _check_cancel()

@@ -81,9 +81,9 @@ SCRAPE_V2_CONFIG = {
     "max_total_scrape_time_seconds": 1800,
     "vision_batch_size": 8,
     "max_segments_per_source": 3,
-    "target_segment_seconds": 2.3,
-    "min_segment_seconds": 1.4,
-    "max_segment_seconds": 3.8,
+    "target_segment_seconds": 3.8,
+    "min_segment_seconds": 2.2,
+    "max_segment_seconds": 5.5,
     "proxy_max_height": 720,
     "proxy_max_filesize_mb": 60,
     # assignment diversity / reuse caps
@@ -257,6 +257,8 @@ class SegmentCandidate:
     source_width: int = 0
     source_height: int = 0
     native_9_16: bool = False
+    frozen_run_seconds: float = 0.0
+    micro_stutter_count: int = 0
     # semantics (filled by vision)
     semantic_score: float = 0.0
     visual_description: dict = field(default_factory=dict)
@@ -1347,6 +1349,15 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
         seg.rejection_reasons = ["no_frames"]
         return seg
 
+    frozen_run = _detect_duplicate_frame_run(src, seg.start_time, seg.end_time)
+    seg.frozen_run_seconds = round(frozen_run, 3)
+    if frozen_run >= 0.15:
+        reasons.append("frozen_frames")
+    cadence_hitches = pipeline.micro_stutter_events(src, seg.start_time, seg.end_time)
+    seg.micro_stutter_count = len(cadence_hitches)
+    if cadence_hitches:
+        reasons.append("cadence_stutter")
+
     fv = clip_scraper.detect_fake_vertical_or_black_bars(src, ffmpeg, seconds=seg.end_time)
     black_bar = float(fv.get("black_bar_score", 0.0))
     if black_bar > SEGMENT_HARD_REJECT_BLACKBAR:
@@ -1397,6 +1408,44 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     seg.vertical_quality = round(vertical_quality, 2)
     seg.rejection_reasons = reasons
     return seg
+
+
+def _detect_duplicate_frame_run(path, start, end, pixel_delta=0.12):
+    """Return the longest near-identical frame run inside a source window.
+
+    This catches the tiny 5-6 frame stalls seen in otherwise valid TikToks. Sampling only five
+    thumbnails missed them, so QA reads the actual frame cadence at a tiny 160px working size.
+    """
+    if cv2 is None or np is None:
+        return 0.0
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return 0.0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        fps = fps if 5.0 <= fps <= 120.0 else 30.0
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(start)) * 1000.0)
+        max_frames = max(1, int(math.ceil(max(0.0, float(end) - float(start)) * fps)) + 2)
+        previous = None
+        current = longest = 0
+        for _ in range(max_frames):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                delta = float(np.mean(cv2.absdiff(previous, gray)))
+                if delta <= float(pixel_delta):
+                    current += 1
+                    longest = max(longest, current)
+                else:
+                    current = 0
+            previous = gray
+        return longest / fps
+    except Exception:
+        return 0.0
+    finally:
+        cap.release()
 
 
 def _sample_window_frames(path, ffmpeg, start, end, n=5):
@@ -1520,8 +1569,29 @@ def semantic_match_score(subject_match, action_match, location_match, mood_match
                  + mood_match * 0.10 + script_match * 0.20, 3)
 
 
-def match_class_for(overall, visual_type):
-    th = MATCH_THRESHOLDS_V2.get(visual_type, MATCH_THRESHOLDS_V2["context"])
+def match_thresholds_for_relevancy(visual_type, script_relevancy=70):
+    """Return the actual semantic floors for the user's relevance control.
+
+    V2 previously accepted a script_relevancy argument but never used it, so 90% behaved exactly
+    like 70%. Keep 70 as the calibrated baseline and tighten/relax smoothly around it.
+    """
+    base = MATCH_THRESHOLDS_V2.get(visual_type, MATCH_THRESHOLDS_V2["context"])
+    try:
+        rel = max(0.0, min(100.0, float(script_relevancy)))
+    except (TypeError, ValueError):
+        rel = 70.0
+    boost = (rel - 70.0) * 0.02
+    script_floor = float(base["script_floor"]) + boost
+    overall = float(base["overall"]) + boost * 0.75
+    if str(visual_type).lower() == "shock" and rel >= 80:
+        # Shock is a presentation strategy, not permission to use an unrelated meme.
+        script_floor = max(script_floor, 4.0 + (rel - 80.0) * 0.03)
+    return {"script_floor": round(max(1.5, min(9.0, script_floor)), 3),
+            "overall": round(max(3.5, min(9.0, overall)), 3)}
+
+
+def match_class_for(overall, visual_type, script_relevancy=70):
+    th = match_thresholds_for_relevancy(visual_type, script_relevancy)
     if overall >= 8.0:
         return "A_MATCH"
     if overall >= 7.0:
@@ -1531,8 +1601,8 @@ def match_class_for(overall, visual_type):
     return "D_REJECTED"
 
 
-def passes_match_floors(script_match, overall, visual_type):
-    th = MATCH_THRESHOLDS_V2.get(visual_type, MATCH_THRESHOLDS_V2["context"])
+def passes_match_floors(script_match, overall, visual_type, script_relevancy=70):
+    th = match_thresholds_for_relevancy(visual_type, script_relevancy)
     return script_match >= th["script_floor"] and overall >= th["overall"]
 
 
@@ -1740,8 +1810,9 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
             style_m = g("style_match")
             overall = semantic_match_score(subj, act, loc, mood, script_m)
             _cat = str(getattr(it, "match_category", "") or "").lower()
+            _rel = getattr(it, "script_relevancy", 70)
             if _cat == "shock":
-                th_s = MATCH_THRESHOLDS_V2["shock"]
+                th_s = match_thresholds_for_relevancy("shock", _rel)
                 try:
                     _absurd = float((seg.visual_description or {}).get("absurdity") or 0)
                 except (TypeError, ValueError):
@@ -1749,13 +1820,13 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                 if not (script_m >= th_s["script_floor"] and overall >= th_s["overall"]
                         and _absurd >= 6.0):
                     continue
-            elif not passes_match_floors(script_m, overall, it.visual_type):
+            elif not passes_match_floors(script_m, overall, it.visual_type, _rel):
                 continue
             scored.append({
                 "segment": seg, "subject_match": subj, "action_match": act, "location_match": loc,
                 "mood_match": mood, "script_match": script_m, "style_match": style_m,
                 "semantic_match": overall, "overall_match": overall,
-                "match_class": match_class_for(overall, it.visual_type),
+                "match_class": match_class_for(overall, it.visual_type, _rel),
                 "reason": str(c.get("reason", ""))[:160]})
             seg.semantic_score = max(seg.semantic_score, overall)
         scored.sort(key=lambda r: (r["overall_match"], r["segment"].quality_score), reverse=True)
@@ -1851,15 +1922,17 @@ def validate_scrape_render_v2(config, status_cb=None):
         vs = 0.0
     if not (0.999 <= vs <= 1.601):
         raise RuntimeError(f"Scrape V2 pre-render validation failed: voice_speed {config.get('voice_speed')} "
-                           "outside 1.0x-1.6x (default 1.30x, user-tunable at the speech gate)")
+                           "outside 1.0x-1.6x (default 1.10x, user-tunable at the speech gate)")
     for i, sc in enumerate(scenes):
         for ov in (sc.get("overlays") or []):
             if ov.get("type") in ("arrows", "highlight", "paper", "newspaper", "counter"):
                 raise RuntimeError("Scrape V2: untargeted/legacy overlay present")
             if ov.get("type") == "callout" and ov.get("shape") in ("circle", "stamp"):
                 raise RuntimeError(f"Scrape V2: circle/stamp overlay on scene {sc.get('id')}")
-    if (scenes[0].get("visual_role") or "") != "hook_influencer":
-        raise RuntimeError("Scrape V2: hook is not the first scene")
+    influencer_hook = bool(config.get("influencer_hook", False))
+    expected_role = "hook_influencer" if influencer_hook else "hook_topic"
+    if (scenes[0].get("visual_role") or "") != expected_role:
+        raise RuntimeError(f"Scrape V2: first scene is not the requested {expected_role} opener")
     emergency_scenes = 0
     for i, sc in enumerate(scenes):
         if not sc.get("clip"):
@@ -1876,6 +1949,8 @@ def validate_scrape_render_v2(config, status_cb=None):
             bbs = 0.0
         if sc.get("is_fake_vertical") or bbs > SEGMENT_HARD_REJECT_BLACKBAR:
             raise RuntimeError(f"Scrape V2: scene {i} massive black bars (score={bbs})")
+        if sc.get("native_9_16") is not True:
+            raise RuntimeError(f"Scrape V2: scene {i} is not native 9:16 footage")
     # A couple of emergency scenes are tolerable; a MAJORITY means the matcher collapsed and
     # the video would be mostly random off-topic footage - refuse to render that.
     if emergency_scenes * 2 > len(scenes):
@@ -2146,7 +2221,9 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
                 for r in seg.rejection_reasons:
                     key = {"massive_black_bars": "black_bars", "ai_watermark": "ai_content",
                            "burned_caption_over_subject": "burned_captions",
-                           "rapid_internal_cuts": "rapid_edits"}.get(r, r)
+                            "rapid_internal_cuts": "rapid_edits",
+                            "frozen_frames": "micro_freezes",
+                            "cadence_stutter": "micro_stutters"}.get(r, r)
                     rej[key] = rej.get(key, 0) + 1
                 continue
             if seg.quality_score < SEGMENT_MIN_QUALITY:
@@ -2173,10 +2250,21 @@ def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
     out_dir = Path(project_dir) / "seedance 2.0"
     key = hashlib.sha1(seg.segment_id.encode("utf-8", "ignore")).hexdigest()[:10]
     dest = out_dir / ("v2seg_" + key + ".mp4")
-    final = clip_scraper.normalize_clip(seg.source_path, dest, ffmpeg, seconds=want,
-                                        start=seg.start_time)
+    ffprobe = clip_scraper._ffmpeg_tools()[1]
+    source_duration = float(clip_scraper._probe_duration(seg.source_path, ffprobe) or 0.0)
+    start = float(seg.start_time or 0.0)
+    if source_duration > 0:
+        if source_duration + 0.05 < want:
+            return ""
+        start = min(start, max(0.0, source_duration - want - 0.03))
+    final = clip_scraper.normalize_clip(seg.source_path, dest, ffmpeg, seconds=want, start=start)
     seg.final_path = str(final) if final else ""
     if final:
+        final_duration = float(clip_scraper._probe_duration(final, ffprobe) or 0.0)
+        if final_duration + 0.08 < want:
+            Path(final).unlink(missing_ok=True)
+            seg.final_path = ""
+            return ""
         seg._final_secs = want
     return seg.final_path
 
@@ -2474,8 +2562,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     ffmpeg, ffprobe = clip_scraper._ffmpeg_tools()
     state = {"rejections": {}, "scene_reports": [], "_downloaded_ids": set()}
 
+    # The strongest reference edits use native portrait footage. Cropping landscape X clips often
+    # made the subject unrecognisable; all Clip Shorts now reject those before vision matching.
+    state["native_vertical_only"] = True
+    _log(status_cb, "Scrape V2 quality profile: native 9:16 footage only.")
     if str(config.get("clip_short_format") or "").lower() == "mini_story":
-        state["native_vertical_only"] = True
         understanding = dict(understanding or {})
         understanding.setdefault(
             "editorial_format",
@@ -2491,6 +2582,13 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     intents = build_viral_search_plan_v2(config.get("title") or "", script_text or "", scenes,
                                          understanding=understanding, reasoning_model=reasoning_model,
                                          status_cb=status_cb)
+    try:
+        _relevancy = max(0, min(100, int(float(script_relevancy))))
+    except (TypeError, ValueError):
+        _relevancy = 90
+    for _intent in intents:
+        # Kept on the intent so every normal, retry and rescue matcher call uses the same floor.
+        _intent.script_relevancy = _relevancy
     _ref_rules = str(config.get("pipeline_version") or "v0.2") != "v0.1"
     if _ref_rules:
         # v0.2 MULTI-CLIP PER SENTENCE: sub-beats split from one sentence (scene["beat_group"])
@@ -2521,8 +2619,14 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             intents = sorted(_by_id.values(), key=lambda x: x.scene_id)
             _log(status_cb, f"v0.2 pacing: {_prop} sub-beat(s) share their sentence's intent "
                             "(top candidates will spread across them).")
-    body_intents = [it for it in intents if it.scene_id != 0]
-    hook_intent = next((it for it in intents if it.scene_id == 0), None)
+    use_influencer_hook = bool(config.get("influencer_hook", False))
+    body_intents = ([it for it in intents if it.scene_id != 0]
+                    if use_influencer_hook else list(intents))
+    hook_intent = (next((it for it in intents if it.scene_id == 0), None)
+                   if use_influencer_hook else None)
+    _log(status_cb, "Scrape V2 hook mode: " + (
+        "optional cute/dance presenter (20K+ likes)." if use_influencer_hook
+        else "topic-matched footage; no presenter search."))
 
     scene_candidates = {}
     seen_source_ids = set()
@@ -2606,7 +2710,10 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 hook_sources = []
             hi_likes = int(getattr(_ac(), "HOOK_MIN_LIKES", 20000) or 20000)
             filt = [s for s in hook_sources if int(getattr(s, "likes", 0) or 0) >= hi_likes]
-            hook_sources = (filt or hook_sources)[:10]
+            hook_sources = filt[:10]
+            if not hook_sources:
+                _log(status_cb, f"Scrape V2 hook: no candidate met the strict {hi_likes:,}-like floor; "
+                                "the app will not substitute a low-engagement cute/dance clip.")
             if hook_sources:
                 hook_presenter_segments = _download_and_segment(
                     hook_sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
@@ -2933,9 +3040,13 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         # rank the remaining pool by relevance to THIS scene
         ranked_spare = sorted(spare, key=lambda s: _spare_relevance(s, it), reverse=True)
         fresh = [s for s in ranked_spare if _src_use.get(s.source_id, 0) < _src_cap]
+        fallback_floor = max(
+            CONTEXT_FALLBACK_MIN_RELEVANCE,
+            match_thresholds_for_relevancy(it.visual_type, getattr(it, "script_relevancy", 70))["overall"] - 0.1,
+        )
         for s in fresh:
             rel = _spare_relevance(s, it)
-            if rel >= CONTEXT_FALLBACK_MIN_RELEVANCE and s.quality_score >= CONTEXT_FALLBACK_MIN_QUALITY:
+            if rel >= fallback_floor and s.quality_score >= CONTEXT_FALLBACK_MIN_QUALITY:
                 chosen = s
                 break
         # Never turn a rejected/zero-score clip into rendered footage merely to fill a slot.
@@ -3005,6 +3116,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         sc["fallback_level"] = flevel
         if visual_role:
             sc["visual_role"] = visual_role
+        elif scene_idx == 0:
+            sc["visual_role"] = "hook_topic"
         scene_clips_out[scene_idx] = final
         _slog(project_dir, {
             "type": "assignment", "segment_id": seg.segment_id, "platform": seg.platform,
@@ -3044,11 +3157,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             pass
         return True
 
-    if hook_intent is not None and hook_seg is not None:
+    if use_influencer_hook and hook_intent is not None and hook_seg is not None:
         if _write_scene(0, hook_seg, "exact", 0, hook_seg.semantic_score, "A_MATCH",
                         visual_role="hook_influencer"):
             hook_pool.append(hook_seg.final_path)
-    elif scenes:
+    elif use_influencer_hook and scenes:
         scenes[0]["visual_role"] = "hook_influencer"
 
     for it in body_intents:

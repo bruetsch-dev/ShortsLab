@@ -194,7 +194,7 @@ UI_TEXT_DEFAULTS = {
     "scrape_platforms": "tiktok,x,instagram",
     "scrape_terms": "",
     "background_music_choice": "none",
-    "script_relevancy": "70",
+    "script_relevancy": "90",
     "scrape_sort": "ALL",
     "scraping_engine": "v2",
     "sfx_amount": "medium",
@@ -209,6 +209,7 @@ UI_CHECKBOX_DEFAULTS = {
     "use_llm_search": True,
     "use_llm_video_review": True,
     "enable_speaker_hook": False,
+    "influencer_hook": False,
     "auto_web_images": True,
     "add_visual_effects": True,
     "add_meme_reactions": False,
@@ -317,7 +318,7 @@ PRESETS_PATH = ROOT / "presets.json"
 CUSTOM_PRESET_PATH = ROOT / "custom_preset.json"   # legacy single file (migrated in)
 
 # Read-only built-in preset: "found-footage" style like the Japan dark-facts short —
-# ALL AI generation off, clips come from a TikTok/Instagram scrape, loose relevancy.
+# ALL AI generation off; clips come from a strict, topic-matched social scrape.
 BUILTIN_PRESETS = {
     "\U0001F1EF\U0001F1F5 Facts about Japan": {
         "speaker_name": "Narrator", "tts_voice": "Charon", "tts_model": "pro",
@@ -327,11 +328,11 @@ BUILTIN_PRESETS = {
         "use_visual_direction": False, "enable_speaker_hook": False,
         # no generated images — the video layer is filled by scraped real clips
         "out_web_images": False, "out_wikimedia": False, "out_gpt_images": False,
-        "out_video_clips": True, "out_sfx": True, "out_transition_sfx": True,
-        "out_background_music": True, "out_captions": True, "halt_after_speech": False,
+        "out_video_clips": True, "out_sfx": False, "out_transition_sfx": True,
+        "out_background_music": False, "out_captions": True, "halt_after_speech": False,
         "clip_source": "scrape", "scrape_platforms": "tiktok,x,instagram",
         "scrape_terms": "japan, japanese women, tokyo street style, salaryman commute, japan daily life, kimono",
-        "script_relevancy": "30",
+        "script_relevancy": "90", "influencer_hook": False,
     },
 }
 
@@ -1899,13 +1900,23 @@ def app_script():
         window.wizBack = function () { var i = WIZ_STEPS.indexOf(wizCur); if (i <= 0) { wizGoto(0); return; } wizGoto(WIZ_STEPS[i - 1]); };
         window.selectMode = function (mode) {
           try { if (typeof playClick === "function") playClick(); } catch (e) {}
+          var fmt = document.querySelector('input[name="clip_short_format"]');
           if (mode === "reddit") { window.location.href = "/reddit"; return; }
           if (mode === "sfx") { window.location.href = "/sfx"; return; }
           if (mode === "captions") { window.location.href = "/captions"; return; }
           if (mode === "visual") { window.location.href = "/visual"; return; }
-          if (mode === "viraltrans") { window.location.href = "/viraltrans"; return; }
           if (mode === "longform") { window.location.href = "/longform"; return; }
-          wizGoto(1);   // Visuals From Script -> existing script workflow
+          
+          if (mode === "viraltrans") { 
+              if (fmt) fmt.value = "discovery";
+              // Skip the script step for Discovery mode
+              WIZ_STEPS = [3, 4];
+              wizGoto(3);
+              return; 
+          }
+          if (fmt) fmt.value = "standard";
+          WIZ_STEPS = [1, 3, 4];
+          wizGoto(1);   // Default Mode
         };
         function wizTypeIntro(cb) {
           var el = document.getElementById("wiz-type"); if (!el) { if (cb) cb(); return; }
@@ -2515,7 +2526,7 @@ def app_script():
             var state = collectFormState();
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","reasoning_mode","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","reasoning_mode","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","influencer_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -3341,41 +3352,16 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <div class="modemenu-grouplabel">&#9679; Make a new video</div>
           <div class="modemenu-cards">
             <button type="button" class="modemenu-card" onclick="selectMode('visuals')">
-              <span class="mm-head"><span class="mm-ico">&#127916;</span><span class="mm-title">A Video from a Script</span></span>
-              <span class="mm-desc">Turn a voice script into a full visual Short with the app pipeline.</span>
+              <span class="mm-head"><span class="mm-ico">&#127916;</span><span class="mm-title">Default Mode</span></span>
+              <span class="mm-desc">Fast-paced, high-retention pipeline with influencer hook (from script).</span>
             </button>
             <button type="button" class="modemenu-card" onclick="selectMode('viraltrans')">
-              <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">A Viral Short from a Topic</span></span>
-              <span class="mm-desc">Give one topic - the agents write, film, caption and voice it fully autonomously.</span>
-            </button>
-            <button type="button" class="modemenu-card" onclick="selectMode('reddit')">
-              <span class="mm-head"><span class="mm-ico">&#128172;</span><span class="mm-title">A Reddit Story Video</span></span>
-              <span class="mm-desc">A Reddit-style story over Minecraft parkour with an AI voiceover.</span>
-            </button>
-            <button type="button" class="modemenu-card" onclick="selectMode('longform')">
-              <span class="mm-head"><span class="mm-ico">&#127912;</span><span class="mm-title">A Longform Image Set</span></span>
-              <span class="mm-desc">Upload a prompt list - Higgsfield renders one 16:9 FLUX.2 Pro image per line, named by timestamp.</span>
+              <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">Discovery Mode</span></span>
+              <span class="mm-desc">Fully autonomous: finds a story, writes the script, and recuts perfectly.</span>
             </button>
           </div>
         </div>
-        <div class="modemenu-group">
-          <div class="modemenu-grouplabel">&#9679; Polish a finished video &middot; Masters</div>
-          <div class="modemenu-cards">
-            <button type="button" class="modemenu-card" onclick="selectMode('sfx')">
-              <span class="mm-head"><span class="mm-ico">&#128266;</span><span class="mm-title">Sound Effects</span></span>
-              <span class="mm-desc">Upload a finished Short and add editor SFX from the local library.</span>
-            </button>
-            <button type="button" class="modemenu-card" onclick="selectMode('visual')">
-              <span class="mm-head"><span class="mm-ico">&#10132;</span><span class="mm-title">Visual Effects</span></span>
-              <span class="mm-desc">Upload a Short - Opus 4.8 adds animated red arrows + fitting SFX.</span>
-            </button>
-            <button type="button" class="modemenu-card" onclick="selectMode('captions')">
-              <span class="mm-head"><span class="mm-ico">&#128172;&#65039;</span><span class="mm-title">Captions</span></span>
-              <span class="mm-desc">Upload a video and burn in viral word-by-word captions, fully locally.</span>
-            </button>
-          </div>
-        </div>
-      </div>
+
 
       <div class="create-bar panel" data-step="4">
         <div class="cbar-row cbar-top">
@@ -3435,7 +3421,9 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
             <input type="hidden" name="scrape_platforms" value="tiktok,x,instagram">
-            <input type="hidden" name="influencer_hook" value="on">
+            <label class="check"><input type="checkbox" name="influencer_hook" value="on">
+              <span><b>Cute dance hook (20K+ likes)</b><small>Optional. Off uses the strongest topic-matched opening clip.</small></span>
+            </label>
             <input type="hidden" name="scraping_engine" id="scraping-engine" value="v2">
             <div class="scrape-auto-note">&#129504; Search terms are derived from visual intent. TikTok handles native action/lifestyle searches; X receives only validated proof, event and exact-action phrases. The opening hook still requires 20K+ likes; body clips have no minimum-like gate. {help_tip("Body footage is ranked using your selected result order and still passes technical, caption and semantic quality gates.")}</div>
             <label class="scrape-lbl">Add your own terms (optional) {help_tip("Extra search terms on top of what the agent derives — they are ALWAYS included. Add English or Japanese words/hashtags (e.g. 原宿 ファッション). Press + or Enter to add.")}</label>
@@ -3520,8 +3508,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <span id="hook-indicator" class="hook-dot" hidden></span>
           </div>
           <div id="script-relevancy-block" style="display:none; margin-top:16px;">
-            <label class="scrape-lbl">Script relevancy <span id="relv-val" class="relv-val">{esc(state.get('script_relevancy') or '70')}%</span> {help_tip("Scrape mode only: how tightly the downloaded clips must match this spoken script versus pure visual style. High = clips closely follow what's being said. Low = prioritize the look (more b-roll of the vibe), looser tie to the words.")}</label>
-            <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '70')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
+            <label class="scrape-lbl">Script relevancy <span id="relv-val" class="relv-val">{esc(state.get('script_relevancy') or '90')}%</span> {help_tip("Scrape mode only: how tightly the downloaded clips must match this spoken script versus pure visual style. High = clips closely follow what's being said. Low = prioritize the look (more b-roll of the vibe), looser tie to the words.")}</label>
+            <input type="range" name="script_relevancy" id="script-relevancy" min="0" max="100" step="5" value="{esc(state.get('script_relevancy') or '90')}" oninput="document.getElementById('relv-val').textContent=this.value+'%';">
             <label class="scrape-lbl" for="scrape-sort">Search result order</label>
             <select name="scrape_sort" id="scrape-sort">
               <option value="ALL"{' selected' if state.get('scrape_sort') in (None, '', 'ALL') else ''}>All sortings (liked &rarr; relevance &rarr; viewed &rarr; recent)</option>
@@ -3561,6 +3549,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
             <select name="tts_model" style="flex:1; min-width:170px;">
               <option value="flash"{' selected' if sel_tts_model == 'flash' else ''}>Gemini 2.5 Flash TTS (cheaper)</option>
               <option value="pro"{' selected' if sel_tts_model == 'pro' else ''}>Gemini 2.5 Pro TTS (higher quality)</option>
+              <option value="gemini-3.1-flash"{' selected' if sel_tts_model == 'gemini-3.1-flash' else ''}>Gemini 3.1 Flash TTS (newest)</option>
             </select>
           </div>
           <audio id="voice-audio" preload="none"></audio>
@@ -3912,6 +3901,7 @@ def longform_page():
           <select name="tts_model">
             <option value="pro" selected>Gemini 2.5 Pro TTS (cleaner)</option>
             <option value="flash">Gemini 2.5 Flash TTS (cheaper)</option>
+            <option value="gemini-3.1-flash">Gemini 3.1 Flash TTS (newest)</option>
           </select>
         </div>
         <div class="panel">
@@ -4650,11 +4640,35 @@ def start_longform_job(fields, files):
     def worker():
         try:
             status_cb(f"Parsed {len(items)} prompt(s). Output -> {out_dir}")
-            status_cb("Opening your Higgsfield session (window stays hidden)...")
-            results = higgsfield_login.generate_batch(
-                items, out_dir, concurrency=concurrency, aspect=aspect, model=model, ext="png",
-                status_cb=status_cb, cancel_check=cancel_event.is_set)
-            ok = [r for r in results if r.get("path")]
+            status_cb("Opening the Higgsfield window - turn ON Unlimited once; generation "
+                      "starts automatically and never spends credits.")
+            if not higgsfield_login.begin_manual_session(
+                    model=model, aspect=aspect, status_cb=status_cb,
+                    cancel_check=cancel_event.is_set, timeout_s=1800):
+                if cancel_event.is_set():
+                    raise RunCancelled("Run cancelled by user.")
+                raise RuntimeError("Higgsfield Unlimited was not enabled in time.")
+
+            pool_items = []
+            for i, item in enumerate(items):
+                pool_items.append((
+                    i,
+                    item["prompt"],
+                    str(out_dir / f"{item['key']}.png"),
+                ))
+
+            completed = {"n": 0}
+
+            def on_done(idx, path):
+                completed["n"] += 1
+                item = items[int(idx)]
+                state = "saved" if path else "failed"
+                status_cb(f"[{completed['n']}/{len(items)}] {item['timestamp']} {state}")
+
+            pool_results = higgsfield_login.generate_pool_sync(
+                pool_items, k=concurrency, timeout_s=300, status_cb=status_cb,
+                cancel_check=cancel_event.is_set, on_done=on_done)
+            ok = [path for path in pool_results.values() if path]
             with JOB_LOCK:
                 if cancel_event.is_set():
                     JOBS[job_id]["status"] = "cancelled"
@@ -5103,7 +5117,7 @@ def start_longform_video_job(fields):
     job_id = str(int(time.time() * 1000))
     script = str(fields.get("script") or "").strip()
     tts_model = (fields.get("tts_model") or "pro").strip().lower()
-    if tts_model not in ("pro", "flash"):
+    if tts_model not in ("pro", "flash", "gemini-3.1-flash"):
         tts_model = "pro"
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
     reasoning_mode = fields.get("reasoning_mode")
@@ -6318,6 +6332,15 @@ def project_preview_kind(project_dir, report):
 def project_preview_image(project_dir, video):
     """A SINGLE representative frame (the opening = hook), cached once, instead of a busy
     contact-sheet grid. Falls back to one generated image, never a sheet."""
+    # A creator-picked thumbnail is authoritative. Do not silently replace it with a new
+    # poster frame when another render is made.
+    for suffix in (".png", ".jpg", ".jpeg", ".webp"):
+        custom = project_dir / ("thumbnail" + suffix)
+        try:
+            if custom.exists() and custom.stat().st_size > 1024:
+                return custom
+        except OSError:
+            pass
     cache = project_dir / "review" / "_preview.jpg"
     try:
         if cache.exists() and cache.stat().st_size > 1024:
@@ -6699,6 +6722,43 @@ TIMELINE_SKELETON = """
           <label class="tl-cap-toggle"><input type="checkbox" id="tl-captions"><span>Render with captions</span></label>
           <label class="tl-cap-toggle" title="Off = render with the voice only, no sound effects (content, transition, cut and added sounds are all muted)"><input type="checkbox" id="tl-sfx-toggle"><span>Render with sound effects</span></label>
           <label class="tl-cap-toggle" title="Re-encodes the finished render for a much smaller file. Stays full 1080p &mdash; just tighter compression (slower, and a touch softer on fine grain)."><input type="checkbox" id="tl-compress"><span>Compress for small file</span></label>
+          <div class="tl-project-media">
+            <div class="tl-project-media-title">Short packaging</div>
+            <div class="tl-thumb-control">
+              <div class="tl-thumb-preview" id="tl-thumb-preview"><span>9:16</span></div>
+              <div class="tl-project-media-copy">
+                <strong>Thumbnail</strong>
+                <small>Shown with this Short in your project library.</small>
+                <div class="tl-media-actions">
+                  <button type="button" class="button secondary" id="tl-thumb-upload">Upload</button>
+                  <button type="button" class="button secondary" id="tl-thumb-playhead">Create from playhead</button>
+                  <button type="button" class="button secondary tl-media-remove" id="tl-thumb-remove">Remove</button>
+                </div>
+              </div>
+              <input type="file" id="tl-thumb-file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden>
+            </div>
+            <div class="tl-thumb-maker">
+              <input type="text" id="tl-thumb-headline" maxlength="36" placeholder="Thumbnail headline (e.g. GONE BY MORNING)">
+              <label class="tl-thumb-arrow"><input type="checkbox" id="tl-thumb-arrow" checked><span>Red arrow</span></label>
+              <small>Uses the exact frame currently under the timeline playhead. Pause on the moment you want first.</small>
+            </div>
+            <div class="tl-music-control">
+              <div class="tl-project-media-copy">
+                <strong>Background music</strong>
+                <small class="tl-media-name" id="tl-music-name">No track added</small>
+              </div>
+              <div class="tl-media-actions">
+                <button type="button" class="button secondary" id="tl-music-upload">Add track</button>
+                <button type="button" class="button secondary tl-media-remove" id="tl-music-remove">Remove</button>
+              </div>
+              <input type="file" id="tl-music-file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/flac,.mp3,.wav,.m4a,.aac,.ogg,.flac" hidden>
+              <label class="tl-music-level" for="tl-music-db">
+                <span>Music level</span><output id="tl-music-db-value">-20 dB</output>
+              </label>
+              <input type="range" id="tl-music-db" min="-60" max="0" step="1" value="-20">
+            </div>
+            <div class="tl-media-status" id="tl-media-status" hidden></div>
+          </div>
           <button type="button" class="button primary tl-render-btn" id="tl-render" title="Saves your timeline automatically, then renders">&#11015; Render</button>
         </div>
       </div>
@@ -6732,6 +6792,7 @@ TIMELINE_SKELETON = """
           <select id="tl-script-ttsmodel" title="TTS model quality">
             <option value="flash">Flash TTS (cheaper)</option>
             <option value="pro">Pro TTS (higher quality)</option>
+            <option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option>
           </select>
         </div>
         <div class="tl-script-densitybar">
@@ -8798,6 +8859,91 @@ TIMELINE_ASSETS = """
   if(voiceA)voiceA.preload='auto';
   if(musicA)musicA.preload='auto';
   if (musicA) musicA.loop = true;
+  var thumbPreview=document.getElementById('tl-thumb-preview');
+  var thumbFile=document.getElementById('tl-thumb-file');
+  var musicFile=document.getElementById('tl-music-file');
+  var musicName=document.getElementById('tl-music-name');
+  var musicDb=document.getElementById('tl-music-db');
+  var musicDbValue=document.getElementById('tl-music-db-value');
+  var mediaStatus=document.getElementById('tl-media-status');
+  function setThumbPreview(url){
+    if(!thumbPreview)return;
+    thumbPreview.innerHTML=url?'<img alt="Short thumbnail" src="'+esc(url)+'">':'<span>9:16</span>';
+  }
+  function volumeToDb(v){ return v>0 ? Math.max(-60,Math.min(0,Math.round(20*Math.log10(v)))) : -60; }
+  function syncMusicUi(){
+    if(musicName)musicName.textContent=model.music_name||'No track added';
+    if(musicDb){musicDb.value=String(volumeToDb(volumes.music||0));musicDb.disabled=!musicA;}
+    if(musicDbValue)musicDbValue.textContent=(musicDb?musicDb.value:'-20')+' dB';
+    var remove=document.getElementById('tl-music-remove');if(remove)remove.disabled=!musicA;
+    var tr=document.getElementById('tl-thumb-remove');if(tr)tr.disabled=!model.thumbnail_url;
+  }
+  function showMediaStatus(message,isError){
+    if(!mediaStatus)return;mediaStatus.hidden=false;mediaStatus.textContent=message;
+    mediaStatus.style.color=isError?'#ff9b94':'';
+  }
+  function postProjectMedia(fd,done){
+    showMediaStatus('Saving project media…',false);
+    fetch('/timeline-project-media',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.ok)throw new Error((d&&d.error)||'Could not update project media.');
+      model.thumbnail_url=d.thumbnail_url||'';model.music_url=d.music_url||'';model.music_name=d.music_name||'';
+      if(d.music_volume!=null)volumes.music=+d.music_volume;
+      setThumbPreview(model.thumbnail_url);if(done)done(d);syncMusicUi();showMediaStatus('Saved.',false);
+      setTimeout(function(){if(mediaStatus)mediaStatus.hidden=true;},1400);
+    }).catch(function(e){showMediaStatus(e.message||'Could not update project media.',true);});
+  }
+  setThumbPreview(model.thumbnail_url||'');
+  syncMusicUi();
+  var thumbUpload=document.getElementById('tl-thumb-upload');
+  if(thumbUpload&&thumbFile){thumbUpload.addEventListener('click',function(){thumbFile.click();});thumbFile.addEventListener('change',function(){
+    if(!this.files||!this.files[0])return;var fd=new FormData();fd.append('slug',slug);fd.append('thumbnail',this.files[0]);postProjectMedia(fd);this.value='';
+  });}
+  var thumbRemove=document.getElementById('tl-thumb-remove');if(thumbRemove)thumbRemove.addEventListener('click',function(){
+    var fd=new FormData();fd.append('slug',slug);fd.append('action','remove_thumbnail');postProjectMedia(fd);
+  });
+  function drawCoverFrame(ctx,source,w,h){
+    var sw=source.videoWidth||source.naturalWidth||w,sh=source.videoHeight||source.naturalHeight||h;
+    var sr=sw/sh,tr=w/h,sx=0,sy=0,cw=sw,ch=sh;
+    if(sr>tr){cw=sh*tr;sx=(sw-cw)/2;}else{ch=sw/tr;sy=(sh-ch)/2;}
+    ctx.save();ctx.filter='contrast(1.16) saturate(1.05) brightness(.92)';ctx.drawImage(source,sx,sy,cw,ch,0,0,w,h);ctx.restore();
+    var shade=ctx.createLinearGradient(0,0,0,h);shade.addColorStop(0,'rgba(0,0,0,.18)');shade.addColorStop(.45,'rgba(0,0,0,0)');shade.addColorStop(1,'rgba(0,0,0,.28)');ctx.fillStyle=shade;ctx.fillRect(0,0,w,h);
+    var vignette=ctx.createRadialGradient(w*.5,h*.48,w*.18,w*.5,h*.48,w*.72);vignette.addColorStop(.45,'rgba(0,0,0,0)');vignette.addColorStop(1,'rgba(0,0,0,.35)');ctx.fillStyle=vignette;ctx.fillRect(0,0,w,h);
+  }
+  function coverLines(ctx,text,maxWidth){
+    var words=String(text||'').trim().toUpperCase().split(/\\s+/).filter(Boolean),lines=[],line='';
+    words.forEach(function(word){var test=line?line+' '+word:word;if(line&&ctx.measureText(test).width>maxWidth){lines.push(line);line=word;}else line=test;});if(line)lines.push(line);return lines.slice(0,3);
+  }
+  function drawCoverArrow(ctx,w,h){
+    var x1=w*.13,y1=h*.58,x2=w*.34,y2=h*.70,ang=Math.atan2(y2-y1,x2-x1),head=62;
+    ctx.save();ctx.strokeStyle='#101010';ctx.lineWidth=42;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+    ctx.fillStyle='#101010';ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-head*Math.cos(ang-.72),y2-head*Math.sin(ang-.72));ctx.lineTo(x2-head*Math.cos(ang+.72),y2-head*Math.sin(ang+.72));ctx.closePath();ctx.fill();
+    ctx.strokeStyle='#ff2118';ctx.lineWidth=25;ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.fillStyle='#ff2118';head=48;ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-head*Math.cos(ang-.72),y2-head*Math.sin(ang-.72));ctx.lineTo(x2-head*Math.cos(ang+.72),y2-head*Math.sin(ang+.72));ctx.closePath();ctx.fill();ctx.restore();
+  }
+  var thumbPlayhead=document.getElementById('tl-thumb-playhead');if(thumbPlayhead)thumbPlayhead.addEventListener('click',function(){
+    stop();var source=(pvid&&pvid.style.display!=='none'&&pvid.readyState>=2)?pvid:((pimg&&pimg.complete&&pimg.naturalWidth)?pimg:null);
+    if(!source){showMediaStatus('Pause on a visible video frame first.',true);return;}
+    var btn=this,old=btn.textContent;btn.disabled=true;btn.textContent='Creating…';
+    try{
+      var w=1080,h=1920,canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;var ctx=canvas.getContext('2d');drawCoverFrame(ctx,source,w,h);
+      var headline=document.getElementById('tl-thumb-headline').value.trim()||String(model.title||'').trim()||'WATCH THIS';
+      headline=headline.slice(0,36);ctx.font='900 136px Impact, Haettenschweiler, Arial Narrow, sans-serif';ctx.textAlign='left';ctx.textBaseline='top';ctx.lineJoin='round';
+      var lines=coverLines(ctx,headline,w*.82),x=w*.085,y=h*.10,lineH=132;lines.forEach(function(line,i){ctx.strokeStyle='#080808';ctx.lineWidth=25;ctx.strokeText(line,x,y+i*lineH);ctx.fillStyle='#fff';ctx.fillText(line,x,y+i*lineH);});
+      if(document.getElementById('tl-thumb-arrow').checked)drawCoverArrow(ctx,w,h);
+      canvas.toBlob(function(blob){if(!blob){btn.disabled=false;btn.textContent=old;showMediaStatus('Could not create thumbnail.',true);return;}var fd=new FormData();fd.append('slug',slug);fd.append('thumbnail',blob,'thumbnail_playhead.png');postProjectMedia(fd,function(){btn.disabled=false;btn.textContent=old;});},'image/png',.95);
+    }catch(e){btn.disabled=false;btn.textContent=old;showMediaStatus(e.message||'Could not create thumbnail.',true);}
+  });
+  var musicUpload=document.getElementById('tl-music-upload');
+  if(musicUpload&&musicFile){musicUpload.addEventListener('click',function(){musicFile.click();});musicFile.addEventListener('change',function(){
+    if(!this.files||!this.files[0])return;var fd=new FormData();fd.append('slug',slug);fd.append('music',this.files[0]);fd.append('music_db','-20');
+    postProjectMedia(fd,function(d){if(musicA){try{musicA.pause();}catch(e){}}musicA=d.music_url?new Audio(d.music_url):null;if(musicA){musicA.preload='auto';musicA.loop=true;musicA.addEventListener('loadedmetadata',function(){syncAudioToClock(clock,true);});audioVolumes();}});this.value='';
+  });}
+  var musicRemove=document.getElementById('tl-music-remove');if(musicRemove)musicRemove.addEventListener('click',function(){
+    var fd=new FormData();fd.append('slug',slug);fd.append('action','remove_music');postProjectMedia(fd,function(){if(musicA){try{musicA.pause();}catch(e){}}musicA=null;volumes.music=0;});
+  });
+  if(musicDb)musicDb.addEventListener('input',function(){
+    var db=+this.value;volumes.music=db<=-60?0:Math.pow(10,db/20);musicDbValue.textContent=db+' dB';audioVolumes();
+    var hidden=document.getElementById('tl-music-vol'),label=document.getElementById('tl-v-music');if(hidden)hidden.value=String(volumes.music);if(label)label.textContent=Math.round(volumes.music*100)+'%';markDirty();
+  });
   var liveSfx = [];
   function audioVolumes(){
     if (voiceA) voiceA.volume = Math.max(0, Math.min(1, volumes.voice != null ? volumes.voice : 1));
@@ -9160,7 +9306,8 @@ TIMELINE_ASSETS = """
     vsel.innerHTML=(model.tts_voices||[]).map(function(v){
       return '<option value="'+esc(v)+'"'+(v===wantVoice?' selected':'')+'>'+esc(v)+'</option>';
     }).join('') || '<option value="">(default voice)</option>';
-    document.getElementById('tl-script-ttsmodel').value = (((changeScriptSettings&&changeScriptSettings.tts_model)||model.tts_model)==='flash')?'flash':'pro';
+    var wantModel=(changeScriptSettings&&changeScriptSettings.tts_model) || model.tts_model || 'pro';
+    document.getElementById('tl-script-ttsmodel').value = wantModel;
     setDensity((changeScriptSettings&&changeScriptSettings.clip_density) || model.clip_density || 'medium');
     setMediaSource((changeScriptSettings&&changeScriptSettings.media_source) || 'scrape');
     syncHookStatus();
@@ -10206,6 +10353,33 @@ TIMELINE_ASSETS = """
   .tl-pop .tl-cap-toggle, .tl-pop .tl-chk { padding:2px 0; border:0; background:none; }
   .tl-pop-field { margin:2px 0 -5px; color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
   .tl-pop select { width:100%; margin:0; }
+  #tl-render-pop { width:min(360px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:auto; }
+  .tl-project-media { display:grid; gap:11px; margin-top:2px; padding-top:12px; border-top:1px solid var(--line); }
+  .tl-project-media-title { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+  .tl-thumb-control { display:grid; grid-template-columns:54px minmax(0,1fr); gap:11px; align-items:center; }
+  .tl-thumb-preview { width:54px; aspect-ratio:9/16; overflow:hidden; display:grid; place-items:center; border-radius:8px;
+    border:1px solid var(--line-strong); background:linear-gradient(145deg,var(--bg-input),var(--bg)); color:var(--muted); font-size:9px; font-weight:800; }
+  .tl-thumb-preview img { width:100%; height:100%; display:block; object-fit:cover; }
+  .tl-project-media-copy { min-width:0; display:grid; gap:3px; }
+  .tl-project-media-copy strong { color:var(--text); font-size:12px; }
+  .tl-project-media-copy small { color:var(--muted); font-size:10.5px; line-height:1.35; }
+  .tl-media-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tl-media-actions { display:flex; gap:6px; margin-top:5px; }
+  .tl-pop .tl-media-actions .button { width:auto; min-height:30px; padding:5px 9px; font-size:10.5px; }
+  .tl-media-remove { color:#ff9b94 !important; }
+  .tl-thumb-maker { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 9px; align-items:center; }
+  .tl-thumb-maker input[type=text] { min-width:0; width:100%; margin:0; padding:8px 9px; border:1px solid var(--line-strong);
+    border-radius:8px; background:var(--bg-input); color:var(--text); font-size:11px; font-weight:700; }
+  .tl-thumb-maker small { grid-column:1/-1; color:var(--muted); font-size:9.5px; line-height:1.35; }
+  .tl-thumb-arrow { display:flex; align-items:center; gap:5px; color:var(--muted); font-size:10px; font-weight:700; white-space:nowrap; }
+  .tl-music-control { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 10px; align-items:end; }
+  .tl-music-control .tl-media-actions { margin:0; }
+  .tl-music-level { grid-column:1/-1; display:flex; justify-content:space-between; align-items:center; margin-top:2px;
+    color:var(--muted); font-size:10.5px; font-weight:700; }
+  .tl-music-level output { color:var(--accent); font-variant-numeric:tabular-nums; }
+  #tl-music-db { grid-column:1/-1; width:100%; margin:0; accent-color:var(--accent); }
+  #tl-music-db:disabled { opacity:.35; }
+  .tl-media-status { padding:7px 9px; border-radius:7px; background:var(--accent-subtle); color:var(--text); font-size:10.5px; }
   .tl-leave-scrim { position:fixed; inset:0; z-index:2147483640; display:grid; place-items:center; padding:20px;
     background:rgba(3,5,4,.68); backdrop-filter:blur(12px); }
   .tl-leave-dialog { width:min(460px,100%); padding:22px; border:1px solid var(--line-strong); border-radius:14px;
@@ -12127,11 +12301,35 @@ def timeline_model(slug):
         except Exception:
             voice_duration = 0.0
     music_url = ""
+    music_name = ""
     music_choice = str(config.get("background_music_choice") or config.get("background_music_file") or "").strip()
     if music_choice and music_choice.lower() != "none":
-        mp = ROOT / "background music" / music_choice
-        if mp.exists():
-            music_url = link_for(mp)
+        raw_music = Path(music_choice)
+        music_candidates = []
+        if raw_music.is_absolute():
+            music_candidates.append(raw_music)
+        music_dir = str(config.get("background_music_dir") or "").strip()
+        if music_dir:
+            music_candidates.append(Path(music_dir) / raw_music.name)
+        music_candidates.extend((project_dir / "input" / "background_music" / raw_music.name,
+                                 ROOT / "background music" / raw_music.name))
+        for mp in music_candidates:
+            if mp.exists() and mp.is_file():
+                music_url = link_for(mp)
+                music_name = mp.name
+                break
+    thumbnail_path = None
+    configured_thumbnail = str(config.get("thumbnail_path") or "").strip()
+    thumbnail_candidates = ([Path(configured_thumbnail)] if configured_thumbnail else [])
+    thumbnail_candidates.extend(project_dir / ("thumbnail" + ext)
+                                for ext in (".png", ".jpg", ".jpeg", ".webp"))
+    for candidate in thumbnail_candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                thumbnail_path = candidate
+                break
+        except OSError:
+            continue
     return {
         "slug": slug,
         "title": config.get("title", slug),
@@ -12172,6 +12370,8 @@ def timeline_model(slug):
         "voice_url": voice_url,
         "voice_duration": round(voice_duration, 3),
         "music_url": music_url,
+        "music_name": music_name,
+        "thumbnail_url": link_for(thumbnail_path) if thumbnail_path else "",
         "clip_source": str(config.get("clip_source") or "generate"),
         "reasoning_model": str((config.get("wavespeed") or {}).get("reasoning_model")
                                or "openai/gpt-5.5"),
@@ -12293,6 +12493,49 @@ def _compress_render_file(video_path, status_cb=None):
     return str(src)
 
 
+def _embed_project_thumbnail(video_path, slug, status_cb=None):
+    """Attach the project's selected Short thumbnail to the MP4 as cover art.
+
+    The main H.264 stream and audio are stream-copied, so embedding cannot change frame timing,
+    introduce playback lag or reduce render quality. Platforms may still choose their own Short
+    preview, but the exported file itself carries a standards-compliant attached_pic stream.
+    """
+    import subprocess
+    src = Path(video_path)
+    project_dir = safe_project_dir(slug)
+    if not src.exists() or not project_dir:
+        return video_path
+    config = agent_core.load_project_config(project_dir.name)
+    configured = str(config.get("thumbnail_path") or "").strip()
+    candidates = ([Path(configured)] if configured else [])
+    candidates.extend(project_dir / ("thumbnail" + suffix)
+                      for suffix in (".png", ".jpg", ".jpeg", ".webp"))
+    thumb = next((p for p in candidates if p.exists() and p.is_file()), None)
+    if not thumb:
+        return video_path
+    ff = pipeline.find_ffmpeg()
+    tmp = src.with_name(src.stem + "_cover_tmp.mp4")
+    if status_cb:
+        status_cb(f"Embedding Short thumbnail: {thumb.name}...")
+    proc = subprocess.run(
+        [ff, "-y", "-loglevel", "error", "-i", str(src), "-i", str(thumb),
+         "-map", "0:v:0", "-map", "0:a?", "-map", "1:v:0", "-map_metadata", "0",
+         "-c:v:0", "copy", "-c:a", "copy", "-c:v:1", "mjpeg", "-q:v:1", "2",
+         "-disposition:v:0", "default", "-disposition:v:1", "attached_pic",
+         "-metadata:s:v:1", "title=Thumbnail", "-metadata:s:v:1", "comment=Cover (front)",
+         "-movflags", "+faststart", str(tmp)],
+        capture_output=True, text=True)
+    if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        if status_cb:
+            status_cb("Thumbnail could not be embedded; keeping the rendered MP4 and separate image.")
+        return video_path
+    os.replace(tmp, src)
+    if status_cb:
+        status_cb("Thumbnail embedded into the MP4 cover-art stream.")
+    return str(src)
+
+
 def start_timeline_job(slug, edits, regen_captions=False):
     job_id = str(int(time.time() * 1000))
     cancel_event = threading.Event()
@@ -12324,6 +12567,11 @@ def start_timeline_job(slug, edits, regen_captions=False):
             result = agent_core.render_project_timeline(slug, edits, status_cb=status_cb, cancel_event=cancel_event)
             if edits.get("compress") and result and result.get("video"):
                 result["video"] = _compress_render_file(result["video"], status_cb=status_cb)
+            if result and result.get("video"):
+                result["video"] = _embed_project_thumbnail(result["video"], slug, status_cb=status_cb)
+                thumb = timeline_model(slug).get("thumbnail_url", "")
+                if thumb:
+                    result["thumbnail"] = thumb
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -12699,6 +12947,88 @@ def create_timeline_project_from_upload(filename, data):
     return slug
 
 
+def update_timeline_project_media(slug, fields, files):
+    """Persist creator-supplied packaging for a Short timeline: thumbnail and background music."""
+    project_dir = safe_project_dir(slug)
+    if not project_dir:
+        raise ValueError("project not found")
+    config = agent_core.load_project_config(project_dir.name)
+    action = str(fields.get("action") or "").strip().lower()
+
+    if action == "remove_thumbnail":
+        config.pop("thumbnail_path", None)
+        for suffix in (".png", ".jpg", ".jpeg", ".webp"):
+            try:
+                (project_dir / ("thumbnail" + suffix)).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    thumbnail = files.get("thumbnail")
+    if thumbnail and thumbnail.get("data"):
+        suffix = Path(str(thumbnail.get("filename") or "thumbnail.png")).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("thumbnail must be PNG, JPG or WebP")
+        if len(thumbnail["data"]) > 20 * 1024 * 1024:
+            raise ValueError("thumbnail is larger than 20 MB")
+        for old_suffix in (".png", ".jpg", ".jpeg", ".webp"):
+            try:
+                (project_dir / ("thumbnail" + old_suffix)).unlink(missing_ok=True)
+            except OSError:
+                pass
+        thumb_path = project_dir / ("thumbnail" + suffix)
+        thumb_path.write_bytes(thumbnail["data"])
+        config["thumbnail_path"] = str(thumb_path)
+
+    if action == "remove_music":
+        config["background_music_enabled"] = False
+        config["background_music_user_enabled"] = False
+        config["background_music_volume"] = 0.0
+        config["background_music_volume_with_speech"] = 0.0
+        for key in ("background_music_file", "background_music_choice"):
+            config.pop(key, None)
+
+    music = files.get("music")
+    if music and music.get("data"):
+        suffix = Path(str(music.get("filename") or "background.mp3")).suffix.lower()
+        if suffix not in {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}:
+            raise ValueError("music must be MP3, WAV, M4A, AAC, OGG or FLAC")
+        if len(music["data"]) > 100 * 1024 * 1024:
+            raise ValueError("music file is larger than 100 MB")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(str(music.get("filename") or "background")).stem)
+        stem = stem[:80].strip("_") or "background"
+        music_dir = project_dir / "input" / "background_music"
+        music_dir.mkdir(parents=True, exist_ok=True)
+        music_path = music_dir / (stem + suffix)
+        music_path.write_bytes(music["data"])
+        try:
+            db = max(-60.0, min(0.0, float(fields.get("music_db", -20))))
+        except (TypeError, ValueError):
+            db = -20.0
+        linear = 0.0 if db <= -60 else 10 ** (db / 20.0)
+        config.update({
+            "background_music_dir": str(music_dir),
+            "background_music_file": music_path.name,
+            "background_music_choice": music_path.name,
+            "background_music_enabled": True,
+            "background_music_user_enabled": True,
+            "background_music_volume": linear,
+            "background_music_volume_with_speech": linear,
+        })
+
+    config_path = project_dir / "config" / "project.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(agent_core.config_for_json(config), indent=2), encoding="utf-8")
+    os.replace(tmp, config_path)
+    model = timeline_model(project_dir.name)
+    return {
+        "thumbnail_url": model.get("thumbnail_url", ""),
+        "music_url": model.get("music_url", ""),
+        "music_name": model.get("music_name", ""),
+        "music_volume": float(model.get("volumes", {}).get("music", 0.0) or 0.0),
+    }
+
+
 def timeline_blank_page():
     """The timeline editor opened with no project: a launchpad to open an existing timeline or to
     upload your own .mp4 and start editing it. #156."""
@@ -13031,7 +13361,7 @@ def job_page(job_id):
               <div style="display:flex; gap:10px; flex-wrap:wrap;">
                 <input type="text" name="speaker_name" value="Narrator" placeholder="Speaker name" style="flex:1; min-width:150px;">
                 <select name="tts_voice" style="flex:1; min-width:180px;">{voice_opts}</select>
-                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option></select>
+                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option><option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option></select>
               </div>
               <button class="danger" type="submit" style="margin-top:14px;">&#8635; Replace voice &amp; regenerate</button>
             </form>
@@ -14652,6 +14982,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"ok": ok, "error": error}).encode("utf-8"))
+            return
+        if parsed.path == "/timeline-project-media":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            content_type = self.headers.get("Content-Type", "")
+            try:
+                if "multipart/form-data" not in content_type:
+                    raise ValueError("expected a media upload")
+                fields, files = parse_multipart(content_type, body)
+                slug = str(fields.get("slug") or "").strip()
+                result = update_timeline_project_media(slug, fields, files)
+                payload = {"ok": True, **result}
+                self.send_bytes(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
             return
         if parsed.path == "/timeline-import":
             # #156 - "load your own video": ingest an uploaded .mp4 into a fresh, editable project.

@@ -90,7 +90,7 @@ const DEFAULT_VALUES = () => {
   v.background_music_enabled = !!st.background_music_enabled;
   if (!v.clip_source) v.clip_source = "generate";
   if (!v.scraping_engine) v.scraping_engine = "v2";
-  if (!v.script_relevancy) v.script_relevancy = "70";
+  if (!v.script_relevancy) v.script_relevancy = "90";
   if (!v.scrape_sort) v.scrape_sort = "ALL";
   if (!v.scrape_platforms) v.scrape_platforms = "tiktok,x,instagram";
   if (!v.sfx_amount) v.sfx_amount = "medium";
@@ -99,6 +99,7 @@ const DEFAULT_VALUES = () => {
   if (st.out_captions === undefined) v.out_captions = true;        // captions ON by default
   if (st.out_sfx === undefined) v.out_sfx = true;                  // sound effects ON by default
   if (st.out_transition_sfx === undefined) v.out_transition_sfx = true;
+  if (st.influencer_hook === undefined) v.influencer_hook = false;
   if (st.halt_after_speech === undefined) v.halt_after_speech = false;
   if (!v.pipeline_version) v.pipeline_version = "v0.2";   // version chooser removed; always v0.2
   if (!v.clip_short_format) v.clip_short_format = "standard";
@@ -171,7 +172,12 @@ function applyCultureFactsPreset() {
   S.values.out_gpt_images = false;
   S.values.out_video_clips = true;
   if (S.values.out_captions === undefined || S.values.out_captions === false) S.values.out_captions = true;
-  if (S.values.out_sfx === undefined || S.values.out_sfx === false) S.values.out_sfx = true;
+  // Clip Short has one deliberately narrow audio profile. Never carry the general
+  // content/reaction-SFX preference from AI Short into this mode.
+  S.values.out_sfx = false;
+  if (S.values.out_transition_sfx === undefined) S.values.out_transition_sfx = true;
+  if (S.values.influencer_hook === undefined) S.values.influencer_hook = false;
+  if (!S.values.script_relevancy) S.values.script_relevancy = "90";
   if (isDiscovery()) S.values.halt_after_speech = false;   // discovery has no speech gate
 }
 function stepsFor(flow) {
@@ -788,6 +794,10 @@ function selectMode(id) {
     applyCultureFactsPreset();
     S.values.clip_short_format = "standard";
     S.values.script_token_limit = "";
+    S.values.script_relevancy = "90";
+    S.values.influencer_hook = false;
+    S.values.out_sfx = false;
+    S.values.out_transition_sfx = true;
   }
   else if (id === "script" || visualScript) {
     S.values.clip_source = "generate";
@@ -1307,14 +1317,27 @@ function renderSourceCard() {
       v => S.values.image_model = v));
   } else {
     S.values.scraping_engine = "v2";
-    // relevancy
-    wrap.appendChild(el("div", "card-cap", esc(T.script_relevancy)));
-    const rr = el("div", "range-row");
-    const rg = el("input"); rg.type = "range"; rg.min = 0; rg.max = 100; rg.step = 5;
-    rg.value = S.values.script_relevancy || "70";
-    const rv = el("span", "range-val", (S.values.script_relevancy || "70") + "%");
-    rg.addEventListener("input", () => { S.values.script_relevancy = rg.value; rv.textContent = rg.value + "%"; persist(); });
-    rr.appendChild(rg); rr.appendChild(rv); wrap.appendChild(rr);
+    if (isDiscovery()) {
+      // Discovery recuts one coherent long source. A detached influencer opener would break
+      // that source story, so the Clip Short hook option is intentionally not applied here.
+      S.values.influencer_hook = false;
+      wrap.appendChild(el("div", "out-sec-hint",
+        "Discovery searches TikTok for one coherent native 9:16 source, rejects black bars and frame stalls, and opens on its strongest on-topic moment."));
+    } else {
+      // Relevance controls belong to multi-source Scrape V2. Discovery ranks whole videos.
+      wrap.appendChild(el("div", "card-cap", esc(T.script_relevancy)));
+      const rr = el("div", "range-row");
+      const rg = el("input"); rg.type = "range"; rg.min = 0; rg.max = 100; rg.step = 5;
+      rg.value = S.values.script_relevancy || "90";
+      const rv = el("span", "range-val", (S.values.script_relevancy || "90") + "%");
+      rg.addEventListener("input", () => { S.values.script_relevancy = rg.value; rv.textContent = rg.value + "%"; persist(); });
+      rr.appendChild(rg); rr.appendChild(rv); wrap.appendChild(rr);
+      wrap.appendChild(toggleField(
+        "Cute dance hook (20K+ likes)", !!S.values.influencer_hook,
+        v => S.values.influencer_hook = v));
+      wrap.appendChild(el("div", "out-sec-hint",
+        "Off opens with the strongest topic-matched clip. On searches a separate Japanese cute/dance opener."));
+    }
     // Sort dropdown removed - the scrape now ALWAYS runs every sort order (liked/relevance/
     // viewed/recent) and merges the unique clips, so there is nothing to choose.
     S.values.scrape_sort = "ALL";
@@ -1480,9 +1503,16 @@ function renderOutputsCard() {
   vg.appendChild(toggleField("Meme reactions", !!S.values.add_meme_reactions, v => S.values.add_meme_reactions = v));
   vg.appendChild(toggleField("Neko reactions", !!S.values.add_neko_reactions, v => S.values.add_neko_reactions = v));
   section("Visual effects", vg, amountSliderField("Amount", S.values.vfx_amount || "medium", v => S.values.vfx_amount = v));
-  // Sound
-  section("Sound", grid([["out_sfx", "Sound effects"], ["out_transition_sfx", "Transition SFX"]]),
-    amountSliderField("Amount", S.values.sfx_amount, v => S.values.sfx_amount = v));
+  // Sound. Real-footage Clip Shorts expose the actual backend policy instead of a broad
+  // "Sound effects" switch that misleadingly suggested semantic impacts/foley were enabled.
+  if (scrape) {
+    section("Sound", grid([["out_transition_sfx", "Hook riser & cut SFX"]]),
+      amountSliderField("Amount", S.values.sfx_amount, v => S.values.sfx_amount = v),
+      el("div", "out-sec-hint", "Only quiet whoosh, swish, pop and click accents. No ambience or content SFX."));
+  } else {
+    section("Sound", grid([["out_sfx", "Sound effects"], ["out_transition_sfx", "Transition SFX"]]),
+      amountSliderField("Amount", S.values.sfx_amount, v => S.values.sfx_amount = v));
+  }
   // Captions — word-by-word toggle + the fully user-customizable style (live preview)
   section("Captions", grid([["out_captions", "Word-by-word captions"]]), captionStylePanel());
   // Speech approval (not in Discovery - its approval moment is the material pick)
@@ -1653,7 +1683,7 @@ function renderEnhanceFlow() {
 }
 function visibleOutputFields() {
   return isCultureFacts()
-    ? OUTPUT_FIELDS.filter(([k]) => ["out_sfx", "out_transition_sfx", "out_captions"].includes(k))
+    ? OUTPUT_FIELDS.filter(([k]) => ["out_transition_sfx", "out_captions"].includes(k))
     : OUTPUT_FIELDS;
 }
 function outputsSummary() {
@@ -1672,7 +1702,8 @@ function renderReviewCard() {
   ];
   if (S.values.clip_source === "scrape") {
     if (!isCultureFacts()) rows.push([T.scrape_engine, "Scrape V2", "source"]);
-    rows.push([T.script_relevancy, (S.values.script_relevancy || "70") + "%", isCultureFacts() ? null : "source"]);
+    rows.push([T.script_relevancy, (S.values.script_relevancy || "90") + "%", isCultureFacts() ? null : "source"]);
+    rows.push(["Cute dance hook", S.values.influencer_hook ? "On · 20K+ likes" : "Off · topic-matched opener", isCultureFacts() ? null : "source"]);
     rows.push(["Search platforms", (S.values.scrape_platforms || "tiktok,x,instagram").split(",").map(p => p === "x" ? "X" : p.charAt(0).toUpperCase() + p.slice(1)).join(", "), "source"]);
     if (S.values.scrape_terms) rows.push(["Search terms", S.values.scrape_terms, isCultureFacts() ? null : "source"]);
   } else {

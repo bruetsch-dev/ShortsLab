@@ -166,9 +166,9 @@ def test_segment_windows():
     # a hard cut inside a region shrinks/moves the window off the cut
     w2 = v._candidate_windows(30.0, cuts=[6.2], cfg=cfg)
     check("windows still produced around a cut", len(w2) >= 3)
-    # a 2.1s segment is acceptable
-    check("2.1s is a valid segment length",
-          cfg["min_segment_seconds"] <= 2.1 <= cfg["max_segment_seconds"])
+    # the current quality profile rejects ultra-short snippets below 2.2s
+    check("2.2s is a valid segment length",
+          cfg["min_segment_seconds"] <= 2.2 <= cfg["max_segment_seconds"])
 
 
 # ---- match formula + floors -----------------------------------------------
@@ -238,11 +238,11 @@ def _seg_creator(scene_candidates, sid, seg_id):
 
 # ---- render validation v2 --------------------------------------------------
 def test_render_validation_v2():
-    good = {"voice_speed": 1.20, "scenes": [
-        {"id": 0, "clip": "hook.mp4", "visual_role": "hook_influencer", "match_class": "A_MATCH",
-         "assignment_type": "exact", "black_bar_score": 0.0},
+    good = {"voice_speed": 1.10, "influencer_hook": False, "scenes": [
+        {"id": 0, "clip": "hook.mp4", "visual_role": "hook_topic", "match_class": "A_MATCH",
+         "assignment_type": "exact", "black_bar_score": 0.0, "native_9_16": True},
         {"id": 1, "clip": "b1.mp4", "visual_role": "body", "match_class": "B_MATCH",
-         "assignment_type": "exact", "black_bar_score": 1.0}]}
+         "assignment_type": "exact", "black_bar_score": 1.0, "native_9_16": True}]}
     try:
         v.validate_scrape_render_v2(dict(good))
         check("valid v2 timeline passes", True)
