@@ -1708,7 +1708,136 @@ def _mini_script(subject, descs, reasoning_model, status_cb=None):
     return data
 
 
-def run_mini_topic_short(form, status_cb=None):
+def run_discovery_fact_short(form, status_cb=None):
+    """Discovery mode for the full fact pipeline: topic only -> scrape clips -> vision-ground
+    a fact script -> inject it and run agent_core.run_project as a normal fact Short.
+
+    Activates automatically when the Default Mode form is submitted with a topic but no script.
+    """
+    cancel_event = form.get("_cancel_event")
+
+    def _check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise pipeline.PipelineCancelled("Run cancelled by user.")
+
+    topic = str(form.get("gen_topic") or "").strip()
+    if not topic:
+        raise RuntimeError("Fact Discovery needs a topic in the Topic field.")
+
+    reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
+    log(status_cb, f"FACT DISCOVERY MODE: '{topic}' - gathering material first.")
+
+    subject, queries = _mini_queries(topic, form, reasoning_model, status_cb)
+    _check_cancel()
+
+    import tiktok_login
+    import scrape_v2
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    tmp_dir = agent_core.PROJECTS_DIR / f"_factdisc_tmp_{stamp}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    seen, picked = set(), []
+    for q in queries:
+        try:
+            items = tiktok_login.search_sync(q, want=8, status_cb=status_cb,
+                                             sort="MOST_LIKED", timeout_s=180)
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Fact Discovery search '{q}' failed: {exc.__class__.__name__}")
+            continue
+        for it in (items or []):
+            vid = str(it.get("id") or "")
+            author = it.get("author")
+            author = str((author.get("uniqueId") if isinstance(author, dict) else author) or "")
+            if not vid or vid in seen or not author:
+                continue
+            seen.add(vid)
+            likes = int((it.get("stats") or {}).get("diggCount") or 0)
+            picked.append({"id": vid, "author": author, "likes": likes})
+
+    picked.sort(key=lambda x: -x["likes"])
+    log(status_cb, f"Fact Discovery: {len(picked)} results, downloading top 10...")
+
+    pool = []
+    for i, it in enumerate(picked[:10]):
+        _check_cancel()
+        url = f"https://www.tiktok.com/@{it['author']}/video/{it['id']}"
+        p = clip_scraper.download_raw(url, tmp_dir, i, status_cb=status_cb)
+        if p and _is_portrait(p):
+            pool.append(Path(p))
+        elif p:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    descs = {}
+    if pool:
+        input_dir = tmp_dir / "input"
+        input_dir.mkdir(exist_ok=True)
+        sheet = _mini_pool_sheet(pool, input_dir, status_cb)
+        vdata = scrape_v2._vision_json(
+            "You see a labeled contact sheet: each row = one TikTok clip ([index] name (dur), 3 "
+            f"frames). Topic: {subject}.\n"
+            "Return JSON: {{\"clips\": {{\"0\": {{\"desc\": \"what is LITERALLY visible "
+            "(objects, actions, setting, process steps)\", \"usable\": true/false}}, ...}}}}.\n"
+            "usable=false for: talking heads, text-card memes, anime, off-topic.",
+            str(sheet), max_tokens=2000, temperature=0.1,
+            reasoning_model=reasoning_model)
+        for k, v in (vdata.get("clips") or {}).items():
+            if str(k).isdigit() and isinstance(v, dict) and v.get("usable"):
+                descs[int(k)] = str(v.get("desc") or "")
+        log(status_cb, f"Fact Discovery: {len(descs)}/{len(pool)} clips inform the script.")
+
+    try:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    _check_cancel()
+
+    # Write a fact script grounded in the discovered material
+    clip_context = ""
+    if descs:
+        clip_context = ("\nVisually confirmed footage (ground the facts in what is real):\n"
+                        + "\n".join(f"- {v}" for v in descs.values()))
+
+    script_data = agent_core._post_llm_json(reasoning_model, [
+        {"role": "system", "content":
+            "You write punchy 30-35s fact short scripts (150-200 words) for Japan/Asia-focused "
+            "documentary Shorts. The script works as standalone narration over visuals. "
+            "Rules: open with the most surprising fact (never 'Did you know'); 5-7 sentences; "
+            "each sentence = one concrete visual fact; end with a payoff/twist. "
+            "Return JSON: {\"title\": str, \"script\": str, "
+            "\"hook_keywords\": [4-8 UPPERCASE words from the script], "
+            "\"impact_word\": \"one uppercase word from sentence 1\", "
+            "\"scrape_terms\": [3-5 TikTok search terms for the visuals]}."},
+        {"role": "user", "content": f"Topic: {subject}{clip_context}"}],
+        max_tokens=600, temperature=0.4)
+
+    script = str(script_data.get("script") or "").strip()
+    if not script:
+        raise RuntimeError("Fact Discovery: script writer returned nothing - try again.")
+    title = str(script_data.get("title") or subject)
+    log(status_cb, f"Fact Discovery: script ready - '{title}' ({len(script.split())} words).")
+
+    # Inject into form and run the full fact pipeline
+    fields = dict(form)
+    fields["script"] = script
+    fields["title"] = title
+    if script_data.get("hook_keywords"):
+        fields["hook_keywords"] = json.dumps([str(k) for k in script_data["hook_keywords"]])
+    if script_data.get("impact_word"):
+        fields["impact_word"] = str(script_data["impact_word"])
+    # Only set scrape_terms if the user hasn't provided any
+    if script_data.get("scrape_terms") and not str(fields.get("scrape_terms") or "").strip():
+        fields["scrape_terms"] = ", ".join(str(t) for t in script_data["scrape_terms"])
+    # Remove format flag so run_project treats this as a standard fact short
+    fields.pop("clip_short_format", None)
+
+    return agent_core.run_project(fields, status_cb)
+
+
     """Mini Story from a TOPIC only: material-first scripting over one subject cluster."""
     form.setdefault("clip_source", "scrape")
     form.setdefault("voice_speed", agent_core.SCRAPE_VOICE_SPEED)

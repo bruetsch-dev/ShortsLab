@@ -4287,6 +4287,11 @@ def start_job(fields, files):
             elif str(fields.get("motion_loop_mode") or "").strip().lower() in ("on", "true", "1"):
                 import motion_loop
                 result = motion_loop.run_motion_loop(fields, status_cb)
+            elif _no_script and str(fields.get("gen_topic") or "").strip():
+                # No script but a topic given -> material-first fact short: scrape a clip pool,
+                # vision-ground a script in what was found, then run the full fact pipeline.
+                import discovery_short
+                result = discovery_short.run_discovery_fact_short(fields, status_cb)
             else:
                 result = agent_core.run_project(fields, status_cb)
             with JOB_LOCK:

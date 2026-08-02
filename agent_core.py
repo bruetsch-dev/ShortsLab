@@ -6019,11 +6019,13 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                           if want and want in Path(str(it.get("path") or "")).name.lower()] or hook_risers
             item, source_len, _ = sfx_library.choose_riser_for_target(riser_pool, riser_target)
             if item and source_len > 0:
-                playback_rate = source_len / riser_target
+                # Never stretch the riser: play at 1.0x and trim to the shorter of the
+                # file length or the hook beat target (same rule as _place_riser).
+                riser_dur = round(min(source_len, riser_target), 3)
                 events.append({"path": str(item["path"]), "start": 0.0,
-                               "duration": round(riser_target, 3), "source_trim": 0.0,
+                               "duration": riser_dur, "source_trim": 0.0,
                                "source_duration": round(source_len, 3),
-                               "playback_rate": round(playback_rate, 6),
+                               "playback_rate": 1.0,
                                "volume": round(min(0.85, sfx_library.db_to_gain(-5.5)), 3),
                                "category": "hook_riser", "id": f"sfx-{len(events):02d}",
                                "sfx_type": "hook_riser"})
