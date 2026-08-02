@@ -28,11 +28,13 @@ Public surface used by clip_scraper:
 import concurrent.futures
 import os
 import json
+import re
 import subprocess
 import time
 import threading
 import scrape_browser_preview
 from pathlib import Path
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 try:
     from playwright.sync_api import sync_playwright
@@ -70,6 +72,100 @@ _EXEC_LOCK = threading.Lock()
 # per-run search health: lets the caller fail FAST when the backend returns nothing at all
 # (expired login / headless block / captcha) instead of grinding through every bucket.
 _SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0}
+
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "at", "for", "from", "in", "of", "on", "the", "to", "with",
+    "japan", "japanese", "video", "viral", "tiktok", "instagram", "reels", "shorts",
+}
+
+
+def _normalise_search_text(value):
+    return re.sub(r"\s+", " ", unquote_plus(str(value or "")).casefold()).strip()
+
+
+def _sanitize_tiktok_query(value):
+    """Strip redundant platform words even for callers that bypass clip_scraper."""
+    query = str(value or "").strip()
+    prefix = "#" if query.startswith("#") else ""
+    query = query.lstrip("#").strip()
+    query = re.sub(r"(?i)(?<![#\w])(?:tiktok|instagram|youtube\s+shorts?|reels?)(?!\w)",
+                   " ", query)
+    query = re.sub(r"(?i)(?<![#\w])(?:on\s+)?(?:twitter|x\.com)(?!\w)", " ", query)
+    query = re.sub(r"\s+", " ", query).strip(" ,;:-")
+    return (prefix + query) if query else ""
+
+
+def _search_response_matches_query(url, query, is_tag=False):
+    """Reject stale search XHRs left over from the previous TikTok page.
+
+    TikTok can keep firing responses after navigation.  Previously every `/full` response was
+    absorbed, so a Japanese query could receive the same unrelated For You/search feed dozens of
+    times.  Responses without an exposed keyword are still allowed and are checked by item text
+    below; responses which *do* expose a keyword must belong to this search.
+    """
+    low = str(url or "").casefold()
+    if is_tag:
+        return "/api/challenge/item_list" in low
+    if "/api/search/" not in low or "/full" not in low:
+        return False
+    try:
+        params = parse_qs(urlparse(url).query)
+    except Exception:
+        return True
+    values = []
+    for key in ("keyword", "query", "q", "search_keyword"):
+        values.extend(params.get(key, []))
+    if not values:
+        return True
+    wanted = _normalise_search_text(query).lstrip("#")
+    return any(_normalise_search_text(value).lstrip("#") == wanted for value in values)
+
+
+def _query_relevance(item, query):
+    """Cheap metadata evidence used before expensive download/vision analysis (0..1)."""
+    author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    hay = _normalise_search_text(" ".join(str(v or "") for v in (
+        item.get("desc"), item.get("title"), item.get("text"),
+        author.get("uniqueId"), author.get("nickname"),
+    )))
+    wanted = _normalise_search_text(query).lstrip("#")
+    if not hay or not wanted:
+        return 0.0
+    if wanted in hay:
+        return 1.0
+    latin = [t for t in re.findall(r"[a-z0-9]+", wanted)
+             if len(t) > 1 and t not in _QUERY_STOPWORDS]
+    chunks = [t for t in re.split(r"\s+", wanted) if re.search(r"[^\x00-\x7f]", t)]
+    evidence = []
+    evidence.extend(1.0 if token in hay else 0.0 for token in latin)
+    for chunk in chunks:
+        compact = re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff]", "", chunk)
+        if not compact:
+            continue
+        if compact in hay:
+            evidence.append(1.0)
+            continue
+        # Native captions often conjugate words or concatenate hashtags.  A three-character
+        # fragment is enough evidence, but one shared kanji is not.
+        grams = {compact[i:i + 3] for i in range(max(1, len(compact) - 2))
+                 if len(compact[i:i + 3]) == 3}
+        evidence.append(max((1.0 for gram in grams if gram in hay), default=0.0))
+    if not evidence:
+        return 0.0
+    return sum(evidence) / len(evidence)
+
+
+def _filter_search_results(items, query):
+    scored = [(item, _query_relevance(item, query)) for item in items]
+    relevant = [(item, score) for item, score in scored if score > 0.0]
+    # A completely evidence-free response is almost certainly TikTok's stale/global feed.  If
+    # at least one result proves the query, keep only evidenced results; downstream vision still
+    # performs the semantic decision.
+    if not relevant:
+        return []
+    for item, score in relevant:
+        item["_query_relevance"] = round(score, 4)
+    return [item for item, _score in relevant]
 
 
 def search_stats():
@@ -535,6 +631,7 @@ class Session:
         self._pids = set()
         self._hide_stop = threading.Event()
         self._watcher = None
+        self._recent_search_fingerprints = []
         self._open()
 
     def _open(self):
@@ -609,9 +706,12 @@ class Session:
                timeout_s=None):
         """Run a logged-in keyword search and return up to ~want native TikTok item dicts."""
         cb = status_cb or self._status_cb
-        query = str(query or "").strip()
+        original_query = str(query or "").strip()
+        query = _sanitize_tiktok_query(original_query)
         if not query:
             return []
+        if query != original_query:
+            _status(cb, f"TikTok search: cleaned platform boilerplate: {original_query!r} -> {query!r}.")
         # A "#hashtag" query is routed to TikTok's DEDICATED hashtag/challenge page
         # (/tag/<tag>), which indexes that tag's videos far better than typing "#tag" into
         # general search. Its item feed arrives via /api/challenge/item_list instead of
@@ -645,7 +745,7 @@ class Session:
         def _on_response(resp):
             try:
                 url = resp.url
-                if ("/api/search/" in url and "/full" in url) or "/api/challenge/item_list" in url:
+                if _search_response_matches_query(url, query, is_tag=is_tag):
                     _absorb(resp.json())
             except Exception:
                 pass
@@ -704,6 +804,27 @@ class Session:
                 page.close()
             except Exception:
                 pass
+        raw_count = len(collected)
+        collected = _filter_search_results(collected, query)
+        fingerprint = frozenset(str(item.get("id") or "") for item in collected if item.get("id"))
+        stale_repeat = False
+        mean_relevance = (sum(float(item.get("_query_relevance") or 0) for item in collected)
+                          / len(collected)) if collected else 0.0
+        if fingerprint:
+            for old_query, old_ids in self._recent_search_fingerprints[-4:]:
+                union = len(fingerprint | old_ids)
+                overlap = (len(fingerprint & old_ids) / float(union)) if union else 0.0
+                if (old_query != _normalise_search_text(query) and overlap >= 0.80
+                        and mean_relevance < 0.34):
+                    stale_repeat = True
+                    break
+        self._recent_search_fingerprints.append((_normalise_search_text(query), fingerprint))
+        self._recent_search_fingerprints = self._recent_search_fingerprints[-6:]
+        if stale_repeat:
+            _status(cb, f"TikTok search {query!r}: discarded a repeated stale result feed.")
+            collected = []
+        elif raw_count and not collected:
+            _status(cb, f"TikTok search {query!r}: discarded {raw_count} unrelated/stale result(s).")
         _SEARCH_STATS["searches"] += 1
         _SEARCH_STATS["items"] += len(collected)
         if collected:
@@ -721,11 +842,16 @@ class Session:
                     pass
             return 0
         if sort_mode == "MOST_LIKED":
-            collected.sort(key=lambda item: _metric(item, ("diggCount", "digg_count", "likeCount")), reverse=True)
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("diggCount", "digg_count", "likeCount"))), reverse=True)
         elif sort_mode == "MOST_VIEWED":
-            collected.sort(key=lambda item: _metric(item, ("playCount", "play_count", "viewCount")), reverse=True)
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("playCount", "play_count", "viewCount"))), reverse=True)
         elif sort_mode == "MOST_RECENT":
-            collected.sort(key=lambda item: _metric(item, ("createTime", "create_time")), reverse=True)
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("createTime", "create_time"))), reverse=True)
+        else:
+            collected.sort(key=lambda item: float(item.get("_query_relevance") or 0), reverse=True)
         _status(cb, f"TikTok search {query!r}: collected {len(collected)} candidate item(s).")
         return collected[:max(0, int(want))]
 

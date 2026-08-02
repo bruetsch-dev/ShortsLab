@@ -1211,7 +1211,7 @@ def split_voice_take_at_hook(full_take, hook_text, input_dir, ffmpeg, status_cb=
 
 
 def generate_project_voiceover(script, project_dir, form, status_cb=None):
-    """Generate the spoken voiceover from the script with Gemini TTS.
+    """Generate the spoken voiceover from the script with the selected TTS provider.
 
     This is the default audio path now: the user picks a speaker name + voice
     and we synthesize the narration instead of requiring an upload. Returns the
@@ -1257,6 +1257,20 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     speaker = (str(form.get("speaker_name") or "").strip() or pipeline.DEFAULT_TTS_SPEAKER) if is_form else pipeline.DEFAULT_TTS_SPEAKER
     voice = (str(form.get("tts_voice") or "").strip() or pipeline.DEFAULT_TTS_VOICE) if is_form else pipeline.DEFAULT_TTS_VOICE
     model = (str(form.get("tts_model") or "").strip() or pipeline.DEFAULT_TTS_MODEL) if is_form else pipeline.DEFAULT_TTS_MODEL
+    is_seed_tts = model in pipeline.SEED_SPEECH_TTS_ALIASES
+    if is_seed_tts and voice not in pipeline.SEED_SPEECH_TTS_VOICES:
+        voice = "stokie_en"
+    seed_tts_kw = {}
+    if is_seed_tts and is_form:
+        seed_tts_kw = {
+            "voice_instruction": str(form.get("tts_voice_instruction") or "").strip() or None,
+            "language": str(form.get("tts_language") or "").strip(),
+            "tts_speed": form.get("tts_native_speed", 1.0),
+            "volume": form.get("tts_volume", 1.0),
+            "pitch": form.get("tts_pitch", 0),
+            "sample_rate": form.get("tts_sample_rate", 24000),
+            "output_format": form.get("tts_output_format", "mp3"),
+        }
     input_dir = project_dir / "input"
     hook_text = form.get("hook_text", "") if is_form else ""
     hook, body = split_hook_from_script(script, hook_text)
@@ -1287,7 +1301,7 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
             log(status_cb, "Generating the FULL narration in ONE take (hook edit cut locally)...")
             full_take = pipeline.generate_speech_gemini(
                 script, input_dir / "voiceover_full", speaker=speaker, voice=voice, model=model,
-                cancel_event=cancel_event, status_cb=status_cb)
+                cancel_event=cancel_event, status_cb=status_cb, **seed_tts_kw)
             pipeline.apply_voice_postprocess(full_take, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
             hook_path, body_path = split_voice_take_at_hook(
                 full_take, hook, input_dir, ffmpeg, status_cb=status_cb)
@@ -1306,7 +1320,7 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
 
         path = pipeline.generate_speech_gemini(
             script, input_dir / "voiceover", speaker=speaker, voice=voice, model=model,
-            cancel_event=cancel_event, status_cb=status_cb)
+            cancel_event=cancel_event, status_cb=status_cb, **seed_tts_kw)
         pipeline.apply_voice_postprocess(path, speed=voice_speed, ffmpeg=ffmpeg, status_cb=status_cb)
         log(status_cb, f"Voiceover generated ({speaker} / {voice}): {path.name}")
         return path
@@ -9720,14 +9734,18 @@ def _rescript_and_recut_impl(slug, new_script, hook_text=None, voice_settings=No
         if hook_text is not None:
             run_form["hook_text"] = hook_clean
         # narrator override: the voiceover regen reads speaker/voice/model from this form
-        for key in ("speaker_name", "tts_voice", "tts_model"):
+        for key in ("speaker_name", "tts_voice", "tts_model", "tts_voice_instruction",
+                    "tts_language", "tts_native_speed", "tts_volume", "tts_pitch",
+                    "tts_sample_rate", "tts_output_format"):
             value = str((voice_settings or {}).get(key) or "").strip()
             if not value:
                 continue
-            if key == "tts_voice" and value not in pipeline.GEMINI_TTS_VOICES:
+            if key == "tts_voice" and value not in set(
+                    pipeline.GEMINI_TTS_VOICES + pipeline.SEED_SPEECH_TTS_VOICES):
                 log(status_cb, f"Unknown TTS voice {value!r} - keeping the saved one.")
                 continue
-            if key == "tts_model" and value not in ("flash", "pro", "gemini-3.1-flash"):
+            if key == "tts_model" and value not in ("flash", "pro", "gemini-3.1-flash",
+                                                      pipeline.SEED_SPEECH_TTS_MODEL):
                 continue
             if str(run_form.get(key) or "") != value:
                 log(status_cb, f"Narrator setting changed: {key} -> {value}")

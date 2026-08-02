@@ -468,6 +468,19 @@ def _ensure_tiktok_cookies(status_cb=None, platforms=None):
 SORT_ALL_ORDER = ("MOST_LIKED", "RELEVANCE", "MOST_VIEWED", "MOST_RECENT")
 
 
+def sanitize_social_search_query(query):
+    """Remove platform boilerplate centrally so every TikTok scrape mode benefits."""
+    value = str(query or "").strip()
+    value = re.sub(r"(?i)(?<![#\w])(?:tiktok|instagram|youtube\s+shorts?|reels?)(?!\w)", " ", value)
+    value = re.sub(r"(?i)(?<![#\w])(?:on\s+)?(?:twitter|x\.com)(?!\w)", " ", value)
+    return re.sub(r"\s+", " ", value).strip(" ,;:-")
+
+
+def _native_hashtag_fallback(query):
+    compact = re.sub(r"[^\u3040-\u30ff\u3400-\u9fff0-9]", "", str(query or ""))
+    return ("#" + compact) if 2 <= len(compact) <= 18 else ""
+
+
 def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=None, deadline=None):
     """Search the selected logged-in backends and return one popularity-ranked result set.
 
@@ -478,6 +491,13 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
     unique results (MOST_LIKED first, then RELEVANCE, then MOST_VIEWED, then MOST_RECENT) so a
     single query harvests the top clips the platform surfaces under each ordering.
     """
+    original_query = str(query or "").strip()
+    query = sanitize_social_search_query(original_query)
+    if not query:
+        _status(status_cb, f"Search skipped platform-only query {original_query!r}.")
+        return []
+    if query != original_query:
+        _status(status_cb, f"Search Controller: cleaned platform boilerplate: {original_query!r} -> {query!r}.")
     if str(sort or "").upper() == "ALL":
         seen, merged = set(), []
         for _mode in SORT_ALL_ORDER:
@@ -529,8 +549,15 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
             sort=sort)
     items = []
     if tt_ready:
-        items = tiktok_login.search_sync(query, want=int(want), status_cb=lambda _message: None,
+        items = tiktok_login.search_sync(query, want=int(want), status_cb=status_cb,
                                          sort=sort, timeout_s=remaining) or []
+        fallback = _native_hashtag_fallback(query) if not items else ""
+        if fallback and (deadline is None or time.monotonic() < deadline):
+            _status(status_cb, f"TikTok: {query!r} had no relevant results; trying native tag {fallback!r} once.")
+            retry_remaining = None if deadline is None else max(0.1, deadline - time.monotonic())
+            items = tiktok_login.search_sync(
+                fallback, want=int(want), status_cb=status_cb,
+                sort=sort, timeout_s=retry_remaining) or []
     if x_future is not None:
         try:
             wait_s = 90.0 if deadline is None else max(0.1, deadline - time.monotonic())
@@ -605,7 +632,10 @@ def backend_search(query, want, status_cb=None, sort="MOST_LIKED", platforms=Non
     sort_mode = str(sort or "MOST_LIKED").upper()
     metric = {"MOST_VIEWED": "views", "MOST_RECENT": "created_at"}.get(sort_mode, "likes")
     if sort_mode in {"MOST_LIKED", "MOST_VIEWED", "MOST_RECENT"}:
-        items.sort(key=lambda item: int((_item_meta(item) or {}).get(metric) or 0), reverse=True)
+        items.sort(key=lambda item: (float(item.get("_query_relevance", 0.5)),
+                   int((_item_meta(item) or {}).get(metric) or 0)), reverse=True)
+    else:
+        items.sort(key=lambda item: float(item.get("_query_relevance", 0.5)), reverse=True)
     return items
 
 
@@ -1729,8 +1759,6 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         try:
             droot = _declined_root()
             droot.mkdir(parents=True, exist_ok=True)
-            if len(list(droot.glob("*.mp4"))) >= 24:
-                return
             key = hashlib.sha1(str(cid_ or raw_path).encode("utf-8", "ignore")).hexdigest()[:12]
             dst = droot / f"declined_{key}.mp4"
             if dst.exists():
@@ -1750,6 +1778,21 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
             if extra:
                 row.update(extra)
             candidate_statuses.append(row)
+        # Metadata rejects have deliberately not been downloaded, so there is no media file to
+        # archive. Preserve their complete discovery record nevertheless: this makes *every*
+        # rejected candidate auditable without wasting bandwidth downloading known-bad clips.
+        if status == "pre_download_rejected":
+            try:
+                droot = _declined_root()
+                droot.mkdir(parents=True, exist_ok=True)
+                row = {"clip_id": cid, "bucket_id": bucket_id, "source_query": q_, "tier": tier,
+                       "status": status, "reason": reason}
+                if extra:
+                    row.update(extra)
+                with (droot / "metadata_rejected.jsonl").open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     def _analyze_item(raw, cid, m, q_, file_key):
         """Full quality gate + normalize for ONE downloaded clip. Runs in a
@@ -1759,6 +1802,9 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         cancel flag); log lines are returned and emitted serially by the collector."""
         logs = []
         if not is_vertical_hq(raw, ffprobe):
+            # Keep every downloaded rejection inspectable.  A clip may be landscape or low-res
+            # for the automatic render yet still be useful to the user manually.
+            _save_declined(raw, cid, "low-res / landscape file")
             _reject(raw)
             return {"kind": "reject", "vertical": False, "query": q_, "logs": logs,
                     "status": "rejected_quality", "reason": "low-res / landscape file"}
@@ -1815,10 +1861,12 @@ def scrape_bucket(out_dir, queries, want, bucket_id="", tier="exact", bucket_ter
         safe_tier = re.sub(r"[^A-Za-z0-9_-]+", "_", str(tier or "tier"))[:20]
         final = normalize_clip(raw, out_dir / f"cand_{safe_bucket}_{safe_tier}_{file_key}.mp4",
                                ffmpeg, seconds=per_clip_seconds, start=stability["start"])
-        _reject(raw)
         if not final:
+            _save_declined(raw, cid, "normalize failed")
+            _reject(raw)
             return {"kind": "reject", "vertical": True, "query": q_, "logs": logs,
                     "status": "rejected_quality", "reason": "normalize failed"}
+        _reject(raw)
         record = {"path": final, "meta": m, "query": q_, "tier": tier, "clip_id": cid,
                   "platform": m.get("platform", "tiktok"), "likes": m.get("likes", 0),
                   "black_bar_score": fv["black_bar_score"], "text_heaviness": th,

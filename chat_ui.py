@@ -21,6 +21,7 @@ import json
 import re
 import time
 import reasoning_modes
+import pipeline
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -299,10 +300,14 @@ RUN_MANIFEST = {
         "scrape_platforms",
         "scrape_terms", "scrape_sort", "background_music_choice", "sfx_amount", "vfx_amount", "script",
         "hook_text", "impact_word", "hook_keywords", "script_relevancy", "visual_script", "speaker_name",
-        "tts_voice", "tts_model", "speaker_image_path", "region", "candidate_url",
+        "tts_voice", "tts_model", "tts_voice_instruction", "tts_language",
+        "tts_native_speed", "tts_volume", "tts_pitch", "tts_sample_rate",
+        "tts_output_format", "speaker_image_path", "region", "candidate_url",
         "caption_active_style", "caption_active_color", "caption_base_color",
         "caption_box_color", "caption_stroke", "caption_size", "caption_uppercase_choice",
         "search_languages",
+        "motion_loop_concept", "motion_loop_profile",
+        "motion_loop_intensity", "motion_loop_quality",
     ],
     # checkbox fields: posted as "on" only when checked (HTML checkbox semantics)
     "check": [
@@ -312,6 +317,7 @@ RUN_MANIFEST = {
         "influencer_hook",
         "add_visual_effects", "add_meme_reactions", "add_neko_reactions",
         "multi_language_search",
+        "motion_loop_mode", "motion_loop_seamless",
     ],
     # file fields
     "file": ["speaker_image_file"],
@@ -378,6 +384,19 @@ def extract_legacy_options():
         "video_model": _parse_select(form, "video_model"),
         "image_model": _parse_select(form, "image_model"),
         "tts_voice": _parse_select(form, "tts_voice"),
+        # The legacy selector only renders the provider active at page creation. The prototype
+        # must instead receive both real provider lists and switch them with the model.
+        "tts_voice_gemini": [{"value": voice, "label": voice}
+                             for voice in pipeline.GEMINI_TTS_VOICES],
+        "tts_voice_seed": [{"value": voice, "label": voice}
+                           for voice in pipeline.SEED_SPEECH_TTS_VOICES],
+        "seed_tts_languages": [{"value": code, "label": label}
+                               for code, label in (("", "Auto language"), ("en", "English"),
+                                                   ("ja", "Japanese"), ("de", "German"),
+                                                   ("fr", "French"), ("es-mx", "Spanish (Mexico)"),
+                                                   ("pt-br", "Portuguese (Brazil)"), ("ko", "Korean"),
+                                                   ("zh", "Chinese"), ("id", "Indonesian"),
+                                                   ("it", "Italian"))],
         "tts_model": _parse_select(form, "tts_model"),
         "sfx_amount": _parse_select(form, "sfx_amount"),
         "scrape_sort": _parse_select(form, "scrape_sort"),

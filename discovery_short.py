@@ -9,6 +9,7 @@ through the normal pipeline so the result stays timeline-editable."""
 import json
 import math
 import re
+import difflib
 import subprocess
 import time
 from pathlib import Path
@@ -389,7 +390,7 @@ def _probe_technical(path, status_cb=None):
     bars (unusable as a 9:16 short) and single-shot talking heads (no visual story)."""
     ff = pipeline.find_ffmpeg()
     out = {"letterbox": 0.0, "cuts_per_min": 0.0, "frozen_run_seconds": 0.0,
-           "micro_stutter_count": 0}
+           "micro_stutter_count": 0, "micro_stutter_times": []}
     try:
         r = subprocess.run([ff, "-hide_banner", "-t", "40", "-i", str(path),
                             "-vf", "cropdetect=24:2:0", "-f", "null", "-"],
@@ -422,10 +423,39 @@ def _probe_technical(path, status_cb=None):
         scan = min(60.0, _video_duration(path) or 60.0)
         out["frozen_run_seconds"] = round(
             float(scrape_v2._detect_duplicate_frame_run(path, 0.0, scan)), 3)
-        out["micro_stutter_count"] = len(pipeline.micro_stutter_events(path, 0.0, scan))
+        hitches = pipeline.micro_stutter_events(path, 0.0, scan)
+        out["micro_stutter_count"] = len(hitches)
+        out["micro_stutter_times"] = [round(float(t), 3) for t in hitches]
     except Exception:  # noqa: BLE001 - objective QA is best effort
         pass
     return out
+
+
+def _start_away_from_hitches(start, stage_end, take, hitches):
+    """Pick a nearby source window that does not include a known isolated frame hitch.
+
+    A library candidate is an intentional user choice.  We should preserve that choice
+    when a few single duplicate frames can simply be cut around, while longer repeated
+    frame stalls are still rejected by the hard technical gate above.
+    """
+    if not hitches or take <= 0:
+        return start
+    latest = max(start, stage_end - take)
+    if latest <= start + 0.01:
+        return start
+    # Prefer the requested position, then look in small forward/backward increments.
+    candidates = [start]
+    step, distance = 0.08, 0.08
+    while distance <= latest - start + 1e-6:
+        candidates.extend((min(latest, start + distance), max(start, start - distance)))
+        distance += step
+    for candidate in candidates:
+        # Keep a tiny safety margin around an event so the rendered 30fps clip cannot
+        # start or end directly on the duplicate frame.
+        if not any(candidate - 0.04 <= float(t) <= candidate + take + 0.04
+                   for t in hitches):
+            return round(candidate, 3)
+    return start
 
 
 def _is_portrait(path):
@@ -722,7 +752,21 @@ def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="p
     return data
 
 
-def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process", feedback=None):
+def _source_copy_score(script, transcript):
+    """Detect source-caption/transcript copying, not merely shared factual nouns."""
+    norm = lambda text: re.findall(r"[a-z0-9]+", str(text or "").lower())
+    left, right = norm(script), norm(transcript)
+    if len(left) < 6 or len(right) < 6:
+        return 0.0
+    sequence = difflib.SequenceMatcher(None, left, right).ratio()
+    left_ngrams = {tuple(left[i:i + 5]) for i in range(len(left) - 4)}
+    right_ngrams = {tuple(right[i:i + 5]) for i in range(len(right) - 4)}
+    phrase_overlap = len(left_ngrams & right_ngrams) / max(1, len(left_ngrams))
+    return max(sequence, phrase_overlap)
+
+
+def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process", feedback=None,
+                  copy_retry=0):
     """LLM: write the mini-short narration; every sentence is tied to one visual stage."""
     stages = analysis["stages"]
     # Stages whose description claims movement a contact sheet cannot prove. Marking them
@@ -760,7 +804,10 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
         "product) when one exists, and its wording must match that shot.\n"
         "4. 6-10 sentences, 85-120 words total, plain punchy English, stages strictly "
         "non-decreasing, every stage index must exist, no dashes (use commas), no emojis, "
-        "no hashtags, every sentence ends with . ! or ?"
+        "no hashtags, every sentence ends with . ! or ?\n"
+        "5. ORIGINAL WORDING ONLY: never copy, closely paraphrase, quote, or preserve the "
+        "sentence structure of narration, captions, or dialogue from the source TikTok. Explain "
+        "only the visible process in fresh independent language."
         + (f"\nThe reveal stage is index {reveal_idx}." if reveal_idx is not None
            else "\nNo reveal stage exists: never describe the finished product's look."))
     user_p = (f"Video: {analysis.get('topic_title')}\nStages:\n{stage_lines}"
@@ -857,6 +904,17 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
             if reveal_idx >= sentences[-1]["stage"] else reveal_idx
     data["sentences"] = sentences
     data["script"] = " ".join(s["text"] for s in sentences)
+    transcript = str(analysis.get("transcript") or "").strip()
+    copy_score = _source_copy_score(data["script"], transcript)
+    if transcript and copy_score >= 0.34:
+        if copy_retry < 2:
+            log(status_cb, f"Discovery: source-wording overlap {copy_score:.0%}; rewriting independently.")
+            copy_feedback = ((feedback or "") + " SOURCE COPYING WAS DETECTED. Do not reuse any "
+                             "five-word phrase, hook construction, or sentence order from the original "
+                             "dialogue/captions. Retell the visible process independently.")
+            return _write_script(analysis, hint, reasoning_model, status_cb=status_cb,
+                                 style=style, feedback=copy_feedback, copy_retry=copy_retry + 1)
+        raise RuntimeError("Discovery script was too close to the source TikTok wording; choose another source.")
     log(status_cb, f"Discovery script ({len(sentences)} sentences): {data.get('title')}")
     return data
 
@@ -1090,9 +1148,17 @@ def run_discovery_short(form, status_cb=None, style="process"):
                            f"{tech['frozen_run_seconds']:.2f}s repeated-frame stall.")
             continue
         if tech.get("micro_stutter_count", 0):
-            log(status_cb, f"Discovery: skipped @{cand['author']} - "
-                           f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es).")
-            continue
+            if not pinned_url:
+                log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                               f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es).")
+                continue
+            # A user-selected library candidate is not an unknown search result. Isolated
+            # duplicate frames are repairable by choosing the cut windows around them;
+            # do not turn the user's explicit pick into the misleading generic
+            # "no candidate survived" error. Sustained freezes are still rejected above.
+            log(status_cb, f"Discovery: selected candidate has "
+                           f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es); "
+                           "the recut will avoid those source moments.")
         if style == "story" and not pinned_url:
             # No scene changes = a talking head with no visual story. Process footage may
             # legitimately contain a long uninterrupted craft shot, so this is story-only.
@@ -1106,11 +1172,18 @@ def run_discovery_short(form, status_cb=None, style="process"):
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
         _min_appeal = 0 if pinned_url else 8
+        # Existing Candidate is an explicit user approval. Keep the quality analysis for
+        # cutting, but do not re-apply the auto-discovery popularity/appeal threshold.
+        # We still require usable stage data: without it there is no honest way to tie
+        # the narration to the footage.
+        min_stages = 1 if pinned_url else 3
         if (not pinned_url and not info.get("is_process")) \
                 or float(info.get("appeal") or 0) < _min_appeal \
-                or len(info["stages"]) < 3:
+                or len(info["stages"]) < min_stages:
             log(status_cb, "Discovery: rejected by vision review - next candidate.")
             continue
+        if pinned_url:
+            info["_micro_stutter_times"] = list(tech.get("micro_stutter_times") or [])
         accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet,
                          "tech": tech})
         log(status_cb, f"Discovery: candidate {len(accepted)}/{_want_accepted} accepted - "
@@ -1191,7 +1264,9 @@ def run_discovery_short(form, status_cb=None, style="process"):
     import shutil
     feedback = None
     for attempt in range(3):
-        if style == "story" and "transcript" not in analysis:
+        # Always retain a local transcript: process videos can have copied source narration too.
+        # It is used as an anti-copy reference, never as wording the new script is allowed to use.
+        if "transcript" not in analysis:
             analysis["transcript"] = _transcribe_source(src, status_cb)
         plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style, feedback=feedback)
         script = plan["script"]
@@ -1325,6 +1400,7 @@ def run_discovery_short(form, status_cb=None, style="process"):
     # ---- recut the long source: each sentence gets footage from ITS process stage
     ff = pipeline.find_ffmpeg()
     stages = analysis["stages"]
+    source_hitches = [float(t) for t in (analysis.get("_micro_stutter_times") or [])]
     stage_cursor = {}
     scenes = []
     # story mode keeps the source's own audio as a quiet bed under the voiceover
@@ -1367,6 +1443,12 @@ def run_discovery_short(form, status_cb=None, style="process"):
             calm = _calmest_start(_src_cuts, t0, st_end, d)
             if calm is not None:
                 t0 = calm
+        if source_hitches:
+            safe_t0 = _start_away_from_hitches(t0, st_end, take, source_hitches)
+            if abs(safe_t0 - t0) >= 0.02:
+                log(status_cb, f"Discovery: clip {i} shifted from {t0:.2f}s to "
+                               f"{safe_t0:.2f}s to avoid a source frame hitch.")
+                t0 = safe_t0
         name = f"disc_{i:02d}.mp4"
         # RETENTION EDIT for story mode (user 2026-07-23, reference-video analysis):
         # a 4-7s sentence over ONE static cut feels slow - split it into ~2s JUMP CUTS

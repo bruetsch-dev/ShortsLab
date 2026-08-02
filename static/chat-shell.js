@@ -15,6 +15,52 @@ const T = BOOT.strings;
 const OPT = BOOT.options;
 const MAN = BOOT.manifest;
 const REASONING = BOOT.reasoningConfig || {};
+const SEED_TTS_MODEL = "bytedance/seed-speech-tts-2.0";
+const isSeedTts = (model) => String(model || "") === SEED_TTS_MODEL ||
+  ["seed-speech", "seed-speech-tts-2.0"].includes(String(model || ""));
+const ttsVoiceOptions = (model) => isSeedTts(model)
+  ? (OPT.tts_voice_seed || []) : (OPT.tts_voice_gemini || OPT.tts_voice || []);
+function resetTtsVoice(holder) {
+  const choices = ttsVoiceOptions(holder.tts_model);
+  if (!choices.some(o => o.value === holder.tts_voice))
+    holder.tts_voice = isSeedTts(holder.tts_model) ? "stokie_en" : (choices[0] || {}).value || "";
+}
+function previewTts(holder, mode) {
+  const a = ensureAudio();
+  a.src = BOOT.voices_preview + encodeURIComponent(holder.tts_voice || "") +
+    "&model=" + encodeURIComponent(holder.tts_model || "pro") + (mode ? "&mode=" + encodeURIComponent(mode) : "");
+  a.play().catch(() => {});
+}
+function seedTtsSettings(holder) {
+  if (!isSeedTts(holder.tts_model)) return null;
+  const box = el("div", "seed-tts-settings");
+  box.appendChild(el("div", "out-sec-hint", "Seed Speech controls the voice directly. Gemini narrator names and Gemini delivery presets are not used."));
+  const instruction = el("textarea"); instruction.rows = 2;
+  instruction.placeholder = "Optional delivery direction, e.g. warm, intimate, energetic";
+  instruction.value = holder.tts_voice_instruction || "";
+  instruction.addEventListener("input", () => { holder.tts_voice_instruction = instruction.value; persist(); });
+  box.appendChild(instruction);
+  const grid = el("div", "seed-tts-grid");
+  const select = (label, options, value, onChange) => {
+    const f = el("label", "seed-tts-field"); f.appendChild(el("span", "", label));
+    const s = el("select"); options.forEach(o => s.appendChild(new Option(o.label || o, o.value || o)));
+    s.value = value == null ? "" : String(value); s.addEventListener("change", () => { onChange(s.value); persist(); });
+    f.appendChild(s); return f;
+  };
+  const number = (label, key, min, max, step, fallback) => {
+    const f = el("label", "seed-tts-field"); f.appendChild(el("span", "", label));
+    const input = el("input"); input.type = "number"; input.min = min; input.max = max; input.step = step;
+    input.value = holder[key] == null || holder[key] === "" ? fallback : holder[key];
+    input.addEventListener("input", () => { holder[key] = input.value; persist(); }); f.appendChild(input); return f;
+  };
+  grid.appendChild(select("Language", OPT.seed_tts_languages || [], holder.tts_language || "", v => holder.tts_language = v));
+  grid.appendChild(number("Speed", "tts_native_speed", "0.5", "2", "0.1", "1"));
+  grid.appendChild(number("Volume", "tts_volume", "0.5", "2", "0.1", "1"));
+  grid.appendChild(number("Pitch", "tts_pitch", "-12", "12", "1", "0"));
+  grid.appendChild(select("Sample rate", [8000, 16000, 22050, 24000, 32000, 44100, 48000].map(v => ({value:String(v), label:v + " Hz"})), holder.tts_sample_rate || "24000", v => holder.tts_sample_rate = v));
+  grid.appendChild(select("Output", [{value:"mp3",label:"MP3"},{value:"opus",label:"Opus"}], holder.tts_output_format || "mp3", v => holder.tts_output_format = v));
+  box.appendChild(grid); return box;
+}
 
 function reasoningOptions(modelId, previous) {
   const cfg = REASONING[modelId];
@@ -48,7 +94,7 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 // What a project's `kind` is CALLED on screen. The raw key doubles as a CSS class, so it stays
 // lowercase; only the badge text lives here. An ordinary generated/scraped project has no kind
 // and so no badge.
-const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch" };
+const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch", motion_loop: "Loop" };
 function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
 // STATE is separate from KIND: a failed Sketch used to show only "failed" and lose its
 // category. State sits top-right, kind top-left; both can show at once.
@@ -105,6 +151,8 @@ const DEFAULT_VALUES = () => {
   if (!v.clip_short_format) v.clip_short_format = "standard";
   if (!v.script_token_limit) v.script_token_limit = "";
   if (!v.speaker_name) v.speaker_name = "Narrator";
+  if (st.motion_loop_seamless === undefined) v.motion_loop_seamless = false;
+  if (!v.motion_loop_quality) v.motion_loop_quality = "economy";
   v.loaded_project_mode = v.loaded_project_mode || "normal";
   v.loaded_project_source = "";
   return v;
@@ -150,6 +198,8 @@ const FLOW_STEPS = {
   visual: ["upload", "settings"],
   captions: ["upload", "settings"],
   enhance: ["choose"],
+  aishort: ["choose"],
+  motionloop: ["concept", "motion", "review"],
   project: ["summary"],
 };
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
@@ -264,6 +314,8 @@ function renderAll() {
      longform: renderLongformFlow, sfx: () => renderMasterFlow("sfx"),
      visual: () => renderMasterFlow("visual"), captions: () => renderMasterFlow("captions"),
      enhance: renderEnhanceFlow,
+     aishort: renderAIShortPicker,
+     motionloop: renderMotionLoopFlow,
      project: renderProjectFlow }[S.flow] || renderModeMenu)();
 
   if (prototypeMode && !S.jobId) decoratePrototypeFlow();
@@ -277,6 +329,7 @@ const STEP_SHORT = {
   outputs: "Finish", review: "Review", topic: "Topic", discover: "Discover",
   pick: "Select", upload: "Source", settings: "Settings", choose: "Upgrade",
   summary: "Project", hook: "Opening", version: "Edit",
+  concept: "Concept", motion: "Motion",
 };
 let _lastStepperOffset = null; // px offset of the previous bar, so the next slides from it
 let _stepperRO = null;
@@ -374,6 +427,8 @@ function stepCopy(step) {
       ? ["PRODUCTION", "Set up the narration", "Pick the narrator, the models and how the voiceover gets approved."]
       : ["SETTINGS", "Direct the enhancement", "Choose the intensity and model."],
     choose:["UPGRADE", "Choose an enhancement", "Pick one production pass."],
+    concept:["CONCEPT", "Build the world", "Describe one surreal place, subject or point of view."],
+    motion:["MOTION", "Direct the loop", "Choose the camera path and intensity; the coded pass keeps it fluid."],
     summary:["PROJECT", "Project overview", "Choose the next action."],
   }[step] || ["SETTINGS", "Configure this step", "Make your choices and continue."]);
 }
@@ -785,11 +840,18 @@ async function refreshPrototypeHomeData() {
   } catch (e) { if (dock) dock.hidden = true; }
 }
 function selectMode(id) {
+  if (id === "visualscript") {
+    S.flow = "aishort"; S.step = "choose"; S.completed = [];
+    renderAll(); persist(); return;
+  }
+  if (id === "visualscript-classic") id = "visualscript";
   const culture = id === "culture";
   const visualScript = id === "visualscript";
+  const motionLoop = id === "motionloop";
   S.flow = (culture || visualScript) ? "script" : id; S.completed = [];
   S.values.culture_facts_mode = culture;
   S.values.visuals_from_script_mode = visualScript;
+  S.values.motion_loop_mode = motionLoop;
   if (culture) {
     applyCultureFactsPreset();
     S.values.clip_short_format = "standard";
@@ -1032,22 +1094,23 @@ function renderScriptFlow() {
       const nrow = el("div", "script-narrator");
       nrow.appendChild(el("span", "sn-lbl", esc(T.tts_voice || "Narrator")));
       const vsel = el("select");
-      (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+      resetTtsVoice(S.values);
+      ttsVoiceOptions(S.values.tts_model).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
       if (S.values.tts_voice && [...vsel.options].some(o => o.value === S.values.tts_voice)) vsel.value = S.values.tts_voice;
       S.values.tts_voice = vsel.value;
       vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
       nrow.appendChild(vsel);
       nrow.appendChild(btn('<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true" style="vertical-align:-2px"><path d="M8 5v14l11-7z"/></svg> Preview', () => {
-        const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.values.tts_voice || "");
-        a.play().catch(() => {});
+        previewTts(S.values);
       }, "ghost small"));
       const msel = el("select");
       (OPT.tts_model || []).forEach(o => msel.appendChild(new Option(o.label, o.value)));
       if (S.values.tts_model && [...msel.options].some(o => o.value === S.values.tts_model)) msel.value = S.values.tts_model;
       S.values.tts_model = msel.value;
-      msel.addEventListener("change", () => { S.values.tts_model = msel.value; persist(); });
+      msel.addEventListener("change", () => { S.values.tts_model = msel.value; resetTtsVoice(S.values); persist(); renderAll(); });
       nrow.appendChild(msel);
       c.appendChild(nrow);
+      const seedSettings = seedTtsSettings(S.values); if (seedSettings) c.appendChild(seedSettings);
       // Region: drives the scrape search language/framing (japan = the original JP-first search).
       // A <japan>-style tag typed in the script still wins server-side; these chips just make the
       // choice visible. Default: japan for the culture-facts preset, general otherwise.
@@ -1399,20 +1462,23 @@ function renderVoiceCard() {
   voiceFld.appendChild(el("label", "", esc(T.tts_voice)));
   const voiceInline = el("div", "voice-inline");
   const vsel = el("select");
-  (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+  resetTtsVoice(S.values);
+  ttsVoiceOptions(S.values.tts_model).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
   if (S.values.tts_voice && [...vsel.options].some(o => o.value === S.values.tts_voice)) vsel.value = S.values.tts_voice;
   S.values.tts_voice = vsel.value;
   vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
   const prev = btn("▶ " + T.preview, () => {
-    const a = ensureAudio(); a.src = BOOT.voices_preview + encodeURIComponent(S.values.tts_voice || "");
-    a.play().catch(() => {});
+    previewTts(S.values);
   }, "ghost small");
   voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
   voiceFld.appendChild(voiceInline);
   const row = el("div", "fld-row");
   row.appendChild(voiceFld);
-  row.appendChild(selectField(T.tts_model, OPT.tts_model, S.values.tts_model, v => S.values.tts_model = v));
+  row.appendChild(selectField(T.tts_model, OPT.tts_model, S.values.tts_model, v => {
+    S.values.tts_model = v; resetTtsVoice(S.values); persist(); renderAll();
+  }));
   c.appendChild(row);
+  const seedSettings = seedTtsSettings(S.values); if (seedSettings) c.appendChild(seedSettings);
   // "fresh voice take" slider hidden by request (force_regenerate still defaults false in state)
   if (!isCultureFacts()) c.appendChild(toggleField(T.speaker_video, S.values.enable_speaker_hook, v => {
     S.values.enable_speaker_hook = v; renderAll(); persist();
@@ -1661,6 +1727,90 @@ function captionStylePanel() {
   wrap.appendChild(grid);
   paintSeg(); paintFields(); paintPreview();
   return wrap;
+}
+
+function renderAIShortPicker() {
+  msgA("Choose how the AI should build the visual world.");
+  const c = card("ai-short-picker");
+  const grid = el("div", "ai-short-choice-grid");
+  const classic = el("button", "ai-short-choice classic");
+  classic.type = "button";
+  classic.innerHTML = `<span class="ai-choice-preview"><video muted autoplay loop playsinline preload="metadata" src="/file?path=static%2Fpreviews%2Fai_short_pig_war_motion_20s_hd.mp4"></video></span>
+    <span class="ai-choice-copy"><small>NARRATED · MULTI-SCENE</small><strong>Visuals from Script</strong>
+    <em>The existing AI Short pipeline: a complete narrated edit made from AI video, generated images and web imagery.</em></span>`;
+  classic.addEventListener("click", () => selectMode("visualscript-classic"));
+  const motion = el("button", "ai-short-choice motion-loop");
+  motion.type = "button";
+  motion.innerHTML = `<span class="ai-choice-preview"><video muted autoplay loop playsinline preload="metadata" poster="/file?path=static%2Fpreviews%2Fmotion_loop_poster.jpg&v=4" src="/file?path=static%2Fpreviews%2Fmotion_loop_prototype.mp4&v=4"></video><i class="ai-loop-orbit"></i></span>
+    <span class="ai-choice-copy"><small>ONE KEYFRAME · ONE MOTION-DNA EDIT</small><strong>Motion Loop</strong>
+    <em>Create a continuous, music-led 9:16 morph using Seedance Video Edit and a locally normalized finish without visual transitions.</em></span>`;
+  motion.addEventListener("click", () => selectMode("motionloop"));
+  grid.append(classic, motion); c.appendChild(grid);
+  const foot = el("div", "card-foot"); foot.appendChild(btn("All modes", resetToMode, "ghost")); c.appendChild(foot);
+  c.querySelectorAll("video").forEach(v => { v.muted = true; v.play().catch(() => {}); });
+  setComposer("off");
+}
+
+function renderMotionLoopFlow() {
+  const done = s => S.completed.includes(s);
+  msgU("Motion Loop");
+  if (!done("concept") && S.step === "concept") {
+    const c = card("motion-loop-config");
+    const label = el("label", "motion-concept-label");
+    label.innerHTML = `<span>Opening world</span><small>Describe only the opening world. The app invents two new destinations and morphs through all three in one continuous 15-second shot.</small>`;
+    const ta = document.createElement("textarea"); ta.rows = 7;
+    ta.placeholder = "Optional: describe a world yourself, or leave this empty for a new random abstract 3D world.";
+    ta.value = S.values.motion_loop_concept || "";
+    ta.addEventListener("input", () => { S.values.motion_loop_concept = ta.value; persist(); });
+    label.appendChild(ta); c.appendChild(label);
+    const surprise=el("button","btn ghost motion-surprise","Surprise me"); surprise.type="button";
+    const worlds=["An Alpine pass folding upward into the sky above inverted valleys","A clean ivory 3D world of arches, chrome spheres and impossible gravity","A translucent glacier canyon with floating mountains and upward waterfalls","A sandstone Moebius desert with levitating black monoliths","A curved green micro-planet with upside-down villages across the sky","A brutalist cloud city bending into a ring around the horizon","A botanical cathedral whose trees continuously become architecture"];
+    surprise.addEventListener("click",()=>{const pov=["bicycle POV","hover-bike cockpit POV","open rover POV","gravity glider POV"];ta.value=worlds[Math.floor(Math.random()*worlds.length)]+", "+pov[Math.floor(Math.random()*pov.length)]+", one continuous morphing journey";S.values.motion_loop_concept=ta.value;persist();});
+    c.appendChild(surprise);
+    const note = el("div", "motion-budget-note", `<b>One continuous 15-second generation</b><span>A fresh GPT Image 2.0 opening frame and one Seedance 2.0 Motion-DNA edit. No stitched clips, reused image inputs or automatic retries.</span>`);
+    c.appendChild(note);
+    const foot = el("div", "card-foot");
+    foot.appendChild(btn("All modes", resetToMode, "ghost"));
+    foot.appendChild(btn("Continue", () => {
+      completeStep("concept", "motion");
+    }, "primary")); c.appendChild(foot); setComposer("off"); return;
+  }
+  if (done("concept")) msgU(esc(S.values.motion_loop_concept), "concept");
+  if (!done("motion") && S.step === "motion") {
+    const c = card("motion-loop-config");
+    const grid = el("div", "motion-profile-grid");
+    const profiles = [
+      ["lateral", "Lateral drift", "Sideways travel with strong foreground parallax — closest to the reference."],
+      ["tunnel", "Tunnel pull", "Forward momentum, repeating frames and a deeper hypnotic vanishing point."],
+      ["orbit", "Dream orbit", "A slower curved camera path with floating subjects and elastic perspective."],
+    ];
+    const current = S.values.motion_loop_profile || "lateral";
+    profiles.forEach(([id,title,desc]) => {
+      const b = el("button", "motion-profile" + (id === current ? " active" : "")); b.type="button";
+      b.innerHTML = `<i class="motion-profile-glyph ${id}"></i><strong>${title}</strong><span>${desc}</span>`;
+      b.addEventListener("click", () => { S.values.motion_loop_profile=id; grid.querySelectorAll(".motion-profile").forEach(x=>x.classList.remove("active")); b.classList.add("active"); persist(); });
+      grid.appendChild(b);
+    }); c.appendChild(grid);
+    const controls = el("div", "motion-inline-controls");
+    const intensity = document.createElement("select"); [["clean","Clean"],["balanced","Balanced"],["intense","Intense"]].forEach(([v,l])=>intensity.appendChild(new Option(l,v)));
+    intensity.value=S.values.motion_loop_intensity||"balanced"; intensity.addEventListener("change",()=>{S.values.motion_loop_intensity=intensity.value;persist();});
+    const addControl=(title,input)=>{const l=el("label");l.append(el("span","",title),input);controls.appendChild(l);};
+    const quality = document.createElement("select"); [["economy","Economy · Seedance 2.0 Fast · 480p"],["standard","Standard · Seedance 2.0 · 480p"],["detail","Detail · Seedance 2.0 · 720p"]].forEach(([v,l])=>quality.appendChild(new Option(l,v)));
+    quality.value=S.values.motion_loop_quality||"economy"; quality.addEventListener("change",()=>{S.values.motion_loop_quality=quality.value;persist();});
+    const fixedDuration=el("div","motion-fixed-duration","<b>15 seconds</b><span>One uninterrupted generation</span>");
+    controls.appendChild(fixedDuration); addControl("Effect intensity",intensity); addControl("Generation quality",quality);
+    const loopLabel=el("label","motion-loop-toggle"); const loop=document.createElement("input"); loop.type="checkbox"; loop.checked=S.values.motion_loop_seamless!==false;
+    loop.addEventListener("change",()=>{S.values.motion_loop_seamless=loop.checked;persist();});
+    loopLabel.append(loop,el("i"),el("span","","<b>Loop</b><small>Direct the motion arc back toward its opening composition without adding a crossfade.</small>")); controls.appendChild(loopLabel); c.appendChild(controls);
+    const foot=el("div","card-foot"); foot.appendChild(btn(T.back,()=>editStep("concept"),"ghost")); foot.appendChild(btn("Review",()=>completeStep("motion","review"),"primary")); c.appendChild(foot);
+    setComposer("off"); return;
+  }
+  if (S.step === "review") {
+    const c=card("motion-loop-review");
+    const rows=[["Opening world",S.values.motion_loop_concept||"Random abstract 3D world"],["Camera",S.values.motion_loop_profile||"lateral"],["Duration","15 seconds · one continuous generation"],["Quality",S.values.motion_loop_quality||"economy"],["Loop",S.values.motion_loop_seamless===true?"On · natural return, no crossfade":"Off"],["Finish",S.values.motion_loop_intensity||"balanced"],["Paid generations","1 fresh image + 1 video · no automatic retry"]];
+    const specs=el("div","review-specs"); rows.forEach(([k,v])=>{const t=el("div","review-spec");t.innerHTML=`<span class="rs-k">${esc(k)}</span><span class="rs-v">${esc(v)}</span>`;specs.appendChild(t);});c.appendChild(specs);
+    const foot=el("div","card-foot"); foot.appendChild(btn(T.back,()=>editStep("motion"),"ghost")); foot.appendChild(btn("Create Motion Loop",submitRun,"primary review-cta")); c.appendChild(foot); setComposer("off");
+  }
 }
 
 function renderEnhanceFlow() {
@@ -2011,24 +2161,25 @@ function renderLongformFlow() {
       voiceFld.appendChild(el("label", "", esc(T.tts_voice || "Narrator")));
       const voiceInline = el("div", "voice-inline");
       const vsel = el("select");
-      (OPT.tts_voice || []).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
+      resetTtsVoice(S.longform);
+      ttsVoiceOptions(S.longform.tts_model).forEach(o => vsel.appendChild(new Option(o.label, o.value)));
       if (S.longform.tts_voice && [...vsel.options].some(o => o.value === S.longform.tts_voice)) vsel.value = S.longform.tts_voice;
       S.longform.tts_voice = vsel.value;
       vsel.addEventListener("change", () => { S.longform.tts_voice = vsel.value; persist(); });
       const prev = btn("▶ " + T.preview, () => {
         // mode=longform so the sample is read with the calm directive this mode actually uses -
         // the default Shorts preview would sell you a punchier narrator than you will get here
-        const a = ensureAudio();
-        a.src = BOOT.voices_preview + encodeURIComponent(S.longform.tts_voice || "") + "&mode=longform";
-        a.play().catch(() => {});
+        previewTts(S.longform, "longform");
       }, "ghost small");
       voiceInline.appendChild(vsel); voiceInline.appendChild(prev);
       voiceFld.appendChild(voiceInline);
     }
-    outSection(c, T.sec_narration || "Narration", voiceFld,
+    const narrationSection = outSection(c, T.sec_narration || "Narration", voiceFld,
       OPT.longform_tts.length ? selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model,
-        v => S.longform.tts_model = v) : null,
+        v => { S.longform.tts_model = v; resetTtsVoice(S.longform); persist(); renderAll(); }) : null,
       el("div", "out-sec-hint", esc(T.longform_voice_hint)));
+    const longformSeedSettings = seedTtsSettings(S.longform);
+    if (longformSeedSettings) (narrationSection.querySelector(".out-sec-body") || narrationSection).appendChild(longformSeedSettings);
     if (OPT.longform_reasoning.length) {
       const dir = outSection(c, T.sec_director || "Director",
         selectField(T.longform_reasoning, OPT.longform_reasoning, S.longform.reasoning_model, v => { const changed=!!S.longform.reasoning_model&&S.longform.reasoning_model!==v; S.longform.reasoning_model = v; S.longform.reasoning_mode = reasoningOptions(v, S.longform.reasoning_mode).value; if(changed)setTimeout(renderAll,0); }));
@@ -2092,6 +2243,9 @@ async function submitLongform() {
   fd.append("script", S.longform.script || "");
   fd.append("tts_model", S.longform.tts_model || firstVal(OPT.longform_tts) || "pro");
   fd.append("tts_voice", S.longform.tts_voice || firstVal(OPT.tts_voice) || "");
+  ["tts_voice_instruction", "tts_language", "tts_native_speed", "tts_volume", "tts_pitch", "tts_sample_rate", "tts_output_format"].forEach(k => {
+    if (S.longform[k] != null) fd.append(k, S.longform[k]);
+  });
   fd.append("reasoning_model", S.longform.reasoning_model || firstVal(OPT.longform_reasoning) || "anthropic/claude-opus-4.8");
   fd.append("reasoning_mode", S.longform.reasoning_mode || "");
   if (S.longform.halt_after_speech !== false) fd.append("halt_after_speech", "on");

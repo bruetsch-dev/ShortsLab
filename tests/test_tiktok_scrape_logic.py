@@ -14,9 +14,56 @@ import scrape_v2
 import sfx_agent
 import sfx_library
 import instagram_login
+import tiktok_login
+import discovery_short
 
 
 class TikTokScrapeLogicTests(unittest.TestCase):
+    def test_selected_discovery_candidate_can_cut_around_isolated_hitches(self):
+        # An explicitly selected library video must not be rejected merely because a
+        # few single duplicated source frames can be avoided by its recut window.
+        start = discovery_short._start_away_from_hitches(0.0, 10.0, 2.0, [0.6, 4.0])
+        self.assertGreater(start, 0.6)
+        self.assertLessEqual(start + 2.0, 4.0)
+
+    def test_discovery_copy_guard_flags_verbatim_source_narration(self):
+        source = ("You cannot say no to anything at this restaurant because the chef spends days "
+                  "learning recipes and refuses customers who cannot appreciate his work.")
+        copied = ("You cannot say no to anything at this restaurant because the chef spends days "
+                  "learning recipes and refuses customers who cannot appreciate his work.")
+        fresh = ("This chef plans every course before you arrive. Turning down a plate is not a "
+                 "casual choice here, because the entire meal is treated as a personal craft.")
+        self.assertGreaterEqual(discovery_short._source_copy_score(copied, source), 0.9)
+        self.assertLess(discovery_short._source_copy_score(fresh, source), 0.34)
+
+    def test_tiktok_response_is_bound_to_current_query(self):
+        self.assertTrue(tiktok_login._search_response_matches_query(
+            "https://www.tiktok.com/api/search/general/full/?keyword=japan%20speed%20dating",
+            "japan speed dating"))
+        self.assertFalse(tiktok_login._search_response_matches_query(
+            "https://www.tiktok.com/api/search/general/full/?keyword=fitness",
+            "財布落とした"))
+        self.assertFalse(tiktok_login._search_response_matches_query(
+            "https://www.tiktok.com/api/challenge/item_list/?challengeID=1",
+            "wallet japan", is_tag=False))
+        self.assertTrue(tiktok_login._search_response_matches_query(
+            "https://www.tiktok.com/api/challenge/item_list/?challengeID=1",
+            "#踊ってみた", is_tag=True))
+
+    def test_tiktok_metadata_relevance_rejects_random_feed_but_keeps_dance(self):
+        random_feed = {"id": "1", "desc": "fitness workout bikini animal compilation"}
+        speed_date = {"id": "2", "desc": "SPEED DATE IN JAPAN with a stranger"}
+        dance = {"id": "3", "desc": "可愛い 踊ってみた #ダンス"}
+        self.assertEqual(tiktok_login._filter_search_results([random_feed], "財布落とした"), [])
+        self.assertEqual(tiktok_login._filter_search_results([speed_date], "japan speed dating"),
+                         [speed_date])
+        self.assertEqual(tiktok_login._filter_search_results([dance], "可愛い ダンス"), [dance])
+
+    def test_all_tiktok_callers_clean_platform_boilerplate(self):
+        self.assertEqual(tiktok_login._sanitize_tiktok_query("女子高校生 TikTok"), "女子高校生")
+        self.assertEqual(clip_scraper.sanitize_social_search_query(
+            "japan speed dating tiktok reels"), "japan speed dating")
+
     def test_clip_short_quality_profile_defaults(self):
         import chat_ui
         self.assertAlmostEqual(agent_core.SCRAPE_VOICE_SPEED, 1.10)

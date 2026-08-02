@@ -182,6 +182,13 @@ UI_TEXT_DEFAULTS = {
     "speaker_name": "Narrator",
     "tts_voice": "Achernar",
     "tts_model": "flash",
+    "tts_voice_instruction": "",
+    "tts_language": "",
+    "tts_native_speed": "1",
+    "tts_volume": "1",
+    "tts_pitch": "0",
+    "tts_sample_rate": "24000",
+    "tts_output_format": "mp3",
     "image_model": "openai/gpt-image-2/text-to-image",
     "hook_text": "",
     "impact_word": "",
@@ -2233,7 +2240,18 @@ def app_script():
               au.onended = function () { if (play) play.innerHTML = "\\u25B6"; };
             } else { au.pause(); if (play) play.innerHTML = "\\u25B6"; }
           };
-          // ---- Voice preview: play a ~10s sample of the selected Gemini voice ----
+          window.syncTtsProvider = function (model) {
+            var seed = model === "bytedance/seed-speech-tts-2.0";
+            var voices = seed ? {json.dumps(list(pipeline.SEED_SPEECH_TTS_VOICES))} : {json.dumps(list(pipeline.GEMINI_TTS_VOICES))};
+            var sel = document.getElementById("tts-voice-select"), old = sel ? sel.value : "";
+            if (sel) {
+              sel.innerHTML = voices.map(function(v){{ return '<option value="'+v+'">'+v+'</option>'; }}).join('');
+              sel.value = voices.indexOf(old) >= 0 ? old : (seed ? 'stokie_en' : '{pipeline.DEFAULT_TTS_VOICE}');
+            }
+            var panel = document.getElementById("seed-tts-settings");
+            if (panel) panel.style.display = seed ? "block" : "none";
+          };
+          // ---- Voice preview: play a ~10s sample of the selected provider voice ----
           window.voicePreview = function () {
             var sel = document.getElementById("tts-voice-select"), btn = document.getElementById("voice-play"),
                 au = document.getElementById("voice-audio");
@@ -2242,7 +2260,8 @@ def app_script():
             if (!au.paused && au.dataset.voice === voice) { au.pause(); btn.innerHTML = "\\u25B6"; return; }
             btn.classList.add("loading"); btn.innerHTML = "\\u2026"; btn.disabled = true;
             au.dataset.voice = voice;
-            au.src = "/voice-preview?voice=" + encodeURIComponent(voice);
+            var modelSel=document.getElementById("tts-model-select"), ttsModel=modelSel?modelSel.value:"pro";
+            au.src = "/voice-preview?voice=" + encodeURIComponent(voice) + "&model=" + encodeURIComponent(ttsModel);
             au.onended = function () { btn.innerHTML = "\\u25B6"; };
             var p = au.play();
             (p && p.then ? p : Promise.resolve()).then(function () {
@@ -2526,7 +2545,7 @@ def app_script():
             var state = collectFormState();
             if (state) { try { localStorage.setItem(autosaveKey, JSON.stringify(state)); } catch (e) {} sendFormState(state); }
           };
-          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","video_model","image_model","reasoning_model","reasoning_mode","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","influencer_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
+          var CUSTOM_PRESET_FIELDS =["speaker_name","tts_voice","tts_model","tts_voice_instruction","tts_language","tts_native_speed","tts_volume","tts_pitch","tts_sample_rate","tts_output_format","video_model","image_model","reasoning_model","reasoning_mode","speaker_image_path","visual_script","use_visual_direction","enable_speaker_hook","influencer_hook","out_web_images","out_wikimedia","out_gpt_images","out_video_clips","out_sfx","out_transition_sfx","out_background_music","out_captions","halt_after_speech","clip_source","scrape_platforms","script_relevancy","scrape_sort","scrape_terms","background_music_choice","scraping_engine","sfx_amount"];
           var activePresetName = null;
           function collectPresetData() {
             var form = document.getElementById("short-form"); if (!form) return {};
@@ -3321,13 +3340,19 @@ def form_page(clear=False, open_load=False, load_slug=""):
         "Achird": "Friendly", "Zubenelgenubi": "Casual", "Vindemiatrix": "Gentle",
         "Sadachbia": "Lively", "Sadaltager": "Knowledgeable", "Sulafat": "Warm",
     }
-    sel_voice = state.get("tts_voice", pipeline.DEFAULT_TTS_VOICE)
+    sel_tts_model = state.get("tts_model", "flash")
+    sel_voice = state.get("tts_voice") or (
+        "stokie_en" if sel_tts_model in pipeline.SEED_SPEECH_TTS_ALIASES
+        else pipeline.DEFAULT_TTS_VOICE)
+    active_voices = (pipeline.SEED_SPEECH_TTS_VOICES
+                     if sel_tts_model in pipeline.SEED_SPEECH_TTS_ALIASES
+                     else pipeline.GEMINI_TTS_VOICES)
     voice_options = "".join(
         f'<option value="{esc(v)}"{" selected" if sel_voice == v else ""}>'
         f'{esc(v)}{" &mdash; " + voice_tones[v] if v in voice_tones else ""}</option>'
-        for v in pipeline.GEMINI_TTS_VOICES
+        for v in active_voices
     )
-    sel_tts_model = state.get("tts_model", "flash")
+    seed_settings_display = "block" if sel_tts_model in pipeline.SEED_SPEECH_TTS_ALIASES else "none"
 
     def checked(name):
         return " checked" if state.get(name) else ""
@@ -3422,7 +3447,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <div id="scrape-settings" class="scrape-settings" style="display:none;">
             <input type="hidden" name="scrape_platforms" value="tiktok,x,instagram">
             <label class="check"><input type="checkbox" name="influencer_hook" value="on">
-              <span><b>Cute dance hook (20K+ likes)</b><small>Optional. Off uses the strongest topic-matched opening clip.</small></span>
+              <span><b>Cute dance retention hook (20K+ likes)</b><small>Optional and intentionally non-literal. It is searched in a separate dance pool and never mistaken for topical proof footage.</small></span>
             </label>
             <input type="hidden" name="scraping_engine" id="scraping-engine" value="v2">
             <div class="scrape-auto-note">&#129504; Search terms are derived from visual intent. TikTok handles native action/lifestyle searches; X receives only validated proof, event and exact-action phrases. The opening hook still requires 20K+ likes; body clips have no minimum-like gate. {help_tip("Body footage is ranked using your selected result order and still passes technical, caption and semantic quality gates.")}</div>
@@ -3546,11 +3571,24 @@ def form_page(clear=False, open_load=False, load_slug=""):
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
             <select name="tts_voice" id="tts-voice-select" style="flex:1; min-width:170px;">{voice_options}</select>
             <button type="button" class="button secondary voice-play" id="voice-play" onclick="voicePreview()" title="Preview this voice (~10s)">&#9654;</button>
-            <select name="tts_model" style="flex:1; min-width:170px;">
+            <select name="tts_model" id="tts-model-select" style="flex:1; min-width:170px;" onchange="syncTtsProvider(this.value)">
               <option value="flash"{' selected' if sel_tts_model == 'flash' else ''}>Gemini 2.5 Flash TTS (cheaper)</option>
               <option value="pro"{' selected' if sel_tts_model == 'pro' else ''}>Gemini 2.5 Pro TTS (higher quality)</option>
               <option value="gemini-3.1-flash"{' selected' if sel_tts_model == 'gemini-3.1-flash' else ''}>Gemini 3.1 Flash TTS (newest)</option>
+              <option value="{pipeline.SEED_SPEECH_TTS_MODEL}"{' selected' if sel_tts_model in pipeline.SEED_SPEECH_TTS_ALIASES else ''}>ByteDance Seed Speech TTS 2.0</option>
             </select>
+          </div>
+          <div id="seed-tts-settings" style="display:{seed_settings_display}; margin-top:14px;">
+            <div class="hint">Seed Speech uses preset voices plus native delivery controls; Gemini speaker labels are not sent.</div>
+            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional delivery instruction: warm, energetic, calm, whispered...">{esc(state.get('tts_voice_instruction'))}</textarea>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
+              <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}"{" selected" if state.get("tts_language") == x else ""}>{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
+              <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="{esc(state.get('tts_native_speed') or '1')}"></label>
+              <label>Volume <input name="tts_volume" type="number" min="0.5" max="2" step="0.1" value="{esc(state.get('tts_volume') or '1')}"></label>
+              <label>Pitch <input name="tts_pitch" type="number" min="-12" max="12" step="1" value="{esc(state.get('tts_pitch') or '0')}"></label>
+              <select name="tts_sample_rate">{''.join(f'<option value="{x}"{" selected" if str(state.get("tts_sample_rate") or "24000") == str(x) else ""}>{x} Hz</option>' for x in (8000,16000,22050,24000,32000,44100,48000))}</select>
+              <select name="tts_output_format"><option value="mp3">MP3</option><option value="opus"{' selected' if state.get('tts_output_format') == 'opus' else ''}>Opus</option></select>
+            </div>
           </div>
           <audio id="voice-audio" preload="none"></audio>
           <input type="hidden" name="mix_voice_in_final" value="on">
@@ -3902,7 +3940,25 @@ def longform_page():
             <option value="pro" selected>Gemini 2.5 Pro TTS (cleaner)</option>
             <option value="flash">Gemini 2.5 Flash TTS (cheaper)</option>
             <option value="gemini-3.1-flash">Gemini 3.1 Flash TTS (newest)</option>
+            <option value="{pipeline.SEED_SPEECH_TTS_MODEL}">ByteDance Seed Speech TTS 2.0</option>
           </select>
+          <label style="margin-top:12px;">Narrator voice</label>
+          <select name="tts_voice">
+            <optgroup label="Gemini voices">{''.join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in pipeline.GEMINI_TTS_VOICES)}</optgroup>
+            <optgroup label="Seed Speech voices">{''.join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in pipeline.SEED_SPEECH_TTS_VOICES)}</optgroup>
+          </select>
+          <details style="margin-top:12px;">
+            <summary>Seed Speech delivery settings</summary>
+            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional tone, emotion, pace or volume instruction"></textarea>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
+              <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}">{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
+              <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="1"></label>
+              <label>Volume <input name="tts_volume" type="number" min="0.5" max="2" step="0.1" value="1"></label>
+              <label>Pitch <input name="tts_pitch" type="number" min="-12" max="12" step="1" value="0"></label>
+              <select name="tts_sample_rate">{''.join(f'<option value="{x}"{" selected" if x == 24000 else ""}>{x} Hz</option>' for x in (8000,16000,22050,24000,32000,44100,48000))}</select>
+              <select name="tts_output_format"><option value="mp3">MP3</option><option value="opus">Opus</option></select>
+            </div>
+          </details>
         </div>
         <div class="panel">
           <label>Reasoning model {help_tip("Writes one doodle image prompt per timestamp (STAGE-3 prompt) and verifies the final image set before assembly.")}</label>
@@ -4228,6 +4284,9 @@ def start_job(fields, files):
                 # women/couples (japan region = Japanese-first) and tell its story.
                 import discovery_short
                 result = discovery_short.run_discovery_short(fields, status_cb, style="story")
+            elif str(fields.get("motion_loop_mode") or "").strip().lower() in ("on", "true", "1"):
+                import motion_loop
+                result = motion_loop.run_motion_loop(fields, status_cb)
             else:
                 result = agent_core.run_project(fields, status_cb)
             with JOB_LOCK:
@@ -5117,16 +5176,30 @@ def start_longform_video_job(fields):
     job_id = str(int(time.time() * 1000))
     script = str(fields.get("script") or "").strip()
     tts_model = (fields.get("tts_model") or "pro").strip().lower()
-    if tts_model not in ("pro", "flash", "gemini-3.1-flash"):
+    if tts_model not in ("pro", "flash", "gemini-3.1-flash", pipeline.SEED_SPEECH_TTS_MODEL):
         tts_model = "pro"
     reasoning_model = (fields.get("reasoning_model") or "anthropic/claude-opus-4.8").strip()
     reasoning_mode = fields.get("reasoning_mode")
     halt_after_speech = agent_core.form_flag(fields, "halt_after_speech", False)
     mascot_enabled = agent_core.form_flag(fields, "mascot_enabled", False)
-    # narrator: only honour a voice the TTS layer actually knows, else keep pipeline's default
+    # narrator: validate against the selected provider's own fixed voice enum
     tts_voice = (fields.get("tts_voice") or "").strip()
-    if tts_voice and tts_voice not in set(pipeline.GEMINI_TTS_VOICES):
+    allowed_tts_voices = (set(pipeline.SEED_SPEECH_TTS_VOICES)
+                          if tts_model == pipeline.SEED_SPEECH_TTS_MODEL
+                          else set(pipeline.GEMINI_TTS_VOICES))
+    if tts_voice and tts_voice not in allowed_tts_voices:
         tts_voice = ""
+    if tts_model == pipeline.SEED_SPEECH_TTS_MODEL and not tts_voice:
+        tts_voice = "stokie_en"
+    tts_options = {
+        "voice_instruction": fields.get("tts_voice_instruction") or "",
+        "language": fields.get("tts_language") or "",
+        "speed": fields.get("tts_native_speed") or 1.0,
+        "volume": fields.get("tts_volume") or 1.0,
+        "pitch": fields.get("tts_pitch") or 0,
+        "sample_rate": fields.get("tts_sample_rate") or 24000,
+        "output_format": fields.get("tts_output_format") or "mp3",
+    }
     cancel_event = threading.Event()
     # the mix gate below waits on this; /approve-speech and cancel_job both set it, exactly as
     # they do for the clip runs, so the gate needs no route of its own
@@ -5285,7 +5358,7 @@ def start_longform_video_job(fields):
                 status_cb=status_cb, cancel_event=cancel_event,
                 speech_gate=lf_speech_gate if halt_after_speech else None,
                 mix_gate=lf_mix_gate if halt_after_speech else None,
-                voice=tts_voice or None, mascot=mascot_enabled)
+                voice=tts_voice or None, mascot=mascot_enabled, tts_options=tts_options)
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
@@ -6788,11 +6861,12 @@ TIMELINE_SKELETON = """
         <div class="tl-script-voicebar">
           <label>Narrator</label>
           <input type="text" id="tl-script-speaker" placeholder="Speaker name" title="Persona name used in the TTS prompt (e.g. Narrator)">
-          <select id="tl-script-voice" title="Gemini TTS voice for the fresh voiceover"></select>
+          <select id="tl-script-voice" title="Narrator voice for the selected TTS provider"></select>
           <select id="tl-script-ttsmodel" title="TTS model quality">
             <option value="flash">Flash TTS (cheaper)</option>
             <option value="pro">Pro TTS (higher quality)</option>
             <option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option>
+            <option value="{pipeline.SEED_SPEECH_TTS_MODEL}">ByteDance Seed Speech TTS 2.0</option>
           </select>
         </div>
         <div class="tl-script-densitybar">
@@ -12387,7 +12461,7 @@ def timeline_model(slug):
                      or pipeline.DEFAULT_TTS_VOICE,
         "tts_model": str(_project_run_form(project_dir).get("tts_model") or "").strip()
                      or pipeline.DEFAULT_TTS_MODEL,
-        "tts_voices": list(pipeline.GEMINI_TTS_VOICES),
+        "tts_voices": list(dict.fromkeys(pipeline.GEMINI_TTS_VOICES + pipeline.SEED_SPEECH_TTS_VOICES)),
         "clip_density": str(config.get("clip_density")
                             or _project_run_form(project_dir).get("clip_density")
                             or "medium").strip().lower(),
@@ -13346,7 +13420,8 @@ def job_page(job_id):
     if status == "awaiting_approval" and job.get("speech_audio"):
         qid = urllib.parse.quote(job_id)
         audio_url = link_for(Path(job["speech_audio"]))
-        voice_opts = "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in pipeline.GEMINI_TTS_VOICES)
+        voice_opts = "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in
+                             dict.fromkeys(pipeline.GEMINI_TTS_VOICES + pipeline.SEED_SPEECH_TTS_VOICES))
         speech_html = f"""
         <section class="panel accent" id="speech-approval">
           <h2>&#127908; Approve the voiceover</h2>
@@ -13361,7 +13436,7 @@ def job_page(job_id):
               <div style="display:flex; gap:10px; flex-wrap:wrap;">
                 <input type="text" name="speaker_name" value="Narrator" placeholder="Speaker name" style="flex:1; min-width:150px;">
                 <select name="tts_voice" style="flex:1; min-width:180px;">{voice_opts}</select>
-                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option><option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option></select>
+                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option><option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option><option value="{pipeline.SEED_SPEECH_TTS_MODEL}">ByteDance Seed Speech TTS 2.0</option></select>
               </div>
               <button class="danger" type="submit" style="margin-top:14px;">&#8635; Replace voice &amp; regenerate</button>
             </form>
@@ -14150,8 +14225,8 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass        # the player closed the connection mid-stream (normal when seeking)
 
-    def serve_voice_preview(self, voice, mode=""):
-        """Generate (once, cached) and serve a ~10s sample of a Gemini TTS voice so the user can
+    def serve_voice_preview(self, voice, mode="", model="pro"):
+        """Generate (once, cached) and serve a ~10s sample of the selected TTS voice so the user can
         preview it before committing. Cached under generated_assets/voice_previews/<voice>.wav.
 
         `mode` picks the delivery directive, because the SAME voice sounds like a different narrator
@@ -14160,7 +14235,10 @@ class Handler(BaseHTTPRequestHandler):
         the original filename and sample, so the Shorts preview is untouched.
         """
         voice = (voice or "").strip()
-        if voice not in pipeline.GEMINI_TTS_VOICES:
+        model = str(model or "pro").strip()
+        is_seed = model in pipeline.SEED_SPEECH_TTS_ALIASES
+        valid_voices = pipeline.SEED_SPEECH_TTS_VOICES if is_seed else pipeline.GEMINI_TTS_VOICES
+        if voice not in valid_voices:
             self.send_error(400, "Unknown voice")
             return
         prev_dir = ROOT / "generated_assets" / "voice_previews"
@@ -14172,18 +14250,18 @@ class Handler(BaseHTTPRequestHandler):
             style = pipeline.TTS_STYLE_LONGFORM
             sample = ("This is a preview of this voice. I can narrate your video calmly and "
                       "clearly, at a pace that stays easy to follow all the way through.")
-            path = prev_dir / f"{voice}_longform.wav"
+            path = prev_dir / f"{voice}_{'seed_' if is_seed else ''}longform.wav"
         else:
             style = None            # None = the default directive: the Shorts preview is unchanged
             sample = ("Hey — this is a quick preview of this voice. I can narrate your story with "
                       "energy, warmth, and a clear, punchy delivery for your short videos.")
-            path = prev_dir / f"{voice}.wav"
+            path = prev_dir / f"{voice}{'_seed' if is_seed else ''}.wav"
         if not path.exists() or path.stat().st_size < 4096:
             if not os.environ.get("WAVESPEED_API_KEY", "").strip():
                 self.send_error(503, "WAVESPEED_API_KEY not set")
                 return
             try:
-                out = pipeline.generate_speech_gemini(sample, path, voice=voice, model="pro",
+                out = pipeline.generate_speech_gemini(sample, path, voice=voice, model=model,
                                                       status_cb=None, style=style)
                 path = Path(out)
             except Exception as exc:  # noqa: BLE001
@@ -14398,7 +14476,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(music_list_payload(), "application/json; charset=utf-8")
         elif parsed.path == "/voice-preview":
             _q = urllib.parse.parse_qs(parsed.query)
-            self.serve_voice_preview(_q.get("voice", [""])[0], _q.get("mode", [""])[0])
+            self.serve_voice_preview(_q.get("voice", [""])[0], _q.get("mode", [""])[0],
+                                     _q.get("model", ["pro"])[0])
         elif parsed.path == "/reddit":
             self.send_bytes(reddit_page() if legacy else chat_ui.chat_shell_page({"flow": "reddit"}))
         elif parsed.path == "/twitter-status":

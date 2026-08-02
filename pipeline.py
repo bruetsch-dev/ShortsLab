@@ -71,6 +71,21 @@ GEMINI_TTS_MODELS = {
     "pro": "google/gemini-2.5-pro/text-to-speech",
     "gemini-3.1-flash": "google/gemini-3.1-flash/text-to-speech",
 }
+SEED_SPEECH_TTS_MODEL = "bytedance/seed-speech-tts-2.0"
+SEED_SPEECH_TTS_ALIASES = {"seed-speech-tts-2.0", "seed-speech", SEED_SPEECH_TTS_MODEL}
+SEED_SPEECH_TTS_VOICES = [
+    "vivi_mixed_en_zh_ja_es_id", "mindy_en_es_id_pt_zh", "stokie_en", "dacey_en",
+    "tim_en", "kian_en_zh", "cedric_en_zh", "sophie_en_zh", "jean_en_zh",
+    "magnus_en_zh", "mabel_en_zh", "nadia_en_zh", "opal_en_zh", "pearl_en_zh",
+    "quentin_en_zh", "vienna_mixed_en_zh", "alina_mixed_en_zh",
+    "corinne_mixed_en_zh", "esther_mixed_en_zh", "freya_mixed_en_zh",
+    "gigi_mixed_en_zh", "holly_mixed_en_zh", "lyla_mixed_en_zh",
+    "daisy_mixed_en_zh", "tracy_es_zh", "jess_ja_es_id_pt_en_zh",
+    "pinky_es_ko_mixed_en_zh", "sweety_ja_es", "sandy_es_mixed_en_zh", "sven_de",
+    "minimi_ja", "usseau_fr", "felipe_es", "han_id", "martins_pt", "enzo_it",
+    "shane_ko", "bonnie_zh", "felix_zh", "celeste_zh", "monkey_king_zh",
+]
+SEED_SPEECH_LANGUAGES = ("", "zh", "en", "ja", "es-mx", "id", "pt-br", "ko", "it", "de", "fr")
 # THE hiss fix (measured): the Flash TTS model generates noise-like HF grain (spectral flatness
 # ~0.205, near white noise) that reads as a constant hiss riding on the voice - no EQ/denoise
 # removes it because it's baked into the generation. Pro is ~2.6x cleaner (flatness ~0.079). Pro
@@ -126,21 +141,61 @@ def format_tts_script(speaker_name, text, style=None):
 def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER,
                            voice=DEFAULT_TTS_VOICE, model=DEFAULT_TTS_MODEL,
                            language=DEFAULT_TTS_LANGUAGE, cancel_event=None,
-                           status_cb=None, style=None):
-    """Generate a spoken voiceover with Gemini TTS and download it to out_path.
+                           status_cb=None, style=None, voice_instruction=None,
+                           tts_speed=1.0, volume=1.0, pitch=0, sample_rate=24000,
+                           output_format="mp3"):
+    """Generate a spoken voiceover with Gemini or ByteDance Seed Speech TTS.
 
-    Returns the local Path. `model` accepts 'flash'/'pro' or a full model id.
-    `style` is the delivery directive; None keeps the default viral-narrator one.
+    The legacy function name is retained for callers/tests. Seed Speech has a different request
+    schema: plain text + one preset ``voice`` and independent delivery/audio controls. Gemini's
+    speaker-labelled text and ``speakers`` array are never sent to the ByteDance endpoint.
     """
     key = key or api_key()
-    model_id = GEMINI_TTS_MODELS.get(model, model)
+    requested_model = str(model or DEFAULT_TTS_MODEL).strip()
+    model_id = GEMINI_TTS_MODELS.get(requested_model, requested_model)
+    is_seed = requested_model in SEED_SPEECH_TTS_ALIASES or model_id == SEED_SPEECH_TTS_MODEL
     speaker = (str(speaker or "").strip() or DEFAULT_TTS_SPEAKER)
-    payload = {
-        "text": format_tts_script(speaker, text, style=style),
-        "language": language or DEFAULT_TTS_LANGUAGE,
-        "speakers": [{"speaker": speaker, "voice": voice or DEFAULT_TTS_VOICE}],
-    }
-    status_log(status_cb, f"Generating voiceover ({speaker}/{voice}) with {model_id}...")
+    if is_seed:
+        seed_voice = str(voice or "").strip()
+        if seed_voice not in SEED_SPEECH_TTS_VOICES:
+            seed_voice = "stokie_en"
+        try:
+            seed_speed = max(0.5, min(2.0, float(tts_speed or 1.0)))
+            seed_volume = max(0.5, min(2.0, float(volume or 1.0)))
+            seed_pitch = max(-12, min(12, int(float(pitch or 0))))
+            seed_rate = int(sample_rate or 24000)
+        except (TypeError, ValueError):
+            seed_speed, seed_volume, seed_pitch, seed_rate = 1.0, 1.0, 0, 24000
+        if seed_rate not in {8000, 16000, 22050, 24000, 32000, 44100, 48000}:
+            seed_rate = 24000
+        seed_format = str(output_format or "mp3").lower()
+        if seed_format not in {"mp3", "opus"}:
+            seed_format = "mp3"
+        seed_language = str(language or "").strip().lower()
+        if seed_language in {"english", "english (united states)", "en-us"}:
+            seed_language = "en"
+        if seed_language not in SEED_SPEECH_LANGUAGES:
+            seed_language = ""
+        # Seed Speech has its own delivery engine. Never leak Gemini's narrator directive into
+        # this payload: doing so made both providers sound and behave like the same preset.
+        # An empty Seed instruction deliberately means the model's native voice behaviour.
+        instruction = str(voice_instruction or "").strip()
+        payload = {"text": str(text or "").strip(), "voice": seed_voice,
+                   "output_format": seed_format, "sample_rate": seed_rate,
+                   "speed": seed_speed, "volume": seed_volume, "pitch": seed_pitch}
+        if instruction:
+            payload["voice_instruction"] = instruction
+        if seed_language:
+            payload["language"] = seed_language
+        voice = seed_voice
+        status_log(status_cb, f"Generating voiceover ({seed_voice}) with {model_id}...")
+    else:
+        payload = {
+            "text": format_tts_script(speaker, text, style=style),
+            "language": language or DEFAULT_TTS_LANGUAGE,
+            "speakers": [{"speaker": speaker, "voice": voice or DEFAULT_TTS_VOICE}],
+        }
+        status_log(status_cb, f"Generating voiceover ({speaker}/{voice}) with {model_id}...")
     response = request_json("POST", f"{API_BASE}/{model_id}", key, payload, timeout=180)
     prediction_id = unwrap_id(response)
     outputs, _ = poll_wavespeed(prediction_id, key, timeout_s=420, cancel_event=cancel_event,

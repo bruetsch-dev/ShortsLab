@@ -301,7 +301,8 @@ def voiceover_path_from_state(out_dir, state=None):
 
 
 def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_event=None,
-                       speech_gate=None, voice=None, speaker=None, resume=True, mix_gate=None):
+                       speech_gate=None, voice=None, speaker=None, resume=True, mix_gate=None,
+                       tts_options=None):
     """Script -> voiceover.wav (parts stitched). Returns (path, parts_count).
 
     `voice` / `speaker` pick the Gemini TTS narrator (None = pipeline defaults), so longform uses
@@ -329,10 +330,22 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     out_dir.mkdir(parents=True, exist_ok=True)
     # only pass a narrator when one was chosen, so an empty pick keeps pipeline's own defaults
     tts_kw = {"style": pipeline.TTS_STYLE_LONGFORM}
+    tts_settings = dict(tts_options or {}) if tts_model in pipeline.SEED_SPEECH_TTS_ALIASES else {}
     if voice:
         tts_kw["voice"] = voice
     if speaker:
         tts_kw["speaker"] = speaker
+    if tts_model in pipeline.SEED_SPEECH_TTS_ALIASES:
+        opts = dict(tts_options or {})
+        tts_kw.update({
+            "voice_instruction": str(opts.get("voice_instruction") or "").strip() or None,
+            "language": str(opts.get("language") or "").strip(),
+            "tts_speed": opts.get("speed", 1.0),
+            "volume": opts.get("volume", 1.0),
+            "pitch": opts.get("pitch", 0),
+            "sample_rate": opts.get("sample_rate", 24000),
+            "output_format": opts.get("output_format", "mp3"),
+        })
 
     # Reusable parts must belong to THIS script, narrator and delivery directive: the state is keyed
     # on the script (load_state) and the split it was recorded under must still produce the same part
@@ -351,6 +364,8 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     saved_voice_path = voiceover_path_from_state(out_dir, saved)
     if (resume and saved and saved.get("voiceover_ready") and _audio_done(raw_voice_path)
             and str(saved.get("voice") or "") == str(voice or "")
+            and str(saved.get("tts_model") or tts_model) == str(tts_model)
+            and dict(saved.get("tts_settings") or {}) == tts_settings
             and str(saved.get("tts_style") or "") == str(tts_kw["style"] or "")):
         _log(status_cb, f"Resume: the voiceover is already stitched ({raw_voice_path.name}) - keeping it.")
         # The mix gate (hear the whole take, set the speed) runs AFTER stitching, so a run killed
@@ -376,6 +391,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     if (int((saved or {}).get("tts_part_total") or 0) != len(parts)
             or str((saved or {}).get("voice") or "") != str(voice or "")
             or str((saved or {}).get("tts_model") or tts_model) != str(tts_model)
+            or dict((saved or {}).get("tts_settings") or {}) != tts_settings
             or str((saved or {}).get("tts_style") or "") != str(tts_kw["style"] or "")):
         saved_files = []
 
@@ -390,7 +406,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         audio with the old script's timings.
         """
         save_state(out_dir, script=script, voice=voice or "", tts_model=tts_model,
-                   tts_style=tts_kw["style"] or "",
+                   tts_style=tts_kw["style"] or "", tts_settings=tts_settings,
                    tts_part_files=[str(p) for p in part_files], tts_part_total=len(parts),
                    # parts are being (re)made, so any stitched voiceover on disk is the old one.
                    # voice_speed None means "the speed question was never answered" - a NUMBER
@@ -407,8 +423,10 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
                             f"({Path(existing).name}) - no new TTS.")
             part_files.append(Path(existing))
             continue
+        _tts_label = ("ByteDance Seed Speech TTS 2.0" if tts_model in pipeline.SEED_SPEECH_TTS_ALIASES
+                      else f"Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS")
         _log(status_cb, f"Voiceover part {i + 1}/{len(parts)} ({len(part)} chars) "
-                        f"with Gemini 2.5 {'Pro' if tts_model == 'pro' else 'Flash'} TTS"
+                        f"with {_tts_label}"
                         f"{(' - narrator ' + str(voice)) if voice else ''}...")
         p = None
         for attempt in range(3):             # a silent part = failed TTS; retry before accepting
@@ -479,7 +497,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
     # paragraph of an existing Sketch Explainer without buying/rebuilding the other paragraphs.
     # Older builds deleted them here, which made per-part editing impossible after the first run.
     save_state(out_dir, tts_part_files=[str(Path(p)) for p in part_files], tts_model=tts_model,
-               tts_part_texts=list(parts), voiceover_ready=True,
+               tts_settings=tts_settings, tts_part_texts=list(parts), voiceover_ready=True,
                voice_speed=None, voiceover_file=out.name)
     _log(status_cb, f"Voiceover ready: {out.name} ({len(parts)} part(s) stitched).")
 
@@ -706,7 +724,7 @@ def finalize_speech_review_timing(out_dir, status_cb=None):
         candidate = out_dir / "images" / f"{image_key(idx, line, natural_durations[idx])}.png"
         if _image_done(candidate, "16:9"):
             results[idx] = str(candidate)
-    cut_durations = caption_cut_durations(new_lines, prompts or [], new_duration)
+    cut_durations = speech_cut_durations(new_lines, new_duration)
     write_timeline_manifest(
         new_lines, cut_durations, results, new_duration, out_dir / "timeline.json",
         voice_speed=float(state.get("voice_speed") or 1.0))
@@ -1259,6 +1277,28 @@ def line_durations(lines, audio_duration):
     return durs
 
 
+def speech_cut_durations(lines, audio_duration):
+    """Return a gapless edit clock anchored to the spoken start of every line.
+
+    Image filenames contain historical timestamps and prompt captions may name a word from the
+    middle of a sentence.  Neither is a reliable edit point.  The local forced-alignment result
+    in ``line['start']`` is: frame 0 opens at video time zero, every following frame switches
+    when its corresponding narration line actually starts, and the final frame holds exactly to
+    the end of the voiceover.  This produces one monotonic timeline without overlaps or holes.
+    """
+    if not lines:
+        return []
+    audio_end = max(0.0, float(audio_duration or 0.0))
+    cuts = [0.0]
+    for line in lines[1:]:
+        cuts.append(max(cuts[-1] + 0.04, min(audio_end, float(line.get("start") or 0.0))))
+    durations = []
+    for idx, cut in enumerate(cuts):
+        nxt = cuts[idx + 1] if idx + 1 < len(cuts) else max(audio_end, cut + 0.04)
+        durations.append(max(0.04, round(nxt - cut, 3)))
+    return durations
+
+
 def retime_longform_assets(out_dir, old_lines, new_lines, old_audio_duration,
                            new_audio_duration, prompts=None, status_cb=None):
     """Move already-generated images onto a changed narration clock.
@@ -1322,16 +1362,18 @@ def write_timeline_manifest(lines, durations, results, audio_duration, out_path,
     """Persist the exact image placement used by assembly and later timeline/resume tooling."""
     out_path = Path(out_path)
     rows = []
+    cursor = 0.0
     for idx, (line, duration) in enumerate(zip(lines, durations)):
         image = results.get(idx) if isinstance(results, dict) else None
         rows.append({
             "index": idx,
-            "start": round(float(line["start"]), 3),
-            "end": round(float(line["start"]) + float(duration), 3),
+            "start": round(cursor, 3),
+            "end": round(cursor + float(duration), 3),
             "duration": round(float(duration), 3),
             "image": Path(image).name if image else None,
             "text": str(line.get("text") or ""),
         })
+        cursor += float(duration)
     payload = {"audio_duration": round(float(audio_duration or 0.0), 3),
                "voice_speed": round(float(voice_speed or 1.0), 3),
                "scenes": rows}
@@ -2194,12 +2236,9 @@ def rebuild_from_disk(project_dir, status_cb=None):
         if f["exists"]:
             results[f["idx"]] = str(project_dir / "images" / f["file"])
     _log(status_cb, f"Rebuilding from disk: {len(results)}/{len(lines)} frames present.")
-    # caption-synced cuts (retrofit the per-word timings once for older states)
-    prompts = state.get("prompts") or []
-    if prompts and ensure_line_words(project_dir, status_cb=status_cb):
-        state = json.loads((project_dir / STATE_FILE).read_text(encoding="utf-8"))
-        lines = state["lines"]
-        durations = caption_cut_durations(lines, prompts, audio_duration)
+    # Cut on the locally aligned start of the corresponding spoken line.  Prompt captions and
+    # the timestamps embedded in image filenames are metadata only and never drive the edit.
+    durations = speech_cut_durations(lines, audio_duration)
     slug = project_dir.name
     out = project_dir / f"{slug}.mp4"
     n = 2
@@ -2218,7 +2257,7 @@ def rebuild_from_disk(project_dir, status_cb=None):
 
 def run_longform_video(script, tts_model="pro", reasoning_model=None,
                        status_cb=None, cancel_event=None, speech_gate=None, resume=True,
-                       voice=None, speaker=None, mix_gate=None, mascot=False):
+                       voice=None, speaker=None, mix_gate=None, mascot=False, tts_options=None):
     """The whole pipeline. Returns a result dict for the job UI.
 
     RESUME (default on): re-running the SAME script continues the existing project instead of
@@ -2312,7 +2351,7 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
                                                    status_cb=status_cb, cancel_event=cancel_event,
                                                    speech_gate=speech_gate, voice=voice,
                                                    speaker=speaker, resume=resume,
-                                                   mix_gate=mix_gate)
+                                                   mix_gate=mix_gate, tts_options=tts_options)
         audio_duration = _probe_duration(voice_path)
         lines = transcribe_lines(script, voice_path, status_cb=status_cb)
         if (speed_retime or explicit_retime) and len(old_lines) == len(lines):
@@ -2370,9 +2409,10 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
 
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
     latest_state = load_state(out_dir, script) or {}
-    # Assembly cuts are CAPTION-synced: each frame appears when its caption word is spoken, not
-    # at the sentence start (image filenames / resume keys stay on the plain line clock).
-    cut_durations = caption_cut_durations(lines, prompts, audio_duration)
+    # Assembly cuts follow the locally forced-aligned narration line starts.  Filename timestamps
+    # and generated caption words are metadata only; using them as edit points caused overlaps,
+    # gaps and images that appeared late relative to the spoken phrase.
+    cut_durations = speech_cut_durations(lines, audio_duration)
     timeline_path = write_timeline_manifest(
         lines, cut_durations, results, audio_duration, out_dir / "timeline.json",
         voice_speed=latest_state.get("voice_speed") or 1.0)

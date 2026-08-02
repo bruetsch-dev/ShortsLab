@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field, asdict
@@ -49,6 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 import clip_scraper                      # V1 primitives (no cycle: clip_scraper never imports us)
+import pipeline                          # shared render/cadence helpers; pipeline does not import scrape_v2
 
 try:
     import cv2
@@ -2183,6 +2185,37 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
     cand_root.mkdir(parents=True, exist_ok=True)
     rej = state.setdefault("rejections", {})
     passed = []
+
+    def _archive_declined(path, src, reason, segment=None):
+        """Persist a watchable source for every V2 post-download rejection.
+
+        V2 previously deleted proxies as soon as a segment failed quality, leaving the user with
+        a log entry but no way to inspect or manually reuse the footage.  Keep one source copy
+        per clip (not one copy per rejected segment) plus the exact reason in a sidecar.
+        """
+        try:
+            source = Path(path)
+            if not source.exists():
+                return
+            root = Path(project_dir) / "seedance 2.0" / "_declined"
+            root.mkdir(parents=True, exist_ok=True)
+            key = hashlib.sha1(str(src.source_id).encode("utf-8", "ignore")).hexdigest()[:12]
+            dest = root / f"declined_v2_{key}.mp4"
+            if not dest.exists():
+                shutil.copy2(source, dest)
+            sidecar = dest.with_suffix(".json")
+            prior = json.loads(sidecar.read_text("utf-8")) if sidecar.exists() else {}
+            reasons = list(prior.get("reasons") or [])
+            if reason not in reasons:
+                reasons.append(str(reason)[:180])
+            sidecar.write_text(json.dumps({
+                "status": "rejected", "platform": src.platform, "clip_id": src.source_id,
+                "query": src.query, "reasons": reasons,
+                "segment": ({"start": round(float(segment.start_time or 0), 3),
+                             "end": round(float(segment.end_time or 0), 3)} if segment else None),
+            }, indent=2, ensure_ascii=False), "utf-8")
+        except Exception:
+            pass
     for src in sources:
         if len(state.setdefault("_downloaded_ids", set())) >= download_budget:
             break
@@ -2205,6 +2238,7 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
                 rej["not_native_9_16"] = rej.get("not_native_9_16", 0) + 1
                 _log(status_cb, f"Scrape V2 Mini Story: rejected {src.platform} clip "
                                 f"{src.source_id} ({shown}); native 9:16 is required.")
+                _archive_declined(got, src, f"native 9:16 required ({shown})")
                 try:
                     Path(got).unlink(missing_ok=True)
                 except Exception:
@@ -2225,9 +2259,11 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
                             "frozen_frames": "micro_freezes",
                             "cadence_stutter": "micro_stutters"}.get(r, r)
                     rej[key] = rej.get(key, 0) + 1
+                _archive_declined(got, src, "; ".join(seg.rejection_reasons), seg)
                 continue
             if seg.quality_score < SEGMENT_MIN_QUALITY:
                 rej["low_quality"] = rej.get("low_quality", 0) + 1
+                _archive_declined(got, src, f"low quality score {seg.quality_score:.1f}", seg)
                 continue
             passed.append(seg)
             kept += 1
@@ -2865,6 +2901,24 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 verdict = "rejected"
                 why = ("below the semantic match floors for every scene "
                        "(subject/action/location did not support any narration line strongly enough)")
+                # Semantic rejections are still real, downloaded footage. Preserve a single
+                # source copy in the Declined library instead of making the user hunt through
+                # transient V2 proxies after the run.
+                try:
+                    source = Path(seg.source_path)
+                    if source.exists():
+                        droot = Path(project_dir) / "seedance 2.0" / "_declined"
+                        droot.mkdir(parents=True, exist_ok=True)
+                        key = hashlib.sha1(str(seg.source_id).encode("utf-8", "ignore")).hexdigest()[:12]
+                        target = droot / f"declined_v2_{key}.mp4"
+                        if not target.exists():
+                            shutil.copy2(source, target)
+                        target.with_suffix(".json").write_text(json.dumps({
+                            "status": "rejected_semantic", "platform": seg.platform,
+                            "clip_id": seg.source_id, "query": seg.query or "", "reason": why,
+                        }, indent=2, ensure_ascii=False), "utf-8")
+                except Exception:
+                    pass
             _slog(project_dir, {
                 "type": "clip", "segment_id": seg.segment_id, "platform": seg.platform,
                 "clip_id": seg.source_id, "query": seg.query or "",
