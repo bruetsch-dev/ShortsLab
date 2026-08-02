@@ -1591,6 +1591,8 @@ def run_discovery_short(form, status_cb=None, style="process"):
         "seedance_audio_volume_with_speech": 0.12,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
+        # Candidate was already chosen - tolerate minor stalls/hitches rather than blocking.
+        "tolerate_clip_defects": True,
     }
     agent_core.apply_caption_style_from_form(config, form)
     (project_dir / "config").mkdir(exist_ok=True)
@@ -1881,6 +1883,8 @@ def run_mini_topic_short(form, status_cb=None):
         "background_music_enabled": False,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
+        # Pool clips are pre-selected material - tolerate minor stalls/hitches rather than blocking.
+        "tolerate_clip_defects": True,
     }
     agent_core.apply_caption_style_from_form(config, form)
     (project_dir / "config").mkdir(exist_ok=True)

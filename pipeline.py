@@ -3497,22 +3497,33 @@ def render_video(config, basename=None):
                         path, window_start, window_end)
                 stall = checked_clip_windows[window_key]
                 if stall >= 0.15:
-                    clip_obj.release()
-                    for existing_clip in clips.values():
-                        existing_clip.release()
-                    raise RuntimeError(
-                        f"Render blocked: scene {scene_id} contains a {stall:.2f}s repeated-frame "
-                        "stall. Replace or retrim this clip; the app will not render visible lag.")
+                    if config.get("tolerate_clip_defects"):
+                        if status_cb:
+                            status_cb(f"Render warning: scene {scene_id} has a {stall:.2f}s "
+                                      "repeated-frame stall - continuing (chosen candidate).")
+                    else:
+                        clip_obj.release()
+                        for existing_clip in clips.values():
+                            existing_clip.release()
+                        raise RuntimeError(
+                            f"Render blocked: scene {scene_id} contains a {stall:.2f}s repeated-frame "
+                            "stall. Replace or retrim this clip; the app will not render visible lag.")
                 cadence_hitches = micro_stutter_events(path, window_start, window_end)
                 if cadence_hitches:
-                    clip_obj.release()
-                    for existing_clip in clips.values():
-                        existing_clip.release()
-                    shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
-                    raise RuntimeError(
-                        f"Render blocked: scene {scene_id} contains isolated duplicate-frame "
-                        f"hitches at source time {shown}. Replace or retrim this clip; the app "
-                        "will not render recurring micro-lag.")
+                    if config.get("tolerate_clip_defects"):
+                        shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
+                        if status_cb:
+                            status_cb(f"Render warning: scene {scene_id} has isolated duplicate-frame "
+                                      f"hitches at {shown} - continuing (chosen candidate).")
+                    else:
+                        clip_obj.release()
+                        for existing_clip in clips.values():
+                            existing_clip.release()
+                        shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
+                        raise RuntimeError(
+                            f"Render blocked: scene {scene_id} contains isolated duplicate-frame "
+                            f"hitches at source time {shown}. Replace or retrim this clip; the app "
+                            "will not render recurring micro-lag.")
                 clips[scene_id] = clip_obj
                 clip_start_trims[scene_id] = start_trim
                 previous_identity = identity
