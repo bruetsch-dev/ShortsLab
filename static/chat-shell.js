@@ -24,6 +24,9 @@ function resetTtsVoice(holder) {
   const choices = ttsVoiceOptions(holder.tts_model);
   if (!choices.some(o => o.value === holder.tts_voice))
     holder.tts_voice = isSeedTts(holder.tts_model) ? "stokie_en" : (choices[0] || {}).value || "";
+  // Seed always receives the normal narration through its required `text` input.
+  // Its optional delivery-instruction field is intentionally not exposed in the app.
+  if (isSeedTts(holder.tts_model)) holder.tts_voice_instruction = "";
 }
 function previewTts(holder, mode) {
   const a = ensureAudio();
@@ -35,11 +38,6 @@ function seedTtsSettings(holder) {
   if (!isSeedTts(holder.tts_model)) return null;
   const box = el("div", "seed-tts-settings");
   box.appendChild(el("div", "out-sec-hint", "Seed Speech controls the voice directly. Gemini narrator names and Gemini delivery presets are not used."));
-  const instruction = el("textarea"); instruction.rows = 2;
-  instruction.placeholder = "Optional delivery direction, e.g. warm, intimate, energetic";
-  instruction.value = holder.tts_voice_instruction || "";
-  instruction.addEventListener("input", () => { holder.tts_voice_instruction = instruction.value; persist(); });
-  box.appendChild(instruction);
   const grid = el("div", "seed-tts-grid");
   const select = (label, options, value, onChange) => {
     const f = el("label", "seed-tts-field"); f.appendChild(el("span", "", label));
@@ -205,7 +203,9 @@ const FLOW_STEPS = {
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
 function isVisualsFromScript() { return S.flow === "script" && !!S.values.visuals_from_script_mode; }
 function isMiniStory() { return isCultureFacts() && S.values.clip_short_format === "mini_story"; }
-function isDiscovery() { return isCultureFacts() && S.values.clip_short_format === "discovery"; }
+// mini_story is retained as a legacy saved-project value, but both old Mini and the
+// former Discovery now use the same scriptless Unified Discovery workflow.
+function isDiscovery() { return isCultureFacts() && ["discovery", "mini_story"].includes(S.values.clip_short_format); }
 function estimatedScriptTokens(text) {
   const chunks = String(text || "").trim().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) || [];
   return chunks.length;
@@ -883,7 +883,8 @@ function renderScriptFlow() {
     const grid = el("div", "clip-format-grid");
     const choose = (value) => {
       S.values.clip_short_format = value;
-      S.values.script_token_limit = value === "mini_story" ? "130" : "";
+      S.values.script_token_limit = "";
+      if (value === "discovery") S.values.script = "";
       completeStep("format", "script");
     };
     const standard = el("button", "clip-format-choice");
@@ -895,7 +896,8 @@ function renderScriptFlow() {
     const disc = el("button", "clip-format-choice mini");
     disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>The agent hunts one long, fascinating process TikTok (a craft, a build, a dish), writes the script itself and recuts the source to the voiceover.</span><em>Topic optional · one long 9:16 source</em>`;
     disc.addEventListener("click", () => choose("discovery"));
-    grid.appendChild(standard); grid.appendChild(mini); grid.appendChild(disc); c.appendChild(grid);
+    disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>Choose an optional direction, or let the agent find an unused surprising topic, real footage and the finished narration itself.</span><em>Real vertical footage · topic optional · no repeats</em>`;
+    grid.appendChild(standard); grid.appendChild(disc); c.appendChild(grid);
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.back, resetToMode, "ghost")); c.appendChild(foot);
     setComposer("off"); return;
@@ -903,7 +905,7 @@ function renderScriptFlow() {
 
   // step: script
   msgA(isDiscovery()
-    ? "Set the direction for the Discovery agent."
+    ? "Optional: give Discovery a direction, or leave it blank for a new topic."
     : isMiniStory()
       ? "Give a topic, or paste a mini script."
       : esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
@@ -914,8 +916,8 @@ function renderScriptFlow() {
     const c = card("script-config-card");
     if (isDiscovery() || isMiniStory()) {
       c.appendChild(el("div", "card-note", isDiscovery()
-        ? "Discovery mode: the agent finds one long Asian craft/process TikTok, writes the "
-          + "narration itself and cuts the source to match it. Give an optional topic direction:"
+        ? "No script is needed. Discovery chooses an unused, visually tellable topic when left blank, "
+          + "finds real footage, then writes and cuts the Short around what is actually visible."
         : "Mini Story needs no script: give a TOPIC (e.g. 'old noodle vending machine') and the "
           + "agent finds real footage of that ONE subject first. Leave BOTH empty and it hunts a "
           + "story/skit TikTok (Asian women/couples) on its own and tells its story. Pasting "
@@ -926,6 +928,7 @@ function renderScriptFlow() {
         ? "Topic (optional) — e.g. bamboo chopsticks, sword forging, tea roasting…"
         : "Topic — e.g. old noodle vending machine, capsule hotel, rural train station…";
       ti.style.cssText = "width:100%; margin:6px 0 4px;";
+      if (isDiscovery()) ti.placeholder = "Optional direction - e.g. Japanese school festivals, strange restaurants, dating rules";
       ti.value = S.values.gen_topic || "";
       ti.addEventListener("input", () => { S.values.gen_topic = ti.value; persist(); });
       c.appendChild(ti);
@@ -970,7 +973,7 @@ function renderScriptFlow() {
     };
     ta.addEventListener("input", () => { sizeScriptBox(); paintTokenMeter(); });
     requestAnimationFrame(sizeScriptBox);
-    if (isMiniStory()) {
+    if (isMiniStory() && !isDiscovery()) {
       tokenMeter = el("div", "script-token-meter");
       c.appendChild(tokenMeter); paintTokenMeter();
     }
@@ -2847,6 +2850,12 @@ async function pollJob() {
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
         if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
+        if (+cd.source_count > 1) card.appendChild(el("div", "card-note", `${+cd.source_count} related source videos in this topic pool`));
+        if ((cd.warnings || []).length) {
+          const warning = el("div", "card-note", "Review note: " + esc(cd.warnings.join(" / ")));
+          warning.style.cssText = "color:#f2bd72; margin:5px 0; line-height:1.35;";
+          card.appendChild(warning);
+        }
         if (cd.video_url) {
           const vp = document.createElement("video");
           vp.src = cd.video_url; vp.controls = true; vp.preload = "metadata";

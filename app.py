@@ -3580,7 +3580,6 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <div id="seed-tts-settings" style="display:{seed_settings_display}; margin-top:14px;">
             <div class="hint">Seed Speech uses preset voices plus native delivery controls; Gemini speaker labels are not sent.</div>
-            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional delivery instruction: warm, energetic, calm, whispered...">{esc(state.get('tts_voice_instruction'))}</textarea>
             <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
               <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}"{" selected" if state.get("tts_language") == x else ""}>{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
               <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="{esc(state.get('tts_native_speed') or '1')}"></label>
@@ -3949,7 +3948,6 @@ def longform_page():
           </select>
           <details style="margin-top:12px;">
             <summary>Seed Speech delivery settings</summary>
-            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional tone, emotion, pace or volume instruction"></textarea>
             <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
               <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}">{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
               <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="1"></label>
@@ -4266,24 +4264,15 @@ def start_job(fields, files):
     def worker():
         try:
             status_cb("Started.")
-            # Clip Short DISCOVERY mode: no script -> the agent finds one long process
-            # TikTok, writes the script itself and recuts the source to the voiceover.
+            # Unified Clip Short Discovery: no script -> the agent chooses an unused,
+            # reference-style real-footage topic (or follows the optional direction), then
+            # finds material and writes/recuts the whole short itself. mini_story remains a
+            # legacy saved-format alias so old projects enter the same reliable workflow.
             _fmt = str(fields.get("clip_short_format") or "")
             _no_script = not str(fields.get("script") or "").strip()
-            if _fmt == "discovery" and _no_script:
+            if _fmt in ("discovery", "mini_story") and _no_script:
                 import discovery_short
-                result = discovery_short.run_discovery_short(fields, status_cb)
-            elif _fmt == "mini_story" and _no_script and str(fields.get("gen_topic") or "").strip():
-                # Mini Story TOPIC mode: scrape a one-subject footage cluster FIRST, then
-                # write a script the material can actually show.
-                import discovery_short
-                result = discovery_short.run_mini_topic_short(fields, status_cb)
-            elif _fmt == "mini_story" and _no_script:
-                # Mini Story AUTO-DISCOVERY (user 2026-07-23, never a selectable option):
-                # empty script AND empty topic -> hunt a story/skit TikTok with Asian
-                # women/couples (japan region = Japanese-first) and tell its story.
-                import discovery_short
-                result = discovery_short.run_discovery_short(fields, status_cb, style="story")
+                result = discovery_short.run_discovery_short(fields, status_cb, style="mixed")
             elif str(fields.get("motion_loop_mode") or "").strip().lower() in ("on", "true", "1"):
                 import motion_loop
                 result = motion_loop.run_motion_loop(fields, status_cb)

@@ -111,6 +111,15 @@ GEMINI_TTS_VOICES = [
 TTS_STYLE_DIRECTIVE = ("Read the following with high energy and enthusiasm - an upbeat, engaging, "
                        "punchy viral-narrator delivery, with crisp, clear enunciation")
 
+# Seed Speech accepts its delivery direction in a separate field rather than inside the
+# spoken text. Keep the same energetic Short profile as Gemini, but phrase it as an API
+# instruction so Seed never reads it aloud. This is intentionally internal: the app has
+# one consistent narrator behaviour instead of a second prompt box.
+SEED_SHORT_STYLE_INSTRUCTION = (
+    "Upbeat, energetic and curious viral short-form narration. Keep a brisk natural pace, "
+    "clear emphasis on the hook and key reveals, crisp confident enunciation, and no flat or sleepy delivery."
+)
+
 # The directive above is written for a 30-second Short, where relentless energy is the point. Over a
 # long narration it is exhausting and fights an informative narrator, so the long formats ask for a
 # delivery that stays listenable for many minutes instead.
@@ -176,10 +185,9 @@ def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER
             seed_language = "en"
         if seed_language not in SEED_SPEECH_LANGUAGES:
             seed_language = ""
-        # Seed Speech has its own delivery engine. Never leak Gemini's narrator directive into
-        # this payload: doing so made both providers sound and behave like the same preset.
-        # An empty Seed instruction deliberately means the model's native voice behaviour.
-        instruction = str(voice_instruction or "").strip()
+        # Seed Speech has its own delivery engine, so Gemini's speaker-labelled text is
+        # never sent here. Its equivalent style prompt belongs in voice_instruction.
+        instruction = str(voice_instruction or "").strip() or SEED_SHORT_STYLE_INSTRUCTION
         payload = {"text": str(text or "").strip(), "voice": seed_voice,
                    "output_format": seed_format, "sample_rate": seed_rate,
                    "speed": seed_speed, "volume": seed_volume, "pitch": seed_pitch}
@@ -3515,6 +3523,11 @@ def render_video(config, basename=None):
                         if status_cb:
                             status_cb(f"Render warning: scene {scene_id} has isolated duplicate-frame "
                                       f"hitches at {shown} - continuing (chosen candidate).")
+                    elif config.get("allow_repairable_source_hitches"):
+                        if status_cb:
+                            shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
+                            status_cb(f"Render warning: scene {scene_id} has isolated duplicate-frame "
+                                      f"hitches at {shown} - continuing (reviewed source).")
                     else:
                         clip_obj.release()
                         for existing_clip in clips.values():

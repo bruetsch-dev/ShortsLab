@@ -19,6 +19,23 @@ import discovery_short
 
 
 class TikTokScrapeLogicTests(unittest.TestCase):
+    def test_discovery_topic_history_rejects_reused_subject(self):
+        history = [{"topic": "Japanese school festival haunted houses"}]
+        self.assertTrue(discovery_short._topic_has_been_used(
+            "Japanese school festival haunted houses", history))
+        self.assertTrue(discovery_short._topic_has_been_used(
+            "Japanese school festival haunted house", history))
+        self.assertFalse(discovery_short._topic_has_been_used(
+            "Unusual Tokyo vending machine meals", history))
+
+    def test_unified_discovery_requires_japan_context_before_download(self):
+        self.assertTrue(discovery_short._has_japan_context(
+            {"query": "Japanese school festival haunted house", "desc": ""}))
+        self.assertTrue(discovery_short._has_japan_context(
+            {"query": "文化祭 お化け屋敷", "desc": ""}))
+        self.assertFalse(discovery_short._has_japan_context(
+            {"query": "realistic fake fried egg", "desc": "sculpture fake food"}))
+
     def test_selected_discovery_candidate_can_cut_around_isolated_hitches(self):
         # An explicitly selected library video must not be rejected merely because a
         # few single duplicated source frames can be avoided by its recut window.

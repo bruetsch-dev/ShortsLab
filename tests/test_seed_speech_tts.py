@@ -50,6 +50,7 @@ class SeedSpeechTtsTests(unittest.TestCase):
         self.assertEqual(payload["pitch"], 12)
         self.assertEqual(payload["sample_rate"], 24000)
         self.assertEqual(payload["output_format"], "mp3")
+        self.assertEqual(payload["voice_instruction"], pipeline.SEED_SHORT_STYLE_INSTRUCTION)
 
 
 if __name__ == "__main__":
