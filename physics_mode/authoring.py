@@ -38,7 +38,9 @@ becomes a real 3D simulation, so only describe things that can be built from sim
 solids: boxes, spheres, cylinders, planes, and stacks of them.
 
 Fill in everything the note leaves open, and choose well:
-  - the objects, their rough sizes and materials
+  - the objects, their rough sizes and materials. Whatever gets destroyed should be
+    LARGE - a wall or tower a person could not reach the top of, not a tabletop model.
+    Small targets are the single most common reason one of these shorts looks cheap.
   - what moves, what it hits, and what happens as a result
   - whether it should LOOP seamlessly (satisfying, hypnotic, repeating) or play once
   - how long one take should be (3-6 seconds for a single action, 2-4 for a loop)
@@ -137,6 +139,20 @@ CRAFT RULES - this is a 9:16 short, judged on how it looks:
     top-down shot flattens the objects and the collision stops reading as a collision.
   * The subject must be the brightest thing in frame. If the floor or the background is
     brighter than what the viewer is meant to watch, lower their brightness.
+  * SCALE IS THE WHOLE POINT. The thing being destroyed must be BIG - tall enough to fill
+    roughly half the frame height on its own, built from at least 200 separate pieces.
+    A small target reads as cheap no matter how correct the simulation is: there is not
+    enough debris to watch, and the impact has nothing to move. If the prompt names
+    several targets, they must still each be large; show fewer of them rather than
+    shrinking them.
+  * A CHAIN IS NOT A ROD. A single stretched cylinder from pivot to ball is the giveaway
+    that nobody built a chain. Make it from 8-14 short links, each its own object, and
+    place them along the line from pivot to ball ON EVERY FRAME as you keyframe the ball,
+    so the chain follows the swing. Same for ropes and cables.
+  * The impact must be VISIBLE and AUDIBLE. The app scores the finished video by watching
+    it, so the collision has to be a real event on screen: mass arriving fast, many pieces
+    leaving at once. A glancing touch on a thin object produces neither picture nor sound
+    worth keeping.
   * If the prompt asks for something SATISFYING or LOOPING: make the motion periodic and
     the camera move at constant speed, so the last frame continues into the first. Say so
     in "kind": "loop" and keep it short - the app repeats it.
@@ -177,6 +193,34 @@ def frame_looks_empty(path) -> bool:
     edge = ImageStat.Stat(im.filter(ImageFilter.FIND_EDGES)).mean[0]
     spread = ImageStat.Stat(im).stddev[0]
     return edge < 2.0 or spread < 16.0
+
+
+def dead_band(path) -> str:
+    """Name a third of the frame that is empty, or "" if the composition uses all of it.
+
+    A 9:16 short is judged on the whole tall frame. A scene can be perfectly built and
+    still waste half its picture on unlit floor - one preview came back with a three-storey
+    glass wall in the top half and pure black below, which is fifty percent of the video
+    doing nothing. Measuring each third catches that; a human eyeballing every preview does
+    not scale.
+    """
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return ""
+    try:
+        im = Image.open(path).convert("L").resize((120, 213))
+    except Exception:  # noqa: BLE001
+        return ""
+    h = im.height // 3
+    for name, box in (("top", (0, 0, im.width, h)),
+                      ("middle", (0, h, im.width, 2 * h)),
+                      ("bottom", (0, 2 * h, im.width, im.height))):
+        band = im.crop(box)
+        st = ImageStat.Stat(band)
+        if st.stddev[0] < 9.0 and st.mean[0] < 60:
+            return name
+    return ""
 
 
 def _slug(text: str) -> str:
@@ -233,6 +277,28 @@ def author_scene(prompt: str, status_cb=None, *, blender: str | None = None,
                                  meta.get("seconds") or 4.0) * 30 * 0.55))},
                             blender=blender, timeout=900)
         shot = probe / "preview.png"
+        if ok and shot.is_file() and not frame_looks_empty(shot):
+            band = dead_band(shot)
+            if band:
+                ok, msg = False, (
+                    f"The shot renders, but the {band} third of the frame is empty and "
+                    "dark - in a 9:16 short that is a third of the picture wasted. Light "
+                    "the floor where the debris lands, and place the camera so the "
+                    "subject and its surroundings occupy the whole tall frame rather "
+                    "than one band of it.")
+        if ok and shot.is_file() and not frame_looks_empty(shot):
+            # Pixel statistics cannot tell that the wrecking ball is above the frame edge
+            # while its chain hangs into shot. One cheap vision call per preview can, and
+            # it is the only check that compares the picture against what was ordered.
+            from vision_judge import judge_frame
+            seen, why = judge_frame(shot, brief["brief"][:400])
+            if not seen:
+                ok, msg = False, (
+                    f"The frame renders, but it does not show the shot: {why}. Every object "
+                    "the shot is about must be INSIDE the frame at the moment shown - "
+                    "compute the camera from the bounds of all of them together, not from "
+                    "one of them.")
+                log(f"  rejected by vision: {why}")
         if ok and shot.is_file() and frame_looks_empty(shot):
             ok, msg = False, (
                 "The script ran but rendered an EMPTY frame - nothing but background. "
