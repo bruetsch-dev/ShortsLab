@@ -73,6 +73,43 @@ def _limb(name, size, joint, material, parent=None, axis="z"):
     return o
 
 
+def _taper(name, bottom, top, height, loc, material, parent=None, rot=(0, 0, 0),
+           origin="centre"):
+    """A box whose top face differs from its bottom - the basic low-poly body part.
+
+    Real low-poly figures are not cubes. A torso narrows at the waist, a leg tapers to the
+    ankle, a muzzle narrows to the nose; that taper is most of what separates the PS1 look
+    from a Minecraft one. `bottom` and `top` are (width, depth) pairs.
+
+    `origin` places the object's pivot at the "centre" or at the "top" - a limb needs its
+    pivot at the joint it swings from.
+    """
+    import bmesh
+    bw, bd = bottom
+    tw, td = top
+    z0, z1 = (-height / 2.0, height / 2.0) if origin == "centre" else (-height, 0.0)
+    verts = [(-bw / 2, -bd / 2, z0), (bw / 2, -bd / 2, z0),
+             (bw / 2, bd / 2, z0), (-bw / 2, bd / 2, z0),
+             (-tw / 2, -td / 2, z1), (tw / 2, -td / 2, z1),
+             (tw / 2, td / 2, z1), (-tw / 2, td / 2, z1)]
+    faces = [(0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1),
+             (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    o = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(o)
+    o.location = loc
+    o.rotation_euler = rot
+    o.data.materials.append(material)
+    for poly in o.data.polygons:
+        poly.use_smooth = False          # flat shading IS the style
+    if parent is not None:
+        o.parent = parent
+        o.matrix_parent_inverse = parent.matrix_world.inverted()
+    return o
+
+
 def _box(name, size, loc, material, parent=None, rot=(0, 0, 0)):
     """A box given by its real DIMENSIONS, not a scale factor.
 
@@ -211,8 +248,10 @@ SPECIES = {
                   ears="round", tail="long", snout=True, neck=0.10),
     # Bipeds get a NECK of almost nothing. The gap is measured in the same units as the
     # head, so 0.08 left the head visibly floating clear of the shoulders.
-    "bird":  dict(body=(0.26, 0.30, 0.30), head=0.16, legs=2, leg=(0.045, 0.13),
-                  ears="none", tail="short", snout=True, neck=0.01, wings=True),
+    # A bird is mostly head and beak on a small body: at 0.30 deep the torso dwarfed the
+    # skull and read as a crate with a face stuck to it.
+    "bird":  dict(body=(0.20, 0.26, 0.20), head=0.19, legs=2, leg=(0.04, 0.14),
+                  ears="none", tail="short", snout=True, neck=0.005, wings=True),
     "human": dict(body=(0.34, 0.22, 0.62), head=0.26, legs=2, leg=(0.12, 0.52),
                   ears="none", tail="none", snout=False, neck=0.015, arms=True),
     "robot": dict(body=(0.40, 0.28, 0.58), head=0.30, legs=2, leg=(0.14, 0.46),
@@ -220,16 +259,29 @@ SPECIES = {
 }
 
 
-def creature(kind="cat", color=None, scale=1.0, name=None, **overrides):
-    """Build a figure from SPECIES proportions, with any value overridable.
+def creature(kind="cat", color=None, scale=1.0, name=None, skin=None, **overrides):
+    """Build a figure from SPECIES proportions as ONE continuous silhouette.
 
-    An unknown kind falls back to the cat proportions rather than raising: an odd-looking
-    animal still carries a shot, an exception does not.
+    Two things make this read as low-poly rather than as a pile of blocks, and both were
+    missing from the first version:
+
+      OVERLAP - every joint sinks into the part it attaches to. Parts that merely touch
+      leave a visible seam at every corner, and a figure assembled that way reads as
+      Minecraft. They stay separate objects because the legs and head must still animate.
+
+      TAPER   - a torso narrows towards the shoulders, a leg towards the paw, a muzzle
+      towards the nose. Uniform cubes are the other half of the blocky look.
+
+    `color` is the body/clothing, `skin` the head and limbs, because the reference figures
+    plainly have both.
     """
     spec = dict(SPECIES.get(str(kind).lower(), SPECIES["cat"]))
     spec.update({k: v for k, v in overrides.items() if v is not None})
     name = name or str(kind).title()
-    fur = mat(name + "_skin", color or FUR)
+    body_rgb = color or FUR
+    skin_rgb = skin or body_rgb
+    fur = mat(name + "_body", body_rgb)
+    hide = mat(name + "_skin", skin_rgb)
     dark = mat(name + "_dark", DARK, rough=0.5)
     pink = mat(name + "_pink", PINK)
 
@@ -246,56 +298,94 @@ def creature(kind="cat", color=None, scale=1.0, name=None, **overrides):
     neck = float(spec.get("neck", 0.0)) * s
 
     body_z = ll + bh / 2
-    body = _box(name + "_body", (bw, bl, bh), (0, 0, body_z), fur, root)
-    head_y = 0.0 if biped else -(bl / 2 + hs / 2) * 0.85
-    head_z = body_z + (bh / 2 + hs / 2 + neck if biped else bh * 0.35 + neck)
-    head = _box(name + "_head", (hs, hs * 0.95, hs), (0, head_y, head_z), fur, root)
+    # a torso that narrows towards the top; for a quadruped that reads as the ribcage
+    body = _taper(name + "_body", (bw, bl), (bw * 0.86, bl * 0.92), bh,
+                  (0, 0, body_z), fur)
+    body.parent = root
+    body.matrix_parent_inverse = root.matrix_world.inverted()
+
+    head_y = 0.0 if biped else -(bl / 2) * 0.72          # sunk INTO the chest, not beside it
+    # The head must not stand PROUD of the back. At bh*0.30 its top sat 0.068 above the
+    # spine on a default cat, and that ledge is exactly what made the figure read as two
+    # boxes rather than one animal.
+    head_z = (body_z + bh / 2 + hs * 0.34 + neck if biped
+              else body_z + bh / 2 - hs * 0.42 + neck)
+    head = _taper(name + "_head", (hs * 0.92, hs * 0.90), (hs, hs * 0.95), hs,
+                  (0, head_y, head_z), hide)
+    head.parent = root
+    head.matrix_parent_inverse = root.matrix_world.inverted()
+    # A neck wedge bridging torso cross-section to head cross-section. Without it the two
+    # shapes meet at a step no matter how much they overlap; with it the silhouette runs
+    # unbroken from tail to nose, which is the whole look.
+    if biped:
+        # A short vertical neck between shoulders and jaw. Giving it the TORSO's
+        # cross-section - which is what the quadruped needs - turned it into a wide flat
+        # plate through the head that read as a hat brim.
+        _taper(name + "_neck", (bw * 0.46, bl * 0.86), (hs * 0.78, hs * 0.74),
+               hs * 0.50, (0, 0, body_z + bh / 2), hide, root)
+    else:
+        # A wedge laid forward along -Y, bridging ribcage to skull.
+        _taper(name + "_neck", (bw * 0.80, bh * 0.92), (hs * 0.90, hs * 0.86),
+               abs(head_y) * 0.9, (0, head_y * 0.45, (head_z + body_z) / 2 + bh * 0.05),
+               fur, root, rot=(math.radians(90), 0, 0))
 
     parts = {"body": body, "head": head}
     if spec.get("snout", True):
-        _box(name + "_snout", (hs * 0.55, hs * 0.40, hs * 0.42),
-             (0, head_y - hs * 0.62, head_z - hs * 0.16), fur, head)
-        _box(name + "_nose", (hs * 0.20, hs * 0.12, hs * 0.14),
-             (0, head_y - hs * 0.84, head_z - hs * 0.10), pink, head)
+        _taper(name + "_snout", (hs * 0.62, hs * 0.50), (hs * 0.44, hs * 0.34),
+               hs * 0.44, (0, head_y - hs * 0.50, head_z - hs * 0.14), hide, head,
+               rot=(math.radians(90), 0, 0))
+        _box(name + "_nose", (hs * 0.18, hs * 0.10, hs * 0.12),
+             (0, head_y - hs * 0.70, head_z - hs * 0.08), pink, head)
     for side in (-1, 1):
-        _box(name + "_eye" + str(side), (hs * 0.22, hs * 0.08, hs * 0.22),
-             (hs * 0.28 * side, head_y - hs * 0.52, head_z + hs * 0.14), dark, head)
+        _box(name + "_eye" + str(side), (hs * 0.20, hs * 0.06, hs * 0.20),
+             (hs * 0.26 * side, head_y - hs * 0.46, head_z + hs * 0.16), dark, head)
 
     ears = str(spec.get("ears", "none")).lower()
     if ears == "pointy":
         for side in (-1, 1):
-            _cone(name + "_ear" + str(side), hs * 0.34, hs * 0.66,
-                  (hs * 0.36 * side, head_y + hs * 0.10, head_z + hs * 0.72), fur, head,
-                  rot=(0, 0, math.radians(90)))
+            _taper(name + "_ear" + str(side), (hs * 0.32, hs * 0.16), (hs * 0.04, hs * 0.04),
+                   hs * 0.52, (hs * 0.30 * side, head_y + hs * 0.06, head_z + hs * 0.62),
+                   hide, head)
     elif ears in ("round", "floppy"):
         for side in (-1, 1):
-            _box(name + "_ear" + str(side), (hs * 0.10, hs * 0.30, hs * 0.34),
-                 (hs * (0.55 if ears == "floppy" else 0.50) * side, head_y,
-                  head_z + (hs * 0.10 if ears == "floppy" else hs * 0.60)), fur, head)
+            _taper(name + "_ear" + str(side), (hs * 0.12, hs * 0.30), (hs * 0.10, hs * 0.24),
+                   hs * 0.30,
+                   (hs * 0.46 * side, head_y,
+                    head_z + (hs * 0.02 if ears == "floppy" else hs * 0.52)), hide, head)
 
     legs = []
     slots = ([(-1, -1), (1, -1), (-1, 1), (1, 1)] if int(spec.get("legs", 4)) >= 4
              else [(-1, 0), (1, 0)])
     for i, (dx, dy) in enumerate(slots):
-        legs.append(_limb(name + "_leg" + str(i), (lw, lw, ll),
-                          (bw * 0.38 * dx, bl * 0.36 * dy, ll), fur, root, axis="z"))
+        # the joint sits INSIDE the torso, so hip and shoulder have no seam
+        joint_z = ll + bh * 0.35
+        leg = _taper(name + "_leg" + str(i), (lw * 0.78, lw * 0.78), (lw, lw),
+                     joint_z, (bw * 0.32 * dx, bl * 0.32 * dy, joint_z), hide,
+                     root, origin="top")
+        legs.append(leg)
     if spec.get("arms"):
         for i, dx in enumerate((-1, 1)):
-            parts["arm" + str(i)] = _limb(
-                name + "_arm" + str(i), (lw * 0.8, lw * 0.8, bh * 0.75),
-                (bw * 0.62 * dx, 0, body_z + bh * 0.36), fur, root, axis="z")
+            parts["arm" + str(i)] = _taper(
+                name + "_arm" + str(i), (lw * 0.62, lw * 0.62), (lw * 0.82, lw * 0.82),
+                bh * 0.80, (bw * 0.46 * dx, 0, body_z + bh * 0.42), hide, root,
+                origin="top")
     if spec.get("wings"):
         for i, dx in enumerate((-1, 1)):
-            parts["wing" + str(i)] = _box(
-                name + "_wing" + str(i), (bw * 0.20, bl * 0.75, bh * 0.30),
-                (bw * 0.60 * dx, 0, body_z), fur, root)
+            parts["wing" + str(i)] = _taper(
+                name + "_wing" + str(i), (bw * 0.10, bl * 0.70), (bw * 0.05, bl * 0.30),
+                bh * 0.55, (bw * 0.40 * dx, 0, body_z + bh * 0.10), fur, root,
+                rot=(0, math.radians(14 * dx), 0))
 
     tail_kind = str(spec.get("tail", "none")).lower()
     if tail_kind != "none":
         tl = bl * (0.75 if tail_kind == "long" else 0.30)
-        parts["tail"] = _limb(name + "_tail", (lw * 0.75, tl, lw * 0.75),
-                              (0, bl * 0.45, body_z + bh * 0.20), fur, root, axis="y")
-        parts["tail"].rotation_euler = (math.radians(-28), 0, 0)
+        parts["tail"] = _taper(name + "_tail", (lw * 0.72, lw * 0.72),
+                               (lw * 0.36, lw * 0.36), tl,
+                               (0, bl * 0.36, body_z + bh * 0.16), fur, root,
+                               origin="top")
+        # 100 degrees, not 118: the geometry hangs along -Z from its joint, so the angle
+        # maps to y'=sin a, z'=-cos a. At 118 the tail stood almost vertical.
+        parts["tail"].rotation_euler = (math.radians(100), 0, 0)
 
     for i, leg in enumerate(legs):
         parts["leg" + str(i)] = leg
@@ -566,7 +656,12 @@ def act(cat, action, sc, target=(0.0, 0.0), start=(0.0, 0.0), facing=0.0):
             t = (f - 1) / max(1, n - 1)
             cat.pose_sit()
             swing = math.sin(2 * math.pi * t * 2.0)
-            cat.leg_fr.rotation_euler = (math.radians(-55 * max(0.0, swing)), 0, 0)
+            # legs[1] is the front-right one. The old cat-only class named them leg_fr and
+            # friends; the parametric builder numbers them, because a biped has no
+            # "back-left" - reaching for the old name lost a whole shot to an
+            # AttributeError that nothing downstream could repair.
+            paw = cat.legs[1] if len(cat.legs) > 1 else cat.legs[0]
+            paw.rotation_euler = (math.radians(-55 * max(0.0, swing)), 0, 0)
             cat.head.rotation_euler = (math.radians(12), 0, math.radians(6 * swing))
             cat.key(f)
         return
