@@ -208,7 +208,7 @@ const FLOW_STEPS = {
   captions: ["upload", "settings"],
   enhance: ["choose"],
   aishort: ["choose"],
-  motionloop: ["concept", "motion", "review"],
+  aicore: ["brief", "pick", "clips"],
   project: ["summary"],
 };
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
@@ -324,7 +324,7 @@ function renderAll() {
      visual: () => renderMasterFlow("visual"), captions: () => renderMasterFlow("captions"),
      enhance: renderEnhanceFlow,
      aishort: renderAIShortPicker,
-     motionloop: renderMotionLoopFlow,
+     aicore: renderAICoreFlow,
      project: renderProjectFlow }[S.flow] || renderModeMenu)();
 
   if (prototypeMode && !S.jobId) decoratePrototypeFlow();
@@ -854,7 +854,7 @@ function selectMode(id) {
   if (id === "visualscript-classic") id = "visualscript";
   const culture = id === "culture";
   const visualScript = id === "visualscript";
-  const motionLoop = id === "motionloop";
+  const motionLoop = id === "aicore";
   S.flow = (culture || visualScript) ? "script" : id; S.completed = [];
   S.values.culture_facts_mode = culture;
   S.values.visuals_from_script_mode = visualScript;
@@ -1755,97 +1755,219 @@ function renderAIShortPicker() {
   const motion = el("button", "ai-short-choice motion-loop");
   motion.type = "button";
   motion.innerHTML = `<span class="ai-choice-preview"><video muted autoplay loop playsinline preload="metadata" poster="/file?path=static%2Fpreviews%2Fmotion_loop_poster.jpg&v=4" src="/file?path=static%2Fpreviews%2Fmotion_loop_prototype.mp4&v=4"></video><i class="ai-loop-orbit"></i></span>
-    <span class="ai-choice-copy"><small>SEEDANCE 2.5 · 3 × 10-SECOND CHAPTERS</small><strong>AI Motion</strong>
-    <em>Create a 30-second, frame-linked 9:16 surreal POV journey from a prompt or optional first-frame image.</em></span>`;
-  motion.addEventListener("click", () => selectMode("motionloop"));
+    <span class="ai-choice-copy"><small>PROMPTS OUT · CLIPS BACK IN</small><strong>AI Core</strong>
+    <em>Describe a short, pick a storyline, copy three prompts that share one world — then drop the generated clips back in.</em></span>`;
+  motion.addEventListener("click", () => selectMode("aicore"));
   grid.append(classic, motion); c.appendChild(grid);
   const foot = el("div", "card-foot"); foot.appendChild(btn("All modes", resetToMode, "ghost")); c.appendChild(foot);
   c.querySelectorAll("video").forEach(v => { v.muted = true; v.play().catch(() => {}); });
   setComposer("off");
 }
 
-function renderMotionLoopFlow() {
-  const done = s => S.completed.includes(s);
-  msgU("Motion Loop");
-  if (!done("concept") && S.step === "concept") {
-    const c = card("motion-loop-config");
-    const label = el("label", "motion-concept-label");
-    label.innerHTML = `<span>Journey direction</span><small>Describe the world, vehicle POV and movement. Chapter one starts from your optional image or the prompt; chapters two and three continue from each prior last frame.</small>`;
-    const ta = document.createElement("textarea"); ta.rows = 7;
-    ta.placeholder = "Optional: describe a world yourself, or leave this empty for a new random abstract 3D world.";
-    ta.value = S.values.motion_loop_concept || "";
-    ta.addEventListener("input", () => { S.values.motion_loop_concept = ta.value; persist(); });
-    label.appendChild(ta); c.appendChild(label);
-    const povControl=el("label","motion-pov-control"); povControl.appendChild(el("span","","POV vehicle")); const pov=document.createElement("select"); [["mountain_bike","Mountain bike"],["e_scooter","E-scooter"],["car","Car"],["cabriolet","Cabriolet"],["motorcycle","Motorcycle"]].forEach(([v,l])=>pov.appendChild(new Option(l,v))); pov.value=S.values.motion_loop_pov||"mountain_bike"; pov.addEventListener("change",()=>{S.values.motion_loop_pov=pov.value;persist();}); povControl.appendChild(pov); c.appendChild(povControl);
-    const insertDirectorTag = (text) => { const gap = ta.value.trim() ? "\n" : ""; ta.value += gap + text; S.values.motion_loop_concept = ta.value; ta.focus(); persist(); };
-    ta.addEventListener("dragover", e => e.preventDefault());
-    ta.addEventListener("drop", e => { e.preventDefault(); const text=e.dataTransfer.getData("text/plain"); if(text) insertDirectorTag(text); });
-    const tagGroups = [
-      ["Film locations", [["Hobbiton · Matamata", "Hobbiton-inspired rolling green farmland near Matamata, New Zealand: round earth homes, a narrow lane, garden fences, sheep-dotted hills and warm late-afternoon light"], ["Edoras · Mount Sunday", "Edoras-inspired windswept high-country valley at Mount Sunday, New Zealand: a lone hilltop fortress, golden grass, braided river and dramatic Southern Alps"], ["Arrakis · Wadi Rum", "Arrakis-inspired Wadi Rum desert in Jordan: immense rust-red sandstone cliffs, sculpted dunes, a winding sandy track and two low suns"], ["Mordor · Tongariro", "Tongariro volcanic plateau in New Zealand: black ash route, steam vents, jagged volcanic rock, distant snow peaks and a dark stormy sky"]]],
-      ["Game locations", [["Hyrule Sky Islands", "Hyrule Sky Islands-inspired route: floating green islands, ancient stone bridges, waterfalls dropping into clouds and distant sunlit mountains"], ["Limgrave", "Limgrave-inspired windswept fantasy road: ruined stone church, giant golden tree on the horizon, rolling grassland, mist and distant castle walls"], ["Skyrim wilds", "Skyrim-inspired Nordic mountain pass: pine forest, ancient Dwemer-like stone ruins, icy stream, snow peaks and low northern sun"], ["Night City", "Night City-inspired rain-soaked neon megacity: dense elevated roads, glowing signs, wet asphalt reflections, distant monorail and blue-magenta haze"]]],
-      ["Atmosphere", [["Golden hour", "warm golden-hour sun, long shadows, dust and soft lens flare"], ["Misty dawn", "misty blue dawn, wet ground, distant birds and calm wind"], ["Summer storm", "dramatic summer storm far away, wet route and moving foliage"], ["Night fireflies", "deep blue night, soft fireflies, reflective water and quiet forest ambience"]]],
-    ];
-    const tagPanel = el("div", "motion-director-tags");
-    tagPanel.appendChild(el("div", "motion-director-label", "Drag a tag into the direction field, or click to add it."));
-    tagGroups.forEach(([name,tags]) => { const group=el("div","motion-tag-group"); group.appendChild(el("span","motion-tag-title",name)); const row=el("div","motion-tag-row"); tags.forEach(([label,text])=>{ const tag=el("button","motion-director-tag",esc(label)); tag.type="button"; tag.draggable=true; tag.title=text; tag.addEventListener("click",()=>insertDirectorTag(text)); tag.addEventListener("dragstart",e=>{e.dataTransfer.setData("text/plain",text); e.dataTransfer.effectAllowed="copy";}); row.appendChild(tag); }); group.appendChild(row); tagPanel.appendChild(group); });
-    c.appendChild(tagPanel);
-    const surprise=el("button","btn ghost motion-surprise","Surprise me"); surprise.type="button";
-    const worlds=["An Alpine pass folding upward into the sky above inverted valleys","A clean ivory 3D world of arches, chrome spheres and impossible gravity","A translucent glacier canyon with floating mountains and upward waterfalls","A sandstone Moebius desert with levitating black monoliths","A curved green micro-planet with upside-down villages across the sky","A brutalist cloud city bending into a ring around the horizon","A botanical cathedral whose trees continuously become architecture"];
-    surprise.addEventListener("click",()=>{const options=[["mountain_bike","mountain-bike POV"],["e_scooter","e-scooter POV"],["car","car driver POV"],["cabriolet","open-top cabriolet driver POV"],["motorcycle","motorcycle POV"]];const picked=options[Math.floor(Math.random()*options.length)];ta.value=worlds[Math.floor(Math.random()*worlds.length)]+", "+picked[1]+", one continuous morphing journey";S.values.motion_loop_concept=ta.value;S.values.motion_loop_pov=picked[0];pov.value=picked[0];persist();});
-    c.appendChild(surprise);
-    const firstFrame = btn("Upload optional first frame", () => pickFile("image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp", f => {
-      FILES.motion_loop_first_frame = f;
-      firstFrame.textContent = "✓ First frame: " + f.name;
-      S.values.motion_loop_has_first_frame = true; persist();
-    }), "ghost small");
-    c.appendChild(firstFrame);
-    const note = el("div", "motion-budget-note", `<b>Three native 10-second Seedance 2.5 chapters</b><span>Use an optional first frame only for chapter one; chapters two and three use the exact prior last frame. Every clip gets contextual ASMR ambience — no music or dialogue. Higgsfield Unlimited is required.</span>`);
-    c.appendChild(note);
+/* AI Core: describe a short, pick a storyline, copy three prompts, drop the clips back in.
+   The clips are generated outside this app, so the flow's job is to hand over three prompts
+   that hold one world together and then take the results back in the right order. */
+const AICORE_FILES = [null, null, null];
+
+function aicoreState() {
+  if (!S.aicore) S.aicore = { brief: "", options: [], chosen: null, world: "", prompts: [] };
+  return S.aicore;
+}
+
+function renderAICoreFlow() {
+  const A = aicoreState();
+  msgU("AI Core");
+  if (S.jobId) return;
+
+  /* ---- step 1: the idea ---- */
+  if (S.step === "brief") {
+    msgA("Describe the short in a sentence or two. Everything else is built from it.");
+    const c = card("aicore-brief");
+    const label = el("label", "aicore-label");
+    label.innerHTML = `<span>Your idea</span><small>Name the character and the point of view first — "SpongeBob one day POV", "dreamcore retro bicycle POV". Three clips will be written for one world.</small>`;
+    const ta = document.createElement("textarea");
+    ta.rows = 5;
+    ta.id = "aicore-brief-input";
+    ta.placeholder = "e.g. dreamcore retro bicycle POV riding to an abandoned station";
+    ta.value = A.brief || "";
+    ta.addEventListener("input", () => { A.brief = ta.value; persist(); });
+    label.appendChild(ta);
+    c.appendChild(label);
     const foot = el("div", "card-foot");
     foot.appendChild(btn("All modes", resetToMode, "ghost"));
-    foot.appendChild(btn("Continue", () => {
-      completeStep("concept", "motion");
-    }, "primary")); c.appendChild(foot); setComposer("off"); return;
+    const go = btn("Continue", async () => {
+      const brief = (A.brief || "").trim();
+      if (!brief) { errorCard(T.err_generic, "Describe the short first."); return; }
+      go.disabled = true; go.textContent = "Writing storylines…";
+      const wait = card("aicore-wait");
+      wait.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
+      try {
+        const d = await jpost("/aicore-storylines", { brief });
+        if (d.error) throw new Error(d.error);
+        A.options = d.options || []; A.chosen = null;
+        A.world = ""; A.prompts = [];
+        AICORE_FILES.fill(null);
+        completeStep("brief", "pick");
+      } catch (e) {
+        wait.remove();
+        go.disabled = false; go.textContent = "Continue";
+        errorCard(T.err_generic, String(e));
+      }
+    }, "primary");
+    foot.appendChild(go);
+    c.appendChild(foot);
+    setComposer("off");
+    return;
   }
-  if (done("concept")) msgU(esc(S.values.motion_loop_concept), "concept");
-  if (!done("motion") && S.step === "motion") {
-    const c = card("motion-loop-config");
-    const grid = el("div", "motion-profile-grid");
-    const profiles = [
-      ["lateral", "Lateral drift", "Sideways travel with strong foreground parallax — closest to the reference."],
-      ["tunnel", "Tunnel pull", "Forward momentum, repeating frames and a deeper hypnotic vanishing point."],
-      ["orbit", "Dream orbit", "A slower curved camera path with floating subjects and elastic perspective."],
-    ];
-    const current = S.values.motion_loop_profile || "lateral";
-    profiles.forEach(([id,title,desc]) => {
-      const b = el("button", "motion-profile" + (id === current ? " active" : "")); b.type="button";
-      b.innerHTML = `<i class="motion-profile-glyph ${id}"></i><strong>${title}</strong><span>${desc}</span>`;
-      b.addEventListener("click", () => { S.values.motion_loop_profile=id; grid.querySelectorAll(".motion-profile").forEach(x=>x.classList.remove("active")); b.classList.add("active"); persist(); });
-      grid.appendChild(b);
-    }); c.appendChild(grid);
-    const controls = el("div", "motion-inline-controls");
-    const intensity = document.createElement("select"); [["clean","Clean"],["balanced","Balanced"],["intense","Intense"]].forEach(([v,l])=>intensity.appendChild(new Option(l,v)));
-    intensity.value=S.values.motion_loop_intensity||"balanced"; intensity.addEventListener("change",()=>{S.values.motion_loop_intensity=intensity.value;persist();});
-    const addControl=(title,input)=>{const l=el("label");l.append(el("span","",title),input);controls.appendChild(l);};
-    const fixedDuration=el("div","motion-fixed-duration","<b>3 × 10 seconds</b><span>30-second frame-linked journey</span>");
-    const speedLabel=el("label","motion-speed-control"); const speedHead=el("span","","Rider speed"); const speed=document.createElement("input"); speed.type="range"; speed.min="1"; speed.max="5"; speed.step="1"; speed.value=String(S.values.motion_loop_speed||3); const speedValue=el("b","",["Slow glide","Relaxed","Cruising","Fast","High speed"][+speed.value-1]); speed.addEventListener("input",()=>{S.values.motion_loop_speed=+speed.value;speedValue.textContent=["Slow glide","Relaxed","Cruising","Fast","High speed"][+speed.value-1];persist();}); speedLabel.append(speedHead,speed,speedValue);
-    const surrealLabel=el("label","motion-speed-control"); const surrealHead=el("span","","World surrealness"); const surreal=document.createElement("input"); surreal.type="range"; surreal.min="1"; surreal.max="5"; surreal.step="1"; surreal.value=String(S.values.motion_loop_surrealness||3); const surrealNames=["Realistic","Subtle","Surreal","Intense morphing","Reality-bending"]; const surrealValue=el("b","",surrealNames[+surreal.value-1]); surreal.addEventListener("input",()=>{S.values.motion_loop_surrealness=+surreal.value;surrealValue.textContent=surrealNames[+surreal.value-1];persist();}); surrealLabel.append(surrealHead,surreal,surrealValue);
-    const unlimitedLabel=el("label","motion-loop-toggle"); const unlimited=document.createElement("input"); unlimited.type="checkbox"; unlimited.checked=true; unlimited.disabled=true;
-    unlimitedLabel.append(unlimited,el("i"),el("span","","<b>Higgsfield Unlimited</b><small>Required and checked before generation. This mode does not use a WaveSpeed API model.</small>"));
-    controls.appendChild(fixedDuration); addControl("Effect intensity",intensity); controls.appendChild(speedLabel); controls.appendChild(surrealLabel); controls.appendChild(unlimitedLabel);
-    const loopLabel=el("label","motion-loop-toggle"); const loop=document.createElement("input"); loop.type="checkbox"; loop.checked=S.values.motion_loop_seamless!==false;
-    loop.addEventListener("change",()=>{S.values.motion_loop_seamless=loop.checked;persist();});
-    loopLabel.append(loop,el("i"),el("span","","<b>Loop</b><small>Direct the motion arc back toward its opening composition without adding a crossfade.</small>")); controls.appendChild(loopLabel); c.appendChild(controls);
-    const foot=el("div","card-foot"); foot.appendChild(btn(T.back,()=>editStep("concept"),"ghost")); foot.appendChild(btn("Review",()=>completeStep("motion","review"),"primary")); c.appendChild(foot);
-    setComposer("off"); return;
+
+  if (A.brief) msgU(esc(A.brief), "brief");
+
+  /* ---- step 2: pick one of five ---- */
+  if (S.step === "pick") {
+    msgA("Five ways this could go. Pick the one you want.");
+    const c = card("aicore-pick");
+    (A.options || []).forEach((o, i) => {
+      const b = el("button", "aicore-option");
+      b.type = "button";
+      const beats = (o.beats || []).filter(Boolean)
+        .map(x => `<li>${esc(x)}</li>`).join("");
+      b.innerHTML = `<span class="ao-num">${i + 1}</span>
+        <span class="ao-body"><strong>${esc(o.title || "")}</strong>
+        <em>${esc(o.summary || "")}</em><ol class="ao-beats">${beats}</ol></span>`;
+      b.addEventListener("click", async () => {
+        c.querySelectorAll(".aicore-option").forEach(x => { x.disabled = true; });
+        b.classList.add("on");
+        A.chosen = o;
+        const wait = card("aicore-wait");
+        wait.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
+        try {
+          const d = await jpost("/aicore-prompts", { brief: A.brief, storyline: o });
+          if (d.error) throw new Error(d.error);
+          A.world = d.world || "";
+          A.prompts = d.prompts || [];
+          AICORE_FILES.fill(null);
+          completeStep("pick", "clips");
+        } catch (e) {
+          wait.remove();
+          c.querySelectorAll(".aicore-option").forEach(x => { x.disabled = false; });
+          b.classList.remove("on");
+          errorCard(T.err_generic, String(e));
+        }
+      });
+      c.appendChild(b);
+    });
+    const foot = el("div", "card-foot");
+    foot.appendChild(btn(T.back, () => editStep("brief"), "ghost"));
+    c.appendChild(foot);
+    setComposer("off");
+    return;
   }
-  if (S.step === "review") {
-    const c=card("motion-loop-review");
-    const povLabels={mountain_bike:"Mountain bike",e_scooter:"E-scooter",car:"Car",cabriolet:"Cabriolet",motorcycle:"Motorcycle"};
-    const surrealNames=["Realistic","Subtle","Surreal","Intense morphing","Reality-bending"];
-    const rows=[["Journey direction",S.values.motion_loop_concept||"Random abstract 3D world"],["POV vehicle",povLabels[S.values.motion_loop_pov||"mountain_bike"]],["Camera",S.values.motion_loop_profile||"lateral"],["Rider speed",["Slow glide","Relaxed","Cruising","Fast","High speed"][Math.max(1,Math.min(5,+S.values.motion_loop_speed||3))-1]],["World surrealness",surrealNames[Math.max(1,Math.min(5,+S.values.motion_loop_surrealness||3))-1]],["Duration","3 × 10 seconds · 30-second journey"],["Model","Seedance 2.5 · Higgsfield Unlimited"],["Input",FILES.motion_loop_first_frame ? "Uploaded first frame → chapter 1" : "Prompt only → chapter 1"],["Continuity","Last frame of chapter 1 → 2, then 2 → 3"],["Audio","Contextual native ASMR · no music or dialogue"],["Loop",S.values.motion_loop_seamless===true?"On · natural return, no crossfade":"Off"]];
-    const specs=el("div","review-specs"); rows.forEach(([k,v])=>{const t=el("div","review-spec");t.innerHTML=`<span class="rs-k">${esc(k)}</span><span class="rs-v">${esc(v)}</span>`;specs.appendChild(t);});c.appendChild(specs);
-    const foot=el("div","card-foot"); foot.appendChild(btn(T.back,()=>editStep("motion"),"ghost")); foot.appendChild(btn("Create Motion Loop",submitRun,"primary review-cta")); c.appendChild(foot); setComposer("off");
+
+  /* ---- step 3: copy the prompts, drop the clips back in ---- */
+  if (S.step === "clips") {
+    if (A.chosen) msgU(esc(A.chosen.title || ""), "pick");
+    msgA("Generate each clip with these prompts, then drop the files onto their slot.");
+    const c = card("aicore-prompts");
+    if (A.world) {
+      const w = el("div", "aicore-world");
+      w.innerHTML = `<span class="aw-k">Shared world · already at the start of every prompt</span>`;
+      const p = el("p", "aw-v", esc(A.world));
+      w.appendChild(p);
+      c.appendChild(w);
+    }
+    const assembleRow = el("div", "card-foot aicore-foot");
+    const go = btn("Assemble video", () => submitAICore(go), "primary");
+    const refresh = () => {
+      const ready = AICORE_FILES.filter(Boolean).length;
+      go.disabled = ready < 1;
+      go.textContent = ready >= (A.prompts || []).length
+        ? "Assemble video"
+        : `Assemble video (${ready}/${(A.prompts || []).length} clips)`;
+    };
+
+    (A.prompts || []).forEach((p, i) => {
+      const row = el("div", "aicore-prompt");
+      const head = el("div", "ap-head");
+      head.innerHTML = `<span class="ap-num">Clip ${i + 1}</span><strong>${esc(p.label || "")}</strong>`;
+      const copy = el("button", "btn small ap-copy", "Copy prompt");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(p.text || "");
+        } catch (e) {
+          // clipboard is blocked outside a secure context; select the text so
+          // Ctrl+C still works rather than leaving the button silently dead
+          const box = row.querySelector(".ap-text");
+          if (box) {
+            const r = document.createRange(); r.selectNodeContents(box);
+            const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+          }
+        }
+        copy.textContent = "Copied ✓";
+        copy.classList.add("ok");
+        setTimeout(() => { copy.textContent = "Copy prompt"; copy.classList.remove("ok"); }, 1600);
+      });
+      head.appendChild(copy);
+      row.appendChild(head);
+      const text = el("pre", "ap-text", esc(p.text || ""));
+      row.appendChild(text);
+
+      const drop = el("div", "aicore-drop");
+      const setName = (f) => {
+        drop.classList.toggle("filled", !!f);
+        const size = f && (f.size >= 1048576
+          ? (f.size / 1048576).toFixed(1) + " MB"
+          : Math.max(1, Math.round(f.size / 1024)) + " KB");
+        drop.innerHTML = f
+          ? `<b>${esc(f.name)}</b><small>${size} · click to replace</small>`
+          : `<b>Drop clip ${i + 1} here</b><small>or click to choose a file</small>`;
+      };
+      setName(null);
+      const take = (f) => {
+        if (!f) return;
+        AICORE_FILES[i] = f; setName(f); refresh();
+      };
+      drop.addEventListener("click", () => pickFile("video/*,.mp4,.mov,.webm", take));
+      drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+      drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+      drop.addEventListener("drop", e => {
+        e.preventDefault(); drop.classList.remove("over");
+        take((e.dataTransfer.files || [])[0]);
+      });
+      row.appendChild(drop);
+      c.appendChild(row);
+    });
+
+    assembleRow.appendChild(btn(T.back, () => editStep("pick"), "ghost"));
+    assembleRow.appendChild(go);
+    c.appendChild(assembleRow);
+    refresh();
+    setComposer("off");
+  }
+}
+
+async function submitAICore(go) {
+  const A = aicoreState();
+  const files = AICORE_FILES.filter(Boolean);
+  if (!files.length) { errorCard(T.err_generic, "Add at least one clip."); return; }
+  go.disabled = true; go.textContent = "Uploading…";
+  const fd = new FormData();
+  // Numbered names, because the clips must be joined in beat order and the
+  // server sorts by field name to get it.
+  AICORE_FILES.forEach((f, i) => { if (f) fd.append(`clip${i + 1}`, f, f.name); });
+  fd.append("title", (A.chosen && A.chosen.title) || A.brief || "AI Core short");
+  fd.append("brief", A.brief || "");
+  fd.append("world", A.world || "");
+  fd.append("storyline", (A.chosen && A.chosen.summary) || "");
+  fd.append("prompts", JSON.stringify(A.prompts || []));
+  try {
+    const r = await fetch("/aicore-assemble", { method: "POST", body: fd });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    startJob(d.job_id, "aicore");
+  } catch (e) {
+    go.disabled = false; go.textContent = "Assemble video";
+    errorCard(T.err_generic, String(e));
   }
 }
 
@@ -2559,7 +2681,7 @@ function startJob(jobId, jobKind) {
   if (jobKind) {
     S.jobKind = String(jobKind);
     const flowForKind = { longform:"longform", sfx:"sfx", visual:"visual",
-      caption:"captions", viraltrans:"viraltrans", reddit:"reddit", physics:"physics", lowpoly:"lowpoly" };
+      caption:"captions", viraltrans:"viraltrans", reddit:"reddit", physics:"physics", lowpoly:"lowpoly", aicore:"aicore" };
     S.flow = flowForKind[S.jobKind] || "script";
   }
   announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = ""; lastAssignedKey = "";

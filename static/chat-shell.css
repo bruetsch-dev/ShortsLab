@@ -2283,3 +2283,54 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
    framing problems this gate exists to catch. */
 .physics-preview-shot { display:block; width:100%; max-width:280px; margin:12px auto 4px;
   border-radius:12px; background:#111; aspect-ratio:9/16; object-fit:contain; }
+
+/* ---- AI Core: idea -> storyline -> three prompts -> drop the clips back in ---- */
+.aicore-label { display:block; }
+.aicore-label > span { display:block; font-weight:600; margin-bottom:2px; }
+.aicore-label > small { display:block; color:var(--text-muted); margin-bottom:8px; line-height:1.5; }
+.aicore-label textarea { width:100%; }
+
+.aicore-option { display:grid; grid-template-columns:34px 1fr; gap:12px; width:100%;
+  padding:14px 16px; margin-bottom:10px; text-align:left; color:var(--text);
+  background:rgba(5,8,6,.62); border:1px solid rgba(167,187,173,.16);
+  border-radius:14px; cursor:pointer; transition:.2s ease; }
+.aicore-option:hover:not(:disabled) { transform:translateY(-2px); border-color:rgba(132,255,101,.34); }
+.aicore-option:disabled { opacity:.45; cursor:default; }
+.aicore-option.on { opacity:1; border-color:#80ee67; box-shadow:inset 0 0 0 1px rgba(128,238,103,.18); }
+.aicore-option .ao-num { display:flex; align-items:center; justify-content:center;
+  width:30px; height:30px; border-radius:50%; font-weight:700; font-size:13px;
+  background:rgba(128,238,103,.12); color:#8ff079; }
+.aicore-option strong { display:block; font-size:15px; }
+.aicore-option em { display:block; margin-top:2px; color:var(--text-muted); font-style:normal;
+  line-height:1.5; }
+.ao-beats { margin:8px 0 0; padding-left:18px; color:var(--text-muted); font-size:12.5px; }
+.ao-beats li { margin:2px 0; }
+
+.aicore-world { padding:12px 14px; margin-bottom:14px; border-radius:12px;
+  background:rgba(128,238,103,.06); border:1px solid rgba(128,238,103,.16); }
+.aicore-world .aw-k { display:block; font-size:11px; letter-spacing:.08em;
+  text-transform:uppercase; color:#8ff079; margin-bottom:4px; }
+.aicore-world .aw-v { margin:0; line-height:1.55; color:var(--text-muted); font-size:13px; }
+
+.aicore-prompt { padding:14px; margin-bottom:12px; border-radius:14px;
+  background:rgba(5,8,6,.52); border:1px solid rgba(167,187,173,.14); }
+.ap-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.ap-head .ap-num { font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--text-muted); }
+.ap-head strong { flex:1; font-size:14px; }
+.ap-copy { min-height:34px; white-space:nowrap; }
+.ap-copy.ok { border-color:#80ee67; color:#8ff079; }
+.ap-text { margin:0 0 12px; padding:11px 12px; max-height:150px; overflow:auto;
+  border-radius:10px; background:rgba(0,0,0,.28); color:var(--text-muted);
+  font-size:12.5px; line-height:1.6; white-space:pre-wrap; word-break:break-word;
+  font-family:inherit; }
+
+.aicore-drop { display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:2px; min-height:76px; padding:12px; border-radius:12px; cursor:pointer;
+  border:1px dashed rgba(167,187,173,.3); background:rgba(0,0,0,.16);
+  text-align:center; transition:.18s ease; }
+.aicore-drop:hover, .aicore-drop.over { border-color:#80ee67; background:rgba(128,238,103,.08); }
+.aicore-drop.filled { border-style:solid; border-color:rgba(128,238,103,.5); }
+.aicore-drop b { font-size:13px; }
+.aicore-drop small { color:var(--text-muted); font-size:11.5px; }
+.aicore-foot { justify-content:space-between; }

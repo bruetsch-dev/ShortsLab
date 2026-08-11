@@ -5807,6 +5807,14 @@ PHYSICS_STEPS = [
 ]
 
 
+AICORE_STEPS = [
+    ("Read clips", ("Assembling",)),
+    ("Convert", ("Preparing clip",)),
+    ("Join", ("Joining the clips",)),
+    ("Finish", ("Assembled",)),
+]
+
+
 CAPTION_STEPS = [
     ("Load video", ("Started", "Extracting audio")),
     ("Transcribe", ("Transcrib",)),
@@ -5873,6 +5881,7 @@ def compute_step_view(status, logs, log_times=None, job_kind=None, clip_source=N
     steps = (SFX_STEPS if job_kind == "sfx"
              else PHYSICS_STEPS if job_kind == "physics"
              else LOWPOLY_STEPS if job_kind == "lowpoly"
+             else AICORE_STEPS if job_kind == "aicore"
              else CAPTION_STEPS if job_kind == "caption"
              else DISCOVERY_RUN_STEPS if _is_discovery_run(logs)
              else SCRAPE_RUN_STEPS if is_scrape else RUN_STEPS)
@@ -13113,6 +13122,12 @@ except Exception as _exc:  # noqa: BLE001
     print("[physics] module unavailable:", _exc)
     physics_run = physics_authoring = lowpoly_build = None
 
+try:
+    import ai_core
+except Exception as _exc:  # noqa: BLE001
+    print("[ai_core] module unavailable:", _exc)
+    ai_core = None
+
 REDDIT_STORY_DIR = ROOT / "outputs" / "reddit_story"
 REDDIT_SESSION_FILE = REDDIT_STORY_DIR / "session_stories.json"
 
@@ -13317,6 +13332,111 @@ def start_lowpoly_job(prompt, seconds=30.0, captions=True):
     return job_id
 
 
+def start_aicore_job(clip_paths, title="", meta=None):
+    """Join the clips the user generated elsewhere into one short, as a normal project."""
+    if ai_core is None:
+        raise RuntimeError("AI Core is unavailable (module failed to import).")
+    meta = dict(meta or {})
+    slug = "aicore_" + (re.sub(r"[^a-z0-9]+", "_", str(title or "short")[:40].lower())
+                        .strip("_") or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
+    project_dir = agent_core.PROJECTS_DIR / slug
+    work_dir = ROOT / "outputs" / "aicore_work" / slug
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": [f"Assembling {len(clip_paths)} clips."],
+            "log_times": [time.time()],
+            "result": None, "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "aicore",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            j = JOBS.get(job_id)
+            if not j or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            j["logs"].append(str(message))
+            j.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            (project_dir / "renders").mkdir(parents=True, exist_ok=True)
+            final = project_dir / "renders" / f"{slug}.mp4"
+            report = ai_core.assemble(clip_paths, final, status_cb=status_cb,
+                                      work_dir=work_dir)
+            report.update({"title": title or slug, "project_dir": str(project_dir),
+                           "mode": "aicore", **meta})
+            _write_aicore_project_config(project_dir, slug, report)
+            (project_dir / "agent_report.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            with JOB_LOCK:
+                JOBS[job_id]["project_dir"] = str(project_dir)
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = report
+        except RunCancelled:
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def _write_aicore_project_config(project_dir, slug, report):
+    """One scene per uploaded clip, so the timeline opens on the real cuts.
+
+    The joined render is what the user watches; the timeline needs the individual clips
+    laid end to end, or dragging a cut would move a single 30-second block.
+    """
+    clips = project_dir / "seedance 2.0"
+    clips.mkdir(parents=True, exist_ok=True)
+    (project_dir / "config").mkdir(parents=True, exist_ok=True)
+    scenes, at = [], 0.0
+    prompts = list(report.get("prompts") or [])
+    for i, item in enumerate(report.get("clips") or []):
+        src = Path(item.get("file") or "")
+        name = f"clip{i + 1}{src.suffix.lower() or '.mp4'}"
+        dst = clips / name
+        try:
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+            pipeline.extract_poster_frame(dst, dst.with_suffix(".poster.jpg"))
+        except Exception:  # noqa: BLE001
+            pass
+        dur = max(0.5, float(item.get("seconds") or 0) or
+                  _clip_source_seconds(dst) or 5.0)
+        prompt = prompts[i] if i < len(prompts) else {}
+        scenes.append({
+            "id": f"s{i}", "start": round(at, 3), "end": round(at + dur, 3),
+            "clip": name, "asset": name, "seedance": True,
+            "name": str((prompt or {}).get("label") or f"Clip {i + 1}"),
+            "prompt": str((prompt or {}).get("text") or ""),
+            "caption": "", "exact_voice_text": "", "word_timings": [],
+        })
+        at += dur
+    config = {
+        "title": report.get("title") or slug.replace("_", " ").title(),
+        "captions_baked": True,
+        "clip_source": "manual",
+        "sfx_enabled": False,
+        "smart_overlays": True,
+        "scenes": scenes,
+    }
+    (project_dir / "config" / "project.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8")
+
+
 def _write_physics_project_config(project_dir, slug, video, report):
     """Give a finished physics render the same shape as any other project.
 
@@ -13405,12 +13525,41 @@ def start_physics_job(preset, values, samples=24, seconds=4.0, prompt="",
             # let the user reject the shot before committing to the whole thing.
             custom = None
             if prompt:
-                # An authored scene is proved by running it, so its test frame IS the
-                # preview - no second render just to show the user something.
-                custom = physics_authoring.author_scene(
-                    prompt, status_cb=status_cb, work_dir=work_dir,
-                    **({"brief_model": brief_model} if brief_model else {}))
-                shot = custom["preview"]
+                # The LIBRARY first. Hand-written scenes get composition, scale and camera
+                # right every time; a model writing one from scratch produced, in one
+                # afternoon, a target too small to read, a chain that was a single rod,
+                # half a frame of unlit floor, a ball parked outside the frame and finally
+                # a camera inside the wall. Variation now comes from the parameters, which
+                # are wide, rather than from letting it invent geometry.
+                picked = None
+                if physics_library is not None:
+                    try:
+                        picked = physics_library.select(prompt, status_cb=status_cb)
+                    except Exception as exc:  # noqa: BLE001
+                        status_cb(f"Scene library unavailable ({exc}); writing one instead.")
+                if picked:
+                    custom = {"scene_path": picked["path"], "params": picked["params"],
+                              "title": picked["title"], "seconds": picked["seconds"],
+                              "kind": "loop" if picked.get("loop") else "single"}
+                    if picked.get("sweep"):
+                        # A comparison short: the same setup rendered once per value and
+                        # joined, each take labelled. This is the format that made the
+                        # wrecking-ball video work - the contrast IS the video.
+                        sw = picked["sweep"]
+                        custom["kind"] = "sweep"
+                        custom["param"] = sw.get("param")
+                        custom["values"] = sw.get("values") or []
+                        custom["unit"] = sw.get("unit", "")
+                    status_cb("Rendering a preview frame for approval...")
+                    shot = physics_run.preview_frame(work_dir, custom=custom,
+                                                     status_cb=status_cb)
+                else:
+                    # An authored scene is proved by running it, so its test frame IS the
+                    # preview - no second render just to show the user something.
+                    custom = physics_authoring.author_scene(
+                        prompt, status_cb=status_cb, work_dir=work_dir,
+                        **({"brief_model": brief_model} if brief_model else {}))
+                    shot = custom["preview"]
             else:
                 status_cb("Rendering a preview frame for approval...")
                 shot = physics_run.preview_frame(work_dir, preset=preset, values=values,
@@ -15178,6 +15327,67 @@ class Handler(BaseHTTPRequestHandler):
                 out = {"job_id": start_lowpoly_job(
                     prompt, seconds=max(10.0, min(90.0, secs)),
                     captions=bool(body.get("captions", True)))}
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        if parsed.path in ("/aicore-storylines", "/aicore-prompts"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except Exception:
+                body = {}
+            try:
+                if ai_core is None:
+                    raise RuntimeError("AI Core is unavailable.")
+                brief = str(body.get("brief") or "").strip()
+                if not brief:
+                    raise RuntimeError("Describe the short first.")
+                model = str(body.get("model") or "").strip()
+                if parsed.path == "/aicore-storylines":
+                    out = {"options": ai_core.storylines(
+                        brief, model=model or ai_core.STORY_MODEL)}
+                else:
+                    picked = body.get("storyline")
+                    if not isinstance(picked, dict):
+                        raise RuntimeError("Pick a storyline first.")
+                    out = ai_core.prompts_for(brief, picked,
+                                              model=model or ai_core.PROMPT_MODEL)
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        if parsed.path == "/aicore-assemble":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                fields, files = parse_multipart(self.headers.get("Content-Type", ""), raw)
+                if not files:
+                    raise RuntimeError("Upload the clips first.")
+                title = str(fields.get("title") or "").strip()
+                stage = ROOT / "outputs" / "aicore_uploads" / time.strftime("%Y%m%d_%H%M%S")
+                stage.mkdir(parents=True, exist_ok=True)
+                saved = []
+                # Order matters: clip1/clip2/clip3 are the beats in sequence, and a dict
+                # from the multipart parser has no guaranteed order for the caller's sake.
+                for key in sorted(files, key=lambda k: str(k)):
+                    item = files[key]
+                    name = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                                  str(item.get("filename") or key))[-80:]
+                    dest = stage / f"{len(saved) + 1}_{name or 'clip.mp4'}"
+                    dest.write_bytes(item.get("data") or b"")
+                    saved.append(str(dest))
+                meta = {}
+                for key in ("brief", "world", "storyline"):
+                    if fields.get(key):
+                        meta[key] = fields[key]
+                try:
+                    meta["prompts"] = json.loads(fields.get("prompts") or "[]")
+                except Exception:  # noqa: BLE001
+                    meta["prompts"] = []
+                out = {"job_id": start_aicore_job(saved, title=title, meta=meta)}
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)}
             self.send_bytes(json.dumps(out).encode("utf-8"),
