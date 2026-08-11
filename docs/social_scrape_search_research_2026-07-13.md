@@ -278,3 +278,85 @@ Learning: the query is semantically excellent, yet tutorial neighbourhoods are c
 The live controller now receives cumulative rejection counts (`burned_captions`, `black_bars`, `rapid_edits`, `low_quality`, download failures) in addition to visual descriptions. Its prompt explicitly changes away from tutorial/news-repost neighbourhoods when caption or framing rejection dominates, and changes the visible subject/action when semantic mismatch dominates.
 
 Popularity ranking was also completed: V2 source candidates now retain both likes and views. Relevance remains dominant, but the engagement component blends log-normalized likes and views, so a million-view exact match ranks above an otherwise identical low-view result without allowing a viral off-topic clip to beat a relevant one. Regression coverage passes.
+
+## Field case 2026-08-12: `tokyo_love_goes_private` — 1 of 14 beats got footage
+
+A fact short on Japanese couples produced thirteen still images and one clip. The user's
+report was that TikTok has "heaps" of the material. It does. The run never asked for it.
+
+### What the run actually did
+
+| measure | value |
+|---|---|
+| beats | 14 |
+| beats with their own footage | 1 |
+| beats that fell back to a still | 13 |
+| queries planned | 218 |
+| **queries executed** | **4** |
+| wall clock | 1977.7s against an 1800s deadline |
+| per query | 494s |
+| metadata candidates → downloads → segments → quality → semantic | 73 → 36 → 62 → 23 → 0 |
+
+The four queries that ran: `カップル デート vlog` (scene 0), `カップル デート vlog` again
+(scene 1), then two adaptive retries `渋谷交差点` and `冷めたカップル` back into the same two
+scenes. Scenes 2-13 were never searched.
+
+### The plan was good; the executor never reached it
+
+`search_plan_audit.json` holds 218 queries, 14-16 per scene, and they are the right shape -
+the compact native `entity + visible object` pattern this log validated in July:
+
+    scene 6   プリクラ 隠れ家 · ゲーセン デート · #プリクラ
+    scene 7   プリクラ 落書き · カップル プリクラ
+    scene 10  ラブホ 自動精算機
+    scene 11  ラブホ 壁面 · #ラブホテル
+    scene 12  ホテルの部屋 扉 · 防音扉 ホテル (X)
+
+None was issued. Five separate mechanisms stacked up:
+
+1. **The generic seeds held the first four slots of every scene.** `カップル デート vlog`,
+   `カップル 日常`, `恋人 デート`, `放課後 デート` are identical for 13 of the 14 beats -
+   55 of the 218 planned slots are duplicates. In 13 beats the first scene-specific term sat
+   at **position 5**. A comment in `queries_for_intent` said the seeds go first so that
+   "vague Architect terms must not spend the first browser round"; the seeds turned out to
+   be the vague ones.
+2. **39 native Japanese queries were discarded before any search**, with the reason
+   "Japanese-context scene requires a native Japanese query" - `渋谷デート`,
+   `スクランブル交差点`, `東京夜景`, `新宿デート`. The language label came from the JSON key
+   the Architect filed the string under (`english` vs `japanese`), not from the text. The
+   Architect writes Japanese into the `english` array.
+3. **The download budget is global and FIFO.** `max_downloaded_analysis_videos = 36` was
+   handed to every call; the first chunk consumed all 36, and from then on
+   `_download_and_segment` returned `[]` for every other beat regardless of remaining time.
+4. **The coverage queue ran scene-block by scene-block, four at a time**, and each scene
+   contributes two entries - so chunk 0 *was* scenes 0 and 1. The adaptive retry can only
+   target scenes inside the current chunk, so both corrective queries went back into the
+   same two beats.
+5. **Nothing ran concurrently.** 35 proxy downloads at a median 34.6s apart = 1211 of the
+   1978 seconds, 61% of the run, on network wait.
+
+### The semantic gate was not the problem
+
+`segments_semantic_passed = 0` looks like a broken gate and is not: it is a stale counter,
+and the material genuinely did not match. The cached contact sheet for the `渋谷交差点`
+round is eight segments of Shibuya city b-roll - crossings, neon, a person dancing on the
+crossing - against a beat asking for "young couple walking side by side without touching".
+Rejecting them was right. The gate was starved, not broken.
+
+The lesson for this log: **a zero-pass rate is a query symptom, not a threshold symptom.**
+Loosening the floors here would have bought worse footage, not more of it.
+
+### Changes made
+
+- language is decided by the text, not by the array it arrived in
+- the beat's own terms lead; the deterministic seed follows immediately behind it (an
+  Architect term can be junk, so the seed must stay inside the coverage slots - there is a
+  regression test for exactly that)
+- the coverage queue is round-robin: every beat gets its first search before any beat gets
+  a second, so a run that is cut short is cut short evenly
+- the download pool is per-round and per-beat, and scales with the beat count; a beat with
+  nothing at all raises the cap rather than surrendering to a still
+- proxy downloads run six at a time
+- **no stills**: a beat that finds nothing borrows motion from the nearest beat that has
+  some, at a different in-point, and is labelled `BORROWED` in the report while still
+  counting as unmatched

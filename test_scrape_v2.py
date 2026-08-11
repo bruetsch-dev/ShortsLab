@@ -9,6 +9,9 @@ detection, global assignment caps, render-validation-v2, and that Scrape V1 is u
 """
 
 import scrape_v2 as v
+import json
+import tempfile
+from pathlib import Path
 
 
 _failures = []
@@ -126,6 +129,29 @@ def test_platform_query_sanitizer():
           v.sanitize_platform_query("cute Japan TikTok dance") == "cute Japan dance")
     check("X and Instagram meta terms removed",
           v.sanitize_platform_query("Japan office x.com Instagram") == "Japan office")
+    check("scene ID and comma separators removed",
+          v.sanitize_platform_query("#03 #女の子, ダンス") == "#女の子 ダンス")
+
+
+def test_scene_bound_query_plan():
+    sleep = v.VisualIntent(
+        scene_id=1, scene_text="A salaryman sleeps on a train.", visual_type="concrete",
+        subject="salaryman", action="sleeping", location="train",
+        english_queries=["office worker asleep train"])
+    romance = v.SearchQueryV2(
+        query="japan couple", language="en", tier="exact_action",
+        visual_intent_id=sleep.intent_id, scene_ids=[1],
+        expected_subject="salaryman", expected_action="sleeping", expected_location="train")
+    valid, reason, _normalized = v.validate_query_against_intent(romance, sleep)
+    check("foreign romance query rejected before search", not valid and "unrelated couple" in reason)
+    with tempfile.TemporaryDirectory() as tmp:
+        by_scene, audit = v.build_scene_bound_query_plan(
+           [sleep], Path(tmp), "A salaryman sleeps on a train.")
+        saved = json.loads((Path(tmp) / "review" / "search_plan_audit.json").read_text(encoding="utf-8"))
+    check("scene-bound plan retains provenance",
+          bool(by_scene[1]) and all(q.scene_ids == [1] for q in by_scene[1]))
+    check("search plan audit persists current script hash",
+          saved["script_sha256"] == audit["script_sha256"] and saved["coverage_by_scene"]["1"] > 0)
 
 
 # ---- relevance-first ranking ----------------------------------------------
@@ -149,6 +175,126 @@ def test_ranking_relevance_over_likes():
           v._dynamic_like_floor_v2("exact_action", "tiktok") == 0)
     check("no tier has a like floor anymore",
           all(v._dynamic_like_floor_v2(t, "tiktok") == 0 for t in v.LIKE_FLOORS_V2))
+
+
+def test_provenance_and_editorial_gates():
+    japanese_intent = v.VisualIntent(
+        scene_id=0, scene_text="Why do many Japanese women style their bangs in Tokyo?",
+        visual_type="concrete", subject="Japanese woman", action="styling bangs", location="Tokyo")
+    query = v.SearchQueryV2(
+        query="前髪 セット", language="ja", tier="exact_action", visual_intent_id="scene_0",
+        expected_subject="woman", expected_action="styling bangs", expected_location="Tokyo",
+        requires_japanese_context=True)
+    native = v.SourceVideoCandidate(
+        platform="tiktok", source_id="native", creator_id="creator", url="", width=720, height=1280,
+        caption="前髪をセットする", hashtags=["#前髪"], query=query.query, query_tier=query.tier)
+    generic = v.SourceVideoCandidate(
+        platform="tiktok", source_id="generic", creator_id="creator", url="", width=720, height=1280,
+        caption="hair styling tutorial", hashtags=["#bangs"], query=query.query, query_tier=query.tier)
+    ranked = v.rank_metadata_candidates_v2([generic, native], query)
+    check("Japan-specific query rejects source without native Japanese provenance",
+          [c.source_id for c in ranked] == ["native"])
+    good = v.SegmentCandidate(segment_id="jp", source_id="native", platform="tiktok", source_path="",
+                              start_time=0, end_time=3, duration=3, query="前髪 セット",
+                              japanese_context=True, visual_description={"age_confidence": "adult"})
+    check("adult native-source clip clears editorial gate",
+          v.editorial_rejection_reason(good, japanese_intent) == "")
+    teen = v.SegmentCandidate(**{**good.__dict__, "segment_id": "teen",
+                                 "visual_description": {"age_confidence": "teen"}})
+    check("teen creator footage rejected", "minor" in v.editorial_rejection_reason(teen, japanese_intent))
+    captions = v.SegmentCandidate(**{**good.__dict__, "segment_id": "caption",
+                                     "visual_description": {"age_confidence": "adult", "burned_captions": True}})
+    check("burned creator captions rejected", "captions" in v.editorial_rejection_reason(captions, japanese_intent))
+    no_provenance = v.SegmentCandidate(**{**good.__dict__, "segment_id": "generic",
+                                          "japanese_context": False})
+    check("Japan scene rejects clip without native provenance",
+          "Japanese source" in v.editorial_rejection_reason(no_provenance, japanese_intent))
+    declined = v.SegmentCandidate(**{**good.__dict__, "segment_id": "declined",
+        "source_path": r"C:\\project\\seedance 2.0\\_declined\\declined_v2_bad.mp4"})
+    check("previously declined footage can never re-enter V2 matching",
+          "previously rejected" in v.editorial_rejection_reason(declined, japanese_intent))
+
+
+def test_uncovered_beats_borrow_motion():
+    """Clips only: a beat the search could not cover must never show a still."""
+    scenes = [
+        {"id": 0, "clip": "a.mp4", "asset": "a.mp4", "assignment_type": "exact",
+         "source_duration": 12.0},
+        {"id": 1, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
+         "scrape_uncovered_reason": "no approved segment"},
+        {"id": 2, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
+         "scrape_uncovered_reason": "no approved segment"},
+        {"id": 3, "clip": "b.mp4", "asset": "b.mp4", "assignment_type": "exact",
+         "source_duration": 12.0},
+    ]
+    borrowed = v.borrow_motion_for_uncovered(scenes)
+    check("both footage-less beats borrow motion", borrowed == 2)
+    check("no beat is left on a still",
+          not any(sc.get("assignment_type") == "uncovered_still" for sc in scenes))
+    check("a borrow takes the NEAREST donor",
+          scenes[1]["borrowed_from_scene"] == 0 and scenes[2]["borrowed_from_scene"] == 3)
+    check("a borrow is labelled, not disguised as a match",
+          all(scenes[i]["match_class"] == "BORROWED" for i in (1, 2)))
+    check("the uncovered reason survives the borrow",
+          scenes[1]["scrape_uncovered_reason"] == "no approved segment")
+    check("a borrowed beat starts at a different in-point than its donor",
+          scenes[1].get("source_trim", 0) > 0)
+    # nothing to borrow from: a still is better than a black frame, and it must stay
+    only_stills = [{"id": 0, "assignment_type": "uncovered_still"}]
+    check("with no footage at all the still fallback survives",
+          v.borrow_motion_for_uncovered(only_stills) == 0
+          and only_stills[0]["assignment_type"] == "uncovered_still")
+
+
+def test_relationship_scene_queries():
+    intent = v.VisualIntent(
+        scene_id=4,
+        scene_text="Only after the confession will the couple finally hold hands in public.",
+        visual_type="concrete", subject="Japanese couple", action="holding hands", location="street",
+        platform_queries={"tiktok": {"japanese": ["人 深呼吸"]}})
+    queries = v.queries_for_intent(intent)
+    texts = [q.query for q in queries]
+    joined = " ".join(texts)
+    check("dating beat gets concrete native hand-holding searches",
+          any(term in joined for term in ("手繋ぎ", "恋人繋ぎ")))
+    check("dating seeds are TikTok actions, not platform-name pollution",
+          any(q.generated_from == "deterministic_relationship_scene_seed" and q.platforms == ["tiktok"]
+              for q in queries) and all("tiktok" not in q.query.casefold() for q in queries))
+    check("dating seeds are bound to their own scene",
+          all(q.scene_ids == [4] for q in queries))
+    # The seed used to be asserted as query[0]. That rule is what starved the Tokyo run:
+    # the seeds are identical for every scene (カップル デート vlog and friends), so they
+    # took slots 1-4 of all 14 beats and pushed each beat's own term (プリクラ 落書き,
+    # ラブホ 自動精算機) to slot 5, which the run never reached. The beat's own term leads
+    # now - but the seed must stay right behind it, because an Architect term can be junk
+    # like 人 深呼吸 for a hand-holding beat and the coverage wave takes two per scene.
+    seed_at = next((i for i, q in enumerate(queries)
+                    if q.generated_from == "deterministic_relationship_scene_seed"), None)
+    check("dating action seed stays inside the coverage-search slots",
+          seed_at is not None and seed_at <= 2)
+    inflected_hands = v.VisualIntent(
+        scene_id=6, scene_text="The couple holds hands while walking home.",
+        subject="Japanese couple", action="holding hands", location="street")
+    check("inflected hand-holding narration keeps the hand-holding search seed",
+          v.queries_for_intent(inflected_hands)[0].query == "カップル 手繋ぎ")
+    confession = v.VisualIntent(
+        scene_id=5, scene_text="A formal confession is required before dating.",
+        subject="Japanese students", action="confessing feelings", location="after school")
+    confession_queries = v.queries_for_intent(confession)
+    check("confession opens in the populated high-school confession neighbourhood",
+          confession_queries[0].query == "高校生 告白")
+    confession_query = confession_queries[0]
+    literal = v.SourceVideoCandidate(
+        platform="tiktok", source_id="literal", creator_id="a", url="", width=720, height=1280,
+        caption="高校生が放課後に告白した瞬間", hashtags=["高校生", "告白"],
+        query=confession_query.query, query_tier=confession_query.tier)
+    generic = v.SourceVideoCandidate(
+        platform="tiktok", source_id="generic", creator_id="b", url="", width=720, height=1280,
+        caption="高校生の青春ダンス", hashtags=["高校生", "青春"],
+        query=confession_query.query, query_tier=confession_query.tier)
+    ranked = v.rank_metadata_candidates_v2([generic, literal], confession_query)
+    check("native confession anchors rank literal action above generic school context",
+          ranked and ranked[0].source_id == "literal")
 
 
 # ---- segment discovery windows --------------------------------------------
@@ -255,14 +401,26 @@ def test_render_validation_v2():
         dict(good["scenes"][0]),
         {"id": 1, "clip": "b1.mp4", "visual_role": "body", "assignment_type": "emergency_fallback"},
         {"id": 2, "clip": "b2.mp4", "visual_role": "body", "assignment_type": "emergency_fallback"}]}
-    check("mostly-emergency timeline rejected",
+    check("unrelated emergency filler is rejected before rendering",
           _raises(lambda: v.validate_scrape_render_v2(mostly_emergency)))
     missing_clip = {"voice_speed": 1.20, "scenes": [dict(good["scenes"][0]),
                     {"id": 1, "visual_role": "body"}]}
     check("scene without clip rejected", _raises(lambda: v.validate_scrape_render_v2(missing_clip)))
+    uncovered_still = {"voice_speed": 1.20, "scenes": [dict(good["scenes"][0]),
+                       {"id": 1, "visual_role": "body", "assignment_type": "uncovered_still",
+                        "match_class": "UNMATCHED"}]}
+    check("uncovered V2 scene uses explicit still fallback instead of unrelated footage",
+          v.validate_scrape_render_v2(uncovered_still))
+    selected_rejected = {"voice_speed": 1.10, "influencer_hook": False, "scenes": [
+        {"id": 0, "clip": "selected.mp4", "visual_role": "hook_topic",
+         "match_class": "D_REJECTED", "assignment_type": "exact",
+         "fallback_level": 0, "black_bar_score": 0.0, "native_9_16": True}]}
+    check("semantically rejected footage cannot be relabeled as a fallback",
+          _raises(lambda: v.validate_scrape_render_v2(selected_rejected)))
     no_hook = {"voice_speed": 1.20, "scenes": [
         {"id": 0, "clip": "b.mp4", "visual_role": "body", "match_class": "B_MATCH", "assignment_type": "exact"}]}
-    check("hook-not-first rejected", _raises(lambda: v.validate_scrape_render_v2(no_hook)))
+    check("stale opener role normalized", v.validate_scrape_render_v2(no_hook)
+          and no_hook["scenes"][0]["visual_role"] == "hook_topic")
 
 
 def _raises(fn):
@@ -287,7 +445,10 @@ def test_v1_untouched():
 if __name__ == "__main__":
     for t in (test_settings, test_query_diversity, test_architect_raw_queries_and_multi_sort,
               test_platform_query_sanitizer,
-              test_ranking_relevance_over_likes,
+              test_scene_bound_query_plan,
+              test_ranking_relevance_over_likes, test_provenance_and_editorial_gates,
+              test_relationship_scene_queries,
+              test_uncovered_beats_borrow_motion,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)
