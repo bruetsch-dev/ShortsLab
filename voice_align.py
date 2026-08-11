@@ -176,7 +176,37 @@ def _load_model(model_name=None, status_cb=None):
 
 
 def _transcribe_words_faster_whisper(audio_path, model_name=None, language=None, status_cb=None):
-    model = _load_model(model_name, status_cb=status_cb)
+    try:
+        return _run_faster_whisper(audio_path, model_name, language, status_cb)
+    except Exception as exc:  # noqa: BLE001
+        # CUDA loads fine and only falls over on the FIRST transcribe, so the cuda->cpu
+        # ladder in _load_model never gets a chance: it saw a constructed model and
+        # reported success. A missing cublas DLL then killed captioning outright.
+        if not _is_cuda_runtime_error(exc):
+            raise
+        global _MODEL, _MODEL_KEY
+        with _MODEL_LOCK:
+            _MODEL, _MODEL_KEY = None, None
+        if status_cb:
+            status_cb(f"Voice aligner: GPU unusable ({str(exc)[:80]}); retrying on CPU.")
+        # MEDIUM on the CPU, not small. Small is ~2x faster but its word onsets sit about
+        # 120ms earlier than medium's, and captions are judged in exactly that range - the
+        # cheap fallback traded a hard failure for a visibly wrong one.
+        return _run_faster_whisper(audio_path, "medium", language, status_cb, force_cpu=True)
+
+
+def _is_cuda_runtime_error(exc) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(t in text for t in ("cublas", "cudnn", "cuda", "libcu", ".dll"))
+
+
+def _run_faster_whisper(audio_path, model_name=None, language=None, status_cb=None,
+                        force_cpu=False):
+    if force_cpu:
+        from faster_whisper import WhisperModel
+        model = WhisperModel(model_name or "small", device="cpu", compute_type="int8")
+    else:
+        model = _load_model(model_name, status_cb=status_cb)
     segments, _info = model.transcribe(
         str(audio_path), word_timestamps=True, language=language,
         vad_filter=True, beam_size=5,

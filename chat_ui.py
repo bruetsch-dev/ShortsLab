@@ -75,6 +75,28 @@ UI_STRINGS = {
     "mode_script_d": "Turn a voice script into a full visual Short with the app pipeline.",
     "mode_viral_t": "A Viral Short from a Topic",
     "mode_viral_d": "Give one topic - the agents write, film, caption and voice it fully autonomously.",
+    "physics_intro": "Pick a scene and the values to sweep. Each value is simulated and rendered separately, then joined with impact sound on the exact frame the collision happens.",
+    "physics_hint": "Comma separated. Three to four values reads best - the contrast between them is the video.",
+    "mode_lowpoly_t": "A Low Poly Story Short",
+    "lowpoly_intro": "Describe the story. The models write the narration, break it into shots, build every shot in Blender and cut it to the voiceover.",
+    "lowpoly_prompt_label": "What is the story?",
+    "lowpoly_prompt_ph": "A guy finds a letter in his mailbox saying he inherited a company he has never heard of",
+    "lowpoly_hint": "It is meant to look cheap - blocky figures, boxes for rooms. Tell it what happens, not how it should look.",
+    "lowpoly_len": "Length",
+    "lowpoly_go": "Make the short",
+    "lowpoly_missing": "Describe the story first.",
+    "physics_go": "Render simulation",
+    "physics_prompt_label": "Describe the scene",
+    "physics_prompt_ph": "A bowling ball swinging into a wall of stacked glass panes, one pane at a time",
+    "physics_prompt_hint": "Say what objects there are and what happens to them. The app writes the 3D scene, then shows you one frame before it renders.",
+    "physics_prompt_missing": "Describe what should happen first.",
+    "physics_brief_model": "Model that writes the scene brief",
+    "physics_approve_t": "Does this shot look right?",
+    "physics_approve_d": "One frame from the middle of the action. The full render takes a while, so check the framing and the look before it starts.",
+    "physics_approve_yes": "Render it",
+    "physics_approve_no": "No, stop here",
+    "mode_physics_t": "A Physics Simulation Short",
+    "mode_physics_d": "One 3D scene, one value swept - 1kg, 10kg, 50kg - simulated in Blender and mixed with ASMR impact sound. No AI video generation.",
     "mode_reddit_t": "A Reddit Story Video",
     "mode_reddit_d": "A Reddit-style story over Minecraft parkour with an AI voiceover.",
     "mode_longform_t": "A Longform Video",
@@ -306,8 +328,7 @@ RUN_MANIFEST = {
         "caption_active_style", "caption_active_color", "caption_base_color",
         "caption_box_color", "caption_stroke", "caption_size", "caption_uppercase_choice",
         "search_languages",
-        "motion_loop_concept", "motion_loop_profile",
-        "motion_loop_intensity", "motion_loop_quality",
+        "motion_loop_concept", "motion_loop_profile", "motion_loop_intensity", "motion_loop_speed", "motion_loop_pov", "motion_loop_surrealness",
     ],
     # checkbox fields: posted as "on" only when checked (HTML checkbox semantics)
     "check": [
@@ -317,10 +338,10 @@ RUN_MANIFEST = {
         "influencer_hook",
         "add_visual_effects", "add_meme_reactions", "add_neko_reactions",
         "multi_language_search",
-        "motion_loop_mode", "motion_loop_seamless",
+        "motion_loop_mode", "motion_loop_seamless", "motion_loop_unlimited",
     ],
     # file fields
-    "file": ["speaker_image_file"],
+    "file": ["speaker_image_file", "motion_loop_first_frame"],
 }
 
 MASTER_MANIFESTS = {
@@ -553,6 +574,8 @@ def longform_projects_payload(active_project_slugs=()):
         script = str(state.get("script") or "")
         if not script:
             continue                      # nothing to resume with, so nothing to offer
+        voice_name = Path(str(state.get("voiceover_file") or "voiceover.wav")).name
+        voiceover_ready = longform_video._audio_done(d / voice_name)
         video = next(iter(sorted(d.glob("*.mp4"))), None)
         images = sorted(d.glob("img*.png"))
         _state, timed_frames = longform_video.frames_from_disk(d)
@@ -583,6 +606,19 @@ def longform_projects_payload(active_project_slugs=()):
             "longform": True,
             "script": script,
             "tts_voice": str(state.get("voice") or ""),
+            "tts_model": str(state.get("tts_model") or "pro"),
+            "reasoning_model": str(state.get("reasoning_model") or ""),
+            "reasoning_mode": str(state.get("reasoning_mode") or ""),
+            "mascot_enabled": bool(state.get("mascot_enabled", False)),
+            "halt_after_speech": bool(state.get("halt_after_speech", False)),
+            "tts_voice_instruction": str(state.get("tts_voice_instruction") or ""),
+            "tts_language": str(state.get("tts_language") or ""),
+            "tts_native_speed": str(state.get("tts_native_speed") or "1"),
+            "tts_volume": str(state.get("tts_volume") or "1"),
+            "tts_pitch": str(state.get("tts_pitch") or "0"),
+            "tts_sample_rate": str(state.get("tts_sample_rate") or "24000"),
+            "tts_output_format": str(state.get("tts_output_format") or "mp3"),
+            "voiceover_ready": voiceover_ready,
             "status": (f"Needs {missing_frames} missing frame(s)" if missing_frames else
                        "Done" if video else
                        "Voiceover ready" if (d / "voiceover.wav").exists() else

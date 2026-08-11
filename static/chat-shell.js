@@ -24,9 +24,6 @@ function resetTtsVoice(holder) {
   const choices = ttsVoiceOptions(holder.tts_model);
   if (!choices.some(o => o.value === holder.tts_voice))
     holder.tts_voice = isSeedTts(holder.tts_model) ? "stokie_en" : (choices[0] || {}).value || "";
-  // Seed always receives the normal narration through its required `text` input.
-  // Its optional delivery-instruction field is intentionally not exposed in the app.
-  if (isSeedTts(holder.tts_model)) holder.tts_voice_instruction = "";
 }
 function previewTts(holder, mode) {
   const a = ensureAudio();
@@ -38,6 +35,11 @@ function seedTtsSettings(holder) {
   if (!isSeedTts(holder.tts_model)) return null;
   const box = el("div", "seed-tts-settings");
   box.appendChild(el("div", "out-sec-hint", "Seed Speech controls the voice directly. Gemini narrator names and Gemini delivery presets are not used."));
+  const instruction = el("textarea"); instruction.rows = 2;
+  instruction.placeholder = "Optional delivery direction, e.g. warm, intimate, energetic";
+  instruction.value = holder.tts_voice_instruction || "";
+  instruction.addEventListener("input", () => { holder.tts_voice_instruction = instruction.value; persist(); });
+  box.appendChild(instruction);
   const grid = el("div", "seed-tts-grid");
   const select = (label, options, value, onChange) => {
     const f = el("label", "seed-tts-field"); f.appendChild(el("span", "", label));
@@ -146,11 +148,18 @@ const DEFAULT_VALUES = () => {
   if (st.influencer_hook === undefined) v.influencer_hook = false;
   if (st.halt_after_speech === undefined) v.halt_after_speech = false;
   if (!v.pipeline_version) v.pipeline_version = "v0.2";   // version chooser removed; always v0.2
-  if (!v.clip_short_format) v.clip_short_format = "standard";
-  if (!v.script_token_limit) v.script_token_limit = "";
+  // Mini Story is retired; never restore it from legacy ui_state.json.
+  v.clip_short_format = "standard";
+  v.script_token_limit = "";
   if (!v.speaker_name) v.speaker_name = "Narrator";
   if (st.motion_loop_seamless === undefined) v.motion_loop_seamless = false;
-  if (!v.motion_loop_quality) v.motion_loop_quality = "economy";
+  v.motion_loop_unlimited = true;
+  // A new creation must start with a blank story. The legacy UI state also
+  // stores the last submitted script, but that is not a reusable default.
+  v.script = "";
+  v.gen_topic = "";
+  v.hook_text = "";
+  v.impact_word = "";
   v.loaded_project_mode = v.loaded_project_mode || "normal";
   v.loaded_project_source = "";
   return v;
@@ -191,6 +200,8 @@ const FLOW_STEPS = {
   script: ["script", "source", "reasoning", "outputs", "review"],
   viraltrans: ["topic", "review"],
   reddit: ["discover", "pick"],
+  physics: ["setup"],
+  lowpoly: ["setup"],
   longform: ["script", "settings"],
   sfx: ["upload", "settings"],
   visual: ["upload", "settings"],
@@ -202,10 +213,7 @@ const FLOW_STEPS = {
 };
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
 function isVisualsFromScript() { return S.flow === "script" && !!S.values.visuals_from_script_mode; }
-function isMiniStory() { return isCultureFacts() && S.values.clip_short_format === "mini_story"; }
-// mini_story is retained as a legacy saved-project value, but both old Mini and the
-// former Discovery now use the same scriptless Unified Discovery workflow.
-function isDiscovery() { return isCultureFacts() && ["discovery", "mini_story"].includes(S.values.clip_short_format); }
+function isDiscovery() { return isCultureFacts() && S.values.clip_short_format === "discovery"; }
 function estimatedScriptTokens(text) {
   const chunks = String(text || "").trim().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) || [];
   return chunks.length;
@@ -311,6 +319,7 @@ function renderAll() {
   }
 
   ({ script: renderScriptFlow, viraltrans: renderViralFlow, reddit: renderRedditFlow,
+     physics: renderPhysicsFlow, lowpoly: renderLowpolyFlow,
      longform: renderLongformFlow, sfx: () => renderMasterFlow("sfx"),
      visual: () => renderMasterFlow("visual"), captions: () => renderMasterFlow("captions"),
      enhance: renderEnhanceFlow,
@@ -405,12 +414,10 @@ function stepCopy(step) {
     // using them - longform cannot generate a script, and its settings step is about narration,
     // not the "enhancement intensity" the SFX/Visual/Caption masters set there.
     script: isLongform()
-      ? ["SCRIPT", "Paste your script", "The full narration, start to finish - it sets the length of the video."]
-      : isDiscovery()
-        ? ["DISCOVERY", "Set the direction", "Optional topic + narrator - the agent finds the material and writes the script."]
-        : isMiniStory()
-          ? ["STORY", "Topic or script", "Give a topic (the agent writes from real material) or paste a mini script."]
-          : ["STORY", "Add your script", "Paste it or generate a fresh one."],
+    ? ["SCRIPT", "Paste your script", "The full narration, start to finish - it sets the length of the video."]
+    : isDiscovery()
+      ? ["DISCOVERY", "Set the direction", "Optional topic + narrator - the agent finds the material and writes the script."]
+      : ["STORY", "Add your script", "Paste it or generate a fresh one."],
     hook:["OPENING", "Mark the hook", "Select the line that must stop the scroll."],
     version:["EDIT", "Choose the cutting style", "Use the current edit system or switch to classic."],
     source:["FOOTAGE", isCultureFacts() ? "Tune the footage search" : "Choose visual models",
@@ -557,7 +564,9 @@ const MODES = [
   { id: "visualscript", grp: 0, ico: "✦", t: "AI Short", d: "Create a short using AI-generated visuals and scraped web imagery matching the script." },
   { id: "script", grp: 0, ico: "🎬", t: T.mode_script_t, d: T.mode_script_d },
   { id: "viraltrans", grp: 0, ico: "🧪", t: T.mode_viral_t, d: T.mode_viral_d },
-  { id: "reddit", grp: 0, ico: "💬", t: T.mode_reddit_t, d: T.mode_reddit_d },
+  // Physics sits where the Reddit story mode used to be (user 2026-07-26). The
+  // reddit flow itself is untouched and still reachable at /reddit.
+  { id: "physics", grp: 0, ico: "⚙", t: T.mode_physics_t, d: T.mode_physics_d },
   { id: "longform", grp: 0, ico: "🎨", t: T.mode_longform_t, d: T.mode_longform_d },
   { id: "sfx", grp: 1, ico: "🔊", t: T.mode_sfx_t, d: T.mode_sfx_d },
   { id: "visual", grp: 1, ico: "➜", t: T.mode_vfx_t, d: T.mode_vfx_d },
@@ -631,19 +640,19 @@ function renderPrototypeHome() {
           <em>Direct a complete short with AI video, AI images, web images and Wikimedia footage.</em></span>
         <span class="proto-tool-go">Build from script ${protoIcon("arrow")}</span>
       </button>
-      <button type="button" class="proto-tool proto-creator-card proto-tool-reddit" data-mode="reddit">
-        <video muted autoplay loop playsinline preload="auto" poster="/file?path=static%2Fpreviews%2Fstory_flow_poster.jpg" src="/file?path=static%2Fpreviews%2Fstory_flow_20s_hd.mp4" aria-hidden="true"></video>
+      <button type="button" class="proto-tool proto-creator-card proto-tool-physics" data-mode="physics">
+        <video muted autoplay loop playsinline preload="auto" poster="/file?path=static%2Fpreviews%2Fphysics_sweep_poster.jpg" src="/file?path=static%2Fpreviews%2Fphysics_sweep.mp4" aria-hidden="true"></video>
         <span class="proto-culture-shade"></span>
-        <span class="proto-reddit-caption"><b>r/AskReddit</b><span>What is a secret you were never supposed to find out?</span></span>
-        <span class="proto-tool-copy"><small>STORY + GAMEPLAY</small><strong>Reddit Story</strong>
-          <em>Turn a thread into a narrated short over Minecraft parkour.</em></span>
-        <span class="proto-tool-go">Find a story ${protoIcon("arrow")}</span>
+        <span class="proto-tool-copy"><small>SIMULATED IN BLENDER</small><strong>Physics Sweep</strong>
+          <em>One 3D scene, one value swept, with ASMR impact sound on the frame it hits.</em></span>
+        <span class="proto-tool-go">Set up a simulation ${protoIcon("arrow")}</span>
       </button>
     </section>
     <section class="proto-secondary-tools" aria-label="More creation modes">
       <button type="button" data-mode="enhance">${protoIcon("visual")}<span><b>Enhance video</b><small>SFX, visual effects or captions</small></span></button>
       <button type="button" data-mode="viraltrans">${protoIcon("flask")}<span><b>Viral Transcriber</b><small>Rebuild a proven format</small></span></button>
       <button type="button" data-mode="longform">${protoIcon("longform")}<span><b>Longform Visuals</b><small>Illustrate longer narration</small></span></button>
+      <button type="button" data-mode="lowpoly">${protoIcon("flask")}<span><b>Low Poly Story</b><small>Crude 3D story from a prompt</small></span></button>
     </section>
     <section class="proto-home-section">
       <header><div><small>CONTINUE WORKING</small><h2>Recent projects</h2></div><button type="button" data-open-assets>View all ${protoIcon("arrow")}</button></header>
@@ -668,12 +677,9 @@ function renderPrototypeHome() {
   const aiShort = home.querySelector('[data-mode="visualscript"]');
   labelCard("visualscript", "AI VISUAL SHORT", "AI Short",
     "Create a short using AI-generated visuals and scraped web imagery matching the script.", "Build AI Short");
-  const story = home.querySelector('[data-mode="reddit"]');
-  if (story) {
-    story.querySelector(".proto-reddit-caption")?.remove();
-  }
-  labelCard("reddit", "STORY B-ROLL", "Story Flow",
-    "Tell Reddit, 4chan or other stories over satisfying background footage.", "Create Story Flow");
+  labelCard("physics", "SIMULATED IN BLENDER", "Physics Sweep",
+    "Sweep one value - 1kg, 10kg, 50kg - through a real rigid-body simulation, with ASMR "
+    + "impact sound landing on the frame the collision happens.", "Set up a simulation");
   const longform = home.querySelector('[data-mode="longform"]');
   if (longform) {
     longform.className = "proto-tool proto-creator-card proto-tool-longform";
@@ -727,6 +733,7 @@ function renderPrototypeHome() {
   home.querySelectorAll(".proto-primary-tools .proto-tool-icon").forEach(icon => icon.remove());
   home.querySelectorAll(".proto-tool-copy small,.proto-enhance-copy small").forEach(label => label.remove());
   home.querySelectorAll(".proto-primary-tools .proto-tool-go,.proto-enhance-copy > span").forEach(action => action.remove());
+  const openAssets = home.querySelector("[data-open-assets]");
   home.querySelector(".proto-home-section")?.remove();
   home.querySelectorAll("video").forEach(video => {
     video.muted = true; video.defaultMuted = true;
@@ -747,7 +754,7 @@ function renderPrototypeHome() {
       b.addEventListener("pointerleave", () => { b.style.removeProperty("--tx"); b.style.removeProperty("--ty"); });
     }
   });
-  home.querySelector("[data-open-assets]").addEventListener("click", () => showAssets(false));
+  if (openAssets) openAssets.addEventListener("click", () => showAssets(false));
   refreshPrototypeHomeData();
 }
 function enterModeFromCard(source, mode) {
@@ -874,29 +881,22 @@ function renderScriptFlow() {
   const done = (s) => S.completed.includes(s);
   msgU(esc(isCultureFacts() ? "Clip Short" : T.mode_script_t));
 
-  // Clip Short has two genuinely different editorial structures. Mini Story deliberately
-  // stays on one real event/source cluster instead of turning every sentence into unrelated
-  // filler. This choice is persisted into /run so pacing and Scrape V2 can honour it too.
+  // Clip Short has a standard fact format and a topic-only Discovery format.
   if (isCultureFacts() && !done("format")) {
-    msgA("Choose the Clip Short structure that fits your idea.");
+    msgA("Choose the Clip Short format.");
     const c = card("clip-format-card");
     const grid = el("div", "clip-format-grid");
     const choose = (value) => {
       S.values.clip_short_format = value;
       S.values.script_token_limit = "";
-      if (value === "discovery") S.values.script = "";
       completeStep("format", "script");
     };
     const standard = el("button", "clip-format-choice");
     standard.innerHTML = `<small>MULTI-BEAT</small><strong>Fact Short</strong><span>Several facts or angles, matched with broader real footage.</span><em>100–140 words</em>`;
     standard.addEventListener("click", () => choose("standard"));
-    const mini = el("button", "clip-format-choice mini");
-    mini.innerHTML = `<small>20–25 SECONDS</small><strong>Mini Story</strong><span>One real event, one coherent footage cluster, a fast hook and a clear payoff.</span><em>Native 9:16 only · maximum 130 tokens</em>`;
-    mini.addEventListener("click", () => choose("mini_story"));
     const disc = el("button", "clip-format-choice mini");
-    disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>The agent hunts one long, fascinating process TikTok (a craft, a build, a dish), writes the script itself and recuts the source to the voiceover.</span><em>Topic optional · one long 9:16 source</em>`;
+    disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>The agent gathers real Japan-related material from multiple sources, writes the fact script, and builds the short around it.</span><em>Topic optional</em>`;
     disc.addEventListener("click", () => choose("discovery"));
-    disc.innerHTML = `<small>NO SCRIPT NEEDED</small><strong>Discovery</strong><span>Choose an optional direction, or let the agent find an unused surprising topic, real footage and the finished narration itself.</span><em>Real vertical footage · topic optional · no repeats</em>`;
     grid.appendChild(standard); grid.appendChild(disc); c.appendChild(grid);
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.back, resetToMode, "ghost")); c.appendChild(foot);
@@ -905,33 +905,45 @@ function renderScriptFlow() {
 
   // step: script
   msgA(isDiscovery()
-    ? "Optional: give Discovery a direction, or leave it blank for a new topic."
-    : isMiniStory()
-      ? "Give a topic, or paste a mini script."
-      : esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
+    ? "Set the direction for the Discovery agent."
+    : esc(T.send_script) + `<div class="card-note">${esc(T.script_hint)}</div>`);
   if (done("script")) {
     const sc = S.values.script || "";
     msgU(esc(sc.length > 220 ? sc.slice(0, 220) + "…" : sc), "script");
   } else if (S.step === "script") {
     const c = card("script-config-card");
-    if (isDiscovery() || isMiniStory()) {
+    if (isDiscovery() || isCultureFacts()) {
       c.appendChild(el("div", "card-note", isDiscovery()
-        ? "No script is needed. Discovery chooses an unused, visually tellable topic when left blank, "
-          + "finds real footage, then writes and cuts the Short around what is actually visible."
-        : "Mini Story needs no script: give a TOPIC (e.g. 'old noodle vending machine') and the "
-          + "agent finds real footage of that ONE subject first. Leave BOTH empty and it hunts a "
-          + "story/skit TikTok (Asian women/couples) on its own and tells its story. Pasting "
-          + "your own script below still works."));
+        ? "Discovery mode: enter a topic below, leave the script blank, and the agent gathers "
+          + "real footage before writing a Japan-focused fact Short around it. Add "
+          + "*instructions* after the topic to guide the agent, e.g. *use catchy and funny scenes*."
+        : "Fact Short needs a script or topic direction. Enter a topic to have the agent write one, or "
+          + "paste your own script."));
       const ti = document.createElement("input");
       ti.type = "text";
       ti.placeholder = isDiscovery()
-        ? "Topic (optional) — e.g. bamboo chopsticks, sword forging, tea roasting…"
-        : "Topic — e.g. old noodle vending machine, capsule hotel, rural train station…";
+        ? "Topic (optional) — e.g. Japanese vending machines *use funny scenes*"
+        : "Topic (optional) — e.g. square watermelons *use catchy and funny scenes*";
       ti.style.cssText = "width:100%; margin:6px 0 4px;";
-      if (isDiscovery()) ti.placeholder = "Optional direction - e.g. Japanese school festivals, strange restaurants, dating rules";
       ti.value = S.values.gen_topic || "";
       ti.addEventListener("input", () => { S.values.gen_topic = ti.value; persist(); });
       c.appendChild(ti);
+      if (isDiscovery()) {
+        const originalAudio = document.createElement("label");
+        originalAudio.style.cssText = "display:flex; align-items:center; gap:8px; margin:8px 0; cursor:pointer;";
+        const originalInput = document.createElement("input");
+        originalInput.type = "checkbox";
+        originalInput.checked = !!S.values.discovery_keep_original_audio;
+        originalInput.addEventListener("change", () => {
+          S.values.discovery_keep_original_audio = originalInput.checked;
+          persist();
+        });
+        originalAudio.appendChild(originalInput);
+        originalAudio.appendChild(el("span", "", "Keep some of original audio"));
+        c.appendChild(originalAudio);
+        c.appendChild(el("div", "card-note",
+          "Alternates explanatory voiceover with selected source moments. The narrator mutes while the original audio plays."));
+      }
       // CANDIDATE LIBRARY (user 2026-07-23): every candidate ever shown as a pick,
       // browsable here; "Use" pins the run to that exact video (no search, no gate).
       const libRow = el("div", "");
@@ -971,12 +983,13 @@ function renderScriptFlow() {
       tokenMeter.textContent = `${count} / 130 estimated tokens`;
       tokenMeter.classList.toggle("over", count > 130);
     };
-    ta.addEventListener("input", () => { sizeScriptBox(); paintTokenMeter(); });
+    ta.addEventListener("input", () => {
+      // Keep the canonical state in sync while typing so a TTS/provider re-render
+      // cannot replace the current script with the last persisted value.
+      S.values.script = ta.value;
+      sizeScriptBox(); paintTokenMeter(); persist();
+    });
     requestAnimationFrame(sizeScriptBox);
-    if (isMiniStory() && !isDiscovery()) {
-      tokenMeter = el("div", "script-token-meter");
-      c.appendChild(tokenMeter); paintTokenMeter();
-    }
     // Hook + impact-word are marked RIGHT HERE on the same script field (no separate step, so the
     // text can never desync). Select text in the box above, then Mark hook / Mark impact.
     // Discovery has no user script -> no hook marking, no Script Creator column.
@@ -1044,8 +1057,8 @@ function renderScriptFlow() {
             body: JSON.stringify({
               topic: ti.value.trim(),
               instructions: instructionInput.value.trim(),
-              format_mode: isMiniStory() ? "mini_story" : "standard",
-              token_limit: isMiniStory() ? 130 : null,
+              format_mode: "standard",
+              token_limit: null,
             }) });
           const d = await r.json();
           if (!d.ok) throw new Error(d.error || "no script");
@@ -1191,12 +1204,9 @@ function renderScriptFlow() {
     foot.appendChild(el("span", "spacer"));
     foot.appendChild(btn(T.continue, () => {
       const v = ta.value.trim();
-      if (!v && !isDiscovery() && !isMiniStory()) { ta.focus(); return; }
-      if (v && isMiniStory() && estimatedScriptTokens(v) > 130) {
-        tokenMeter.classList.add("over");
-        tokenMeter.textContent = `${estimatedScriptTokens(v)} / 130 estimated tokens — shorten the script to continue`;
-        ta.focus(); return;
-      }
+      const hasFactDiscoveryTopic = isCultureFacts() && !isDiscovery()
+        && String(S.values.gen_topic || "").trim();
+      if (!v && !isDiscovery() && !hasFactDiscoveryTopic) { ta.focus(); return; }
       S.values.script = v;
       if (S.values.hook_text && !v.includes(S.values.hook_text)) S.values.hook_text = "";
       if (S.values.impact_word && !v.toLowerCase().includes(S.values.impact_word.toLowerCase())) S.values.impact_word = "";
@@ -1651,7 +1661,7 @@ function captionStylePanel() {
   // Fully user-customizable caption style (applies to every clip-short mode; the render
   // reads the same keys, and the timeline editor mirrors them from project.json).
   const V = S.values;
-  if (!V.caption_active_style || V.caption_active_style === "box") V.caption_active_style = "color";
+  if (!V.caption_active_style || V.caption_active_style === "box") V.caption_active_style = "none";
   const wrap = el("div", "capstyle");
   // live preview
   const prev = el("div", "capstyle-preview");
@@ -1745,8 +1755,8 @@ function renderAIShortPicker() {
   const motion = el("button", "ai-short-choice motion-loop");
   motion.type = "button";
   motion.innerHTML = `<span class="ai-choice-preview"><video muted autoplay loop playsinline preload="metadata" poster="/file?path=static%2Fpreviews%2Fmotion_loop_poster.jpg&v=4" src="/file?path=static%2Fpreviews%2Fmotion_loop_prototype.mp4&v=4"></video><i class="ai-loop-orbit"></i></span>
-    <span class="ai-choice-copy"><small>ONE KEYFRAME · ONE MOTION-DNA EDIT</small><strong>Motion Loop</strong>
-    <em>Create a continuous, music-led 9:16 morph using Seedance Video Edit and a locally normalized finish without visual transitions.</em></span>`;
+    <span class="ai-choice-copy"><small>SEEDANCE 2.5 · 3 × 10-SECOND CHAPTERS</small><strong>AI Motion</strong>
+    <em>Create a 30-second, frame-linked 9:16 surreal POV journey from a prompt or optional first-frame image.</em></span>`;
   motion.addEventListener("click", () => selectMode("motionloop"));
   grid.append(classic, motion); c.appendChild(grid);
   const foot = el("div", "card-foot"); foot.appendChild(btn("All modes", resetToMode, "ghost")); c.appendChild(foot);
@@ -1760,17 +1770,36 @@ function renderMotionLoopFlow() {
   if (!done("concept") && S.step === "concept") {
     const c = card("motion-loop-config");
     const label = el("label", "motion-concept-label");
-    label.innerHTML = `<span>Opening world</span><small>Describe only the opening world. The app invents two new destinations and morphs through all three in one continuous 15-second shot.</small>`;
+    label.innerHTML = `<span>Journey direction</span><small>Describe the world, vehicle POV and movement. Chapter one starts from your optional image or the prompt; chapters two and three continue from each prior last frame.</small>`;
     const ta = document.createElement("textarea"); ta.rows = 7;
     ta.placeholder = "Optional: describe a world yourself, or leave this empty for a new random abstract 3D world.";
     ta.value = S.values.motion_loop_concept || "";
     ta.addEventListener("input", () => { S.values.motion_loop_concept = ta.value; persist(); });
     label.appendChild(ta); c.appendChild(label);
+    const povControl=el("label","motion-pov-control"); povControl.appendChild(el("span","","POV vehicle")); const pov=document.createElement("select"); [["mountain_bike","Mountain bike"],["e_scooter","E-scooter"],["car","Car"],["cabriolet","Cabriolet"],["motorcycle","Motorcycle"]].forEach(([v,l])=>pov.appendChild(new Option(l,v))); pov.value=S.values.motion_loop_pov||"mountain_bike"; pov.addEventListener("change",()=>{S.values.motion_loop_pov=pov.value;persist();}); povControl.appendChild(pov); c.appendChild(povControl);
+    const insertDirectorTag = (text) => { const gap = ta.value.trim() ? "\n" : ""; ta.value += gap + text; S.values.motion_loop_concept = ta.value; ta.focus(); persist(); };
+    ta.addEventListener("dragover", e => e.preventDefault());
+    ta.addEventListener("drop", e => { e.preventDefault(); const text=e.dataTransfer.getData("text/plain"); if(text) insertDirectorTag(text); });
+    const tagGroups = [
+      ["Film locations", [["Hobbiton · Matamata", "Hobbiton-inspired rolling green farmland near Matamata, New Zealand: round earth homes, a narrow lane, garden fences, sheep-dotted hills and warm late-afternoon light"], ["Edoras · Mount Sunday", "Edoras-inspired windswept high-country valley at Mount Sunday, New Zealand: a lone hilltop fortress, golden grass, braided river and dramatic Southern Alps"], ["Arrakis · Wadi Rum", "Arrakis-inspired Wadi Rum desert in Jordan: immense rust-red sandstone cliffs, sculpted dunes, a winding sandy track and two low suns"], ["Mordor · Tongariro", "Tongariro volcanic plateau in New Zealand: black ash route, steam vents, jagged volcanic rock, distant snow peaks and a dark stormy sky"]]],
+      ["Game locations", [["Hyrule Sky Islands", "Hyrule Sky Islands-inspired route: floating green islands, ancient stone bridges, waterfalls dropping into clouds and distant sunlit mountains"], ["Limgrave", "Limgrave-inspired windswept fantasy road: ruined stone church, giant golden tree on the horizon, rolling grassland, mist and distant castle walls"], ["Skyrim wilds", "Skyrim-inspired Nordic mountain pass: pine forest, ancient Dwemer-like stone ruins, icy stream, snow peaks and low northern sun"], ["Night City", "Night City-inspired rain-soaked neon megacity: dense elevated roads, glowing signs, wet asphalt reflections, distant monorail and blue-magenta haze"]]],
+      ["Atmosphere", [["Golden hour", "warm golden-hour sun, long shadows, dust and soft lens flare"], ["Misty dawn", "misty blue dawn, wet ground, distant birds and calm wind"], ["Summer storm", "dramatic summer storm far away, wet route and moving foliage"], ["Night fireflies", "deep blue night, soft fireflies, reflective water and quiet forest ambience"]]],
+    ];
+    const tagPanel = el("div", "motion-director-tags");
+    tagPanel.appendChild(el("div", "motion-director-label", "Drag a tag into the direction field, or click to add it."));
+    tagGroups.forEach(([name,tags]) => { const group=el("div","motion-tag-group"); group.appendChild(el("span","motion-tag-title",name)); const row=el("div","motion-tag-row"); tags.forEach(([label,text])=>{ const tag=el("button","motion-director-tag",esc(label)); tag.type="button"; tag.draggable=true; tag.title=text; tag.addEventListener("click",()=>insertDirectorTag(text)); tag.addEventListener("dragstart",e=>{e.dataTransfer.setData("text/plain",text); e.dataTransfer.effectAllowed="copy";}); row.appendChild(tag); }); group.appendChild(row); tagPanel.appendChild(group); });
+    c.appendChild(tagPanel);
     const surprise=el("button","btn ghost motion-surprise","Surprise me"); surprise.type="button";
     const worlds=["An Alpine pass folding upward into the sky above inverted valleys","A clean ivory 3D world of arches, chrome spheres and impossible gravity","A translucent glacier canyon with floating mountains and upward waterfalls","A sandstone Moebius desert with levitating black monoliths","A curved green micro-planet with upside-down villages across the sky","A brutalist cloud city bending into a ring around the horizon","A botanical cathedral whose trees continuously become architecture"];
-    surprise.addEventListener("click",()=>{const pov=["bicycle POV","hover-bike cockpit POV","open rover POV","gravity glider POV"];ta.value=worlds[Math.floor(Math.random()*worlds.length)]+", "+pov[Math.floor(Math.random()*pov.length)]+", one continuous morphing journey";S.values.motion_loop_concept=ta.value;persist();});
+    surprise.addEventListener("click",()=>{const options=[["mountain_bike","mountain-bike POV"],["e_scooter","e-scooter POV"],["car","car driver POV"],["cabriolet","open-top cabriolet driver POV"],["motorcycle","motorcycle POV"]];const picked=options[Math.floor(Math.random()*options.length)];ta.value=worlds[Math.floor(Math.random()*worlds.length)]+", "+picked[1]+", one continuous morphing journey";S.values.motion_loop_concept=ta.value;S.values.motion_loop_pov=picked[0];pov.value=picked[0];persist();});
     c.appendChild(surprise);
-    const note = el("div", "motion-budget-note", `<b>One continuous 15-second generation</b><span>A fresh GPT Image 2.0 opening frame and one Seedance 2.0 Motion-DNA edit. No stitched clips, reused image inputs or automatic retries.</span>`);
+    const firstFrame = btn("Upload optional first frame", () => pickFile("image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp", f => {
+      FILES.motion_loop_first_frame = f;
+      firstFrame.textContent = "✓ First frame: " + f.name;
+      S.values.motion_loop_has_first_frame = true; persist();
+    }), "ghost small");
+    c.appendChild(firstFrame);
+    const note = el("div", "motion-budget-note", `<b>Three native 10-second Seedance 2.5 chapters</b><span>Use an optional first frame only for chapter one; chapters two and three use the exact prior last frame. Every clip gets contextual ASMR ambience — no music or dialogue. Higgsfield Unlimited is required.</span>`);
     c.appendChild(note);
     const foot = el("div", "card-foot");
     foot.appendChild(btn("All modes", resetToMode, "ghost"));
@@ -1798,10 +1827,12 @@ function renderMotionLoopFlow() {
     const intensity = document.createElement("select"); [["clean","Clean"],["balanced","Balanced"],["intense","Intense"]].forEach(([v,l])=>intensity.appendChild(new Option(l,v)));
     intensity.value=S.values.motion_loop_intensity||"balanced"; intensity.addEventListener("change",()=>{S.values.motion_loop_intensity=intensity.value;persist();});
     const addControl=(title,input)=>{const l=el("label");l.append(el("span","",title),input);controls.appendChild(l);};
-    const quality = document.createElement("select"); [["economy","Economy · Seedance 2.0 Fast · 480p"],["standard","Standard · Seedance 2.0 · 480p"],["detail","Detail · Seedance 2.0 · 720p"]].forEach(([v,l])=>quality.appendChild(new Option(l,v)));
-    quality.value=S.values.motion_loop_quality||"economy"; quality.addEventListener("change",()=>{S.values.motion_loop_quality=quality.value;persist();});
-    const fixedDuration=el("div","motion-fixed-duration","<b>15 seconds</b><span>One uninterrupted generation</span>");
-    controls.appendChild(fixedDuration); addControl("Effect intensity",intensity); addControl("Generation quality",quality);
+    const fixedDuration=el("div","motion-fixed-duration","<b>3 × 10 seconds</b><span>30-second frame-linked journey</span>");
+    const speedLabel=el("label","motion-speed-control"); const speedHead=el("span","","Rider speed"); const speed=document.createElement("input"); speed.type="range"; speed.min="1"; speed.max="5"; speed.step="1"; speed.value=String(S.values.motion_loop_speed||3); const speedValue=el("b","",["Slow glide","Relaxed","Cruising","Fast","High speed"][+speed.value-1]); speed.addEventListener("input",()=>{S.values.motion_loop_speed=+speed.value;speedValue.textContent=["Slow glide","Relaxed","Cruising","Fast","High speed"][+speed.value-1];persist();}); speedLabel.append(speedHead,speed,speedValue);
+    const surrealLabel=el("label","motion-speed-control"); const surrealHead=el("span","","World surrealness"); const surreal=document.createElement("input"); surreal.type="range"; surreal.min="1"; surreal.max="5"; surreal.step="1"; surreal.value=String(S.values.motion_loop_surrealness||3); const surrealNames=["Realistic","Subtle","Surreal","Intense morphing","Reality-bending"]; const surrealValue=el("b","",surrealNames[+surreal.value-1]); surreal.addEventListener("input",()=>{S.values.motion_loop_surrealness=+surreal.value;surrealValue.textContent=surrealNames[+surreal.value-1];persist();}); surrealLabel.append(surrealHead,surreal,surrealValue);
+    const unlimitedLabel=el("label","motion-loop-toggle"); const unlimited=document.createElement("input"); unlimited.type="checkbox"; unlimited.checked=true; unlimited.disabled=true;
+    unlimitedLabel.append(unlimited,el("i"),el("span","","<b>Higgsfield Unlimited</b><small>Required and checked before generation. This mode does not use a WaveSpeed API model.</small>"));
+    controls.appendChild(fixedDuration); addControl("Effect intensity",intensity); controls.appendChild(speedLabel); controls.appendChild(surrealLabel); controls.appendChild(unlimitedLabel);
     const loopLabel=el("label","motion-loop-toggle"); const loop=document.createElement("input"); loop.type="checkbox"; loop.checked=S.values.motion_loop_seamless!==false;
     loop.addEventListener("change",()=>{S.values.motion_loop_seamless=loop.checked;persist();});
     loopLabel.append(loop,el("i"),el("span","","<b>Loop</b><small>Direct the motion arc back toward its opening composition without adding a crossfade.</small>")); controls.appendChild(loopLabel); c.appendChild(controls);
@@ -1810,7 +1841,9 @@ function renderMotionLoopFlow() {
   }
   if (S.step === "review") {
     const c=card("motion-loop-review");
-    const rows=[["Opening world",S.values.motion_loop_concept||"Random abstract 3D world"],["Camera",S.values.motion_loop_profile||"lateral"],["Duration","15 seconds · one continuous generation"],["Quality",S.values.motion_loop_quality||"economy"],["Loop",S.values.motion_loop_seamless===true?"On · natural return, no crossfade":"Off"],["Finish",S.values.motion_loop_intensity||"balanced"],["Paid generations","1 fresh image + 1 video · no automatic retry"]];
+    const povLabels={mountain_bike:"Mountain bike",e_scooter:"E-scooter",car:"Car",cabriolet:"Cabriolet",motorcycle:"Motorcycle"};
+    const surrealNames=["Realistic","Subtle","Surreal","Intense morphing","Reality-bending"];
+    const rows=[["Journey direction",S.values.motion_loop_concept||"Random abstract 3D world"],["POV vehicle",povLabels[S.values.motion_loop_pov||"mountain_bike"]],["Camera",S.values.motion_loop_profile||"lateral"],["Rider speed",["Slow glide","Relaxed","Cruising","Fast","High speed"][Math.max(1,Math.min(5,+S.values.motion_loop_speed||3))-1]],["World surrealness",surrealNames[Math.max(1,Math.min(5,+S.values.motion_loop_surrealness||3))-1]],["Duration","3 × 10 seconds · 30-second journey"],["Model","Seedance 2.5 · Higgsfield Unlimited"],["Input",FILES.motion_loop_first_frame ? "Uploaded first frame → chapter 1" : "Prompt only → chapter 1"],["Continuity","Last frame of chapter 1 → 2, then 2 → 3"],["Audio","Contextual native ASMR · no music or dialogue"],["Loop",S.values.motion_loop_seamless===true?"On · natural return, no crossfade":"Off"]];
     const specs=el("div","review-specs"); rows.forEach(([k,v])=>{const t=el("div","review-spec");t.innerHTML=`<span class="rs-k">${esc(k)}</span><span class="rs-v">${esc(v)}</span>`;specs.appendChild(t);});c.appendChild(specs);
     const foot=el("div","card-foot"); foot.appendChild(btn(T.back,()=>editStep("motion"),"ghost")); foot.appendChild(btn("Create Motion Loop",submitRun,"primary review-cta")); c.appendChild(foot); setComposer("off");
   }
@@ -1902,7 +1935,11 @@ function buildRunForm() {
   MAN.run.state_hidden.forEach(k => fd.append(k, S.values[k] ? "on" : ""));
   MAN.run.text.forEach(k => fd.append(k, S.values[k] != null ? String(S.values[k]) : ""));
   MAN.run.check.forEach(k => { if (S.values[k]) fd.append(k, "on"); });
+  if (isDiscovery() && S.values.discovery_keep_original_audio) {
+    fd.append("discovery_keep_original_audio", "on");
+  }
   if (FILES.speaker_image_file) fd.append("speaker_image_file", FILES.speaker_image_file);
+  if (FILES.motion_loop_first_frame) fd.append("motion_loop_first_frame", FILES.motion_loop_first_frame);
   return fd;
 }
 async function submitRun() {
@@ -2064,6 +2101,152 @@ async function submitViral() {
 }
 
 /* ------------------------------------------------------------------ FLOW: reddit story */
+/* ------------------------------------------------------------------ physics simulation flow
+   One scene, one value swept, rendered in Blender. No model call anywhere in this flow -
+   the preset and the values fully determine the output, so there is nothing to wait on
+   but the renderer. */
+const PHYS_BRIEF_MODELS = [
+  { id: "google/gemini-3.5-flash-lite", t: "Gemini 3.5 Flash Lite (fast)" },
+  { id: "google/gemini-3.1-flash-lite", t: "Gemini 3.1 Flash Lite" },
+  { id: "google/gemini-3.5-flash", t: "Gemini 3.5 Flash" },
+  { id: "anthropic/claude-opus-4.8", t: "Claude Opus 4.8 (most detailed)" },
+];
+const PHYS_PRESETS = [
+  { id: "wrecking_ball", t: "Wrecking ball vs block",
+    d: "A steel ball on a swing hits a brick tower. Sweeping the ball's mass.",
+    unit: "kg", values: "1, 10, 50", sweep: true },
+  { id: "tumbling_cube", t: "Tumbling cube into gaps",
+    d: "A cube rolls along a tiled floor, dropping into glowing gaps. Seamless loop.",
+    unit: "", values: "", sweep: false },
+  { id: "__prompt__", t: "Describe your own",
+    d: "Write what should happen and the app builds the 3D scene for it.",
+    unit: "", values: "", sweep: false, prompt: true },
+];
+/* ------------------------------------------------------------------ low-poly story short
+   Crude PS1-era 3D, written end to end by the models: story and shot list, then one whole
+   Blender script per shot. Looking cheap is the point, so nothing here is hand-authored. */
+function renderLowpolyFlow() {
+  msgU(esc(T.mode_lowpoly_t));
+  msgA(esc(T.lowpoly_intro));
+  if (S.jobId) return;
+  const c = card();
+  const row = el("div", "field");
+  row.innerHTML = `<label>${esc(T.lowpoly_prompt_label)}</label>`;
+  const ta = el("textarea", "");
+  ta.rows = 4;
+  ta.placeholder = T.lowpoly_prompt_ph;
+  ta.value = S.values.lp_prompt || "";
+  ta.addEventListener("input", () => { S.values.lp_prompt = ta.value; persist(); });
+  row.appendChild(ta);
+  row.appendChild(el("div", "hint", esc(T.lowpoly_hint)));
+  c.appendChild(row);
+  const lenRow = el("div", "field");
+  lenRow.innerHTML = `<label>${esc(T.lowpoly_len)}</label>`;
+  const sel = el("select", "");
+  [20, 30, 45, 60].forEach(v => {
+    const o = el("option", "", v + "s");
+    o.value = String(v);
+    if (String(S.values.lp_seconds || 30) === String(v)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", () => { S.values.lp_seconds = sel.value; persist(); });
+  lenRow.appendChild(sel);
+  c.appendChild(lenRow);
+  const go = btn(T.lowpoly_go, async () => {
+    if (!(S.values.lp_prompt || "").trim()) {
+      errorCard(T.err_generic, T.lowpoly_missing); return;
+    }
+    go.disabled = true; go.textContent = "…";
+    try {
+      const d = await jpost("/lowpoly-run", {
+        prompt: S.values.lp_prompt || "",
+        seconds: Number(S.values.lp_seconds || 30),
+      });
+      if (d.error) throw new Error(d.error);
+      startJob(d.job_id, "lowpoly");
+    } catch (e) {
+      go.disabled = false; go.textContent = T.lowpoly_go;
+      errorCard(T.err_generic, String(e));
+    }
+  }, "primary");
+  c.appendChild(go);
+  setComposer("off");
+}
+
+function renderPhysicsFlow() {
+  msgU(esc(T.mode_physics_t));
+  msgA(esc(T.physics_intro));
+  if (S.jobId) return;
+  const c = card();
+  const preset = S.values.phys_preset || PHYS_PRESETS[0].id;
+  const cur = PHYS_PRESETS.find(p => p.id === preset) || PHYS_PRESETS[0];
+  PHYS_PRESETS.forEach(p => {
+    const b = el("button", "choice" + (p.id === preset ? " on" : ""),
+      `<b>${esc(p.t)}</b><p>${esc(p.d)}</p>`);
+    b.addEventListener("click", () => { S.values.phys_preset = p.id; renderAll(); persist(); });
+    c.appendChild(b);
+  });
+  if (cur.prompt) {
+    const row = el("div", "field");
+    row.innerHTML = `<label>${esc(T.physics_prompt_label)}</label>`;
+    const ta = el("textarea", "");
+    ta.rows = 4;
+    ta.placeholder = T.physics_prompt_ph;
+    ta.value = S.values.phys_prompt || "";
+    ta.addEventListener("input", () => { S.values.phys_prompt = ta.value; persist(); });
+    row.appendChild(ta);
+    row.appendChild(el("div", "hint", esc(T.physics_prompt_hint)));
+    c.appendChild(row);
+    // Which model turns the note into a shot brief. The scene CODE is always written by
+    // the strongest model - that step is where a wrong choice costs a failed render.
+    const mrow = el("div", "field");
+    mrow.innerHTML = `<label>${esc(T.physics_brief_model)}</label>`;
+    const sel = el("select", "");
+    PHYS_BRIEF_MODELS.forEach(m => {
+      const o = el("option", "", esc(m.t));
+      o.value = m.id;
+      if ((S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id) === m.id) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", () => {
+      S.values.phys_brief_model = sel.value; persist();
+    });
+    mrow.appendChild(sel);
+    c.appendChild(mrow);
+  } else if (cur.sweep) {
+    const row = el("div", "field");
+    row.innerHTML = `<label>Values to sweep (${esc(cur.unit)})</label>`;
+    const inp = el("input", "");
+    inp.type = "text";
+    inp.value = S.values.phys_values || cur.values;
+    inp.addEventListener("input", () => { S.values.phys_values = inp.value; persist(); });
+    row.appendChild(inp);
+    row.appendChild(el("div", "hint", esc(T.physics_hint)));
+    c.appendChild(row);
+  }
+  const go = btn(T.physics_go, async () => {
+    if (cur.prompt && !(S.values.phys_prompt || "").trim()) {
+      errorCard(T.err_generic, T.physics_prompt_missing); return;
+    }
+    go.disabled = true; go.textContent = "…";
+    try {
+      const d = await jpost("/physics-run", {
+        preset: cur.prompt ? "" : cur.id,
+        prompt: cur.prompt ? (S.values.phys_prompt || "") : "",
+        values: cur.sweep ? (S.values.phys_values || cur.values) : "",
+        brief_model: cur.prompt ? (S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id) : "",
+      });
+      if (d.error) throw new Error(d.error);
+      startJob(d.job_id, "physics");
+    } catch (e) {
+      go.disabled = false; go.textContent = T.physics_go;
+      errorCard(T.err_generic, String(e));
+    }
+  }, "primary");
+  c.appendChild(go);
+  setComposer("off");
+}
+
 function renderRedditFlow() {
   msgU(esc(T.mode_reddit_t));
   msgA(esc(T.reddit_intro));
@@ -2112,7 +2295,7 @@ function renderLongformFlow() {
   const script = (S.longform.script || "").trim();
   if (S.completed.includes("script") && script) {
     msgU(esc(script.length > 220 ? script.slice(0, 220) + "…" : script), "script");
-  } else if (S.step === "script" || !S.completed.includes("script")) {
+  } else if (!script || S.step === "script" || !S.completed.includes("script")) {
     const c = card();
     const existing = el("div", "lf-existing");
     const existingBtn = btn("Open an existing Sketch Explainer", async () => {
@@ -2179,7 +2362,11 @@ function renderLongformFlow() {
     }
     const narrationSection = outSection(c, T.sec_narration || "Narration", voiceFld,
       OPT.longform_tts.length ? selectField(T.longform_tts, OPT.longform_tts, S.longform.tts_model,
-        v => { S.longform.tts_model = v; resetTtsVoice(S.longform); persist(); renderAll(); }) : null,
+        v => {
+          const changed = S.longform.tts_model !== v;
+          S.longform.tts_model = v; resetTtsVoice(S.longform); persist();
+          if (changed) setTimeout(renderAll, 0);
+        }) : null,
       el("div", "out-sec-hint", esc(T.longform_voice_hint)));
     const longformSeedSettings = seedTtsSettings(S.longform);
     if (longformSeedSettings) (narrationSection.querySelector(".out-sec-body") || narrationSection).appendChild(longformSeedSettings);
@@ -2336,10 +2523,22 @@ function openLongformProject(info) {
   S.projectTitle = info.title || info.slug;
   S.flow = "longform"; S.step = "settings"; S.completed = ["script"]; S.draft = true;
   S.longform.script = info.script || "";
-  if (info.tts_voice) S.longform.tts_voice = info.tts_voice;
+  ["tts_model", "tts_voice", "reasoning_model", "reasoning_mode",
+   "tts_voice_instruction", "tts_language", "tts_native_speed", "tts_volume",
+   "tts_pitch", "tts_sample_rate", "tts_output_format"].forEach(k => {
+    if (info[k] != null && info[k] !== "") S.longform[k] = info[k];
+  });
+  ["mascot_enabled", "halt_after_speech"].forEach(k => {
+    if (info[k] != null) S.longform[k] = !!info[k];
+  });
   S.view = "chat";
   hideLoading();
   renderAll(); persist();
+  // Once narration exists, reopening is a resume action: go straight to the
+  // pre-render timeline instead of asking for narration settings again.
+  if (info.voiceover_ready) {
+    setTimeout(() => openLongformPreRenderEditor(info.slug), 0);
+  }
 }
 async function continueProject(slug) {
   const d = await jpost("/resume-project", { slug });
@@ -2360,7 +2559,7 @@ function startJob(jobId, jobKind) {
   if (jobKind) {
     S.jobKind = String(jobKind);
     const flowForKind = { longform:"longform", sfx:"sfx", visual:"visual",
-      caption:"captions", viraltrans:"viraltrans", reddit:"reddit" };
+      caption:"captions", viraltrans:"viraltrans", reddit:"reddit", physics:"physics", lowpoly:"lowpoly" };
     S.flow = flowForKind[S.jobKind] || "script";
   }
   announcedPhases = []; lastProgressHTML = lastMediaHTML = lastOutputsHTML = ""; lastAssignedKey = "";
@@ -2850,12 +3049,6 @@ async function pollJob() {
         card.appendChild(el("strong", "", esc(cd.title || "Candidate")));
         card.appendChild(el("div", "card-note", `@${esc(cd.author || "")} · ${cd.dur}s · ${(+cd.likes || 0).toLocaleString()} likes · appeal ${cd.appeal}/10`));
         if (cd.premise) card.appendChild(el("div", "card-note", "“" + esc(cd.premise) + "”"));
-        if (+cd.source_count > 1) card.appendChild(el("div", "card-note", `${+cd.source_count} related source videos in this topic pool`));
-        if ((cd.warnings || []).length) {
-          const warning = el("div", "card-note", "Review note: " + esc(cd.warnings.join(" / ")));
-          warning.style.cssText = "color:#f2bd72; margin:5px 0; line-height:1.35;";
-          card.appendChild(warning);
-        }
         if (cd.video_url) {
           const vp = document.createElement("video");
           vp.src = cd.video_url; vp.controls = true; vp.preload = "metadata";
@@ -2909,6 +3102,92 @@ async function pollJob() {
   // speech approval
   const sp = $("job-speech");
   if (sp) {
+    if (d.status === "awaiting_approval" && d.motion_manual && !sp.dataset.motionManual) {
+      sp.dataset.motionManual = "1"; sp.innerHTML = "";
+      const chapter = +(d.motion_manual.chapter || 0);
+      const c = el("div", "chat-card speech-approve-card motion-preflight-card"); sp.appendChild(c);
+      c.appendChild(el("div", "sa-head", `<div class="sa-title"><b>Generate chapter ${chapter} of 3 in normal Chrome</b><em>Higgsfield stays completely manual: keep Unlimited on, paste this prompt, generate and download the finished clip. ShortsLab only imports it and prepares the next continuity frame.</em></div>`));
+      const prompt = el("textarea", "sa-textarea"); prompt.readOnly = true; prompt.rows = 10; prompt.value = String(d.motion_manual.prompt || ""); c.appendChild(prompt);
+      const promptActions = el("div", "sa-actions");
+      promptActions.appendChild(btn("Copy prompt", async ev => {
+        const b = ev.currentTarget;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(prompt.value);
+          else { prompt.focus(); prompt.select(); document.execCommand("copy"); }
+          b.textContent = "Copied";
+          setTimeout(() => { b.textContent = "Copy prompt"; }, 1400);
+        } catch (_err) {
+          prompt.focus(); prompt.select();
+          b.textContent = "Select & copy";
+        }
+      }, "secondary"));
+      c.appendChild(promptActions);
+      if (d.motion_manual.first_frame_url) {
+        const frame = el("div", "motion-frame-note");
+        frame.innerHTML = `<b>Use this as Higgsfield's first frame for chapter ${chapter}.</b>`;
+        const img = document.createElement("img"); img.src = d.motion_manual.first_frame_url; img.alt = "Previous chapter final frame"; img.className = "motion-continuity-frame";
+        const download = document.createElement("a"); download.href = d.motion_manual.first_frame_url; download.download = `ai-motion-chapter-${chapter}-first-frame.png`; download.textContent = "Download continuity frame";
+        frame.appendChild(img); frame.appendChild(download); c.appendChild(frame);
+      } else {
+        c.appendChild(el("p", "motion-frame-note", "Chapter 1 is prompt-only unless you supplied an optional first-frame image when creating the project."));
+      }
+      const picker = document.createElement("input"); picker.type = "file"; picker.accept = "video/mp4,video/quicktime,video/webm"; picker.className = "sa-file"; c.appendChild(picker);
+      const actions = el("div", "sa-actions");
+      const submit = btn("Import finished chapter", async ev => {
+        if (!picker.files || !picker.files[0]) { picker.focus(); return; }
+        const b = ev.currentTarget; b.disabled = true; b.textContent = "Importing chapter…";
+        const fd = new FormData(); fd.append("motion_manual_clip", picker.files[0]);
+        try {
+          const res = await fetch("/motion-manual-upload?id=" + encodeURIComponent(S.jobId), { method: "POST", body: fd });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok || !out.ok) throw new Error(out.error || "could not import that video");
+        } catch (err) {
+          b.disabled = false; b.textContent = "Import finished chapter"; alert(String(err.message || err));
+        }
+      }, "primary");
+      actions.appendChild(submit); c.appendChild(actions); scrollDown();
+    } else if ((d.status !== "awaiting_approval" || !d.motion_manual) && sp.dataset.motionManual) {
+      sp.innerHTML = ""; delete sp.dataset.motionManual;
+    }
+    if (d.status === "awaiting_approval" && d.motion_preflight && !sp.dataset.motionReady) {
+      sp.dataset.motionReady = "1"; sp.innerHTML = "";
+      const c = el("div", "chat-card speech-approve-card motion-preflight-card"); sp.appendChild(c);
+      c.appendChild(el("div", "sa-head", `<div class="sa-title"><b>Prepare Higgsfield yourself</b><em>The browser is on the Higgsfield homepage. Navigate to Seedance 2.5, set 10 seconds, 9:16 and Unlimited, complete any verification, then confirm here. ShortsLab will not navigate or change any Higgsfield setting.</em></div>`));
+      const actions = el("div", "sa-actions");
+      actions.appendChild(btn("I’m ready — start AI Motion", async ev => {
+        const b = ev.currentTarget; b.disabled = true; b.textContent = "Checking Higgsfield…";
+        const res = await fetch("/motion-preflight-ready?id=" + encodeURIComponent(S.jobId), { method: "POST" });
+        if (!res.ok) { b.disabled = false; b.textContent = "I’m ready — start AI Motion"; }
+      }, "primary"));
+      c.appendChild(actions); scrollDown();
+    } else if ((d.status !== "awaiting_approval" || !d.motion_preflight) && sp.dataset.motionReady) {
+      sp.innerHTML = ""; delete sp.dataset.motionReady;
+    }
+    if (d.status === "awaiting_approval" && d.physics_preview_url && !sp.dataset.physDone) {
+      sp.dataset.physDone = "1"; sp.innerHTML = "";
+      const c = el("div", "chat-card speech-approve-card"); sp.appendChild(c);
+      c.appendChild(el("div", "sa-head",
+        `<div class="sa-title"><b>${esc(T.physics_approve_t)}</b><em>${esc(T.physics_approve_d)}</em></div>`));
+      const shot = el("img", "physics-preview-shot");
+      shot.src = d.physics_preview_url;
+      shot.alt = "";
+      c.appendChild(shot);
+      const actions = el("div", "sa-actions");
+      const decide = async (action, b, label) => {
+        b.disabled = true; b.textContent = "…";
+        try {
+          await fetch("/approve-physics?id=" + encodeURIComponent(S.jobId) + "&action=" + action,
+                      { method: "POST" });
+        } catch (e) { b.disabled = false; b.textContent = label; }
+      };
+      actions.appendChild(btn(T.physics_approve_yes,
+        ev => decide("approve", ev.currentTarget, T.physics_approve_yes), "primary"));
+      actions.appendChild(btn(T.physics_approve_no,
+        ev => decide("decline", ev.currentTarget, T.physics_approve_no), "danger"));
+      c.appendChild(actions); scrollDown();
+    } else if ((d.status !== "awaiting_approval" || !d.physics_preview_url) && sp.dataset.physDone) {
+      sp.innerHTML = ""; delete sp.dataset.physDone;
+    }
     if (d.status === "awaiting_approval" && d.speech_audio_url && !sp.dataset.done) {
       sp.dataset.done = "1"; sp.innerHTML = "";
       const c = el("div", "chat-card speech-approve-card"); sp.appendChild(c);
@@ -2952,14 +3231,35 @@ async function pollJob() {
       const redo = el("div", "sa-redo");
       redo.appendChild(el("div", "sa-lbl", "Not happy? Redo with a different voice"));
       const redoRow = el("div", "sa-redo-row");
-      const vsel = el("select"); OPT.tts_voice.forEach(o => vsel.appendChild(new Option(o.label, o.value)));
-      vsel.value = S.values.tts_voice || vsel.value;
       const msel = el("select"); OPT.tts_model.forEach(o => msel.appendChild(new Option(o.label, o.value)));
+      if (S.values.tts_model && [...msel.options].some(o => o.value === S.values.tts_model)) msel.value = S.values.tts_model;
+      const vsel = el("select");
+      const seedHost = el("div", "sa-seed-settings");
+      const refreshRedoTts = () => {
+        const model = msel.value;
+        S.values.tts_model = model;
+        const choices = ttsVoiceOptions(model);
+        vsel.innerHTML = "";
+        choices.forEach(o => vsel.appendChild(new Option(o.label || o.value || o, o.value || o)));
+        resetTtsVoice(S.values);
+        vsel.value = S.values.tts_voice;
+        seedHost.innerHTML = "";
+        const settings = seedTtsSettings(S.values);
+        if (settings) seedHost.appendChild(settings);
+        persist();
+      };
+      vsel.addEventListener("change", () => { S.values.tts_voice = vsel.value; persist(); });
+      msel.addEventListener("change", refreshRedoTts);
+      refreshRedoTts();
       redoRow.appendChild(vsel); redoRow.appendChild(msel);
       redoRow.appendChild(btn("↻ " + T.new_take, async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
         const body = new URLSearchParams({ speaker_name: S.values.speaker_name || "Narrator",
           tts_voice: vsel.value, tts_model: msel.value });
+        ["tts_voice_instruction", "tts_language", "tts_native_speed", "tts_volume",
+          "tts_pitch", "tts_sample_rate", "tts_output_format"].forEach(k => {
+            if (S.values[k] != null) body.set(k, S.values[k]);
+          });
         // #127 - /replace-speech regenerates the voiceover as a follow-on run in the SAME project.
         S.replacePending = true;
         try {
@@ -2978,7 +3278,7 @@ async function pollJob() {
         sp.innerHTML = ""; delete sp.dataset.done;
         renderTopbar();
       }, "ghost"));
-      redo.appendChild(redoRow); c.appendChild(redo);
+      redo.appendChild(redoRow); redo.appendChild(seedHost); c.appendChild(redo);
       scrollDown();
     } else if (d.status !== "awaiting_approval" && sp.dataset.done) {
       sp.innerHTML = ""; delete sp.dataset.done;
@@ -3233,6 +3533,27 @@ async function openLongformPreRenderEditor(slug) {
     const chosen = () => frames.find(f => f.idx === selectedFrame) || frames[0];
     const count = el("span", "lf-duration", `${frames.length} images / ${Number(data.audio_duration || 0).toFixed(1)}s`);
     timeline.appendChild(sectionHead("Timeline", "The same time scale controls both tracks; clip width now represents its real duration.", count));
+    // Range retime is intentionally local: it only redistributes the selected narration
+    // span and matches the images already in those slots. It never generates media.
+    const retimeBar = el("div", "lf-retime-bar");
+    retimeBar.appendChild(el("span", "lf-track-help", "Retime a scene range with existing images"));
+    const from = document.createElement("input"); from.type = "number"; from.min = "1"; from.max = String(frames.length);
+    from.value = String(Math.min(selectedFrame + 1, frames.length)); from.title = "First scene";
+    const to = document.createElement("input"); to.type = "number"; to.min = "1"; to.max = String(frames.length);
+    to.value = String(Math.min(selectedFrame + 2, frames.length)); to.title = "Last scene";
+    const retimeBtn = btn("Analyze + retime", async ev => {
+      const a = Math.max(1, Math.min(frames.length, Number(from.value || 1))) - 1;
+      const b = Math.max(1, Math.min(frames.length, Number(to.value || frames.length))) - 1;
+      if (b <= a) { errorCard(T.err_generic, "Choose at least two scenes."); return; }
+      ev.currentTarget.disabled = true; ev.currentTarget.textContent = "Retiming…";
+      const r = await jpost("/longform-retime", {slug: data.slug, start_idx: a, end_idx: b});
+      if (!r || !r.ok) errorCard(T.err_generic, (r && r.error) || "Could not retime the selected range.");
+      else await refresh();
+      ev.currentTarget.disabled = false; ev.currentTarget.textContent = "Analyze + retime";
+    }, "secondary small");
+    retimeBar.appendChild(el("span", "", "Scenes"));
+    retimeBar.appendChild(from); retimeBar.appendChild(el("span", "", "–")); retimeBar.appendChild(to);
+    retimeBar.appendChild(retimeBtn); timeline.appendChild(retimeBar);
 
     const workspace = el("div", "lf-nle-workspace"); timeline.appendChild(workspace);
     const preview = el("div", "lf-nle-preview"); workspace.appendChild(preview);
@@ -3346,14 +3667,15 @@ async function openLongformPreRenderEditor(slug) {
   function paintAll() { paintThumbs(); paintTimeline(); paintUnused(); }
   paintAll();
   const foot = el("div", "card-foot lf-render-foot");
-  foot.appendChild(el("div", "lf-render-copy", "<b>Ready to render?</b><span>Your timeline and selected thumbnail are saved before assembly.</span>"));
+  foot.appendChild(el("div", "lf-render-copy", "<b>Ready to render?</b><span>Your existing images and selected thumbnail are saved before assembly.</span>"));
   foot.appendChild(el("span", "spacer"));
   foot.appendChild(btn("Render video", async ev => {
     ev.currentTarget.disabled = true;
     const r = await jpost("/longform-rebuild", {slug:data.slug});
     if (r && r.ok && r.id) { root.remove(); startJob(r.id); }
     else { ev.currentTarget.disabled = false; errorCard(T.err_generic, (r && r.error) || "Render failed."); }
-  }, "primary")); root.appendChild(foot);
+  }, "primary"));
+  root.appendChild(foot);
   requestAnimationFrame(() => root.scrollIntoView({behavior:REDUCED ? "auto" : "smooth", block:"start"}));
 }
 

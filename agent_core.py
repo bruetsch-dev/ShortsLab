@@ -1,4 +1,6 @@
 import concurrent.futures
+import multiprocessing
+import queue
 import contextlib
 import copy
 import json
@@ -19,6 +21,47 @@ import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
+
+
+def _voice_alignment_with_timeout(voice_align, audio_path, script, duration,
+                                  status_cb=None, speed=1.0, timeout_s=180):
+    """Prevent a stalled Whisper/CUDA load from blocking every run indefinitely."""
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_voice_alignment_worker,
+        args=(str(audio_path), script, duration, speed, result_queue),
+        daemon=True,
+    )
+    process.start()
+    try:
+        result = result_queue.get(timeout=timeout_s)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    except queue.Empty as exc:
+        if status_cb:
+            status_cb(f"Local voice alignment exceeded {timeout_s}s; switching to audio timing fallback.")
+        raise RuntimeError(f"local voice alignment timed out after {timeout_s}s") from exc
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        result_queue.close()
+
+
+def _voice_alignment_worker(audio_path, script, duration, speed, result_queue):
+    import voice_align
+    try:
+        result_queue.put(voice_align.analysis_from_audio(
+            audio_path,
+            script_text=script,
+            duration=duration,
+            status_cb=None,
+            speed=speed,
+        ))
+    except Exception as exc:
+        result_queue.put(exc)
 
 import pipeline
 import reasoning_modes
@@ -814,6 +857,22 @@ def choose_seedance_scenes(scenes, max_clips=4, preferred_indexes=None, exclude_
 _IMAGE_NO_TEXT = "No text, captions, letters, numbers or logos anywhere in the image."
 
 
+def scene_time_direction(title, voice_line):
+    """Keep generated image plates in the era actually implied by the script.
+
+    The prior blanket ``period-accurate`` instruction made contemporary social stories look
+    like historical reconstructions.  Historical treatment now requires evidence in the title
+    or narration; otherwise the model gets an authentic present-day setting.
+    """
+    context = f"{title or ''} {voice_line or ''}".lower()
+    historical_cues = ("ancient", "medieval", "century", "historic", "historical",
+                       "world war", "wwi", "wwii", "19th century", "18th century")
+    has_old_year = bool(re.search(r"\b(1[0-9]{3}|200[0-5])\b", context))
+    if has_old_year or any(cue in context for cue in historical_cues):
+        return "historically accurate for the stated era", "period-appropriate attire"
+    return "contemporary and authentic to the stated place", "ordinary present-day attire"
+
+
 def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
     # Kept lean on purpose: over-stuffed image prompts make the models render weird,
     # conflicting detail. Carry the topic, the spoken line, the must-show subjects,
@@ -825,6 +884,7 @@ def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
     topic = humanize_title(title)
     show_phrase = ", ".join(str(item) for item in must_show[:5])
     avoid_phrase = ", ".join(str(item) for item in must_not_show[:4])
+    era_style, attire = scene_time_direction(topic, voice_line)
     model = str(image_model or "").lower()
 
     if "nano-banana" in model or "gemini" in model:
@@ -838,17 +898,17 @@ def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
             parts.append(f"Show {show_phrase}.")
         if visual_direction:
             parts.append(f"Direction (only if it fits): {visual_direction}.")
-        parts.append("Period-accurate, cinematic and slightly desaturated, with clear depth; the main subject frozen at the start of a visible action.")
-        parts.append("Single coherent scene, fully clothed period attire, no nudity or gore.")
+        parts.append(f"{era_style.capitalize()}, cinematic and slightly desaturated, with clear depth; the main subject frozen at the start of a visible action.")
+        parts.append(f"Single coherent scene, fully clothed {attire}, no nudity or gore.")
         parts.append(_IMAGE_NO_TEXT)
         parts.append("Photorealistic and serious. Vertical 9:16.")
         return " ".join(part for part in parts if part)
 
     # GPT-Image-2 (default): short, skimmable sections with concrete visual facts.
     prompt = (
-        f'Scene: period-accurate documentary reconstruction for "{topic}".\n'
+        f'Scene: authentic documentary reconstruction for "{topic}"; {era_style}.\n'
         f'Subject: one clear subject that answers the spoken line "{voice_line}". Show: {show_phrase}.\n'
-        "Details: cinematic, slightly desaturated period palette, soft realistic light, clear depth, 35-50mm; "
+        "Details: cinematic, natural slightly desaturated colour palette, soft realistic light, clear depth, 35-50mm; "
         "the subject frozen at the start of a visible action.\n"
     )
     if visual_direction:
@@ -856,7 +916,7 @@ def scene_prompt(title, scene, image_model="openai/gpt-image-2/text-to-image"):
     prompt += (
         "Use case: vertical 9:16 Short scene plate and image-to-video source frame.\n"
         f"Constraints: single coherent scene (no collage, grid or inset); avoid {avoid_phrase}; "
-        f"fully clothed period attire; no nudity; no gore. {_IMAGE_NO_TEXT}"
+        f"fully clothed {attire}; no nudity; no gore. {_IMAGE_NO_TEXT}"
     )
     return prompt
 
@@ -1057,10 +1117,10 @@ def split_hook_from_script(script, hook_text):
     return matched.strip(), body
 
 
-# Narration pace, baked into the voiceover at generation. The strongest manually-reviewed
-# Clip Shorts use 1.10x: fast enough for retention without the clipped, synthetic delivery
-# and micro-stutter impression produced by the former 1.30x default.
-SCRAPE_VOICE_SPEED = 1.10
+# Narration pace, baked into the voiceover at generation.  Fact Shorts using real scraped
+# footage need the brisk 1.25x delivery selected for the final manual Shorts; it remains below
+# the old 1.30x setting that sounded clipped and synthetic.  A user-selected speed still wins.
+SCRAPE_VOICE_SPEED = 1.25
 GENERATE_VOICE_SPEED = 1.15
 VOICE_SPEED_MIN, VOICE_SPEED_MAX = 1.0, 1.6
 
@@ -1259,7 +1319,11 @@ def generate_project_voiceover(script, project_dir, form, status_cb=None):
     model = (str(form.get("tts_model") or "").strip() or pipeline.DEFAULT_TTS_MODEL) if is_form else pipeline.DEFAULT_TTS_MODEL
     is_seed_tts = model in pipeline.SEED_SPEECH_TTS_ALIASES
     if is_seed_tts and voice not in pipeline.SEED_SPEECH_TTS_VOICES:
+        log(status_cb, f"Seed Speech does not support Gemini voice {voice!r}; using stokie_en.")
         voice = "stokie_en"
+    elif not is_seed_tts and voice not in pipeline.GEMINI_TTS_VOICES:
+        log(status_cb, f"Gemini TTS does not support Seed voice {voice!r}; using {pipeline.DEFAULT_TTS_VOICE}.")
+        voice = pipeline.DEFAULT_TTS_VOICE
     seed_tts_kw = {}
     if is_seed_tts and is_form:
         seed_tts_kw = {
@@ -1836,19 +1900,54 @@ def normalize_micro_beat_plan(raw_beats, title, script, target_duration):
 
 SCRIPT_CREATOR_MODEL = "google/gemini-3.5-flash"
 
-# Curated JAPAN angles for the no-topic case. The model alone converges on the same 1-2
-# topics every call ("schools banned brown hair"); rotating through this pool with a
-# persisted history guarantees variety across consecutive generations.
+# Curated JAPAN angles for the no-topic case. The reference edits are not all "weird rules":
+# they also work because they follow real people through youth culture, beauty pressure, hobbies,
+# city life and a surprising everyday ritual.  Keep the pool broad so the model cannot collapse
+# every click into schools, dating rules or a list of bans.
 SCRIPT_CREATOR_ANGLES = (
-    "school rules", "dating rules", "work culture rules", "beauty standards",
-    "train and commuting etiquette", "convenience store culture", "apartment renting rules",
-    "onsen and tattoo rules", "garbage separation rules", "vending machine culture",
-    "customer service rules", "eating and restaurant etiquette", "shoes and indoor rules",
-    "gift giving rules", "drinking with coworkers culture", "school lunch system",
-    "school club activities", "senpai-kohai hierarchy", "childhood independence",
-    "public silence rules", "hanko stamp bureaucracy", "driving license process",
-    "capsule hotel rules", "theme cafe culture", "lost wallet honesty culture",
-    "wedding and funeral etiquette", "neighborhood association rules",
+    "high-school festival and club culture", "young people\'s street fashion", "dating and couples\' rituals",
+    "women\'s everyday beauty, safety or work pressures", "men\'s grooming and status culture",
+    "motorcycle, car and late-night rider culture", "anime, cosplay or fandom life",
+    "nightlife and the hidden after-work city", "strange service jobs and customer rituals",
+    "convenience-store inventions and food obsessions", "train, station and commuting behaviour",
+    "tiny-apartment survival and unusual housing", "vending machines and hyper-specific retail",
+    "theme cafés, pop-up experiences or performance restaurants", "school lunch and childhood independence",
+    "the outsider culture shock visitors can physically film", "unspoken public etiquette",
+    "workplace hierarchy shown through a visible ritual", "relationship, wedding or family expectations",
+    "onsen, tattoo and body-image culture", "seasonal festivals and local traditions",
+    "Tokyo versus small-town daily life", "student nightlife and coming-of-age culture",
+    "cute culture with a surprising real-world consequence", "unusual hobbies and obsessive collecting",
+    "sports clubs, dance teams or synchronized group culture", "public cleanliness and lost-property habits",
+    "garbage sorting or household routines", "restaurant etiquette and food presentation",
+    "neighbourhood rules and community rituals", "bureaucracy people physically deal with",
+)
+
+# Relationship and social-presentation themes have proved to earn stronger retention than generic
+# odd-fact lists. They are a priority, not a monopoly: automatic Fact Shorts favor this pool while
+# still rotating through the wider Japan pool so the feed does not become repetitive.
+SCRIPT_CREATOR_HIGH_RETENTION_ANGLES = (
+    "couples acting distant in public versus private dating culture",
+    "the subtle public-affection rules young Japanese couples navigate",
+    "how people signal a relationship without obvious PDA",
+    "women's face-covering, makeup, privacy or appearance habits and the social reason behind them",
+    "young women's dating, friendship, beauty or safety routines shown through a visible action",
+    "men's and women's expectations around dating, confessions, matching items or couple rituals",
+    "the gap between romance anime expectations and ordinary Japanese dating behaviour",
+    "a small public behaviour that makes sense only after the hidden social pressure is explained",
+)
+
+# These are *editorial* reference archetypes inferred from the supplied ref edits, not topics or
+# claims to copy.  They give automatic generations the same human, phone-filmable range: a person
+# under pressure, an outsider discovering something, an intense subculture, or a visible ritual.
+SCRIPT_CREATOR_REFERENCE_ARCHETYPES = (
+    "a young person navigating a surprising social expectation",
+    "an outsider visibly discovering an everyday Japanese custom",
+    "a niche youth subculture with a striking look, hobby or ritual",
+    "a woman\'s or man\'s everyday pressure shown through ordinary actions",
+    "a night-time city scene that reveals a hidden social rule",
+    "a group performance, festival or shared ritual that looks unbelievable on camera",
+    "an unexpectedly intense hobby or work routine people can film on a phone",
+    "a contrast between Japan\'s polished image and a concrete everyday reality",
 )
 _SCRIPT_TOPIC_HISTORY = ROOT / "generated_assets" / "script_creator_history.json"
 
@@ -1889,6 +1988,7 @@ def _script_text_similarity(left, right):
 
 
 MINI_STORY_SCRIPT_TOKEN_LIMIT = 130
+FACT_SHORT_SCRIPT_TOKEN_LIMIT = 150
 
 
 def estimate_script_tokens(text):
@@ -1941,12 +2041,33 @@ def generate_viral_script(topic="", status_cb=None, instructions="", format_mode
         token_limit = int(token_limit) if token_limit not in (None, "") else None
     except (TypeError, ValueError):
         token_limit = None
-    token_limit = max(80, min(180, token_limit or MINI_STORY_SCRIPT_TOKEN_LIMIT)) if mini_story else None
+    if mini_story:
+        token_limit = max(80, min(180, token_limit or MINI_STORY_SCRIPT_TOKEN_LIMIT))
+    else:
+        # Fact Shorts must stay speakable and visually coverable.  The previous open-ended
+        # standard mode regularly returned dense 140-word scripts whose tiny visual beats forced
+        # frantic edits and generic filler.  Keep a hard ceiling while still allowing a user to
+        # request a shorter result.
+        token_limit = max(90, min(180, token_limit or FACT_SHORT_SCRIPT_TOKEN_LIMIT))
     recent = _script_creator_history()
     system = (
-        "You are an elite short-form scriptwriter for viral 'dark facts' style TikTok/Shorts "
-        "narration (the Japan-facts reference style: punchy, factual-sounding, slightly "
-        "outrageous, zero fluff). You write EXACTLY in that voice. "
+        "You are an elite short-form scriptwriter for viral Japan-focused TikTok/Shorts narration. "
+        "The supplied reference style is punchy, factual-sounding, human and visually exciting: it "
+        "can be a dark fact, but it can equally be youth culture, a relationship ritual, a night-time "
+        "scene, a visible social pressure, an obsessive hobby or an outsider culture shock. Never "
+        "reduce every idea to a law, ban or school rule. You write in that voice: curious, slightly "
+        "outrageous when the truth supports it, and zero fluff. "
+        "HIGH-RETENTION EDITORIAL BRIEF: automatic Fact Shorts should often prioritize intimate "
+        "everyday social behaviour people recognize instantly: couples, dating, public affection, "
+        "friendship, beauty, masks, makeup, privacy and the small pressures young women and men "
+        "navigate. Build these as a visible behaviour, then the real social reason behind it. Never "
+        "claim all Japanese people or all women behave one way; say 'many', name the setting, or "
+        "explain the specific norm whenever scope varies. "
+        "Never frame women of a nationality as a reward, a set of 'girlfriend rules', or a reason "
+        "someone should date them. If a user phrases a topic that way, respectfully recast it as "
+        "an explanation of a specific dating custom or social behaviour, with agency on both sides. "
+        "Do not turn general gift etiquette (including okaeshi) into a debt a girlfriend owes her "
+        "partner unless the exact, well-documented relationship context supports that claim. "
         "FACTS ARE NON-NEGOTIABLE: every claim must be TRUE and describe a real, widely "
         "documented Japanese practice. Never invent statistics - use a number only when it is "
         "a well-known real figure, otherwise state the claim without one. The outrageousness "
@@ -1983,21 +2104,37 @@ def generate_viral_script(topic="", status_cb=None, instructions="", format_mode
             f'USER-LOCKED TOPIC: "{topic}". The complete script MUST be specifically about this exact topic. '
             "Do not replace it with a familiar Japan-school, women-at-work, sumo, or social-rules topic unless "
             "the user explicitly named that subject. About JAPAN only when the topic says or clearly implies Japan.\n"
+            "If the topic asks why somebody should date Japanese women/men or describes nationality-based "
+            "'girlfriend/boyfriend rules', keep the requested dating subject but recast it as an accurate, "
+            "non-objectifying explanation of specific customs; do not promise traits, obedience, gifts or benefits.\n"
             f"Fresh editorial lens for this generation: {lens}.\n"
             f"Uniqueness token: {secrets.token_hex(6)}. This token is not script content."
             + (f"\nRECENT OUTPUTS FOR THIS TOPIC — actively choose different facts, hook and structure:\n{avoid}" if avoid else "")
         )
         temperature = 0.92
     else:
-        # rotate through curated angles + exclude recent topics -> real variety per click
+        # Rotate through curated angles + exclude recent topics -> real variety per click. The
+        # relationship/social-priority pool is deliberately favored after the two strong reference
+        # patterns, while the full list still supplies roughly one third of generations.
         used_angles = {str(r.get("angle") or "") for r in recent if isinstance(r, dict)}
-        fresh = [a for a in SCRIPT_CREATOR_ANGLES if a not in used_angles] or list(SCRIPT_CREATOR_ANGLES)
+        priority_fresh = [a for a in SCRIPT_CREATOR_HIGH_RETENTION_ANGLES if a not in used_angles]
+        broad_fresh = [a for a in SCRIPT_CREATOR_ANGLES if a not in used_angles]
+        use_priority = bool(priority_fresh) and (not broad_fresh or random.random() < 0.68)
+        fresh = priority_fresh if use_priority else (broad_fresh or list(SCRIPT_CREATOR_ANGLES))
         angle = random.choice(fresh)
         avoid = ", ".join(f'"{str(r.get("topic") or "")[:60]}"' for r in recent
                           if isinstance(r, dict) and r.get("topic"))
+        archetype = random.choice(SCRIPT_CREATOR_REFERENCE_ARCHETYPES)
         ask = (f"Write about JAPAN ONLY (never South Korea, China or any other country). "
                f"Your assigned angle: JAPANESE {angle.upper()}. Pick one specific, surprising, "
-               f"REAL aspect of it." + (f" Do NOT reuse these recent topics: {avoid}." if avoid else ""))
+               f"REAL aspect of it. Use this reference-style editorial shape: {archetype}. "
+               "Do NOT default to a ban, a school rule, sumo, convenience stores, trains, or a "
+               "generic list of etiquette unless the assigned angle specifically demands it. "
+               "The story must centre a real person, visible behaviour or recognisable subculture "
+               "that can be found as exciting vertical phone footage. For couples, dating or "
+               "women's presentation, write a curiosity hook in the shape 'Why do many Japanese ...?' "
+               "and answer it with a concrete, truthful social context rather than a stereotype."
+               + (f" Do NOT reuse these recent topics: {avoid}." if avoid else ""))
         temperature = 0.9
     custom_direction = ""
     if instructions:
@@ -2023,19 +2160,21 @@ the active length limit, narration-only requirement, or strict JSON output.
   is hard; shorten before returning. No headings, lists, emojis, hashtags or camera directions.
 """
     else:
-        structure_rules = """
+        structure_rules = f"""
 - HOOK: the first sentence is a shocking claim of AT MOST 12 words (a real number, a REAL
   ban, or a jaw-dropping TRUE practice - NEVER a fake ban).
-- ONE CENTRAL THEME: the hook names it; every following fact is framed as another example,
-  consequence, contrast or escalation of that SAME theme. Facts from different settings are
-  welcome when the link is explicit - drop a fact only if its connection to the theme cannot
-  be stated in one transition sentence.
-- STRUCTURE: exactly 3 thought blocks after the hook, each 2-3 sentences. Escalate between
-  blocks; open the final block with an escalation like "But the craziest part?" or
-  "But the harshest reality?".
-- TRANSITIONS carry the theme: each block opener says how the next fact relates. Never imply one
-  fact CAUSED another unless that link is verified. Order the facts so the strongest one lands last.
-- 100-140 words total.
+- IDENTIFY THE REAL SUBJECT: infer the recurring human subject and claim from the whole topic.
+  The hook may be one striking example, but its noun is NOT automatically the overall topic.
+  If the hook mentions a sumo ring in a story about restrictions on women, sumo belongs only to
+  that hook beat; the later blocks remain about women and their other visible restrictions.
+- STRUCTURE: hook plus exactly 3 concrete, escalating visual blocks. Each block contains one
+  physical action or situation a phone camera can clearly show. The final block is the strongest.
+- VISUAL VARIETY: every block needs a different setting, action or prop. Do not repeat the hook
+  location as generic filler and do not restate the same fact with synonyms.
+- RETENTION: use a clean curiosity gap, an immediate concrete reveal, then escalation and payoff.
+  Funny or surprising details are welcome when relevant, but never insert a random meme into the text.
+- 85-120 spoken words and never more than {token_limit} estimated script tokens. The token limit
+  is hard; shorten before returning.
 """
     prompt = f"""{ask}{custom_direction}
 
@@ -2050,6 +2189,8 @@ Write ONE narration script following ALL of these rules:
   titles and niche terminology unless that exact detail is the payoff.
 - ONE IDEA PER SENTENCE. Most sentences should be 8-16 words. Explain any unavoidable unfamiliar
   term immediately in plain language, or replace it with a familiar description.
+- ORIGINAL SYNTHESIS: never copy a source video's wording, sentence order or signature hook.
+  Use source facts only, then write a genuinely new narration.
 - READ-ALOUD TEST: every sentence must sound natural when spoken once at normal speed. Rewrite
   anything that feels dense, formal, overqualified, oddly specific or difficult to remember.
 - Simple spoken language, present tense, narration text only.
@@ -2059,6 +2200,10 @@ Write ONE narration script following ALL of these rules:
 - SELF FACT-CHECK before returning: re-read every sentence and rewrite any claim a Japanese
   person would call false - a custom presented as law, an invented consequence, an invented
   number, or a rare edge case presented as universal.
+- DATING FACT-CHECK: never say "your Japanese girlfriend/boyfriend will" unless it is an
+  explicitly scoped anecdote. Never use gift-return customs as evidence that a partner owes the
+  other person money. For broad dating topics, focus on a documented visible custom and name who,
+  where or when it applies.
 
 Return STRICT JSON:
 {{"topic": "<short topic label>",
@@ -2081,7 +2226,7 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
                 f"Rejected draft to avoid: {script[:500]}\n"
                 f"Retry nonce: {secrets.token_hex(8)}."
             )
-        model_output_tokens = max(280, token_limit * 2) if mini_story else 4000
+        model_output_tokens = max(280, token_limit * 2)
         data = _post_llm_json(SCRIPT_CREATOR_MODEL,
                               [{"role": "system", "content": system},
                                {"role": "user", "content": attempt_prompt}], model_output_tokens,
@@ -2098,7 +2243,7 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
         if duplicate_score < 0.68 and not repeated_hook and not too_long:
             break
         if too_long:
-            log(status_cb, f"Mini Story draft exceeded {token_limit} tokens; requesting a shorter version...")
+            log(status_cb, f"Script draft exceeded {token_limit} tokens; requesting a shorter version...")
         else:
             log(status_cb, f"Script creator: duplicate-like result ({duplicate_score:.0%}); requesting a new angle...")
     if not script:
@@ -2595,6 +2740,9 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
         if scene.get("clip"):
             scene_data["seedance"] = True
             scene_data["clip"] = Path(scene["clip"]).name
+            # Real source footage can carry creator subtitles.  Keep the default explicit in
+            # project config so the first render and the later timeline render agree.
+            scene_data["blur_captions"] = scene.get("blur_captions") is not False
             scene_data["needs_gpt_asset"] = False
             scene_data["shots"] = [{"at": 0.0, "use_clip": True}]
             config_scenes.append(scene_data)
@@ -2615,6 +2763,7 @@ def plan_config(project_dir, title, script, target_duration, allow_seedance=True
                 seedance = False
             else:
                 scene_data["clip"] = clip.name
+                scene_data["blur_captions"] = scene.get("blur_captions") is not False
                 scene_data["shots"] = [{"at": 0.0, "use_clip": True}]
         if seedance and scene_data.get("clip"):
             pass
@@ -3190,7 +3339,11 @@ def llm_search_plan(title, scenes, reasoning_model=None, status_cb=None):
         "Avoid generic keywords like 'war', 'battle', 'farm', or words copied blindly from the script.\n"
         "Avoid book covers, title pages, library catalog scans, scanned book pages, archive.org/open-library scans, and text-only pages unless the scene explicitly asks for a book or manuscript.\n"
         "Create queries for general web image search, not only Wikimedia. Prefer specific entity/place/object/event phrases that can find real photos, maps, archives, news images, museums, official pages, or documentary references.\n"
-        "Among correct options, bias queries toward the most visually striking, dramatic, and instantly readable images (strong subject, high contrast, emotion, scale) - this is a scroll-stopping Short, not an encyclopedia.\n\n"
+        "Among correct options, strongly bias queries toward unusual, strange, surreal, extreme, or "
+        "curiosity-provoking visuals (strong subject, high contrast, emotion, scale, transformation, "
+        "unexpected juxtaposition). Generic streets, skylines, stock smiles, and calm talking heads are "
+        "last resorts. Abstract or metaphorical visuals are allowed when they clearly communicate the "
+        "spoken beat; never use unrelated weirdness.\n\n"
         f"Title: {humanize_title(title)}\n"
         f"Scenes JSON: {json.dumps(scene_lines, ensure_ascii=False)}"
     )
@@ -3317,7 +3470,12 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
         understanding_brief(understanding) +
         "You plan REAL TikTok search queries for a vertical short cut entirely from found footage about JAPAN.\n"
         "Go LINE BY LINE through the voice script. For EACH line, write ONE query that would surface a clip that "
-        "literally DEPICTS what that line is about - the concrete subject, place, or action - not just 'Japan'.\n"
+        "visually supports the concrete subject, place, or action - not just 'Japan'. The footage should feel "
+        "unexpected, strange, intense, surreal, absurd, or visually fascinating when the script allows it: "
+        "prefer a bizarre real-world moment, unusual object, uncanny transformation, extreme reaction, strange "
+        "custom, impossible-looking process, or bold visual contrast over safe stock-like scenery. It must still "
+        "be semantically defensible for the spoken line; abstract/metaphorical visuals are welcome when they make "
+        "the idea instantly understandable, but do not use random unrelated memes.\n"
         "Map meaning to footage, e.g.:\n"
         "  'clean streets' -> 日本 綺麗な 街並み  /  tokyo clean street\n"
         "  'stress / exhausted / weakness' -> 疲れた サラリーマン  /  日本 残業 疲れ  /  overworked japanese worker\n"
@@ -3326,6 +3484,10 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
         "  'sleep in cafes' -> ネットカフェ 寝る  /  カフェ 仮眠 日本\n"
         "  'surrounded by millions, still alone' -> 渋谷 雑踏 一人  /  東京 孤独 夜\n"
         "  'quiet pressure / scary perfect' -> 東京 夜 無人 街  /  静かな 日本 路地\n"
+        "SCROLL-STOPPING PRIORITY: among relevant options, rank the weirdest and most curiosity-provoking footage "
+        "first. A normal street, skyline, generic walking shot, or calm talking head is a last resort. Prefer "
+        "visible action, a strong reveal, unusual camera angle, uncanny scale, striking colour, or a reaction that "
+        "makes viewers ask 'what am I looking at?'.\n"
         "FOCUS ON HUMAN EXPRESSION & EMOTION: prefer footage of real people's FACES and body language showing the "
         "feeling of the line - a tired face, blank stare, forced/fake smile, sighing, looking down, crying - over "
         "empty scenery. Use expression words: 表情, 疲れた顔, 無表情, ため息, 作り笑い, うつむく, 涙, 真顔, 困った顔. "
@@ -3349,7 +3511,8 @@ def llm_scrape_plan(script, title="", visual_script="", script_relevancy=70, rea
     payload = {
         "model": reasoning_model or GPT55_MODEL,
         "messages": [
-            {"role": "system", "content": "You turn a narration script into concrete TikTok footage search queries. Return JSON only."},
+            {"role": "system", "content": "You turn a narration script into concrete, scroll-stopping TikTok footage search queries. "
+             "Choose unusual but semantically defensible visuals, never generic filler. Return JSON only."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
@@ -5965,9 +6128,48 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
     # sound at every cut, rotating through whoosh, swish, bubble-pop and mouse-click families.
     if bool(config.get("scrape_transition_only_sfx")):
         events, sfx_events_report = [], []
+        approved_cut_order = (
+            "fast-swish.mp3", "bubble-poping.mp3", "mouse-click-sound.mp3",
+            "pop-button.mp3",
+        )
+        approved_cut_files = set(approved_cut_order)
+        approved_pool = {}
+        def approved_source_name(candidate):
+            record = rec_by_path.get(str(candidate)) or {}
+            return Path(str(record.get("file") or candidate)).name.casefold()
+        for category in ("bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"):
+            for candidate in (lib.get(category) or []):
+                name = approved_source_name(candidate)
+                if name in approved_cut_files:
+                    approved_pool.setdefault(name, candidate)
+        approved_assets_present = any(
+            name in approved_pool for name in approved_cut_order
+        )
+
+        def pick_approved_cut(cat):
+            """Use only the four transition sounds approved in the manual reference edits.
+
+            This deliberately excludes the analog pack, pings, dings and the two permanently
+            rejected generic whoosh files even if a classifier routed them into the same bucket.
+            """
+            files = [candidate for candidate in (lib.get(cat) or [])
+                     if (not approved_assets_present
+                         or approved_source_name(candidate) in approved_cut_files)]
+            if not files:
+                return None
+            j = rot.get("fact_" + cat, 0)
+            for step in range(len(files)):
+                candidate = files[(j + step) % len(files)]
+                if use_count.get(str(candidate), 0) < 8:
+                    rot["fact_" + cat] = j + step + 1
+                    use_count[str(candidate)] = use_count.get(str(candidate), 0) + 1
+                    return candidate
+            return None
+
         cut_categories = [c for c in (
             "bright_whoosh", "swipe_whoosh", "caption_pop", "ui_click"
-        ) if lib.get(c)]
+        ) if (lib.get(c) and (not approved_assets_present or any(
+            approved_source_name(p) in approved_cut_files for p in (lib.get(c) or []))))]
         cut_index = 0
         for i, start in cuts:
             if i == 0 or not cut_categories:
@@ -5978,15 +6180,22 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
                             else _hook_beat)
             if riser_target > 0 and abs(float(start) - riser_target) <= 0.12:
                 continue
-            cat = cut_categories[cut_index % len(cut_categories)]
-            path = pick(cat)
-            if not path:
-                # Stay inside the approved transition family when a file hits its reuse cap.
-                for offset in range(1, len(cut_categories) + 1):
-                    cat = cut_categories[(cut_index + offset) % len(cut_categories)]
-                    path = pick(cat)
-                    if path:
-                        break
+            if approved_assets_present:
+                available_names = [name for name in approved_cut_order if name in approved_pool]
+                picked_name = available_names[cut_index % len(available_names)]
+                path = approved_pool[picked_name]
+                cat = ("swipe_whoosh" if picked_name == "fast-swish.mp3" else
+                       "ui_click" if picked_name == "mouse-click-sound.mp3" else "caption_pop")
+            else:
+                # Synthetic/test libraries and older installs keep the classified fallback.
+                cat = cut_categories[cut_index % len(cut_categories)]
+                path = pick_approved_cut(cat)
+                if not path:
+                    for offset in range(1, len(cut_categories) + 1):
+                        cat = cut_categories[(cut_index + offset) % len(cut_categories)]
+                        path = pick_approved_cut(cat)
+                        if path:
+                            break
             cut_index += 1
             if not path:
                 continue
@@ -6017,15 +6226,16 @@ def place_editor_sfx(config, reasoning_model=None, status_cb=None):
             want = str(config.get("hook_riser_file") or "").lower()
             riser_pool = [it for it in hook_risers
                           if want and want in Path(str(it.get("path") or "")).name.lower()] or hook_risers
-            item, source_len, _ = sfx_library.choose_riser_for_target(riser_pool, riser_target)
+            item, source_len, playback_rate = sfx_library.choose_riser_for_target(
+                riser_pool, riser_target)
             if item and source_len > 0:
-                # Never stretch the riser: play at 1.0x and trim to the shorter of the
-                # file length or the hook beat target (same rule as _place_riser).
-                riser_dur = round(min(source_len, riser_target), 3)
+                # The hook riser always owns 0.0 -> the selected climax timestamp. Choose the
+                # nearest-duration asset, then time-fit it so the drop lands exactly on the word.
+                riser_dur = round(riser_target, 3)
                 events.append({"path": str(item["path"]), "start": 0.0,
                                "duration": riser_dur, "source_trim": 0.0,
                                "source_duration": round(source_len, 3),
-                               "playback_rate": 1.0,
+                               "playback_rate": round(playback_rate, 6),
                                "volume": round(min(0.85, sfx_library.db_to_gain(-5.5)), 3),
                                "category": "hook_riser", "id": f"sfx-{len(events):02d}",
                                "sfx_type": "hook_riser"})
@@ -8184,7 +8394,7 @@ def recover_legacy_timeline_overlays(config, project_dir):
     return recovered
 
 
-def load_project_config(slug):
+def load_project_config(slug, prepare_media=True):
     """Load the latest saved render config for a project (for the timeline editor)."""
     config_dir = PROJECTS_DIR / slug / "config"
     if not config_dir.exists():
@@ -8205,13 +8415,14 @@ def load_project_config(slug):
         try:
             saved_edits = json.loads(timeline_edits_path.read_text(encoding="utf-8"))
             if isinstance(saved_edits, dict):
-                apply_timeline_edits_to_config(config, saved_edits, slug)
+                apply_timeline_edits_to_config(config, saved_edits, slug,
+                                              prepare_media=prepare_media)
         except Exception:
             pass
     return config
 
 
-def apply_timeline_edits_to_config(config, edits, slug):
+def apply_timeline_edits_to_config(config, edits, slug, prepare_media=True):
     """Apply the timeline editor's edits onto a loaded config IN PLACE so that a
     render of this config reproduces exactly what the editor shows. Shared by the
     live render, the Save button and Agent rework."""
@@ -8467,7 +8678,7 @@ def apply_timeline_edits_to_config(config, edits, slug):
         # re-encodes the blurred footage, not the raw one.
         want_blur = blur_by_id.get(sid) if sid in blur_by_id else bool(scene.get("blur_captions"))
         scene["blur_captions"] = bool(want_blur)
-        if scene.get("clip"):
+        if prepare_media and scene.get("clip"):
             try:
                 clip_dir = project_dir / "seedance 2.0"
                 base = str(scene.get("caption_blur_src") or scene.get("timeline_speed_src") or scene["clip"])
@@ -8482,8 +8693,17 @@ def apply_timeline_edits_to_config(config, edits, slug):
                         shutil.copy2(clip_dir / base, dest)
                         found = 0
                         try:
+                            # This must remain glyph-only.  The legacy time-varying cleaner
+                            # expanded each OCR row into a padded rectangle, which made clean
+                            # footage look worse than the original caption.  The glyph-mask pass
+                            # touches only detected letter strokes; if it cannot identify text we
+                            # preserve the source instead of creating a visible blur patch.
                             import clip_scraper as _cs_blur
-                            found = _cs_blur.blur_caption_regions(dest, pipeline.find_ffmpeg())
+                            found = _cs_blur.blur_caption_regions(
+                                dest, pipeline.find_ffmpeg(),
+                                seconds=max(1.0, float(scene.get("end", 0) or 0)
+                                            - float(scene.get("start", 0) or 0)),
+                                status_cb=status_cb)
                         except Exception:
                             found = 0
                         if not found:
@@ -8519,7 +8739,20 @@ def apply_timeline_edits_to_config(config, edits, slug):
         # Persist the user's chosen value even when the source clip is temporarily unavailable or
         # FFmpeg cannot prepare the cached speed file during Save. Render/load can retry later.
         scene["timeline_speed"] = speed
-        if abs(speed - 1.0) > 0.01 and scene.get("clip"):
+        # A previous save/render may have persisted a generated speed cache that was
+        # later removed (for example after a project copy or cleanup). Never leave
+        # the renderer pointing at that stale filename; restore the remembered source
+        # so the normal preparation below can rebuild the cache.
+        if prepare_media and scene.get("clip"):
+            _current_clip = str(scene.get("clip") or "")
+            _current_path = project_dir / "seedance 2.0" / _current_clip
+            _original_name = str(scene.get("timeline_speed_src") or "")
+            if (_current_clip.startswith("speed_") and not _current_path.exists()
+                    and _original_name
+                    and (project_dir / "seedance 2.0" / _original_name).exists()):
+                scene["clip"] = _original_name
+                scene["asset"] = _original_name
+        if prepare_media and abs(speed - 1.0) > 0.01 and scene.get("clip"):
             try:
                 clip_dir = project_dir / "seedance 2.0"
                 # always re-encode from the ORIGINAL clip (remembered across saves) so the
@@ -8580,7 +8813,7 @@ def apply_timeline_edits_to_config(config, edits, slug):
     # NEVER cut the voiceover (user 2026-07-24, long-standing "die letzten Sekunden
     # fehlen"): when the edited clips end before the speech does, extend the last
     # scene to the full voice length - a held tail beats chopped words every time.
-    if config.get("speech_audio_in_final") and config.get("audio_path"):
+    if prepare_media and config.get("speech_audio_in_final") and config.get("audio_path"):
         try:
             _adur = float(probe_audio_duration(str(config["audio_path"])) or 0.0)
         except Exception:  # noqa: BLE001
@@ -8698,8 +8931,10 @@ def apply_timeline_edits_to_config(config, edits, slug):
 def save_timeline_edits(slug, edits):
     """Persist timeline-editor edits into the project's main config so the editor
     reloads identically and the next render reproduces the saved state."""
-    config = load_project_config(slug)
-    apply_timeline_edits_to_config(config, edits, slug)
+    # Saving stores the user's intent only. Media preprocessing belongs to the
+    # render job; doing it here can block the HTTP request on FFmpeg.
+    config = load_project_config(slug, prepare_media=False)
+    apply_timeline_edits_to_config(config, edits, slug, prepare_media=False)
     project_dir = PROJECTS_DIR / slug
     out_path = project_dir / "config" / "project.json"
     edits_path = project_dir / "config" / "timeline_edits.json"
@@ -8744,7 +8979,8 @@ def ensure_timeline_voice(config, project_dir, status_cb=None):
     return None
 
 
-def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
+def render_project_timeline(slug, edits, status_cb=None, cancel_event=None,
+                            tolerate_clip_defects=False):
     """Re-render a project from the timeline editor's edits."""
     config = load_project_config(slug)
     project_dir = PROJECTS_DIR / slug
@@ -8753,6 +8989,9 @@ def render_project_timeline(slug, edits, status_cb=None, cancel_event=None):
     config["_status_cb"] = status_cb          # real "Rendering frames: N%" for the progress bar
     apply_timeline_edits_to_config(config, edits, slug)
     config["timeline_editor_render"] = True
+    # Timeline rendering is an export operation, not a scrape/quality gate. Never block
+    # an editor render because an already-selected source has a hitch, freeze, or short tail.
+    config["tolerate_clip_defects"] = True
     ensure_timeline_voice(config, project_dir, status_cb=status_cb)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -9052,7 +9291,8 @@ def _persist_retimed_timeline(slug, config):
     os.replace(edits_tmp, edits_path)
 
 
-def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=True):
+def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=True,
+                               voice_speed=None):
     """Create a fresh TTS take and retime timeline clips/captions to the new audio."""
     config = load_project_config(slug)
     project_dir = PROJECTS_DIR / slug
@@ -9087,6 +9327,14 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
     form["regenerate_voice"] = "on"
     form["force_regenerate"] = "on"
     form["use_audio_timing"] = "on"
+    if voice_speed is not None:
+        try:
+            speed = max(0.5, min(2.0, float(voice_speed)))
+        except (TypeError, ValueError):
+            raise RuntimeError("Voice speed must be a number between 0.5x and 2.0x.")
+        form["tts_native_speed"] = str(round(speed, 2))
+        form["voice_speed"] = str(round(speed, 2))
+        log(status_cb, f"Regenerating speech at {speed:.2f}x and retiming the full timeline...")
     if cancel_event is not None:
         form["_cancel_event"] = cancel_event
     log(status_cb, "Regenerating speech with the project's saved speaker and voice settings...")
@@ -9103,8 +9351,8 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
         import voice_align
         if voice_align.available():
             log(status_cb, "Force-aligning the new speech for exact caption and cut timing...")
-            analysis, word_timeline = voice_align.analysis_from_audio(
-                audio_path, script_text=script, duration=duration, status_cb=status_cb)
+            analysis, word_timeline = _voice_alignment_with_timeout(
+                voice_align, audio_path, script, duration, status_cb=status_cb)
     except Exception as exc:
         log(status_cb, f"Local speech alignment failed ({exc}); trying audio analysis fallback.")
     if not analysis:
@@ -9138,7 +9386,12 @@ def regenerate_timeline_speech(slug, status_cb=None, cancel_event=None, render=T
     config["speech_audio_in_final"] = True
     config["timeline_editor_render"] = True
     _vs_default = SCRAPE_VOICE_SPEED if str(form.get("clip_source") or "generate").lower() == "scrape" else GENERATE_VOICE_SPEED
-    config["voice_speed"] = float(form.get("voice_speed", config.get("voice_speed", _vs_default)) or _vs_default)
+    # The approval gate writes the user's post-generation narration speed to
+    # voice_speed. It must take precedence over tts_native_speed, which only
+    # controls the provider's generation request.
+    config["voice_speed"] = float(form.get("voice_speed",
+                                          form.get("tts_native_speed", config.get("voice_speed", _vs_default)))
+                                  or _vs_default)
     caption_track = []
     for row in analysis.get("sentence_timestamps") or []:
         if not isinstance(row, dict) or not str(row.get("text") or "").strip():
@@ -9832,6 +10085,10 @@ def apply_caption_style_from_form(config, form):
     values persist in project.json so the timeline editor mirrors them 1:1."""
     if not isinstance(form, dict):
         return
+    if not any(str(form.get(k) or "").strip() for k in
+               ("caption_active_style", "caption_active_color", "caption_base_color",
+                "caption_box_color", "caption_stroke")):
+        config.setdefault("caption_active_style", "none")
     for k in ("caption_active_style", "caption_active_color", "caption_base_color",
               "caption_box_color", "caption_stroke"):
         v = str(form.get(k) or "").strip()
@@ -10042,8 +10299,8 @@ def run_project(form, status_cb=None):
                 # de-speeds a copy to x1.0 for tighter word boundaries (uploaded audio = x1.0).
                 _align_speed = (resolve_voice_speed(form, form.get("clip_source"))
                                 if form_flag(form, "generate_voice", True) else 1.0)
-                audio_analysis, word_timeline_cache = voice_align.analysis_from_audio(
-                    audio_path, script_text=script, duration=audio_duration, status_cb=status_cb,
+                audio_analysis, word_timeline_cache = _voice_alignment_with_timeout(
+                    voice_align, audio_path, script, audio_duration, status_cb=status_cb,
                     speed=_align_speed,
                 )
                 if audio_analysis:
@@ -10144,15 +10401,16 @@ def run_project(form, status_cb=None):
     micro_beat_scenes = micro_beat_result["micro_beats"]
     visual_sections = micro_beat_result["visual_sections"]
     scenes_override = apply_visual_script_to_scenes(micro_beat_scenes, visual_script, target_duration)
-    # Reference dark-facts edits cut every ~2s (measured: 23-27 cuts over 43-56s). Split any
-    # beat longer than that so the pacing matches instead of reading as a slow slideshow.
+    # Fact Short profile: one readable visual idea per 1.8-3.2s.  The former 1.5s splitter was
+    # faster than the successful hand edits and compounded source-video cuts into visual stutter.
     # (clip_source is read straight from the form here; its canonical local is assigned later.)
     if str(form.get("clip_source", "generate") or "generate").strip().lower() == "scrape":
         before_n = len(scenes_override)
         scenes_override = enforce_reference_pacing(
-            scenes_override, max_s=1.5)
+            scenes_override, max_s=(3.2 if mini_story_mode else 2.4))
         if len(scenes_override) != before_n:
-            log(status_cb, f"Pacing: split long beats for reference cut rate ({before_n} -> {len(scenes_override)} beats, ~1 cut/1.5s).")
+            log(status_cb, f"Pacing: split long beats into readable Fact Short shots "
+                           f"({before_n} -> {len(scenes_override)} beats, target 1.8-3.2s).")
         canonical_words = word_timeline_cache or estimated_word_timeline_from_scenes(base_scenes)
         if canonical_words:
             scenes_override = sync_scenes_to_voice_timeline(
@@ -10161,10 +10419,10 @@ def run_project(form, status_cb=None):
         before_stabilize = len(scenes_override)
         scenes_override = coalesce_short_scrape_scenes(
             scenes_override,
-            min_s=(1.8 if mini_story_mode else 1.45),
+            min_s=1.8,
             max_s=(4.2 if mini_story_mode else 3.2))
         if len(scenes_override) != before_stabilize:
-            log(status_cb, f"Pacing: merged isolated sub-1.45s beats ({before_stabilize} -> "
+            log(status_cb, f"Pacing: merged isolated sub-1.8s beats ({before_stabilize} -> "
                            f"{len(scenes_override)}) to prevent rapid double-cuts in TikTok footage.")
             # the merge moved boundaries AFTER the voice sync - re-snap every cut onto the
             # nearest spoken word onset, or the cuts drift off the narration (user complaint)
@@ -10211,10 +10469,10 @@ def run_project(form, status_cb=None):
     manual_auto_web_images = auto_web_images
     allow_gpt = form_flag(form, "allow_gpt", True)
     allow_seedance = form_flag(form, "allow_seedance", True)
-    use_llm_search = form_flag(form, "use_llm_search", form_flag(form, "use_glm_search", True))
-    use_llm_video_review = form_flag(form, "use_llm_video_review", True)
+    use_llm_search = form_flag(form, "use_llm_search", form_flag(form, "use_glm_search", False))
+    use_llm_video_review = form_flag(form, "use_llm_video_review", False)
     background_music_enabled = form_flag(form, "background_music_enabled", False)
-    autonomous_director = form_flag(form, "autonomous_director", True)
+    autonomous_director = form_flag(form, "autonomous_director", False)
     # Run mode is auto-determined now (the UI selector was removed): a "smart" fill-missing
     # pass when the project already has media, otherwise a full run. An explicit form value
     # (programmatic callers) still wins.
@@ -10334,6 +10592,10 @@ def run_project(form, status_cb=None):
     clip_source = requested_clip_source
     if clip_source not in ("generate", "scrape"):
         clip_source = "generate"
+    if clip_source == "scrape":
+        # Fact Short always uses the live search controller. It inspects zero-result searches,
+        # vision mismatches and rejection logs between rounds instead of repeating dead terms.
+        use_llm_search = True
     scrape_platforms = [
         p.strip() for p in str(form.get("scrape_platforms", "tiktok,x") or "").replace("\n", ",").split(",")
         if p.strip()
@@ -10567,11 +10829,14 @@ def run_project(form, status_cb=None):
                     # and stash its result on. The scene fields it writes go onto scenes_override
                     # (which becomes config['scenes']); the run is flagged v2 on `form` for validation.
                     _v2cfg = {"title": title, "voice_speed": resolve_voice_speed(form, "scrape"),
-                              "scrape_sort": str(form.get("scrape_sort") or "RELEVANCE"),
+                              # Fact Short searches every platform result order, then ranks the
+                              # merged pool by visible relevance first and popularity second.
+                              "scrape_sort": str(form.get("scrape_sort") or "ALL"),
                               "pipeline_version": str(form.get("pipeline_version") or "v0.2"),
                               "clip_short_format": clip_short_format,
                               "influencer_hook": use_influencer_hook,
-                              "script_relevancy": script_relevancy}
+                              "script_relevancy": script_relevancy,
+                              "use_llm_search": use_llm_search}
                     (pool, clip_meta, query_perf, scene_bucket, hook_pool, candidate_statuses,
                      filter_summary) = scrape_v2.scrape_social_plan_v2(
                         _v2cfg, scenes_override, project_dir, scrape_platforms, per_clip,
@@ -10989,6 +11254,7 @@ def run_project(form, status_cb=None):
             while len(clip_decision_log) < scene_total:
                 clip_decision_log.append(None)
 
+            strict_material_only = bool(form.get("fact_discovery_material_only"))
             # After all threshold reductions, keep the edit renderable. Prefer an accepted clip
             # from the same semantic search bucket; otherwise hold/reuse the nearest accepted body
             # clip. This is controlled continuity, not arbitrary global filler.
@@ -11013,7 +11279,15 @@ def run_project(form, status_cb=None):
             # text/black-bar/fake-vertical gate at download time (just not the stricter vision 'clean'
             # gate). A looser-matching real clip still beats an empty render.
             def _download_clean(path):
+                # A preserved rejection is for the Media panel/manual inspection only.  It has
+                # no trustworthy metadata by design, so treating a missing sidecar as “clean”
+                # silently reintroduced clips rejected for captions, freezes or bad framing.
+                _parts = {part.casefold() for part in Path(str(path)).parts}
+                if "_declined" in _parts:
+                    return False
                 m = clip_meta.get(str(path)) or {}
+                if not m:
+                    return False
                 try: _th = float(m.get("text_heaviness", 0) or 0)
                 except (TypeError, ValueError): _th = 0.0
                 try: _bb = float(m.get("black_bar_score", 0) or 0)
@@ -11104,7 +11378,12 @@ def run_project(form, status_cb=None):
                 if _sc:
                     used_identity.add(_content_key(_sc))
 
-            for scene_index in range(1, scene_total):
+            # V2 owns matching and has already spent its recovery rounds.  Do not quietly replace
+            # an uncovered V2 scene with a merely clean download: that is how items from
+            # ``seedance 2.0/_declined`` were rendered as RELAXED_CONTEXT in Fact Shorts.
+            # Uncovered V2 beats stay uncovered for its targeted recovery / timeline review rather
+            # than being misrepresented as a successful visual match.
+            for scene_index in ([] if (strict_material_only or _v2) else range(1, scene_total)):
                 if scene_clips[scene_index] is not None:
                     continue
                 wanted_bucket = scene_bucket.get(scene_index)
@@ -11156,6 +11435,9 @@ def run_project(form, status_cb=None):
             if relaxed_scene_count:
                 log(status_cb, f"Adaptive fallback kept the render running for {relaxed_scene_count} scene(s) "
                                "using same-bucket/adjacent clean footage.")
+            elif strict_material_only:
+                log(status_cb, "Fact Discovery: material-only matching is enabled; unmatched scenes will not "
+                               "be filled with generic or continuity footage.")
 
             hook_chosen = next((r for r in hook_results if best_hook is not None
                                 and str(Path(r["clip"]).resolve()) == str(Path(best_hook).resolve())), None)
@@ -11377,17 +11659,43 @@ def run_project(form, status_cb=None):
                 seedance_clip_count = 0
                 log(status_cb, "Scrape: no usable TikTok clips found after all search rounds.")
             unmatched_scenes = [i for i, sc in enumerate(scenes_override) if not sc.get("clip")]
-            if unmatched_scenes and _v2:
+            if unmatched_scenes and placed and not _v2:
                 details = ", ".join(str(i) for i in unmatched_scenes[:12])
-                raise RuntimeError(
-                    f"Scrape V2 could not find a sufficiently relevant native 9:16 clip for "
-                    f"{len(unmatched_scenes)} scene(s) ({details}). The run kept all gathered media, "
-                    "but refused to fill the timeline with unrelated or repeated footage.")
-            if unmatched_scenes and placed:
-                source_scene = next((sc for sc in scenes_override if sc.get("clip")), None)
-                source_path = seedance_target_dir / source_scene["clip"] if source_scene else None
-                if source_path and source_path.exists():
+                report_path = project_dir / "review" / "scrape_v2_report.json"
+                log(status_cb, f"Scrape V2 WARNING: no sufficiently relevant native 9:16 clip for "
+                               f"{len(unmatched_scenes)} scene(s) ({details}); continuing with "
+                               f"controlled continuity fallback. Search/download details: {report_path}")
+                # Keep the run alive, but never duplicate the first available clip across every
+                # missing scene. Prefer a nearby, strong body match; only then use another strong
+                # body match. This is a continuity fallback, not a claim that the footage is an
+                # exact match, and the targeted V2 recovery stages above get first chance to fill
+                # the scene with new material.
+                approved_sources = []
+                for source_index, candidate_scene in enumerate(scenes_override):
+                    candidate_clip = candidate_scene.get("clip")
+                    source_path = seedance_target_dir / candidate_clip if candidate_clip else None
+                    source_class = str(candidate_scene.get("match_class") or "").upper()
+                    if (source_path and source_path.exists() and source_index != 0
+                            and source_class in ("A_MATCH", "B_MATCH", "C_MATCH")):
+                        approved_sources.append((source_index, candidate_scene, source_path))
+                # A hook is allowed only when no body source exists, never as generic body filler.
+                if not approved_sources:
+                    for source_index, candidate_scene in enumerate(scenes_override):
+                        candidate_clip = candidate_scene.get("clip")
+                        source_path = seedance_target_dir / candidate_clip if candidate_clip else None
+                        if source_path and source_path.exists():
+                            approved_sources.append((source_index, candidate_scene, source_path))
+                source_uses = {}
+                if approved_sources:
                     for scene_index in unmatched_scenes:
+                        # Same-section/nearest visual continuity first; cap one source at two
+                        # fallback placements so a single clip cannot take over the whole Short.
+                        ordered_sources = sorted(approved_sources,
+                                                 key=lambda row: (abs(row[0] - scene_index), row[0]))
+                        choice = next((row for row in ordered_sources
+                                       if source_uses.get(str(row[2]), 0) < 2), ordered_sources[0])
+                        source_index, source_scene, source_path = choice
+                        source_uses[str(source_path)] = source_uses.get(str(source_path), 0) + 1
                         dst = seedance_target_dir / f"scraped_{scene_index:02d}.mp4"
                         _shutil.copyfile(source_path, dst)
                         sc = scenes_override[scene_index]
@@ -11405,6 +11713,20 @@ def run_project(form, status_cb=None):
                     log(status_cb, f"Continuity hold filled {len(unmatched_scenes)} remaining scene(s); "
                                    "the render will continue instead of aborting.")
                     seedance_clip_count = len([s for s in scenes_override if s.get("clip")])
+            elif unmatched_scenes and _v2:
+                # V2 intentionally refuses an unrelated continuity fill.  A partial scrape stays
+                # renderable with the planned scene-image motion for uncovered beats; the project
+                # report keeps those beats explicit so the user can replace them in the editor.
+                report_path = project_dir / "review" / "scrape_v2_report.json"
+                log(status_cb, f"Scrape V2 WARNING: {len(unmatched_scenes)} scene(s) remain uncovered "
+                               f"after relevance recovery; continuing with planned scene-image motion, "
+                               f"never unrelated continuity footage. Details: {report_path}")
+            elif unmatched_scenes and strict_material_only:
+                details = ", ".join(str(i) for i in unmatched_scenes[:12])
+                report_path = project_dir / "review" / "scrape_v2_report.json"
+                raise RuntimeError(
+                    f"Fact Discovery could not find any usable native 9:16 clip for "
+                    f"{len(unmatched_scenes)} scene(s) ({details}). Search/download details: {report_path}")
             elif unmatched_scenes:
                 if not getattr(clip_scraper, "backend_active", lambda _p=None: False)(scrape_platforms):
                     raise RuntimeError(
@@ -11492,6 +11814,18 @@ def run_project(form, status_cb=None):
     config["project_slug"] = slug
     config["loaded_project_mode"] = recut_mode
     attach_cancel_event(config, form)  # so the InfiniteTalk hook render below is cancellable
+    # Caption cleaning defaults to ON for every source-video scene from the very first render.
+    # The same scene-level setting is what the timeline inspector shows and persists, so opening
+    # an untouched project can no longer silently change the caption-cleanup behaviour.
+    _caption_default_edits = {
+        "scenes": [
+            {"id": str(sc.get("id")), "blur_captions": sc.get("blur_captions") is not False}
+            for sc in (config.get("scenes") or []) if sc.get("clip")
+        ]
+    }
+    if _caption_default_edits["scenes"]:
+        log(status_cb, "Caption cleanup: glyph-only blur enabled by default for source footage.")
+        apply_timeline_edits_to_config(config, _caption_default_edits, slug, prepare_media=True)
     config.setdefault("wavespeed", {})
     config["wavespeed"]["seedance_model"] = seedance_model_choice
     config["wavespeed"]["video_model"] = SEEDANCE_VIDEO_MODELS.get(seedance_model_choice)
@@ -11554,6 +11888,7 @@ def run_project(form, status_cb=None):
         config["sfx_enabled"] = editorial_sfx_on
         config["scrape_transition_only_sfx"] = editorial_sfx_on
         config["hook_riser_full_hook"] = True
+        config.setdefault("hook_riser_file", "hook_riser2")
         # Reference edits use SHORT, real edited hits only - never a synthesized ambient bed and
         # never Kling-generated SFX. Hard-disable all SFX generation for scrape runs so the only
         # sounds are the short library impacts/whooshes placed on cuts by place_editor_sfx.
@@ -11567,6 +11902,9 @@ def run_project(form, status_cb=None):
         config["caption_size"] = 94
         config["caption_active_box"] = False
         config["allow_ambient_sfx"] = False
+        # Native 9:16 UGC is already framed for a phone. Repeated automatic punch-ins made faces
+        # and actions unreadable and did not exist in the successful manual reference edits.
+        config["dynamic_zoom"] = False
         # Reference edits are SFX-dense: a whoosh on most cuts PLUS accents (pops/dings/impacts).
         # 33/min still felt sparse (~25 on a 45s short); 46/min lands a hit on nearly every cut and
         # leaves room for callout/emphasis accents between them.

@@ -180,7 +180,9 @@ UI_TEXT_DEFAULTS = {
     "loaded_project_mode": "normal",
     "run_type": "normal",
     "speaker_name": "Narrator",
-    "tts_voice": "Achernar",
+    # Fact Shorts need an energetic host by default.  Achernar is intentionally soft and
+    # made fresh projects sound flat even though the narration directive asked for energy.
+    "tts_voice": "Laomedeia",
     "tts_model": "flash",
     "tts_voice_instruction": "",
     "tts_language": "",
@@ -210,11 +212,11 @@ UI_TEXT_DEFAULTS = {
     "scrape_cookies_file": "",
 }
 UI_CHECKBOX_DEFAULTS = {
-    "autonomous_director": True,
+    "autonomous_director": False,
     "use_audio_timing": True,
     "mix_voice_in_final": True,
-    "use_llm_search": True,
-    "use_llm_video_review": True,
+    "use_llm_search": False,
+    "use_llm_video_review": False,
     "enable_speaker_hook": False,
     "influencer_hook": False,
     "auto_web_images": True,
@@ -586,10 +588,10 @@ def project_form_state(project_dir):
         state["reasoning_model"] = str(wavespeed.get("reasoning_model"))
         state["reasoning_mode"] = reasoning_modes.validate_reasoning_mode(
             state["reasoning_model"], wavespeed.get("reasoning_mode")) or ""
-    state["autonomous_director"] = bool(agent.get("director_enabled", True))
+    state["autonomous_director"] = bool(agent.get("director_enabled", False))
     state["use_audio_timing"] = True
-    state["use_llm_search"] = True
-    state["use_llm_video_review"] = True
+    state["use_llm_search"] = False
+    state["use_llm_video_review"] = False
     state["background_music_enabled"] = bool(config.get("background_music_enabled", False))
     speaker_hook = config.get("speaker_hook") if isinstance(config.get("speaker_hook"), dict) else {}
     state["enable_speaker_hook"] = bool(speaker_hook.get("enabled"))
@@ -1913,6 +1915,10 @@ def app_script():
           if (mode === "captions") { window.location.href = "/captions"; return; }
           if (mode === "visual") { window.location.href = "/visual"; return; }
           if (mode === "longform") { window.location.href = "/longform"; return; }
+          if (mode === "povjourney") {
+              if (fmt) fmt.value = "pov_journey";
+              WIZ_STEPS = [5]; wizGoto(5); return;
+          }
           
           if (mode === "viraltrans") { 
               if (fmt) fmt.value = "discovery";
@@ -3384,9 +3390,31 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <span class="mm-head"><span class="mm-ico">&#129529;</span><span class="mm-title">Discovery Mode</span></span>
               <span class="mm-desc">Fully autonomous: finds a story, writes the script, and recuts perfectly.</span>
             </button>
+            <button type="button" class="modemenu-card" onclick="selectMode('povjourney')">
+              <span class="mm-head"><span class="mm-ico">&#127758;</span><span class="mm-title">AI POV Journey</span></span>
+              <span class="mm-desc">Seedance 2.5 surreal worlds, frame-linked into one continuous POV film.</span>
+            </button>
           </div>
         </div>
 
+      <section class="create-bar panel" data-step="5" aria-labelledby="pov-journey-title">
+        <div class="cbar-row"><div class="cbar-cell" style="flex:1 1 100%;">
+          <span class="cbar-cap">AI video journey</span><h2 id="pov-journey-title" style="margin:0;">One POV. Three impossible worlds.</h2>
+          <p class="hint" style="margin:0; max-width:650px;">Three 10-second Seedance 2.5 chapters. Each new chapter begins with the literal final frame of the last one, so the journey stays continuous. Native ambient ASMR only — no narration, captions or music.</p>
+        </div></div>
+        <div class="cbar-row">
+          <div class="cbar-cell" style="flex:1 1 220px;"><label class="cbar-cap" for="pov-journey-pov">POV vehicle</label><select id="pov-journey-pov" name="pov_journey_pov"><option value="mountain_bike">Mountain bike</option><option value="e_scooter">E-scooter</option><option value="car">Car</option><option value="cabriolet">Cabriolet</option><option value="motorcycle">Motorcycle</option></select></div>
+          <div class="cbar-cell" style="flex:1 1 240px;"><span class="cbar-cap">Generation access</span><label class="otoggle"><input type="checkbox" name="pov_journey_unlimited" checked><span>Unlimited generation — required</span></label><span class="hint">Always verified on Higgsfield before a chapter starts.</span></div>
+        </div>
+        <div class="cbar-row"><div class="cbar-cell" style="flex:1 1 100%;"><label class="cbar-cap" for="pov-journey-direction">Optional opening world</label><input id="pov-journey-direction" name="pov_journey_direction" maxlength="500" placeholder="Leave blank for an original surreal world. Example: a living green aqueduct over an Alpine valley"><span class="hint">The background can evolve; the POV rig, hands and motion stay consistent.</span></div></div>
+        <div class="cbar-row">
+          <div class="cbar-cell" style="flex:1 1 180px;"><label class="cbar-cap" for="pov-journey-camera">Camera energy</label><select id="pov-journey-camera" name="pov_journey_camera"><option value="calm">Calm glide</option><option value="dynamic">Dynamic ride</option><option value="orbit">Wide orbit</option></select></div>
+          <div class="cbar-cell" style="flex:1 1 180px;"><label class="cbar-cap" for="pov-journey-transform">World transformation</label><select id="pov-journey-transform" name="pov_journey_transform"><option value="subtle">Subtle and physical</option><option value="balanced" selected>Balanced surreal</option><option value="bold">Bold, dreamlike</option></select></div>
+          <div class="cbar-cell" style="flex:1 1 180px;"><label class="cbar-cap" for="pov-journey-atmosphere">Sound atmosphere</label><select id="pov-journey-atmosphere" name="pov_journey_atmosphere"><option value="nature">Nature ASMR</option><option value="wind">Wind and motion</option><option value="quiet">Quiet cinematic ambience</option></select></div>
+        </div>
+        <div class="cbar-row"><div class="cbar-cell" style="flex:1 1 100%;"><label class="cbar-cap" for="pov-journey-instructions">Director instructions</label><textarea id="pov-journey-instructions" name="pov_journey_instructions" rows="4" maxlength="1600" placeholder="Optional: describe exact scenery, colour palette, movement, objects to keep stable, or things to avoid. These instructions apply to all three connected chapters."></textarea><span class="hint">Example: “warm pink dusk, no cities, the arches grow larger in chapter two, keep the trail clearly readable.”</span></div></div>
+        <button type="submit" class="create-short-btn create-short-big" onclick="this.form.querySelector('input[name=clip_short_format]').value='pov_journey'">Generate POV journey</button>
+      </section>
 
       <div class="create-bar panel" data-step="4">
         <div class="cbar-row cbar-top">
@@ -3410,6 +3438,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="moonshotai/kimi-k3"{' selected' if state.get("reasoning_model") == "moonshotai/kimi-k3" else ""}>Kimi K3</option>
               <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
               <option value="google/gemini-3.1-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-flash-lite" else ""}>Gemini 3.1 Flash Lite</option>
+              <option value="google/gemini-3.5-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash-lite" else ""}>Gemini 3.5 Flash Lite</option>
               <option value="google/gemini-3.1-pro-preview"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-pro-preview" else ""}>Gemini 3.1 Pro Preview (cheap)</option>
             </select>
           </div>
@@ -3580,6 +3609,7 @@ def form_page(clear=False, open_load=False, load_slug=""):
           </div>
           <div id="seed-tts-settings" style="display:{seed_settings_display}; margin-top:14px;">
             <div class="hint">Seed Speech uses preset voices plus native delivery controls; Gemini speaker labels are not sent.</div>
+            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional delivery instruction: warm, energetic, calm, whispered...">{esc(state.get('tts_voice_instruction'))}</textarea>
             <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
               <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}"{" selected" if state.get("tts_language") == x else ""}>{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
               <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="{esc(state.get('tts_native_speed') or '1')}"></label>
@@ -3725,6 +3755,7 @@ def sfx_page():
             <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+            <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent detects scene changes, reads the timed transcript, and chooses sound effects from your local <code>soundeffects/</code> library.</div>
@@ -3781,6 +3812,7 @@ def visual_page():
             <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+            <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (cheap)</option>
           </select>
           <div class="hint">The agent looks at real frames + the timed transcript, finds the concrete on-screen target per punchy moment, and only then places an arrow at it.</div>
@@ -3948,6 +3980,7 @@ def longform_page():
           </select>
           <details style="margin-top:12px;">
             <summary>Seed Speech delivery settings</summary>
+            <textarea name="tts_voice_instruction" rows="2" placeholder="Optional tone, emotion, pace or volume instruction"></textarea>
             <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:10px;">
               <select name="tts_language"><option value="">Auto language</option>{''.join(f'<option value="{x}">{x}</option>' for x in pipeline.SEED_SPEECH_LANGUAGES if x)}</select>
               <label>Native speed <input name="tts_native_speed" type="number" min="0.5" max="2" step="0.1" value="1"></label>
@@ -3972,6 +4005,7 @@ def longform_page():
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+            <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
           </select>
         </div>
 
@@ -4149,6 +4183,68 @@ def _make_discovery_gate(job_id, cancel_event, approval_event):
     return gate
 
 
+def _make_motion_preflight_gate(job_id, cancel_event, ready_event):
+    """Pause AI Motion after opening Higgsfield's homepage, before any automation starts."""
+    def gate():
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise RunCancelled("Run cancelled by user.")
+            job["status"] = "awaiting_approval"
+            job["motion_preflight"] = True
+            job["logs"].append("AI Motion preflight: Higgsfield is open. Navigate to Seedance, set 10s, 9:16 and Unlimited yourself, then press Ready in ShortsLab.")
+            job.setdefault("log_times", []).append(time.time())
+        while not ready_event.wait(timeout=0.5):
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+        ready_event.clear()
+        if cancel_event.is_set():
+            raise RunCancelled("Run cancelled by user.")
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job["motion_preflight"] = False
+                job["status"] = "running"
+                job["logs"].append("AI Motion preflight confirmed by user — checking the visible Higgsfield page before generation.")
+                job.setdefault("log_times", []).append(time.time())
+        return True
+    return gate
+
+
+def _make_motion_manual_chapter_gate(job_id, cancel_event, chapter_event):
+    """Request one user-generated Seedance chapter from the normal Chrome workflow."""
+    def gate(chapter, prompt, first_frame=None):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise RunCancelled("Run cancelled by user.")
+            job["status"] = "awaiting_approval"
+            job["motion_manual"] = {
+                "chapter": int(chapter), "prompt": str(prompt or ""),
+                "first_frame": str(first_frame) if first_frame and Path(first_frame).is_file() else "",
+                "upload_path": "",
+            }
+            job["logs"].append(f"AI Motion manual chapter {chapter}/3: generate it in normal Chrome with Unlimited, download the MP4, then import it here.")
+            job.setdefault("log_times", []).append(time.time())
+        while not chapter_event.wait(timeout=0.5):
+            if cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+        chapter_event.clear()
+        if cancel_event.is_set():
+            raise RunCancelled("Run cancelled by user.")
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            state = dict(job.get("motion_manual") or {}) if job else {}
+            path = str(state.get("upload_path") or "")
+            if job:
+                job["motion_manual"] = None
+                job["status"] = "running"
+        if not path or not Path(path).is_file() or Path(path).stat().st_size < 1000:
+            raise RunCancelled("No valid manual Seedance video was imported.")
+        return path
+    return gate
+
+
 def start_job(fields, files):
     job_id = str(int(time.time() * 1000))
     fields = dict(fields)
@@ -4186,6 +4282,9 @@ def start_job(fields, files):
         fields["impact_word"] = ""
     audio_path = save_upload(files.get("audio_file"), job_id)
     speaker_image_path = save_upload(files.get("speaker_image_file"), job_id)
+    motion_loop_first_frame = save_upload(files.get("motion_loop_first_frame"), job_id)
+    if motion_loop_first_frame:
+        fields["motion_loop_first_frame"] = motion_loop_first_frame
     cancel_event = threading.Event()
     replace_lock = threading.Lock()
     media_exclusion_lock = threading.Lock()
@@ -4207,6 +4306,8 @@ def start_job(fields, files):
         except Exception:
             pass
     approval_event = threading.Event()
+    motion_preflight_event = threading.Event()
+    motion_manual_event = threading.Event()
     fields["_cancel_event"] = cancel_event
     fields["_replace_lock"] = replace_lock
     fields["_replace_requests"] = replace_requests
@@ -4214,6 +4315,8 @@ def start_job(fields, files):
     fields["_media_exclusions"] = media_exclusions
     fields["_speech_gate"] = _make_speech_gate(job_id, cancel_event, approval_event)
     fields["_discovery_gate"] = _make_discovery_gate(job_id, cancel_event, approval_event)
+    fields["_motion_preflight_gate"] = _make_motion_preflight_gate(job_id, cancel_event, motion_preflight_event)
+    fields["_motion_manual_chapter_gate"] = _make_motion_manual_chapter_gate(job_id, cancel_event, motion_manual_event)
     restart_fields = {k: v for k, v in fields.items() if not k.startswith("_") and k not in ("audio_path",)}
     if audio_path:
         fields["audio_path"] = audio_path
@@ -4241,6 +4344,10 @@ def start_job(fields, files):
             "media_exclusion_lock": media_exclusion_lock,
             "media_exclusions": media_exclusions,
             "approval_event": approval_event,
+            "motion_preflight_event": motion_preflight_event,
+            "motion_preflight": False,
+            "motion_manual_event": motion_manual_event,
+            "motion_manual": None,
             "restart_fields": restart_fields,
             "project_dir": None,
             "created_at": time.time(),
@@ -4264,17 +4371,38 @@ def start_job(fields, files):
     def worker():
         try:
             status_cb("Started.")
-            # Unified Clip Short Discovery: no script -> the agent chooses an unused,
-            # reference-style real-footage topic (or follows the optional direction), then
-            # finds material and writes/recuts the whole short itself. mini_story remains a
-            # legacy saved-format alias so old projects enter the same reliable workflow.
+            # Clip Short DISCOVERY mode: no script -> the agent finds one long process
+            # TikTok, writes the script itself and recuts the source to the voiceover.
             _fmt = str(fields.get("clip_short_format") or "")
             _no_script = not str(fields.get("script") or "").strip()
-            if _fmt in ("discovery", "mini_story") and _no_script:
+            if _fmt == "discovery" and _no_script:
                 import discovery_short
-                result = discovery_short.run_discovery_short(fields, status_cb, style="mixed")
+                result = discovery_short.run_discovery_short(fields, status_cb)
+            elif _fmt == "pov_journey":
+                import pov_journey
+                result = pov_journey.run_pov_journey(fields, status_cb)
+            elif _fmt == "mini_story" and _no_script and str(fields.get("gen_topic") or "").strip():
+                # Mini Story TOPIC mode: scrape a one-subject footage cluster FIRST, then
+                # write a script the material can actually show.
+                import discovery_short
+                result = discovery_short.run_mini_topic_short(fields, status_cb)
+            elif _fmt == "mini_story" and _no_script:
+                # Mini Story AUTO-DISCOVERY (user 2026-07-23, never a selectable option):
+                # empty script AND empty topic -> hunt a story/skit TikTok with Asian
+                # women/couples (japan region = Japanese-first) and tell its story.
+                import discovery_short
+                result = discovery_short.run_discovery_short(fields, status_cb, style="story")
             elif str(fields.get("motion_loop_mode") or "").strip().lower() in ("on", "true", "1"):
+                # Keep this development desktop app hot-loadable: the user must not have to stop
+                # the app just to pick up the dedicated Seedance 2.5 AI Motion implementation.
+                import importlib
+                import higgsfield_login
                 import motion_loop
+                # `motion_loop` imports this module at file load. Reload both so a running
+                # desktop app picks up preflight/CAPTCHA fixes on the very next AI Motion run
+                # without requiring the user to close the application.
+                higgsfield_login = importlib.reload(higgsfield_login)
+                motion_loop = importlib.reload(motion_loop)
                 result = motion_loop.run_motion_loop(fields, status_cb)
             elif _no_script and str(fields.get("gen_topic") or "").strip():
                 # No script but a topic given -> material-first fact short: scrape a clip pool,
@@ -4898,6 +5026,21 @@ def longform_frame_use(slug, rel_path, idx):
     return {"ok": True, "img": link_for(target)}
 
 
+def longform_retime_range(slug, start_idx, end_idx, replacement_lines=None):
+    """Retime only a selected longform scene range using existing local assets."""
+    import longform_video
+    d = _longform_dir(slug)
+    if not d:
+        return {"ok": False, "error": "Unknown project."}
+    try:
+        result = longform_video.retime_existing_range(
+            d, start_idx, end_idx, replacement_lines=replacement_lines)
+        result["ok"] = True
+        return result
+    except Exception as exc:  # noqa: BLE001 - return an editor-friendly error
+        return {"ok": False, "error": str(exc)}
+
+
 def longform_thumbnail_select(slug, index):
     """Select one of the three thumbnail/title pairs as the project's final thumbnail."""
     import longform_video
@@ -5349,6 +5492,7 @@ def start_longform_video_job(fields):
             reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = longform_video.run_longform_video(
                 script, tts_model=tts_model, reasoning_model=reasoning_model,
+                reasoning_mode=reasoning_mode, halt_after_speech=halt_after_speech,
                 status_cb=status_cb, cancel_event=cancel_event,
                 speech_gate=lf_speech_gate if halt_after_speech else None,
                 mix_gate=lf_mix_gate if halt_after_speech else None,
@@ -5645,6 +5789,24 @@ SFX_STEPS = [
     ("Finish", ("SFX enhancement complete",)),
 ]
 
+LOWPOLY_STEPS = [
+    ("Write story", ("Writing the story",)),
+    ("Voiceover", ("Recording the voiceover", "Voiceover:")),
+    ("Build shots", ("Shot ", "writing scene")),
+    ("Cut", ("Burning word-by-word", "Done:")),
+]
+
+
+PHYSICS_STEPS = [
+    ("Set up", ("Queued physics simulation",)),
+    ("Simulate", ("sweeping",)),
+    ("Render frames", ("blender:", "frame ")),
+    ("Join sweep", ("joined",)),
+    ("ASMR sound", ("ASMR bed mixed", "no ASMR layer")),
+    ("Finish", ("Done:",)),
+]
+
+
 CAPTION_STEPS = [
     ("Load video", ("Started", "Extracting audio")),
     ("Transcribe", ("Transcrib",)),
@@ -5709,6 +5871,8 @@ def compute_step_view(status, logs, log_times=None, job_kind=None, clip_source=N
     # wrongly showed early. Trust the job's clip_source when we have it.
     is_scrape = (str(clip_source or "").lower() == "scrape") or _is_scrape_run(logs)
     steps = (SFX_STEPS if job_kind == "sfx"
+             else PHYSICS_STEPS if job_kind == "physics"
+             else LOWPOLY_STEPS if job_kind == "lowpoly"
              else CAPTION_STEPS if job_kind == "caption"
              else DISCOVERY_RUN_STEPS if _is_discovery_run(logs)
              else SCRAPE_RUN_STEPS if is_scrape else RUN_STEPS)
@@ -6584,7 +6748,13 @@ def resume_project(slug):
     fields = {k: v for k, v in run_form.items() if not str(k).startswith("_")}
     fields["loaded_project_source"] = project_dir.name      # continue THIS project folder
     fields["slug"] = project_dir.name
-    fields["run_type"] = "audit"                            # smart: reuse existing + fill missing
+    if str(fields.get("motion_loop_mode") or "").strip().lower() in ("on", "true", "1", "yes"):
+        # AI Motion cannot be audited by the normal clip pipeline. It resumes exactly where a
+        # Seedance chapter stopped, preserving the stored final frame as chapter 2/3's input.
+        fields["motion_loop_resume_project"] = project_dir.name
+        fields["run_type"] = "motion_resume"
+    else:
+        fields["run_type"] = "audit"                        # smart: reuse existing + fill missing
     fields.pop("initial_replace_media_path", None)
     fields.pop("initial_remove_media_path", None)
     try:
@@ -6759,6 +6929,9 @@ TIMELINE_SKELETON = """
           <label class="tl-chk"><input type="checkbox" id="tl-rw-replace"><span id="tl-rw-replace-label">replace selected media</span></label>
           <label class="tl-chk"><input type="checkbox" id="tl-rw-recut"> reorder &amp; recut</label>
           <label class="tl-chk" title="Creates a fresh take with the saved voice, then force-aligns captions and clip cuts to it"><input type="checkbox" id="tl-rw-revoice"> regenerate speech + retime</label>
+          <label class="tl-pop-field" for="tl-rw-speed">Voice speed (x)</label>
+          <input id="tl-rw-speed" type="number" min="0.5" max="2" step="0.05" value="1" title="Set this, enable regenerate speech + retime, then click Start rework.">
+          <span class="tl-density-hint">Set the speed, tick <b>regenerate speech + retime</b>, then click <b>Start rework</b>.</span>
           <label class="tl-chk" id="tl-rw-change-script-wrap"><input type="checkbox" id="tl-rw-change-script"> change script</label>
           <label class="tl-chk" id="tl-rw-redo-sfx-wrap"><input type="checkbox" id="tl-rw-redo-sfx"> redo SFX</label>
           <label class="tl-chk" id="tl-rw-add-sfx-wrap"><input type="checkbox" id="tl-rw-add-sfx"> add SFX</label>
@@ -6776,6 +6949,7 @@ TIMELINE_SKELETON = """
             <option value="moonshotai/kimi-k3">Kimi K3</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+            <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
           </select>
           <button type="button" class="button tl-rework-btn" id="tl-rework">&#129302; Start rework</button>
@@ -6808,21 +6982,6 @@ TIMELINE_SKELETON = """
               <input type="text" id="tl-thumb-headline" maxlength="36" placeholder="Thumbnail headline (e.g. GONE BY MORNING)">
               <label class="tl-thumb-arrow"><input type="checkbox" id="tl-thumb-arrow" checked><span>Red arrow</span></label>
               <small>Uses the exact frame currently under the timeline playhead. Pause on the moment you want first.</small>
-            </div>
-            <div class="tl-music-control">
-              <div class="tl-project-media-copy">
-                <strong>Background music</strong>
-                <small class="tl-media-name" id="tl-music-name">No track added</small>
-              </div>
-              <div class="tl-media-actions">
-                <button type="button" class="button secondary" id="tl-music-upload">Add track</button>
-                <button type="button" class="button secondary tl-media-remove" id="tl-music-remove">Remove</button>
-              </div>
-              <input type="file" id="tl-music-file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/flac,.mp3,.wav,.m4a,.aac,.ogg,.flac" hidden>
-              <label class="tl-music-level" for="tl-music-db">
-                <span>Music level</span><output id="tl-music-db-value">-20 dB</output>
-              </label>
-              <input type="range" id="tl-music-db" min="-60" max="0" step="1" value="-20">
             </div>
             <div class="tl-media-status" id="tl-media-status" hidden></div>
           </div>
@@ -6862,6 +7021,7 @@ TIMELINE_SKELETON = """
             <option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option>
             <option value="{pipeline.SEED_SPEECH_TTS_MODEL}">ByteDance Seed Speech TTS 2.0</option>
           </select>
+          <label>Speed <input type="number" id="tl-script-speed" min="0.5" max="2" step="0.05" value="1" title="Narration speed; the complete timeline is retimed to the new voiceover"></label>
         </div>
         <div class="tl-script-densitybar">
           <label>Clips</label>
@@ -6917,6 +7077,16 @@ TIMELINE_SKELETON = """
           <button type="button" class="tl-ctrl tl-ctrl-main" id="tl-play" title="Play / Pause" aria-label="Play"><span id="tl-play-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span></button>
           <button type="button" class="tl-ctrl" id="tl-fwd" title="Forward 5s" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M15.8 6H18v12h-2.2zM4 6v12l10.5-6z"/></svg></button>
           <button type="button" class="tl-ctrl" id="tl-cut" title="Cut clip at playhead (C)" aria-label="Cut clip at playhead"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="6" r="2.6"/><circle cx="6" cy="18" r="2.6"/><path d="M8.2 7.6 20 19M8.2 16.4 20 5"/></svg></button>
+          <div class="tl-popwrap">
+            <button type="button" class="tl-ctrl" id="tl-audio-open" title="Audio mixer" aria-label="Open audio mixer">&#128266;</button>
+            <div class="tl-pop tl-audio-pop" id="tl-audio-pop" hidden>
+              <div class="tl-pop-field">Audio mixer</div>
+              <div class="tl-slider"><label>Voice <span id="tl-audio-v-voice"></span></label><input type="range" id="tl-audio-voice" min="0" max="1.5" step="0.05"></div>
+              <div class="tl-slider"><label>Original audio <span id="tl-audio-v-tiktok"></span></label><input type="range" id="tl-audio-tiktok" min="0" max="0.6" step="0.01"></div>
+              <div class="tl-slider"><label>SFX <span id="tl-audio-v-sfx"></span></label><input type="range" id="tl-audio-sfx" min="0" max="1.5" step="0.05"></div>
+              <div class="tl-slider"><label>Music <span id="tl-audio-v-music"></span></label><input type="range" id="tl-audio-music" min="0" max="0.6" step="0.01"></div>
+            </div>
+          </div>
           <span class="tl-playtime" id="tl-playtime">0:00 / 0:00</span>
         </div>
       </div>
@@ -7042,6 +7212,27 @@ TIMELINE_SKELETON = """
         <div class="tl-track tl-ovtrack" id="tl-ovtrack"></div>
         <div class="tl-track tl-aud" id="tl-voice"></div>
         <div class="tl-track tl-sfx tl-trtrack" id="tl-sfx"></div>
+      </div>
+    </div>
+  </div>
+  <div class="tl-bg-music-wrap">
+    <button type="button" class="button secondary" id="tl-music-open" title="Add or adjust background music">&#127925; Background music</button>
+    <div class="tl-pop tl-bg-music-pop" id="tl-music-pop" hidden>
+      <div class="tl-pop-field">Background music</div>
+      <div class="tl-music-control">
+        <div class="tl-project-media-copy">
+          <strong>Track</strong>
+          <small class="tl-media-name" id="tl-music-name">No track added</small>
+        </div>
+        <div class="tl-media-actions">
+          <button type="button" class="button secondary" id="tl-music-upload">Add track</button>
+          <button type="button" class="button secondary tl-media-remove" id="tl-music-remove">Remove</button>
+        </div>
+        <input type="file" id="tl-music-file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/flac,.mp3,.wav,.m4a,.aac,.ogg,.flac" hidden>
+        <label class="tl-music-level" for="tl-music-db">
+          <span>Volume</span><output id="tl-music-db-value">-20 dB</output>
+        </label>
+        <input type="range" id="tl-music-db" min="-60" max="0" step="1" value="-20">
       </div>
     </div>
   </div>
@@ -7197,7 +7388,7 @@ TIMELINE_ASSETS = """
   .tl-clip-transform-box.active { display:block; }
   .tl-clip-transform-tag { position:absolute; left:8px; top:8px; padding:3px 6px; border-radius:5px; background:rgba(7,10,8,.78); color:var(--accent); font:800 9px/1.2 var(--mono); letter-spacing:.08em; }
   .tl-clip-scale-handle { position:absolute; right:-8px; bottom:-8px; width:18px; height:18px; border-radius:50%; background:var(--accent); border:2px solid #fff; box-shadow:0 2px 8px rgba(0,0,0,.45); cursor:nwse-resize; pointer-events:auto; touch-action:none; }
-  .tl-preview-caption { position:absolute; left:7%; right:7%; top:72%; z-index:6; display:none; text-align:center; color:#fff; font-size:clamp(18px,3.1vh,31px); line-height:1.04; font-weight:950; letter-spacing:.02em; text-transform:uppercase; text-shadow:-2px -2px 0 #111,2px -2px 0 #111,-2px 2px 0 #111,2px 2px 0 #111,0 4px 8px rgba(0,0,0,.8); pointer-events:none; }
+  .tl-preview-caption { position:absolute; left:7%; right:7%; top:72%; z-index:6; display:none; max-height:32%; overflow:hidden; overflow-wrap:anywhere; word-break:break-word; box-sizing:border-box; text-align:center; color:#fff; font-size:clamp(18px,3.1vh,31px); line-height:1.04; font-weight:950; letter-spacing:.02em; text-transform:uppercase; text-shadow:-2px -2px 0 #111,2px -2px 0 #111,-2px 2px 0 #111,2px 2px 0 #111,0 4px 8px rgba(0,0,0,.8); pointer-events:none; }
   .tl-overlay-layer { position:absolute; inset:0; z-index:4; pointer-events:none; }
   .tl-preview-overlay { position:absolute; transform:translate(-50%,-50%); pointer-events:auto; cursor:move; touch-action:none; color:#ed2f25; filter:drop-shadow(2px 2px 0 #fff) drop-shadow(3px 3px 0 #17150f); transform-origin:center; }
   .tl-preview-overlay.selected { outline:2px solid var(--accent); outline-offset:5px; }
@@ -7846,7 +8037,12 @@ TIMELINE_ASSETS = """
 
   function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
   function visible(){ return scenes.filter(function(s){ return !s.removed; }); }
-  function totalDur(){ return visible().reduce(function(a,s){ return a+s.dur; },0); }
+  function visualDur(){ return visible().reduce(function(a,s){ return a+s.dur; },0); }
+  // The sequence may legitimately end before the narration (for example after a manual
+  // trim or when the user leaves intentional empty space).  Do not stop the master clock
+  // at the final visual clip: that was cutting the last part of the real voiceover off in
+  // the editor.  The voice is the authoritative minimum playback duration.
+  function totalDur(){ return Math.max(visualDur(), voiceDuration||0); }
   function fmt(t){ t=Math.max(0,t); var m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+(s<10?'0':'')+s; }
   function startOf(id){ var vis=visible(), acc=0; for(var i=0;i<vis.length;i++){ if(vis[i].id===id) return acc; acc+=vis[i].dur; } return null; }
   function overlayLabel(ov){ var k=String((ov&&ov.type)||'visual'); return k==='callout'?'Arrow':k==='arrows'?'Arrows':k.charAt(0).toUpperCase()+k.slice(1); }
@@ -8380,7 +8576,7 @@ TIMELINE_ASSETS = """
     var canBlur=chosen.every(function(x){return !!x.clip;});
     blurRow.hidden=!canBlur; blurHint.hidden=!canBlur;
     var bc=document.getElementById('tl-insp-blurcap');
-    bc.checked=!!s.blur_captions;
+    bc.checked=s.blur_captions!==false;
     bc.indeterminate=chosen.some(function(x){return !!x.blur_captions!==!!s.blur_captions;});
   }
   function currentFx(){
@@ -8775,6 +8971,11 @@ TIMELINE_ASSETS = """
     }
     pcaption.innerHTML=html;
     pcaption.style.display='block';
+    // Keep the whole caption inside the visible 9:16 stage. Long lines and a
+    // low caption_center_y used to grow below the video and outside the panel.
+    var targetY=Math.max(0,Math.min(sh,+(model.caption_center_y||.72)*sh));
+    var maxTop=Math.max(0,sh-pcaption.offsetHeight);
+    pcaption.style.top=Math.round(Math.min(maxTop,Math.max(0,targetY-pcaption.offsetHeight/2)))+'px';
   }
   function renderPreviewOverlays(scene){
     if(!overlayLayer)return; overlayLayer.innerHTML='';
@@ -9248,13 +9449,19 @@ TIMELINE_ASSETS = """
 
   function bindVol(id, key, out){
     var el=document.getElementById(id), o=document.getElementById(out);
-    el.value=volumes[key]; o.textContent=Math.round(volumes[key]*100)+'%';
-    el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; markDirty(); });
+    var popupId='tl-audio-'+key, popupOut='tl-audio-v-'+key;
+    function syncPopup(){ var pe=document.getElementById(popupId), po=document.getElementById(popupOut); if(pe)pe.value=String(volumes[key]); if(po)po.textContent=Math.round(volumes[key]*100)+'%'; }
+    el.value=volumes[key]; o.textContent=Math.round(volumes[key]*100)+'%'; syncPopup();
+    el.addEventListener('input', function(){ volumes[key]=parseFloat(this.value); o.textContent=Math.round(volumes[key]*100)+'%'; syncPopup(); markDirty(); });
   }
   bindVol('tl-voice-vol','voice','tl-v-voice');
   bindVol('tl-tiktok-vol','tiktok','tl-v-tiktok');
   bindVol('tl-sfx-vol','sfx','tl-v-sfx');
   bindVol('tl-music-vol','music','tl-v-music');
+  [['voice','tl-voice-vol'],['tiktok','tl-tiktok-vol'],['sfx','tl-sfx-vol'],['music','tl-music-vol']].forEach(function(pair){
+    var popup=document.getElementById('tl-audio-'+pair[0]), master=document.getElementById(pair[1]);
+    if(popup&&master) popup.addEventListener('input',function(){ master.value=this.value; master.dispatchEvent(new Event('input')); });
+  });
   document.getElementById('tl-tiktok-vol').addEventListener('input', function(){
     if(activeSceneInfo) applyClipAudio(pvid, activeSceneInfo.scene);
   });
@@ -9277,7 +9484,7 @@ TIMELINE_ASSETS = """
   function collectEdits(){
     var vis=visible();
     return {
-      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:!!s.blur_captions, mirror:!!s.timeline_mirror, scale_enabled:!!s.timeline_free_scale, scale:+(+(s.timeline_clip_scale||1)).toFixed(3), source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined, seedance_audio_volume:((s.seedance_audio_volume!=null&&s.seedance_audio_volume!=='')?+(+s.seedance_audio_volume).toFixed(3):undefined)};}),
+      scenes: vis.map(function(s){return {id:s.id, duration:s.dur, speed:(s.speed&&Math.abs(s.speed-1)>0.01)?s.speed:1, blur_captions:s.blur_captions!==false, mirror:!!s.timeline_mirror, scale_enabled:!!s.timeline_free_scale, scale:+(+(s.timeline_clip_scale||1)).toFixed(3), source_trim:(s.clip?+(+(s.source_trim||0)).toFixed(3):undefined), subject_override:s.subject_override||undefined, seedance_audio_volume:((s.seedance_audio_volume!=null&&s.seedance_audio_volume!=='')?+(+s.seedance_audio_volume).toFixed(3):undefined)};}),
       order: vis.map(function(s){return s.id;}),
       removed: scenes.filter(function(s){return s.removed;}).map(function(s){return s.id;}),
       added: scenes.filter(function(s){return s.added;}).map(function(s){return {id:s.id, kind:s.kind, path:s.path, clip:s.clip, poster:s.poster, dur:s.dur, after:s.id};}),
@@ -9312,7 +9519,8 @@ TIMELINE_ASSETS = """
     edits.compress=!!(_cmp&&_cmp.checked);   // "Compress for small file" (1080p stays)
     // ALWAYS save the project before a render starts (user rule)
     fetch('/timeline-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})})
-      .then(function(){ dirty=false; try{ document.getElementById('tl-save').classList.remove('tl-unsaved'); }catch(e){} btn.textContent='Starting…';
+      .then(function(d){ if(!d || !d.ok) throw new Error((d&&d.error)||'Could not save edits.');
+        dirty=false; try{ document.getElementById('tl-save').classList.remove('tl-unsaved'); }catch(e){} btn.textContent='Starting…';
         return fetch('/timeline-render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, edits:edits})}); })
       .then(function(r){return r.json();})
       .then(function(d){ if(d&&d.ok&&d.job){ gotoProgress(d.job); } else { btn.disabled=false; btn.innerHTML=old; alert((d&&d.error)||'Could not start render.'); } })
@@ -9354,6 +9562,8 @@ TIMELINE_ASSETS = """
     setTimeout(function(){
       var open=document.getElementById('tl-rework-open'), pop=document.getElementById('tl-rework-pop');
       if(!open||!pop) return;
+      var speedInput=document.getElementById('tl-rw-speed');
+      if(speedInput && !speedInput.dataset.edited) speedInput.value=Number(model.voice_speed||model.tts_native_speed||1).toFixed(2);
       document.querySelectorAll('.tl-pop').forEach(function(p){ p.setAttribute('hidden',''); });
       pop.removeAttribute('hidden');
       var anchor=open.getBoundingClientRect(),box=pop.getBoundingClientRect();
@@ -9363,6 +9573,8 @@ TIMELINE_ASSETS = """
       pop.style.left=left+'px';pop.style.top=Math.max(8,top)+'px';
     }, 0);
   }
+  var _speedInput=document.getElementById('tl-rw-speed');
+  if(_speedInput) _speedInput.addEventListener('input', function(){ this.dataset.edited='1'; });
   function openScriptModal(){
     document.querySelectorAll('.tl-pop').forEach(function(p){ p.setAttribute('hidden',''); });
     document.getElementById('tl-script-text').value = (changeScriptSettings&&changeScriptSettings.script) || model.script_text || '';
@@ -9376,6 +9588,8 @@ TIMELINE_ASSETS = """
     }).join('') || '<option value="">(default voice)</option>';
     var wantModel=(changeScriptSettings&&changeScriptSettings.tts_model) || model.tts_model || 'pro';
     document.getElementById('tl-script-ttsmodel').value = wantModel;
+    document.getElementById('tl-script-speed').value = String(
+      (changeScriptSettings&&changeScriptSettings.tts_native_speed) || model.tts_native_speed || 1);
     setDensity((changeScriptSettings&&changeScriptSettings.clip_density) || model.clip_density || 'medium');
     setMediaSource((changeScriptSettings&&changeScriptSettings.media_source) || 'scrape');
     syncHookStatus();
@@ -9463,6 +9677,7 @@ TIMELINE_ASSETS = """
       speaker_name:(document.getElementById('tl-script-speaker').value||'').trim(),
       tts_voice: document.getElementById('tl-script-voice').value||'',
       tts_model: document.getElementById('tl-script-ttsmodel').value||'pro',
+      tts_native_speed: document.getElementById('tl-script-speed').value||'1',
       clip_density: scriptDensity, media_source: scriptMediaSource
     };
     scriptModal.hidden=true;
@@ -9488,6 +9703,7 @@ TIMELINE_ASSETS = """
       fetch('/timeline-rescript',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({slug:slug, script:cs.script, hook_text:cs.hook_text,
                                speaker_name:cs.speaker_name, tts_voice:cs.tts_voice, tts_model:cs.tts_model,
+                               tts_native_speed:cs.tts_native_speed,
                                clip_density:cs.clip_density, media_source:cs.media_source})})
         .then(function(r){return r.json();})
         .then(function(d){ if(d&&d.ok&&d.job){ dirty=false; window.location.href=d.job; }
@@ -9503,9 +9719,12 @@ TIMELINE_ASSETS = """
     if(doReplace && !Object.keys(markedReplace).length){ alert('Mark at least one clip\\'s media to replace (select a clip, then tick \"Mark this clip\\'s media to be replaced\").'); return; }
     var doRender=(document.getElementById('tl-rw-render')||{}).checked||false;
     var btn=this;
+    var speedInput=document.getElementById('tl-rw-speed');
+    var voiceSpeed=parseFloat(speedInput&&speedInput.value||'1');
+    if(!isFinite(voiceSpeed)||voiceSpeed<0.5||voiceSpeed>2){ alert('Voice speed must be between 0.5x and 2.0x.'); return; }
     function submitRework(mediaSource){
       btn.disabled=true; btn.textContent='Starting…';
-      fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, redo_sfx:doRedoSfx, add_more_sfx:doAddSfx, redo_captions:doRedoCaptions, sfx_amount:reworkSfxAmount, reasoning_model:reworkModel, reasoning_mode:reworkReasoning, render_after:doRender, media_source:mediaSource||'', replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
+      fetch('/timeline-rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug, replace_media:doReplace, reorder_recut:doRecut, regenerate_speech:doRevoice, voice_speed:voiceSpeed, redo_sfx:doRedoSfx, add_more_sfx:doAddSfx, redo_captions:doRedoCaptions, sfx_amount:reworkSfxAmount, reasoning_model:reworkModel, reasoning_mode:reworkReasoning, render_after:doRender, media_source:mediaSource||'', replace_ids:Object.keys(markedReplace), edits:collectEdits()})})
         .then(function(r){return r.json();})
         .then(function(d){ if(d&&d.ok&&d.job){ dirty=false; window.location.href=d.job; } else { btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert((d&&d.error)||'Could not start rework.'); } })
         .catch(function(){ btn.disabled=false; btn.innerHTML='\\uD83E\\uDD16 Agent rework'; alert('Could not start rework.'); });
@@ -10440,6 +10659,8 @@ TIMELINE_ASSETS = """
     border-radius:8px; background:var(--bg-input); color:var(--text); font-size:11px; font-weight:700; }
   .tl-thumb-maker small { grid-column:1/-1; color:var(--muted); font-size:9.5px; line-height:1.35; }
   .tl-thumb-arrow { display:flex; align-items:center; gap:5px; color:var(--muted); font-size:10px; font-weight:700; white-space:nowrap; }
+  .tl-bg-music-wrap { position:relative; display:flex; align-items:center; padding:10px 0 0 74px; }
+  .tl-bg-music-pop { min-width:300px; }
   .tl-music-control { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 10px; align-items:end; }
   .tl-music-control .tl-media-actions { margin:0; }
   .tl-music-level { grid-column:1/-1; display:flex; justify-content:space-between; align-items:center; margin-top:2px;
@@ -10716,6 +10937,8 @@ TIMELINE_ASSETS = """
   }
   wirePop('tl-render-open','tl-render-pop');
   wirePop('tl-rework-open','tl-rework-pop');
+  wirePop('tl-audio-open','tl-audio-pop');
+  wirePop('tl-music-open','tl-music-pop');
   document.addEventListener('click', function(){
     document.querySelectorAll('.tl-pop').forEach(function(p){ p.setAttribute('hidden',''); });
   });
@@ -10764,6 +10987,35 @@ def _find_scene_image(project_dir, asset):
     return None
 
 
+def _resolve_scene_clip(project_dir, clip):
+    """Find a scene's clip file wherever the mode that made it put it.
+
+    Only "seedance 2.0" used to be searched, so AI Motion projects - whose scenes store a
+    full path into `generated/` - resolved to nothing and the timeline editor showed empty
+    tiles for clips that were sitting right there on disk. Paths stay confined to the
+    project folder: a config is data, and data does not get to point at the filesystem.
+    """
+    project_dir = Path(project_dir)
+    raw = str(clip or "").strip()
+    if not raw:
+        return None
+    candidates = [Path(raw), project_dir / raw]
+    name = Path(raw).name
+    for sub in ("", "seedance 2.0", "generated", "local media", "speaker clip"):
+        candidates.append(project_dir / sub / name if sub else project_dir / name)
+    root = project_dir.resolve()
+    for cand in candidates:
+        try:
+            if not cand.exists() or not is_video_path(cand):
+                continue
+            if root not in cand.resolve().parents and cand.resolve() != root:
+                continue
+        except OSError:
+            continue
+        return cand
+    return None
+
+
 def _timeline_media(project_dir, scene, config, index, manifest_clips=None):
     """Return (poster_url, clip_url, source_image_path). Resolves the clip with the
     SAME logic the renderer uses (pipeline.scene_clip_path: derived name, then the
@@ -10783,9 +11035,7 @@ def _timeline_media(project_dir, scene, config, index, manifest_clips=None):
         clip_path = None
     # explicit clip name (e.g. speaker_hook.mp4) even if scene isn't seedance-flagged
     if clip_path is None and scene.get("clip"):
-        cand = project_dir / "seedance 2.0" / Path(scene["clip"]).name
-        if cand.exists() and is_video_path(cand):
-            clip_path = cand
+        clip_path = _resolve_scene_clip(project_dir, scene["clip"])
     if clip_path is not None and is_video_path(clip_path):
         clip_url = link_for(clip_path)
         poster = clip_path.with_suffix(".poster.jpg")
@@ -10930,7 +11180,12 @@ def project_has_timeline_edit(slug):
     the full edit, writes project.json with the scenes, and hands off to the timeline, which is
     where the render actually happens. project_has_render() alone then said "not ready" and locked
     the user out of the very screen the run just sent them to. An edit exists once project.json has
-    at least one scene carrying media (a clip, asset or image)."""
+    at least one scene whose media is ACTUALLY ON DISK.
+
+    Naming a file in the config was enough here, which is how a run that died before it ever
+    assigned its media still opened the editor - on a track of empty tiles, with the Continue
+    button hidden behind the very check that was wrong. A config entry is an intention; the
+    file is the edit."""
     project_dir = safe_project_dir(slug)
     if not project_dir:
         return False
@@ -10939,8 +11194,15 @@ def project_has_timeline_edit(slug):
     try:
         config = read_json_file(project_dir / "config" / "project.json") or {}
         for scene in (config.get("scenes") or []):
-            if isinstance(scene, dict) and (scene.get("clip") or scene.get("asset")
-                                            or scene.get("image") or scene.get("speaker_hook")):
+            if not isinstance(scene, dict):
+                continue
+            if scene.get("clip") and _resolve_scene_clip(project_dir, scene["clip"]):
+                return True
+            for key in ("asset", "image"):
+                if scene.get(key) and _find_scene_image(project_dir, scene[key]):
+                    return True
+            if scene.get("speaker_hook") and _resolve_scene_clip(
+                    project_dir, str(scene.get("clip") or "speaker_hook.mp4")):
                 return True
     except Exception:
         pass
@@ -12153,6 +12415,14 @@ def timeline_model(slug):
         end = float(scene.get("end", start) or start)
         dur = max(0.3, end - start)
         poster, clip_url, img, clip_path = _timeline_media(project_dir, scene, config, index + 1, manifest_clips)
+        if end <= start and clip_path is not None:
+            # Scenes written by AI Motion carry only a clip, no start/end, so the generic
+            # end-start collapsed every one of them to the 0.3s floor - three slivers on
+            # the track instead of three clips. Fall back to the footage's own length.
+            real = _clip_source_seconds(clip_path)
+            if real and real > dur:
+                dur = real
+                end = start + real
         is_speaker = bool(scene.get("speaker_hook"))
         label = scene.get("name") or scene.get("caption") or scene.get("script") or f"Scene {index + 1}"
         label = re.sub(r"\s+", " ", str(label)).strip()[:54] or f"Scene {index + 1}"
@@ -12413,7 +12683,7 @@ def timeline_model(slug):
         # user-customizable caption style (same keys the render reads) - the preview mirrors it 1:1
         "caption_style": {
             "active_style": str(config.get("caption_active_style")
-                                or ("box" if config.get("caption_active_box") else "color")),
+                                or ("box" if config.get("caption_active_box") else "none")),
             "active_color": str(config.get("caption_active_color") or "#ffffff"),
             "base_color": str(config.get("caption_base_color") or "#ffffff"),
             "box_color": str(config.get("caption_box_color") or "#23d160"),
@@ -12451,6 +12721,14 @@ def timeline_model(slug):
         "hook_text": str(_project_run_form(project_dir).get("hook_text") or "").strip(),
         "speaker_name": str(_project_run_form(project_dir).get("speaker_name") or "").strip()
                         or pipeline.DEFAULT_TTS_SPEAKER,
+        "voice_speed": float(config.get("voice_speed")
+                              or _project_run_form(project_dir).get("voice_speed")
+                              or _project_run_form(project_dir).get("tts_native_speed")
+                              or 1.0),
+        "tts_native_speed": float(config.get("voice_speed")
+                                 or _project_run_form(project_dir).get("voice_speed")
+                                 or _project_run_form(project_dir).get("tts_native_speed")
+                                 or 1.0),
         "tts_voice": str(_project_run_form(project_dir).get("tts_voice") or "").strip()
                      or pipeline.DEFAULT_TTS_VOICE,
         "tts_model": str(_project_run_form(project_dir).get("tts_model") or "").strip()
@@ -12632,7 +12910,9 @@ def start_timeline_job(slug, edits, regen_captions=False):
         try:
             if regen_captions:
                 _regenerate_project_captions(slug, status_cb=status_cb)
-            result = agent_core.render_project_timeline(slug, edits, status_cb=status_cb, cancel_event=cancel_event)
+            result = agent_core.render_project_timeline(
+                slug, edits, status_cb=status_cb, cancel_event=cancel_event,
+                tolerate_clip_defects=regen_captions)
             if edits.get("compress") and result and result.get("video"):
                 result["video"] = _compress_render_file(result["video"], status_cb=status_cb)
             if result and result.get("video"):
@@ -12770,7 +13050,7 @@ def _persist_job_error(project_dir, kind, exc, tb):
 
 
 def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=None, reasoning_mode=None,
-                               regen_captions=False, render_after=False):
+                               regen_captions=False, render_after=False, voice_speed=None):
     """Regenerate narration, retime the saved timeline, and optionally replace marked social clips."""
     replace_scene_ids = [str(value) for value in (replace_scene_ids or []) if str(value)]
     job_id = str(int(time.time() * 1000))
@@ -12798,7 +13078,8 @@ def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=Non
             reasoning_modes.set_current_reasoning_mode(reasoning_model, reasoning_mode)
             result = agent_core.regenerate_timeline_speech(
                 slug, status_cb=status_cb, cancel_event=cancel_event,
-                render=bool(render_after) and not bool(replace_scene_ids))
+                render=bool(render_after) and not bool(replace_scene_ids),
+                voice_speed=voice_speed)
             if regen_captions:
                 status_cb("Redo captions: rebuilt and aligned the editable caption track to the fresh voiceover.")
             if replace_scene_ids:
@@ -12824,6 +13105,14 @@ def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=Non
 
 
 # ============================ Reddit Story Mode ============================
+try:
+    from lowpoly_mode import build as lowpoly_build
+    from physics_mode import authoring as physics_authoring
+    from physics_mode import run as physics_run
+except Exception as _exc:  # noqa: BLE001
+    print("[physics] module unavailable:", _exc)
+    physics_run = physics_authoring = lowpoly_build = None
+
 REDDIT_STORY_DIR = ROOT / "outputs" / "reddit_story"
 REDDIT_SESSION_FILE = REDDIT_STORY_DIR / "session_stories.json"
 
@@ -12953,6 +13242,213 @@ def start_reddit_job(story):
                 JOBS[job_id]["status"] = "done"
                 JOBS[job_id]["result"] = result
         except (RunCancelled, pipeline.PipelineCancelled):
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def start_lowpoly_job(prompt, seconds=30.0, captions=True):
+    """Write, render and cut a narrated low-poly short in the background."""
+    if lowpoly_build is None:
+        raise RuntimeError("Low-poly mode is unavailable (module failed to import).")
+    slug = "lowpoly_" + (re.sub(r"[^a-z0-9]+", "_", str(prompt)[:40].lower()).strip("_")
+                         or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
+    project_dir = agent_core.PROJECTS_DIR / slug
+    work_dir = ROOT / "outputs" / "lowpoly_work" / slug
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": [f"Queued low-poly short: {prompt}"],
+            "log_times": [time.time()],
+            "result": None, "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "lowpoly",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            j = JOBS.get(job_id)
+            if not j or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            j["logs"].append(str(message))
+            j.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            report = lowpoly_build.build(work_dir, prompt, seconds=seconds,
+                                         captions=captions, status_cb=status_cb)
+            src = Path(report["video"])
+            (project_dir / "renders").mkdir(parents=True, exist_ok=True)
+            final = project_dir / "renders" / f"{slug}.mp4"
+            shutil.copy2(src, final)
+            report["video"] = str(final)
+            report["project_dir"] = str(project_dir)
+            _write_physics_project_config(project_dir, slug, src, report)
+            (project_dir / "agent_report.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            with JOB_LOCK:
+                JOBS[job_id]["project_dir"] = str(project_dir)
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = report
+        except RunCancelled:
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def _write_physics_project_config(project_dir, slug, video, report):
+    """Give a finished physics render the same shape as any other project.
+
+    Without this the folder holds a render and nothing else, and the timeline editor opens
+    on an empty track - it builds its clips from config["scenes"], not from the renders
+    folder. Storing the video as the project's single clip makes it editable exactly like
+    an imported one.
+    """
+    clips = project_dir / "seedance 2.0"
+    clips.mkdir(parents=True, exist_ok=True)
+    (project_dir / "config").mkdir(parents=True, exist_ok=True)
+    clip_name = "simulation.mp4"
+    clip_path = clips / clip_name
+    shutil.copy2(video, clip_path)
+    try:
+        pipeline.extract_poster_frame(clip_path, clip_path.with_suffix(".poster.jpg"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        dur = max(0.5, float(_clip_source_seconds(clip_path) or report.get("seconds") or 6.0))
+    except Exception:  # noqa: BLE001
+        dur = float(report.get("seconds") or 6.0)
+    config = {
+        "title": report.get("title") or slug.replace("_", " ").title(),
+        "captions_baked": True,
+        "clip_source": "manual",
+        "sfx_enabled": False,
+        "smart_overlays": True,
+        "scenes": [{
+            "id": "s0", "start": 0.0, "end": round(dur, 3),
+            "clip": clip_name, "asset": clip_name, "seedance": True,
+            "name": report.get("title") or "Simulation",
+            "caption": "", "exact_voice_text": "", "word_timings": [],
+        }],
+    }
+    (project_dir / "config" / "project.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8")
+
+
+def start_physics_job(preset, values, samples=24, seconds=4.0, prompt="",
+                      brief_model=""):
+    """Render a Blender physics sweep in the background.
+
+    The output lands in a normal project folder (renders/) so the finished short shows up
+    in the library, plays in the app and can be opened in the timeline editor like any
+    other render - the mode is new, the surrounding app is not.
+    """
+    if physics_run is None:
+        raise RuntimeError("Physics mode is unavailable (module failed to import).")
+    name = str(prompt or preset)[:40]
+    slug = "physics_" + (re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "scene")         + "_" + time.strftime("%Y%m%d_%H%M%S")
+    project_dir = agent_core.PROJECTS_DIR / slug
+    # Built outside PROJECTS_DIR: a project folder with no render in it is listed as a
+    # FAILED project, and a sweep takes the better part of an hour - the whole time the
+    # library would be advertising a failure that has not happened.
+    work_dir = ROOT / "outputs" / "physics_work" / slug
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    approval = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "approval_event": approval,
+            "logs": [f"Queued physics scene: {prompt or preset}."],
+            "log_times": [time.time()],
+            "result": None,
+            "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,        # set once the render exists, see worker()
+            "created_at": time.time(),
+            "job_kind": "physics",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            j = JOBS.get(job_id)
+            if not j or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            j["logs"].append(str(message))
+            j.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            # A sweep is the better part of an hour of GPU time. Show one cheap frame and
+            # let the user reject the shot before committing to the whole thing.
+            custom = None
+            if prompt:
+                # An authored scene is proved by running it, so its test frame IS the
+                # preview - no second render just to show the user something.
+                custom = physics_authoring.author_scene(
+                    prompt, status_cb=status_cb, work_dir=work_dir,
+                    **({"brief_model": brief_model} if brief_model else {}))
+                shot = custom["preview"]
+            else:
+                status_cb("Rendering a preview frame for approval...")
+                shot = physics_run.preview_frame(work_dir, preset=preset, values=values,
+                                                 status_cb=status_cb)
+            with JOB_LOCK:
+                JOBS[job_id]["physics_preview"] = str(shot)
+                JOBS[job_id]["status"] = "awaiting_approval"
+            approval.clear()
+            approval.wait()
+            with JOB_LOCK:
+                decision = JOBS[job_id].get("physics_decision")
+                JOBS[job_id]["status"] = "running"
+                JOBS[job_id]["physics_preview"] = None
+            if decision != "approve":
+                with JOB_LOCK:
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Declined at the preview frame.")
+                return
+            status_cb("Preview approved - rendering the full sequence.")
+            report = physics_run.build(work_dir, preset=preset, values=values,
+                                       samples=samples, seconds=seconds, custom=custom,
+                                       status_cb=status_cb)
+            src = Path(report["video"])
+            (project_dir / "renders").mkdir(parents=True, exist_ok=True)
+            final = project_dir / "renders" / f"{slug}.mp4"
+            shutil.copy2(src, final)
+            _write_physics_project_config(project_dir, slug, src, report)
+            with JOB_LOCK:
+                JOBS[job_id]["project_dir"] = str(project_dir)
+            report["video"] = str(final)
+            report["project_dir"] = str(project_dir)
+            (project_dir / "agent_report.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8")
+            status_cb(f"Done: {final.name} ({report.get('seconds', 0)}s)")
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = report
+        except RunCancelled:
             with JOB_LOCK:
                 JOBS[job_id]["status"] = "cancelled"
                 JOBS[job_id]["logs"].append("Cancelled.")
@@ -13414,8 +13910,33 @@ def job_page(job_id):
     if status == "awaiting_approval" and job.get("speech_audio"):
         qid = urllib.parse.quote(job_id)
         audio_url = link_for(Path(job["speech_audio"]))
-        voice_opts = "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in
-                             dict.fromkeys(pipeline.GEMINI_TTS_VOICES + pipeline.SEED_SPEECH_TTS_VOICES))
+        current = job.get("restart_fields") or {}
+        current_model = str(current.get("tts_model") or "pro")
+        current_voice = str(current.get("tts_voice") or (
+            "stokie_en" if current_model in pipeline.SEED_SPEECH_TTS_ALIASES
+            else pipeline.DEFAULT_TTS_VOICE))
+        current_instruction = str(current.get("tts_voice_instruction") or "")
+        current_language = str(current.get("tts_language") or "")
+        current_speed = str(current.get("tts_native_speed") or "1.0")
+        current_volume = str(current.get("tts_volume") or "1.0")
+        current_pitch = str(current.get("tts_pitch") or "0")
+        current_format = str(current.get("tts_output_format") or "mp3")
+        model_opts = "".join(
+            f'<option value="{esc(v)}"{ " selected" if v == current_model else ""}>{esc(label)}</option>'
+            for v, label in (
+                ("flash", "Gemini 2.5 Flash"),
+                ("pro", "Gemini 2.5 Pro"),
+                ("gemini-3.1-flash", "Gemini 3.1 Flash"),
+                (pipeline.SEED_SPEECH_TTS_MODEL, "ByteDance Seed Speech 2.0"),
+            )
+        )
+        voice_opts = "".join(
+            f'<option value="{esc(v)}" data-provider="gemini"{ " selected" if v == current_voice else ""}>{esc(v)}</option>'
+            for v in pipeline.GEMINI_TTS_VOICES
+        ) + "".join(
+            f'<option value="{esc(v)}" data-provider="seed"{ " selected" if v == current_voice else ""}>{esc(v)}</option>'
+            for v in pipeline.SEED_SPEECH_TTS_VOICES
+        )
         speech_html = f"""
         <section class="panel accent" id="speech-approval">
           <h2>&#127908; Approve the voiceover</h2>
@@ -13428,12 +13949,40 @@ def job_page(job_id):
             <summary style="cursor:pointer; font-family:var(--pixel); font-size:11px; text-transform:uppercase; color:var(--accent-2);">Replace the voice (re-pick speaker)</summary>
             <form method="post" action="/replace-speech?id={qid}" style="margin-top:14px;">
               <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                <input type="text" name="speaker_name" value="Narrator" placeholder="Speaker name" style="flex:1; min-width:150px;">
-                <select name="tts_voice" style="flex:1; min-width:180px;">{voice_opts}</select>
-                <select name="tts_model" style="flex:1; min-width:160px;"><option value="flash">Flash TTS (cheaper)</option><option value="pro">Pro TTS (higher quality)</option><option value="gemini-3.1-flash">Gemini 3.1 Flash (newest)</option><option value="{pipeline.SEED_SPEECH_TTS_MODEL}">ByteDance Seed Speech TTS 2.0</option></select>
+                <input type="text" name="speaker_name" value="{esc(str(current.get('speaker_name') or 'Narrator'))}" placeholder="Speaker name" style="flex:1; min-width:150px;">
+                <select name="tts_model" id="speech-approval-model" style="flex:1; min-width:180px;">{model_opts}</select>
+                <select name="tts_voice" id="speech-approval-voice" style="flex:1; min-width:180px;">{voice_opts}</select>
+              </div>
+              <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                <input type="text" name="tts_voice_instruction" value="{esc(current_instruction)}" placeholder="Delivery instruction (optional)" style="flex:2; min-width:260px;">
+                <input type="text" name="tts_language" value="{esc(current_language)}" placeholder="Language" style="flex:1; min-width:120px;">
+                <input type="number" name="tts_native_speed" value="{esc(current_speed)}" min="0.5" max="2" step="0.05" title="Native TTS speed" style="width:105px;">
+                <input type="number" name="tts_volume" value="{esc(current_volume)}" min="0.5" max="2" step="0.05" title="Volume" style="width:90px;">
+                <input type="number" name="tts_pitch" value="{esc(current_pitch)}" min="-12" max="12" step="1" title="Pitch" style="width:80px;">
+                <select name="tts_output_format" title="Output format" style="width:100px;">
+                  <option value="mp3"{ " selected" if current_format == "mp3" else ""}>MP3</option>
+                  <option value="opus"{ " selected" if current_format == "opus" else ""}>Opus</option>
+                </select>
               </div>
               <button class="danger" type="submit" style="margin-top:14px;">&#8635; Replace voice &amp; regenerate</button>
             </form>
+            <script>
+              (function() {{
+                var model = document.getElementById("speech-approval-model");
+                var voice = document.getElementById("speech-approval-voice");
+                if (!model || !voice) return;
+                function sync() {{
+                  var seed = model.value === {json.dumps(pipeline.SEED_SPEECH_TTS_MODEL)};
+                  Array.prototype.forEach.call(voice.options, function(o) {{
+                    o.hidden = (o.dataset.provider === "seed") !== seed;
+                  }});
+                  if (voice.selectedOptions.length && voice.selectedOptions[0].hidden) {{
+                    voice.value = seed ? "stokie_en" : {json.dumps(pipeline.DEFAULT_TTS_VOICE)};
+                  }}
+                }}
+                model.addEventListener("change", sync); sync();
+              }})();
+            </script>
           </details>
         </section>"""
     discovery_html = ""
@@ -13712,6 +14261,8 @@ def job_status_payload(job_id):
     with JOB_LOCK:
         job = dict(JOBS.get(job_id, {"status": "missing", "logs": [], "result": None, "error": "Unknown job"}))
     status = job.get("status", "missing")
+    _motion_manual = dict(job.get("motion_manual") or {})
+    _motion_first_frame = Path(str(_motion_manual.get("first_frame") or ""))
     klass = "done" if status == "done" else "error" if status == "error" else "cancelled" if status == "cancelled" else "cancelling" if status == "cancelling" else ""
     logs = job.get("logs", [])
     payload = {
@@ -13733,6 +14284,15 @@ def job_status_payload(job_id):
         "clip_source": job.get("clip_source", ""),
         "scrape_preview_allowed": bool(_scrape_preview_project_slug(job)),
         "speech_review": bool(job.get("speech_review")),
+        "motion_preflight": bool(job.get("motion_preflight")),
+        "motion_manual": ({
+            "chapter": int(_motion_manual.get("chapter") or 0),
+            "prompt": str(_motion_manual.get("prompt") or ""),
+            "first_frame_url": link_for(_motion_first_frame) if _motion_first_frame.is_file() else "",
+        } if status == "awaiting_approval" and _motion_manual else None),
+        "physics_preview_url": (link_for(Path(job["physics_preview"]))
+                                if job.get("physics_preview")
+                                and Path(job["physics_preview"]).is_file() else ""),
         "thumbnail_generation": bool(job.get("thumbnail_generation")),
         "project_slug": (Path(job["project_dir"]).name
                          if job.get("project_dir") and Path(job["project_dir"]).exists() else ""),
@@ -14604,6 +15164,53 @@ class Handler(BaseHTTPRequestHandler):
                                      f'<section class="panel"><h2>Could not open trainer</h2>'
                                      f'<p>{esc(exc)}</p><a class="button secondary" href="/dev-tools">Back</a></section>'))
             return
+        if parsed.path == "/lowpoly-run":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except Exception:
+                body = {}
+            try:
+                prompt = str(body.get("prompt") or "").strip()
+                if not prompt:
+                    raise RuntimeError("Describe the story first.")
+                secs = float(body.get("seconds") or 30.0)
+                out = {"job_id": start_lowpoly_job(
+                    prompt, seconds=max(10.0, min(90.0, secs)),
+                    captions=bool(body.get("captions", True)))}
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        if parsed.path == "/physics-run":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except Exception:
+                body = {}
+            preset = str(body.get("preset") or "wrecking_ball")
+            raw = str(body.get("values") or "")
+            vals = []
+            for tok in re.split(r"[,;\s]+", raw):
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    continue
+            prompt = str(body.get("prompt") or "").strip()
+            try:
+                if not prompt and preset not in (physics_run.PRESETS if physics_run else {}):
+                    raise RuntimeError(f"Unknown physics preset: {preset}")
+                job_id = start_physics_job(
+                    preset, vals or None, prompt=prompt,
+                    brief_model=str(body.get("brief_model") or ""))
+                out = {"job_id": job_id}
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+
         if parsed.path == "/reddit-discover":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -14782,6 +15389,19 @@ class Handler(BaseHTTPRequestHandler):
             result = longform_frame_use(data.get("slug"), data.get("rel_path"), data.get("idx"))
             self.send_bytes(json.dumps(result).encode("utf-8"), "application/json; charset=utf-8")
             return
+        if parsed.path == "/longform-retime":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                data = {}
+            result = longform_retime_range(
+                data.get("slug"), data.get("start_idx"), data.get("end_idx"),
+                data.get("lines"))
+            self.send_bytes(json.dumps(result).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/longform-thumbnail-select":
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length else b""
@@ -14918,6 +15538,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
             self.end_headers()
             return
+        if parsed.path == "/approve-physics":
+            _q = urllib.parse.parse_qs(parsed.query)
+            job_id = _q.get("id", [""])[0]
+            ok = _q.get("action", ["approve"])[0] == "approve"
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if job and job.get("status") == "awaiting_approval":
+                    job["physics_decision"] = "approve" if ok else "decline"
+            if job and job.get("approval_event"):
+                job["approval_event"].set()
+            self.send_bytes(json.dumps({"ok": True}).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/approve-speech":
             _q = urllib.parse.parse_qs(parsed.query)
             job_id = _q.get("id", [""])[0]
@@ -14938,6 +15571,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", f"/job?id={urllib.parse.quote(job_id)}")
             self.end_headers()
+            return
+        if parsed.path == "/motion-preflight-ready":
+            job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if job and job.get("status") == "awaiting_approval" and job.get("motion_preflight"):
+                    event = job.get("motion_preflight_event")
+                else:
+                    event = None
+            if event:
+                event.set()
+            self.send_bytes(json.dumps({"ok": bool(event)}).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/motion-manual-upload":
+            job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            content_type = self.headers.get("Content-Type", "")
+            try:
+                if "multipart/form-data" not in content_type:
+                    raise ValueError("choose the finished Seedance MP4 first")
+                _fields, files = parse_multipart(content_type, body)
+                upload = files.get("motion_manual_clip") or (list(files.values())[0] if files else None)
+                if not upload or not upload.get("data"):
+                    raise ValueError("no video was received")
+                filename = str(upload.get("filename") or "")
+                if Path(filename).suffix.lower() not in {".mp4", ".mov", ".webm"}:
+                    raise ValueError("import the downloaded video file (.mp4, .mov or .webm)")
+                path = save_upload(upload, job_id)
+                if not path or not Path(path).is_file() or Path(path).stat().st_size < 1024:
+                    raise ValueError("that video looks empty")
+                with JOB_LOCK:
+                    job = JOBS.get(job_id)
+                    if not job or job.get("status") != "awaiting_approval" or not job.get("motion_manual"):
+                        raise ValueError("this chapter is no longer waiting for an import")
+                    job["motion_manual"]["upload_path"] = path
+                    event = job.get("motion_manual_event")
+                if event:
+                    event.set()
+                self.send_bytes(json.dumps({"ok": True}).encode("utf-8"), "application/json; charset=utf-8")
+            except Exception as exc:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
             return
         if parsed.path == "/replace-speech":
             job_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
@@ -14979,7 +15657,9 @@ class Handler(BaseHTTPRequestHandler):
             # Force a full fresh regeneration (never reuse a cached voiceover the user just rejected).
             restart_fields["regenerate_voice"] = "on"
             # apply the user's new speaker choice and restart focusing on speech first
-            for key in ("speaker_name", "tts_voice", "tts_model", "speaker_image_path"):
+            for key in ("speaker_name", "tts_voice", "tts_model", "tts_voice_instruction",
+                        "tts_language", "tts_native_speed", "tts_volume", "tts_pitch",
+                        "tts_output_format", "speaker_image_path"):
                 vals = posted.get(key)
                 if vals:
                     restart_fields[key] = vals[0]
@@ -15393,6 +16073,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
                                        "moonshotai/kimi-k3",
                                        "google/gemini-3.5-flash", "google/gemini-3.1-flash-lite",
+                                       "google/gemini-3.5-flash-lite",
                                        "google/gemini-3.1-pro-preview"}:
                 reasoning_model = "openai/gpt-5.5"
             reasoning_mode = reasoning_modes.validate_reasoning_mode(reasoning_model, data.get("reasoning_mode"))
@@ -15443,7 +16124,8 @@ class Handler(BaseHTTPRequestHandler):
                                                     reasoning_model=reasoning_model,
                                                     reasoning_mode=reasoning_mode,
                                                     regen_captions=do_redo_captions,
-                                                    render_after=render_after)
+                                                    render_after=render_after,
+                                                    voice_speed=data.get("voice_speed"))
                 self.send_bytes(json.dumps({"ok": True, "job": f"/job?id={urllib.parse.quote(job_id)}"}).encode("utf-8"), "application/json; charset=utf-8")
                 return
             # Scrape projects replace marked scenes by running a NEW targeted TikTok/X search.

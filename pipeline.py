@@ -73,6 +73,10 @@ GEMINI_TTS_MODELS = {
 }
 SEED_SPEECH_TTS_MODEL = "bytedance/seed-speech-tts-2.0"
 SEED_SPEECH_TTS_ALIASES = {"seed-speech-tts-2.0", "seed-speech", SEED_SPEECH_TTS_MODEL}
+SEED_DEFAULT_VOICE_INSTRUCTION = (
+    "Upbeat, energetic, confident short-form narrator. Fast but clear, conversational, "
+    "with strong emphasis on the hook and key words. Avoid sounding rushed or overly dramatic."
+)
 SEED_SPEECH_TTS_VOICES = [
     "vivi_mixed_en_zh_ja_es_id", "mindy_en_es_id_pt_zh", "stokie_en", "dacey_en",
     "tim_en", "kian_en_zh", "cedric_en_zh", "sophie_en_zh", "jean_en_zh",
@@ -104,21 +108,13 @@ GEMINI_TTS_VOICES = [
 ]
 
 
-# A leading DELIVERY directive for Gemini TTS. Gemini 2.5 interprets a natural-language style
-# instruction at the top of the text and applies it to the performance WITHOUT reading it aloud -
-# this is what makes the narration genuinely ENERGETIC (not just EQ'd louder) and crisper. Set to
-# "" to disable instantly if a voice ever speaks it literally.
-TTS_STYLE_DIRECTIVE = ("Read the following with high energy and enthusiasm - an upbeat, engaging, "
-                       "punchy viral-narrator delivery, with crisp, clear enunciation")
-
-# Seed Speech accepts its delivery direction in a separate field rather than inside the
-# spoken text. Keep the same energetic Short profile as Gemini, but phrase it as an API
-# instruction so Seed never reads it aloud. This is intentionally internal: the app has
-# one consistent narrator behaviour instead of a second prompt box.
-SEED_SHORT_STYLE_INSTRUCTION = (
-    "Upbeat, energetic and curious viral short-form narration. Keep a brisk natural pace, "
-    "clear emphasis on the hook and key reveals, crisp confident enunciation, and no flat or sleepy delivery."
-)
+# Fact Shorts need to sound like a creator who is genuinely excited to tell the viewer something,
+# not like a calm documentary read.  Keep it conversational and clear rather than shouty; Seed
+# Speech has its own separate instruction path below and is intentionally unaffected by this.
+TTS_STYLE_DIRECTIVE = ("Read the following as an upbeat, lively short-form creator: warm, curious "
+                       "and confidently energetic, with expressive natural emphasis and crisp, "
+                       "easy-to-follow pacing. Sound genuinely excited by each reveal, never flat, "
+                       "shouty, salesy, or like an advertisement")
 
 # The directive above is written for a 30-second Short, where relentless energy is the point. Over a
 # long narration it is exhausting and fights an informative narrator, so the long formats ask for a
@@ -150,7 +146,7 @@ def format_tts_script(speaker_name, text, style=None):
 def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER,
                            voice=DEFAULT_TTS_VOICE, model=DEFAULT_TTS_MODEL,
                            language=DEFAULT_TTS_LANGUAGE, cancel_event=None,
-                           status_cb=None, style=None, voice_instruction=None,
+                           status_cb=None, style=None, voice_instruction=None, auto_upbeat=True,
                            tts_speed=1.0, volume=1.0, pitch=0, sample_rate=24000,
                            output_format="mp3"):
     """Generate a spoken voiceover with Gemini or ByteDance Seed Speech TTS.
@@ -185,9 +181,12 @@ def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER
             seed_language = "en"
         if seed_language not in SEED_SPEECH_LANGUAGES:
             seed_language = ""
-        # Seed Speech has its own delivery engine, so Gemini's speaker-labelled text is
-        # never sent here. Its equivalent style prompt belongs in voice_instruction.
-        instruction = str(voice_instruction or "").strip() or SEED_SHORT_STYLE_INSTRUCTION
+        # Seed Speech has its own delivery engine. Never leak Gemini's narrator directive into
+        # this payload: doing so made both providers sound and behave like the same preset.
+        # An empty Seed instruction deliberately means the model's native voice behaviour.
+        instruction = str(voice_instruction or "").strip() or (
+            SEED_DEFAULT_VOICE_INSTRUCTION if auto_upbeat else ""
+        )
         payload = {"text": str(text or "").strip(), "voice": seed_voice,
                    "output_format": seed_format, "sample_rate": seed_rate,
                    "speed": seed_speed, "volume": seed_volume, "pitch": seed_pitch}
@@ -198,12 +197,15 @@ def generate_speech_gemini(text, out_path, key=None, speaker=DEFAULT_TTS_SPEAKER
         voice = seed_voice
         status_log(status_cb, f"Generating voiceover ({seed_voice}) with {model_id}...")
     else:
+        gemini_voice = str(voice or "").strip()
+        if gemini_voice not in GEMINI_TTS_VOICES:
+            gemini_voice = DEFAULT_TTS_VOICE
         payload = {
             "text": format_tts_script(speaker, text, style=style),
             "language": language or DEFAULT_TTS_LANGUAGE,
-            "speakers": [{"speaker": speaker, "voice": voice or DEFAULT_TTS_VOICE}],
+            "speakers": [{"speaker": speaker, "voice": gemini_voice}],
         }
-        status_log(status_cb, f"Generating voiceover ({speaker}/{voice}) with {model_id}...")
+        status_log(status_cb, f"Generating voiceover ({speaker}/{gemini_voice}) with {model_id}...")
     response = request_json("POST", f"{API_BASE}/{model_id}", key, payload, timeout=180)
     prediction_id = unwrap_id(response)
     outputs, _ = poll_wavespeed(prediction_id, key, timeout_s=420, cancel_event=cancel_event,
@@ -800,8 +802,63 @@ def caption_chunk_sizes(tokens, timings=None, config=None):
     return sizes
 
 
+def _attach_word_timings(caption_track, project_dir, status_cb=None):
+    """Fill each caption sentence with real per-word timings from the voiceover.
+
+    Transcribes the project's voiceover once (locally, no API), caches the result next to
+    it, and hands each sentence the words that fall inside its window. Anything that fails
+    leaves the track untouched: even captions are worse than none, but they still work.
+    """
+    project_dir = Path(project_dir)
+    cache = project_dir / "voice" / "word_timestamps.json"
+    words = []
+    try:
+        if cache.is_file():
+            raw = json.loads(cache.read_text(encoding="utf-8"))
+            words = raw if isinstance(raw, list) else (raw.get("words") or [])
+    except Exception:  # noqa: BLE001
+        words = []
+    if not words:
+        audio = next((project_dir / "input" / n for n in
+                      ("voiceover.wav", "voiceover.mp3", "voiceover.m4a")
+                      if (project_dir / "input" / n).is_file()), None)
+        if audio is None:
+            return
+        try:
+            import voice_align
+            if not voice_align.available():
+                return
+            status_log(status_cb, "Captions: timing words against the voiceover...")
+            words = voice_align.transcribe_words(str(audio), status_cb=status_cb) or []
+        except Exception as exc:  # noqa: BLE001
+            status_log(status_cb, f"Captions: word timing unavailable ({exc}); "
+                                  "falling back to even spacing.")
+            return
+        if words:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(words, indent=1), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+    if not words:
+        return
+    for row in caption_track:
+        try:
+            start = float(row.get("start", 0) or 0)
+            end = float(row.get("end", start) or start)
+        except (TypeError, ValueError):
+            continue
+        inside = [w for w in words
+                  if start - 0.05 <= float(w.get("start", 0) or 0) < end + 0.05]
+        # times are stored relative to the sentence, which is what build_caption_chunks wants
+        row["word_timings"] = [{"word": w.get("word", ""),
+                                "start": max(0.0, float(w.get("start", 0) or 0) - start),
+                                "end": max(0.0, float(w.get("end", 0) or 0) - start)}
+                               for w in inside]
+
+
 def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times=None, fps=None,
-                         kw_colors=None):
+                         kw_colors=None, caption_config=None):
     """Turn a spoken line into timed caption chunks (1-`max_words` words each).
 
     When `word_times` (frame-accurate [{word,start,end}] in scene-local seconds) is
@@ -830,9 +887,11 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
             if not word:
                 continue
             start = _snap(max(0.0, float(wt.get("start", 0.0)) - CAPTION_SYNC_LEAD))
+            start = min(start, max(0.0, duration - 0.05))
             if spans and start < spans[-1]["start"] + 0.03:
-                start = spans[-1]["start"] + 0.03
-            end = max(start + 0.05, _snap(float(wt.get("end", start)) - CAPTION_SYNC_LEAD))
+                start = min(spans[-1]["start"] + 0.03, max(0.0, duration - 0.05))
+            end = min(duration, max(start + 0.05,
+                                   _snap(float(wt.get("end", start)) - CAPTION_SYNC_LEAD)))
             if spans and spans[-1]["end"] > start:
                 spans[-1]["end"] = start           # keep spans gap-free + non-overlapping
             spans.append({
@@ -862,7 +921,22 @@ def build_caption_chunks(text, duration, max_words=3, uppercase=True, word_times
     # WORD-BY-WORD captions (user rule 2026-07-23): every word with 4+ characters stands
     # ALONE on screen; short words (1-3 chars: "by", "the", "a") never stand alone -
     # consecutive short words group ("by the"), a lone short word joins the NEXT word.
-    sizes = caption_chunk_sizes([s["text"] for s in spans])
+    sizes = caption_chunk_sizes(
+        [s["text"] for s in spans],
+        timings=word_times,
+        config=caption_config,
+    )
+    # Keep the visual card limit authoritative even when a timing-based grouping
+    # strategy returns a larger reading-time card.
+    safe_max_words = max(1, int(max_words or 1))
+    bounded_sizes = []
+    for size in sizes:
+        while size > safe_max_words:
+            bounded_sizes.append(safe_max_words)
+            size -= safe_max_words
+        if size:
+            bounded_sizes.append(size)
+    sizes = bounded_sizes
     chunks = []
     i = 0
     for size in sizes:
@@ -3402,6 +3476,13 @@ def render_video(config, basename=None):
             caption_track = []
         if not caption_track:
             caption_track = list(config.get("timeline_caption_track") or [])
+        # Sentence timestamps alone are not enough. With no word timings the chunk builder
+        # spreads the words EVENLY across the sentence window - and that window includes the
+        # pause at the end of the sentence, so every word after the first drifts late and
+        # resets at the next sentence. Measured on a finished render: mean +677ms, median
+        # +510ms, worst +1710ms, with 71 of 89 words more than 150ms behind the voice.
+        if caption_track and not any(row.get("word_timings") for row in caption_track):
+            _attach_word_timings(caption_track, asset_dir.parent, status_cb=status_cb)
         for row in caption_track:
             try:
                 start = max(0.0, float(row.get("start", 0) or 0))
@@ -3419,7 +3500,8 @@ def render_video(config, basename=None):
                 })
             chunks = build_caption_chunks(
                 str(row.get("text") or ""), end - start, caption_max_words,
-                caption_uppercase, word_times=word_times, fps=fps, kw_colors=_cap_kw)
+                caption_uppercase, word_times=word_times, fps=fps, kw_colors=_cap_kw,
+                caption_config=config)
             for chunk in chunks:
                 shifted = dict(chunk)
                 shifted["start"] = float(chunk["start"]) + start
@@ -3436,6 +3518,7 @@ def render_video(config, basename=None):
             caption_chunks_by_scene[sid] = build_caption_chunks(
                 ctext, sdur, caption_max_words, caption_uppercase,
                 word_times=scene.get("word_timings"), fps=fps, kw_colors=_cap_kw,
+                caption_config=config,
             )
         if bool(config.get("export_caption_pngs", True)):
             try:
@@ -3490,7 +3573,7 @@ def render_video(config, basename=None):
                 scene_duration = max(0.1, float(scene.get("end", 0)) - float(scene.get("start", 0)))
                 usable_duration = max(0.0, clip_obj.duration - start_trim - offset)
                 # Never stretch or loop a too-short video into a frozen/glitchy tail.
-                if usable_duration + 0.08 < scene_duration:
+                if usable_duration + 0.08 < scene_duration and not config.get("tolerate_clip_defects"):
                     clip_obj.release()
                     for existing_clip in clips.values():
                         existing_clip.release()
@@ -3523,11 +3606,6 @@ def render_video(config, basename=None):
                         if status_cb:
                             status_cb(f"Render warning: scene {scene_id} has isolated duplicate-frame "
                                       f"hitches at {shown} - continuing (chosen candidate).")
-                    elif config.get("allow_repairable_source_hitches"):
-                        if status_cb:
-                            shown = ", ".join(f"{stamp:.2f}s" for stamp in cadence_hitches[:4])
-                            status_cb(f"Render warning: scene {scene_id} has isolated duplicate-frame "
-                                      f"hitches at {shown} - continuing (reviewed source).")
                     else:
                         clip_obj.release()
                         for existing_clip in clips.values():
@@ -3829,6 +3907,22 @@ def render_video(config, basename=None):
                 dur = float(segment["duration"])
                 playback_rate = max(0.01, float(segment.get("playback_rate") or 1.0))
                 source_duration = float(segment.get("source_duration") or (dur * playback_rate))
+                if config.get("timeline_editor_render"):
+                    # The editor preview plays the selected SFX through its real file end.
+                    # Do not let the stale event duration silently chop risers and effects
+                    # during the final render.
+                    try:
+                        if not float(segment.get("source_duration") or 0.0):
+                            probed = subprocess.run(
+                                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1",
+                                 str(segment["path"])],
+                                capture_output=True, text=True, timeout=15,
+                            )
+                            source_duration = max(source_duration, float(probed.stdout.strip() or 0.0))
+                    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+                        pass
+                    dur = max(dur, source_duration / playback_rate)
                 tempo = atempo_filter_chain(playback_rate)
                 tempo_part = f",{tempo}" if tempo else ""
                 fade_out_start = max(0.0, dur - 0.08)

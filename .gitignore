@@ -105,3 +105,9 @@ _stretched_risers/
 /assets/broll/
 /reference.mp4
 /candidate library/
+
+# Generated Blender scenes and probe frames: every prompt writes a new one, they are run
+# artefacts and not source. The hand-written scenes and the kit ARE tracked.
+physics_mode/scenes/generated/
+lowpoly_mode/generated/
+lowpoly_mode/**/probe/
