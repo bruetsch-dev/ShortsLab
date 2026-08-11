@@ -16,8 +16,8 @@ from pathlib import Path
 import caption_agent
 import pipeline
 
-from . import shots as shotlib
 from . import story as storylib
+from .render import render_shot
 
 # Small and cheap on purpose. The style is crude, so resolution and sample count buy
 # nothing but render time - and a 12-shot story is 12 renders, not one.
@@ -76,11 +76,9 @@ def build(out_dir, prompt: str, *, seconds: float = 30.0, status_cb=None,
     for i, shot in enumerate(timed, 1):
         _log(status_cb, f"Shot {i}/{len(timed)} ({shot['seconds']:.1f}s)")
         try:
-            script = shotlib.author_shot(shot["scene"], i, shot["seconds"], out,
-                                         status_cb=status_cb, blender=blender)
-            clip = shotlib.render_shot(script, out / "shots" / f"{i:02d}",
-                                       shot["seconds"], res=RES, samples=SAMPLES,
-                                       fps=FPS, status_cb=status_cb, blender=blender)
+            clip = render_shot(shot["spec"], out / "shots" / f"{i:02d}",
+                               shot["seconds"], res=RES, fps=FPS,
+                               status_cb=status_cb, blender=blender)
         except Exception as exc:  # noqa: BLE001
             _log(status_cb, f"  shot {i} dropped: {exc}")
             clip = None

@@ -103,75 +103,83 @@ def _cone(name, radius, depth, loc, material, parent=None, rot=(0, 0, 0), verts=
     return o
 
 
-# ---------------------------------------------------------------- the cat
+# ---------------------------------------------------------------- creatures
+# ONE parametric builder, not a library of animals. The model supplies proportions - how
+# long the body is, how many legs, whether there are ears, a tail, a snout - and this
+# assembles them. That keeps "the model never writes geometry" true while still allowing a
+# cat, a dog, a bird, a person or a cow, which a cat-only kit could not.
 
 
-class Cat:
-    """One low-poly cat. `root` is an empty at its feet - move and rotate THAT.
+class Creature:
+    """A built figure. `root` is an empty at its feet - move and rotate THAT.
 
-    Every part is kept as an attribute so a shot can pose the head, tail or a leg without
-    guessing object names.
+    `legs` is a list in build order, so the poses below work whether there are two of them
+    or four.
     """
 
-    def __init__(self, root, parts, scale=1.0):
+    def __init__(self, root, parts, legs, scale=1.0, body_z=0.3, biped=False):
         self.root = root
         self.parts = parts
+        self.legs = legs
         self.scale = scale
+        self._body_z = body_z
+        self.biped = biped
         for k, v in parts.items():
             setattr(self, k, v)
 
-    # --- placement
     def place(self, x=0.0, y=0.0, z=0.0, facing_deg=0.0):
         self.root.location = (x, y, z)
         self.root.rotation_euler = (0, 0, math.radians(facing_deg))
         return self
 
     def key(self, frame):
-        """Keyframe the whole cat as it currently stands."""
         for o in [self.root] + list(self.parts.values()):
             o.keyframe_insert("location", frame=frame)
             o.keyframe_insert("rotation_euler", frame=frame)
         return self
 
-    # --- poses
     def pose_stand(self):
-        for leg in (self.leg_fl, self.leg_fr, self.leg_bl, self.leg_br):
+        for leg in self.legs:
             leg.rotation_euler = (0, 0, 0)
         self.body.rotation_euler = (0, 0, 0)
+        self.body.location.z = self._body_z
         self.head.rotation_euler = (0, 0, 0)
         return self
 
     def pose_sit(self):
-        """Rear folded FORWARD under the body, front legs straight, chest up.
+        """Rear folded forward under the body, front upright, chest lifted.
 
-        The cat faces -Y, and a limb hangs below its hip joint, so a POSITIVE rotation
-        about X swings the paw backwards - which laid the first attempt flat on its side.
-        Folding under the body is negative, and the root must not sink or the whole cat
-        drops through the floor with it.
+        The figure faces -Y and a limb hangs below its joint, so folding it UNDER the body
+        is a NEGATIVE rotation about X. Getting that sign wrong lays the whole thing on its
+        side, which is exactly how the first attempt looked.
         """
-        self.root.location.z = 0.0
         self.body.rotation_euler = (math.radians(-22), 0, 0)
         self.body.location.z = self._body_z - 0.06 * self.scale
-        for leg in (self.leg_bl, self.leg_br):
+        for leg in (self.legs[2:] if len(self.legs) > 2 else []):
             leg.rotation_euler = (math.radians(-72), 0, 0)
-        for leg in (self.leg_fl, self.leg_fr):
+        for leg in self.legs[:2]:
             leg.rotation_euler = (0, 0, 0)
         self.head.rotation_euler = (math.radians(10), 0, 0)
-        self.tail.rotation_euler = (math.radians(6), 0, 0)
+        if getattr(self, "tail", None):
+            self.tail.rotation_euler = (math.radians(6), 0, 0)
         return self
 
     def pose_walk(self, phase):
-        """`phase` 0..1 through one stride. Diagonal pairs, as cats actually move."""
+        """One stride. Four legs move in diagonal pairs; two legs alternate."""
         a = math.radians(26) * math.sin(2 * math.pi * phase)
-        self.leg_fl.rotation_euler = (a, 0, 0)
-        self.leg_br.rotation_euler = (a, 0, 0)
-        self.leg_fr.rotation_euler = (-a, 0, 0)
-        self.leg_bl.rotation_euler = (-a, 0, 0)
-        # a small vertical bob at twice the stride rate reads as weight
+        if len(self.legs) >= 4:
+            self.legs[0].rotation_euler = (a, 0, 0)
+            self.legs[3].rotation_euler = (a, 0, 0)
+            self.legs[1].rotation_euler = (-a, 0, 0)
+            self.legs[2].rotation_euler = (-a, 0, 0)
+        else:
+            for i, leg in enumerate(self.legs):
+                leg.rotation_euler = ((a if i % 2 == 0 else -a), 0, 0)
         self.body.location.z = self._body_z + 0.012 * self.scale * math.sin(
             4 * math.pi * phase)
-        self.tail.rotation_euler = (math.radians(-18),
-                                    math.radians(9) * math.sin(2 * math.pi * phase), 0)
+        if getattr(self, "tail", None):
+            self.tail.rotation_euler = (math.radians(-18),
+                                        math.radians(9) * math.sin(2 * math.pi * phase), 0)
         return self
 
     def look(self, yaw_deg=0.0, pitch_deg=0.0):
@@ -179,55 +187,124 @@ class Cat:
         return self
 
     def tail_sway(self, phase, amount_deg=22.0):
-        self.tail.rotation_euler = (math.radians(-25), 0,
-                                    math.radians(amount_deg) * math.sin(2 * math.pi * phase))
+        if getattr(self, "tail", None):
+            self.tail.rotation_euler = (
+                math.radians(-25), 0,
+                math.radians(amount_deg) * math.sin(2 * math.pi * phase))
         return self
 
     def objects(self):
         return [self.root] + list(self.parts.values())
 
 
-def cat(color=FUR, scale=1.0, name="Cat"):
-    """Build a cat. Returns a `Cat`; move it with .place(), pose it with .pose_*()."""
-    fur = mat(f"{name}_fur", color)
-    dark = mat(f"{name}_dark", DARK, rough=0.5)
-    pink = mat(f"{name}_pink", PINK)
+# Proportions only - no geometry. A new animal is a new row here, not new code.
+SPECIES = {
+    "cat":   dict(body=(0.30, 0.60, 0.26), head=0.24, legs=4, leg=(0.09, 0.30),
+                  ears="pointy", tail="long", snout=True, neck=0.0),
+    "dog":   dict(body=(0.34, 0.72, 0.32), head=0.28, legs=4, leg=(0.11, 0.34),
+                  ears="floppy", tail="long", snout=True, neck=0.0),
+    "mouse": dict(body=(0.18, 0.30, 0.16), head=0.15, legs=4, leg=(0.05, 0.12),
+                  ears="round", tail="long", snout=True, neck=0.0),
+    "bear":  dict(body=(0.52, 0.90, 0.50), head=0.36, legs=4, leg=(0.16, 0.36),
+                  ears="round", tail="none", snout=True, neck=0.0),
+    "cow":   dict(body=(0.46, 1.00, 0.46), head=0.30, legs=4, leg=(0.12, 0.46),
+                  ears="round", tail="long", snout=True, neck=0.10),
+    # Bipeds get a NECK of almost nothing. The gap is measured in the same units as the
+    # head, so 0.08 left the head visibly floating clear of the shoulders.
+    "bird":  dict(body=(0.26, 0.30, 0.30), head=0.16, legs=2, leg=(0.045, 0.13),
+                  ears="none", tail="short", snout=True, neck=0.01, wings=True),
+    "human": dict(body=(0.34, 0.22, 0.62), head=0.26, legs=2, leg=(0.12, 0.52),
+                  ears="none", tail="none", snout=False, neck=0.015, arms=True),
+    "robot": dict(body=(0.40, 0.28, 0.58), head=0.30, legs=2, leg=(0.14, 0.46),
+                  ears="none", tail="none", snout=False, neck=0.02, arms=True),
+}
+
+
+def creature(kind="cat", color=None, scale=1.0, name=None, **overrides):
+    """Build a figure from SPECIES proportions, with any value overridable.
+
+    An unknown kind falls back to the cat proportions rather than raising: an odd-looking
+    animal still carries a shot, an exception does not.
+    """
+    spec = dict(SPECIES.get(str(kind).lower(), SPECIES["cat"]))
+    spec.update({k: v for k, v in overrides.items() if v is not None})
+    name = name or str(kind).title()
+    fur = mat(name + "_skin", color or FUR)
+    dark = mat(name + "_dark", DARK, rough=0.5)
+    pink = mat(name + "_pink", PINK)
 
     bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
     root = bpy.context.object
     root.name = name
     root.empty_display_size = 0.15
 
-    s = scale
-    body_z = 0.30 * s
-    body = _box(f"{name}_body", (0.30 * s, 0.60 * s, 0.26 * s), (0, 0, body_z), fur, root)
-    head = _box(f"{name}_head", (0.26 * s, 0.24 * s, 0.24 * s),
-                (0, -0.40 * s, 0.42 * s), fur, root)
-    _box(f"{name}_muzzle", (0.14 * s, 0.09 * s, 0.10 * s),
-         (0, -0.54 * s, 0.37 * s), fur, head)
-    _box(f"{name}_nose", (0.05 * s, 0.03 * s, 0.035 * s),
-         (0, -0.59 * s, 0.39 * s), pink, head)
+    s = float(scale)
+    bw, bl, bh = [v * s for v in spec["body"]]
+    lw, ll = [v * s for v in spec["leg"]]
+    biped = int(spec.get("legs", 4)) <= 2
+    hs = spec["head"] * s
+    neck = float(spec.get("neck", 0.0)) * s
+
+    body_z = ll + bh / 2
+    body = _box(name + "_body", (bw, bl, bh), (0, 0, body_z), fur, root)
+    head_y = 0.0 if biped else -(bl / 2 + hs / 2) * 0.85
+    head_z = body_z + (bh / 2 + hs / 2 + neck if biped else bh * 0.35 + neck)
+    head = _box(name + "_head", (hs, hs * 0.95, hs), (0, head_y, head_z), fur, root)
+
+    parts = {"body": body, "head": head}
+    if spec.get("snout", True):
+        _box(name + "_snout", (hs * 0.55, hs * 0.40, hs * 0.42),
+             (0, head_y - hs * 0.62, head_z - hs * 0.16), fur, head)
+        _box(name + "_nose", (hs * 0.20, hs * 0.12, hs * 0.14),
+             (0, head_y - hs * 0.84, head_z - hs * 0.10), pink, head)
     for side in (-1, 1):
-        _box(f"{name}_eye{side}", (0.055 * s, 0.02 * s, 0.055 * s),
-             (0.075 * s * side, -0.52 * s, 0.46 * s), dark, head)
-        # three-sided cones: an ear is a triangle, and three verts is as low-poly as it gets
-        _cone(f"{name}_ear{side}", 0.085 * s, 0.16 * s,
-              (0.095 * s * side, -0.36 * s, 0.57 * s), fur, head,
-              rot=(0, 0, math.radians(90)))
-    legs = {}
-    for key, (dx, dy) in {"leg_fl": (-1, -1), "leg_fr": (1, -1),
-                          "leg_bl": (-1, 1), "leg_br": (1, 1)}.items():
-        # jointed at the shoulder/hip, hanging down to the floor
-        legs[key] = _limb(f"{name}_{key}", (0.09 * s, 0.09 * s, 0.30 * s),
-                          (0.11 * s * dx, 0.22 * s * dy, 0.30 * s), fur, root, axis="z")
-    # jointed where it meets the body, running backwards
-    tail = _limb(f"{name}_tail", (0.07 * s, 0.42 * s, 0.07 * s),
-                 (0, 0.28 * s, 0.38 * s), fur, root, axis="y")
-    tail.rotation_euler = (math.radians(-28), 0, 0)
-    parts = {"body": body, "head": head, "tail": tail, **legs}
-    c = Cat(root, parts, scale=s)
-    c._body_z = body_z
-    return c
+        _box(name + "_eye" + str(side), (hs * 0.22, hs * 0.08, hs * 0.22),
+             (hs * 0.28 * side, head_y - hs * 0.52, head_z + hs * 0.14), dark, head)
+
+    ears = str(spec.get("ears", "none")).lower()
+    if ears == "pointy":
+        for side in (-1, 1):
+            _cone(name + "_ear" + str(side), hs * 0.34, hs * 0.66,
+                  (hs * 0.36 * side, head_y + hs * 0.10, head_z + hs * 0.72), fur, head,
+                  rot=(0, 0, math.radians(90)))
+    elif ears in ("round", "floppy"):
+        for side in (-1, 1):
+            _box(name + "_ear" + str(side), (hs * 0.10, hs * 0.30, hs * 0.34),
+                 (hs * (0.55 if ears == "floppy" else 0.50) * side, head_y,
+                  head_z + (hs * 0.10 if ears == "floppy" else hs * 0.60)), fur, head)
+
+    legs = []
+    slots = ([(-1, -1), (1, -1), (-1, 1), (1, 1)] if int(spec.get("legs", 4)) >= 4
+             else [(-1, 0), (1, 0)])
+    for i, (dx, dy) in enumerate(slots):
+        legs.append(_limb(name + "_leg" + str(i), (lw, lw, ll),
+                          (bw * 0.38 * dx, bl * 0.36 * dy, ll), fur, root, axis="z"))
+    if spec.get("arms"):
+        for i, dx in enumerate((-1, 1)):
+            parts["arm" + str(i)] = _limb(
+                name + "_arm" + str(i), (lw * 0.8, lw * 0.8, bh * 0.75),
+                (bw * 0.62 * dx, 0, body_z + bh * 0.36), fur, root, axis="z")
+    if spec.get("wings"):
+        for i, dx in enumerate((-1, 1)):
+            parts["wing" + str(i)] = _box(
+                name + "_wing" + str(i), (bw * 0.20, bl * 0.75, bh * 0.30),
+                (bw * 0.60 * dx, 0, body_z), fur, root)
+
+    tail_kind = str(spec.get("tail", "none")).lower()
+    if tail_kind != "none":
+        tl = bl * (0.75 if tail_kind == "long" else 0.30)
+        parts["tail"] = _limb(name + "_tail", (lw * 0.75, tl, lw * 0.75),
+                              (0, bl * 0.45, body_z + bh * 0.20), fur, root, axis="y")
+        parts["tail"].rotation_euler = (math.radians(-28), 0, 0)
+
+    for i, leg in enumerate(legs):
+        parts["leg" + str(i)] = leg
+    return Creature(root, parts, legs, scale=s, body_z=body_z, biped=biped)
+
+
+def cat(color=FUR, scale=1.0, name="Cat"):
+    """Shortcut kept because plenty of shots ask for exactly this."""
+    return creature("cat", color=color, scale=scale, name=name)
 
 
 # ---------------------------------------------------------------- world
@@ -269,7 +346,13 @@ def lights(strength=3.0):
 
 def _bounds(objects):
     xs, ys, zs = [], [], []
+    # Force the transforms to catch up first. Framing runs after the animation has been
+    # keyed, and without this the world matrices are still whatever they were when the
+    # objects were built - a cat that walks in from the left gets framed at the position
+    # it never occupies, and drops out of the shot entirely.
+    bpy.context.view_layer.update()
     deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
     for o in objects:
         if o.type == "EMPTY":
             continue
@@ -296,7 +379,7 @@ def frame(subjects, fill=0.5, lens=42.0, yaw_deg=-35.0, pitch_deg=68.0):
         subjects = [subjects]
     flat = []
     for s in subjects:
-        flat.extend(s.objects() if isinstance(s, Cat) else [s])
+        flat.extend(s.objects() if isinstance(s, Creature) else [s])
     centre, span = _bounds(flat)
     dist = (span / max(0.15, fill)) * lens / 36.0
     yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
@@ -357,3 +440,172 @@ def finish(P, sc, note=""):
     sc.render.filepath = os.path.join(out, "frame_")
     bpy.ops.render.render(animation=True)
     print(f"SCENE_OK frames={sc.frame_end} {note}")
+
+# ---------------------------------------------------------------- props
+# A fixed, small catalogue. The model picks from it by name; it never invents geometry,
+# which is what made the first version render floating rectangles.
+
+PALETTE = {
+    "wood": (0.42, 0.30, 0.20), "cream": (0.80, 0.76, 0.68),
+    "red": (0.62, 0.20, 0.18), "blue": (0.22, 0.34, 0.58),
+    "green": (0.24, 0.44, 0.30), "grey": (0.34, 0.35, 0.38),
+    "white": (0.85, 0.85, 0.84), "black": (0.10, 0.10, 0.12),
+    "pink": (0.82, 0.52, 0.56), "yellow": (0.85, 0.70, 0.25),
+}
+
+
+def _colour(name, default=(0.45, 0.35, 0.28)):
+    return PALETTE.get(str(name or "").lower(), default)
+
+
+def prop(kind, at=(0.0, 0.0), colour="wood", size=1.0, name=None):
+    """One prop from the catalogue, sitting on the floor at `at`.
+
+    Returns the object (or a list for multi-part props) so a shot can frame it and the
+    cat together. Unknown kinds fall back to a plain box rather than failing the render.
+    """
+    kind = str(kind or "box").lower()
+    c = mat(f"p_{kind}_{colour}", _colour(colour))
+    x, y = float(at[0]), float(at[1])
+    n = name or f"{kind}_{abs(hash((kind, x, y))) % 9999}"
+    s_ = float(size)
+    if kind in ("box", "crate", "cardboard_box"):
+        h = 0.55 * s_
+        return _box(n, (0.7 * s_, 0.7 * s_, h), (x, y, h / 2), c)
+    if kind in ("bowl", "food_bowl"):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=8, radius=0.16 * s_, depth=0.10 * s_,
+                                            location=(x, y, 0.05 * s_))
+        o = bpy.context.object
+        o.name = n
+        o.data.materials.append(c)
+        return o
+    if kind in ("ball", "yarn", "toy"):
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=1, radius=0.13 * s_,
+                                              location=(x, y, 0.13 * s_))
+        o = bpy.context.object
+        o.name = n
+        o.data.materials.append(c)
+        return o
+    if kind in ("table", "desk"):
+        top_z = 0.62 * s_
+        parts = [_box(n, (1.1 * s_, 0.7 * s_, 0.07 * s_), (x, y, top_z), c)]
+        for dx in (-1, 1):
+            for dy in (-1, 1):
+                parts.append(_box(f"{n}_leg{dx}{dy}", (0.07 * s_, 0.07 * s_, top_z),
+                                  (x + dx * 0.48 * s_, y + dy * 0.28 * s_, top_z / 2), c))
+        return parts
+    if kind in ("sofa", "couch", "bed"):
+        parts = [_box(n, (1.6 * s_, 0.75 * s_, 0.35 * s_), (x, y, 0.175 * s_), c),
+                 _box(f"{n}_back", (1.6 * s_, 0.16 * s_, 0.45 * s_),
+                      (x, y + 0.30 * s_, 0.40 * s_), c)]
+        return parts
+    if kind in ("window", "wall"):
+        # a wall panel standing behind the action, with a lighter pane in it
+        parts = [_box(n, (2.4 * s_, 0.1 * s_, 1.9 * s_), (x, y, 0.95 * s_), c)]
+        if kind == "window":
+            parts.append(_box(f"{n}_pane", (1.0 * s_, 0.12 * s_, 0.9 * s_),
+                              (x, y - 0.01, 1.15 * s_),
+                              mat("pane", (0.55, 0.68, 0.80), rough=0.25)))
+        return parts
+    if kind in ("rug", "mat"):
+        return _box(n, (1.5 * s_, 1.0 * s_, 0.03 * s_), (x, y, 0.015 * s_), c)
+    if kind in ("plant", "tree"):
+        parts = [_box(f"{n}_pot", (0.24 * s_, 0.24 * s_, 0.26 * s_), (x, y, 0.13 * s_),
+                      mat("pot", _colour("red")))]
+        for i, (dx, dz, sz) in enumerate(((0, 0.55, 0.42), (0.12, 0.75, 0.30),
+                                          (-0.10, 0.70, 0.26))):
+            parts.append(_cone(f"{n}_leaf{i}", sz * s_ * 0.5, 0.5 * s_,
+                               (x + dx * s_, y, dz * s_ + 0.2), c, verts=4))
+        return parts
+    h = 0.4 * s_
+    return _box(n, (0.5 * s_, 0.5 * s_, h), (x, y, h / 2), c)
+
+
+def flatten(items):
+    """Props may be one object or several; framing wants a flat list."""
+    out = []
+    for it in (items if isinstance(items, (list, tuple)) else [items]):
+        out.extend(flatten(it) if isinstance(it, (list, tuple)) else [it])
+    return out
+
+
+# ---------------------------------------------------------------- actions
+
+
+def act(cat, action, sc, target=(0.0, 0.0), start=(0.0, 0.0), facing=0.0):
+    """Animate the cat through one named action for the whole shot length.
+
+    Every action is keyframed here, once, so a shot never has to describe motion in code.
+    Unknown actions fall back to sitting and breathing, which is never wrong for a cat.
+    """
+    action = str(action or "sit").lower()
+    n = sc.frame_end
+    tx, ty = float(target[0]), float(target[1])
+    sx, sy = float(start[0]), float(start[1])
+
+    if action in ("walk", "walk_to", "approach"):
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            cat.place(sx + (tx - sx) * t, sy + (ty - sy) * t, 0, facing_deg=facing)
+            cat.pose_walk((t * n / 12.0) % 1.0)
+            cat.key(f)
+        return
+    if action in ("jump", "jump_on", "leap"):
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            # a parabola: up and over, landing on the target
+            z = max(0.0, 1.6 * t * (1 - t)) * 1.2
+            cat.place(sx + (tx - sx) * t, sy + (ty - sy) * t, z, facing_deg=facing)
+            cat.pose_stand()
+            cat.body.rotation_euler = (math.radians(-18 * math.sin(math.pi * t)), 0, 0)
+            cat.key(f)
+        return
+    if action in ("paw", "paw_at", "swat", "knock_over"):
+        cat.place(sx, sy, 0, facing_deg=facing)
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            cat.pose_sit()
+            swing = math.sin(2 * math.pi * t * 2.0)
+            cat.leg_fr.rotation_euler = (math.radians(-55 * max(0.0, swing)), 0, 0)
+            cat.head.rotation_euler = (math.radians(12), 0, math.radians(6 * swing))
+            cat.key(f)
+        return
+    if action in ("look", "look_around", "alert", "curious"):
+        cat.place(sx, sy, 0, facing_deg=facing)
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            cat.pose_sit()
+            cat.look(yaw_deg=32 * math.sin(2 * math.pi * t), pitch_deg=6)
+            cat.tail_sway(t * 1.5)
+            cat.key(f)
+        return
+    if action in ("sleep", "loaf", "rest"):
+        cat.place(sx, sy, 0, facing_deg=facing)
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            cat.pose_sit()
+            # slow breathing, nothing else
+            cat.body.location.z = cat._body_z - 0.06 * cat.scale + 0.01 * math.sin(
+                2 * math.pi * t)
+            cat.head.rotation_euler = (math.radians(26), 0, 0)
+            cat.key(f)
+        return
+    if action in ("run", "chase", "flee"):
+        for f in range(1, n + 1):
+            t = (f - 1) / max(1, n - 1)
+            cat.place(sx + (tx - sx) * t, sy + (ty - sy) * t, 0, facing_deg=facing)
+            cat.pose_walk((t * n / 6.0) % 1.0)
+            cat.key(f)
+        return
+    # default: sit, tail moving so the frame is never dead
+    cat.place(sx, sy, 0, facing_deg=facing)
+    for f in range(1, n + 1):
+        t = (f - 1) / max(1, n - 1)
+        cat.pose_sit()
+        cat.tail_sway(t, amount_deg=14)
+        cat.key(f)
+
+
+CAMERAS = {"wide": 0.32, "medium": 0.48, "close": 0.72}
+ANGLES = {"front": (0.0, 74.0), "side": (-80.0, 76.0), "high": (-35.0, 52.0),
+          "low": (-30.0, 88.0), "three_quarter": (-35.0, 70.0)}
