@@ -11780,6 +11780,13 @@ def run_project(form, status_cb=None):
                 "hook_first": hook_first, "best_hook_present": best_hook is not None,
                 "semantic_matching_skipped": bool(semantic_matching_skipped),
                 "scene_meta": [{"visual_role": sc.get("visual_role"),
+                                # assignment_type has to survive into config: the pre-render
+                                # gate's "an uncovered beat may have no clip" branch keys off
+                                # it, and without it that branch was dead in production - the
+                                # run raised instead, which is why a scrape that reported 13
+                                # uncovered beats left an empty renders/ folder.
+                                "assignment_type": sc.get("assignment_type"),
+                                "borrowed_from_scene": sc.get("borrowed_from_scene"),
                                 "match_class": sc.get("match_class"),
                                 "script_match_score": sc.get("script_match_score"),
                                 "black_bar_score": sc.get("black_bar_score"),
@@ -11948,6 +11955,11 @@ def run_project(form, status_cb=None):
                 _cs["is_fake_vertical"] = _sm[_i].get("is_fake_vertical")
                 _cs["native_9_16"] = _sm[_i].get("native_9_16")
                 _cs["scrape_source"] = _sm[_i].get("scrape_source")
+                # The gate reads assignment_type to decide whether a clip-less beat is a
+                # known-uncovered one or a broken run. Dropping it here made that branch
+                # unreachable and turned every uncovered beat into a hard render failure.
+                _cs["assignment_type"] = _sm[_i].get("assignment_type")
+                _cs["borrowed_from_scene"] = _sm[_i].get("borrowed_from_scene")
     config["use_seedance_clips"] = bool(out_clips) and config.get("use_seedance_clips", True)
     config["render_captions"] = bool(out_caps)
     config["use_wikimedia"] = bool(out_wiki)

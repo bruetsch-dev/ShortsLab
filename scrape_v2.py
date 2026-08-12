@@ -2324,7 +2324,26 @@ def assign_segments_globally_v2(intents, scene_candidates, cfg=None, status_cb=N
 
 # ---------------------------------------------------------------- render validation V2 (PURE)
 
-def borrow_motion_for_uncovered(scenes):
+def _clip_seconds(path):
+    """Real duration of a clip file, or 0.0. Scenes do not carry one.
+
+    The first version of the borrow read scene["source_duration"], which nothing writes onto
+    a scene - so the in-point shift never happened and every borrowed beat was the donor's
+    identical three seconds. The unit test passed only because its fixture invented the key.
+    """
+    if not path:
+        return 0.0
+    try:
+        out = subprocess.run(
+            [str(clip_scraper._ffmpeg_tools()[1]), "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+        return max(0.0, float(out))
+    except Exception:      # noqa: BLE001 - a missing probe must not break the borrow
+        return 0.0
+
+
+def borrow_motion_for_uncovered(scenes, scene_clips=None):
     """Give every footage-less beat a moving picture borrowed from its nearest neighbour.
 
     The user's rule is clips only. The previous behaviour put a still on screen for any beat
@@ -2354,10 +2373,12 @@ def borrow_motion_for_uncovered(scenes):
         scene["assignment_type"] = "borrowed_clip"
         scene["match_class"] = "BORROWED"
         scene["borrowed_from_scene"] = donor_idx
-        try:
-            src_len = float(donor.get("source_duration") or 0)
-        except (TypeError, ValueError):
-            src_len = 0.0
+        if scene_clips is not None and donor_idx < len(scene_clips):
+            # the resolved path, not the basename - this is what the renderer reads
+            scene_clips[idx] = scene_clips[donor_idx]
+        src_len = _clip_seconds(scene_clips[donor_idx] if (scene_clips is not None
+                                                          and donor_idx < len(scene_clips))
+                                else donor.get("clip"))
         if src_len > 4.0:
             step = max(1.0, min(3.0, src_len / 4.0))
             scene["source_trim"] = round(abs(idx - donor_idx) * step % max(1.0, src_len - 2.0), 2)
@@ -4147,7 +4168,12 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             counters["scenes_unmatched"] += 1
 
     # CLIPS ONLY: a beat with no footage of its own shows borrowed motion, never a still.
-    borrowed = borrow_motion_for_uncovered(scenes)
+    #
+    # scene_clips_out is the list agent_core rebuilds the timeline from; a scene missing
+    # from it has its clip popped again just before the render. Writing only the scene dict
+    # made this whole feature invisible - and worse than the still it replaced, because the
+    # pre-render gate lets an uncovered_still through and does not know borrowed_clip.
+    borrowed = borrow_motion_for_uncovered(scenes, scene_clips_out)
     # Counted separately from scenes_unmatched, which still includes these. A run where ten
     # beats borrow is a run whose search failed ten times, and the report has to say so even
     # though the video plays as motion throughout.

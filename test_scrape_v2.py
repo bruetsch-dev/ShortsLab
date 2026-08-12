@@ -301,18 +301,38 @@ def test_download_budget_is_spent_once():
 
 
 def test_uncovered_beats_borrow_motion():
-    """Clips only: a beat the search could not cover must never show a still."""
-    scenes = [
-        {"id": 0, "clip": "a.mp4", "asset": "a.mp4", "assignment_type": "exact",
-         "source_duration": 12.0},
-        {"id": 1, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
-         "scrape_uncovered_reason": "no approved segment"},
-        {"id": 2, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
-         "scrape_uncovered_reason": "no approved segment"},
-        {"id": 3, "clip": "b.mp4", "asset": "b.mp4", "assignment_type": "exact",
-         "source_duration": 12.0},
-    ]
-    borrowed = v.borrow_motion_for_uncovered(scenes)
+    """Clips only - and the borrow has to survive all the way to the renderer.
+
+    The first version of this test hand-fed the fixture a "source_duration" key and asserted
+    against it. No scene dict ever carries that key, so the test passed while the feature did
+    nothing: the in-point never shifted, and the borrowed clip was popped again by
+    agent_core, which rebuilds every scene from the scene_clips list. Real files and the real
+    list now, so a fiction cannot pass twice.
+    """
+    import subprocess as _sp
+    ff = v.clip_scraper._ffmpeg_tools()[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        made = []
+        for name, secs in (("a.mp4", 12), ("b.mp4", 12)):
+            out = Path(tmp) / name
+            _sp.run([str(ff), "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", f"testsrc=size=64x64:rate=8:duration={secs}",
+                     "-pix_fmt", "yuv420p", str(out)], capture_output=True, timeout=120)
+            made.append(out)
+        if not all(m.exists() for m in made):
+            check("borrow fixture built", False)
+            return
+        scenes = [
+            {"id": 0, "clip": "a.mp4", "asset": "a.mp4", "assignment_type": "exact"},
+            {"id": 1, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
+             "scrape_uncovered_reason": "no approved segment"},
+            {"id": 2, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
+             "scrape_uncovered_reason": "no approved segment"},
+            {"id": 3, "clip": "b.mp4", "asset": "b.mp4", "assignment_type": "exact"},
+        ]
+        scene_clips = [str(made[0]), None, None, str(made[1])]
+        borrowed = v.borrow_motion_for_uncovered(scenes, scene_clips)
+
     check("both footage-less beats borrow motion", borrowed == 2)
     check("no beat is left on a still",
           not any(sc.get("assignment_type") == "uncovered_still" for sc in scenes))
@@ -322,13 +342,48 @@ def test_uncovered_beats_borrow_motion():
           all(scenes[i]["match_class"] == "BORROWED" for i in (1, 2)))
     check("the uncovered reason survives the borrow",
           scenes[1]["scrape_uncovered_reason"] == "no approved segment")
+    # THE ONE THAT WAS MISSING: agent_core rebuilds each scene from this list and pops the
+    # clip of anything absent from it. A borrow that only edits the scene dict is erased.
+    check("the borrow is written into the scene_clips list the renderer reads",
+          scene_clips[1] == scene_clips[0] and scene_clips[2] == scene_clips[3])
     check("a borrowed beat starts at a different in-point than its donor",
           scenes[1].get("source_trim", 0) > 0)
-    # nothing to borrow from: a still is better than a black frame, and it must stay
+
     only_stills = [{"id": 0, "assignment_type": "uncovered_still"}]
     check("with no footage at all the still fallback survives",
-          v.borrow_motion_for_uncovered(only_stills) == 0
+          v.borrow_motion_for_uncovered(only_stills, [None]) == 0
           and only_stills[0]["assignment_type"] == "uncovered_still")
+
+
+def test_download_budget_is_spent_once():
+    """A round must attempt exactly the downloads it was given, not half of them.
+
+    The concurrent-prefetch rewrite reserved each planned source in _downloaded_ids AND
+    added len(planned) to the same guard, so every source counted twice and a budget of 6
+    delivered 3. min_downloads_per_scene = 3 quietly became 1.5 per beat.
+    """
+    calls = []
+
+    def fake_download(raw_item, proxy, status_cb=None):
+        calls.append(proxy)
+        return None                     # counts as a failed fetch; stops before ffmpeg
+
+    real = v.download_proxy_v2
+    v.download_proxy_v2 = fake_download
+    try:
+        for budget, spent, want in ((6, 0, 6), (3, 0, 3), (36, 30, 6), (5, 5, 0)):
+            calls.clear()
+            state = {"rejections": {}, "_downloaded_ids": {f"old{i}" for i in range(spent)}}
+            sources = [v.SourceVideoCandidate(source_id=f"s{i}", platform="tiktok",
+                                              creator_id="c", url="https://x/%d" % i,
+                                              query="q", raw_item={})
+                       for i in range(40)]
+            with tempfile.TemporaryDirectory() as tmp:
+                v._download_and_segment(sources, Path(tmp), "ffmpeg", "ffprobe",
+                                        None, None, state, None, budget)
+            check(f"budget {budget} with {spent} spent attempts {want}", len(calls) == want)
+    finally:
+        v.download_proxy_v2 = real
 
 
 def test_relationship_scene_queries():
