@@ -1,4 +1,4 @@
-"""A slender tower of stacked blocks, struck low, going over.
+"""A slender tower of stacked blocks is hit and goes over: a weight dropped on its top, a ball dropped into a chute that turns the fall into a side impact, a swinging wrecking ball, or a horizontal ram.
 
     blender -b -noaudio -P tower_collapse.py -- '{"material": "brick", "out_dir": "..."}'
 

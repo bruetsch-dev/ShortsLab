@@ -782,6 +782,30 @@ def test_v1_untouched():
     check("V1 scrape_bucket still exists", hasattr(clip_scraper, "scrape_bucket"))
 
 
+def test_every_physics_scene_is_visible_to_the_chooser():
+    """The scene chooser must SEE every scene, however long the library gets.
+
+    The listing was json.dumps(catalogue)[:12000], which cut the JSON off mid-string. With
+    eleven scenes that hid nine of them - everything from domino_run to wall_smash - so the
+    chooser could only ever answer with the two that fitted, and it correctly reported "no
+    scene stacks a tall wide tower" for a brief asking for exactly that. The newest scene is
+    always the one that vanishes, so the library silently got worse as it grew.
+    """
+    from physics_mode import library
+    cat = library.catalogue()
+    check("the library has scenes at all", len(cat) >= 5)
+    listing = library._listing_for(cat)
+    missing = [name for name in cat if name not in listing]
+    check(f"every scene appears in the listing ({len(cat)} scenes)", not missing)
+    check("the listing stays inside its budget", len(listing) <= library.LISTING_BUDGET)
+    # and it must still survive a library far bigger than today's
+    big = {f"scene_{i:03d}": v for i in range(60) for v in [list(cat.values())[0]]}
+    wide = library._listing_for(big)
+    check("a 60-scene library still lists every scene",
+          all(f"scene_{i:03d}" in wide for i in range(60)))
+    check("the oversized listing is still capped", len(wide) <= library.LISTING_BUDGET)
+
+
 if __name__ == "__main__":
     for t in (test_settings, test_query_diversity, test_architect_raw_queries_and_multi_sort,
               test_platform_query_sanitizer,
@@ -791,6 +815,7 @@ if __name__ == "__main__":
               test_a_bare_json_array_does_not_kill_the_run,
               test_a_failed_cut_scan_is_not_reported_as_clean_footage,
               test_the_matcher_reads_every_shape_the_model_answers_with,
+              test_every_physics_scene_is_visible_to_the_chooser,
               test_one_inherited_cut_is_allowed_two_are_not,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,

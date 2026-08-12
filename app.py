@@ -13126,10 +13126,11 @@ def start_timeline_revoice_job(slug, replace_scene_ids=None, reasoning_model=Non
 try:
     from lowpoly_mode import build as lowpoly_build
     from physics_mode import authoring as physics_authoring
+    from physics_mode import library as physics_library
     from physics_mode import run as physics_run
 except Exception as _exc:  # noqa: BLE001
     print("[physics] module unavailable:", _exc)
-    physics_run = physics_authoring = lowpoly_build = None
+    physics_run = physics_authoring = lowpoly_build = physics_library = None
 
 try:
     import ai_core
