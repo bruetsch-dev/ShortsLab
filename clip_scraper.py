@@ -849,9 +849,18 @@ def _probe_duration(path, ffprobe):
 
 
 def hard_cut_times(path, ffmpeg, scan_seconds=24.0, threshold=0.30):
-    """Return hard-cut timestamps using ffmpeg's scene score (no OpenCV dependency)."""
+    """Hard-cut timestamps from ffmpeg's scene score, or None when the scan FAILED.
+
+    None and [] are different answers and the difference matters. This used to return []
+    for both "this is one continuous take" and "ffmpeg timed out / the file is unreadable",
+    which made a failed scan indistinguishable from clean footage - so a heavily cut clip
+    passed the internal-cut gate whenever the machine was busy. It also produced a
+    measurement that flipped between 56% and 0% on the same pool, which is how it was
+    found. Callers must decide for themselves what to do with "unknown"; none of them may
+    silently read it as "clean".
+    """
     if not ffmpeg:
-        return []
+        return None
     try:
         cmd = [ffmpeg, "-hide_banner", "-nostats", "-i", str(path)]
         if scan_seconds and float(scan_seconds) > 0:
@@ -859,14 +868,22 @@ def hard_cut_times(path, ffmpeg, scan_seconds=24.0, threshold=0.30):
         cmd += ["-vf", f"select='gt(scene,{float(threshold):.3f})',showinfo",
                 "-an", "-f", "null", os.devnull]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        text = f"{result.stdout or ''}\n{result.stderr or ''}"
-        return sorted({
-            round(float(match), 3)
-            for match in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", text)
-            if float(match) > 0.08
-        })
-    except Exception:
-        return []
+    except Exception as exc:  # noqa: BLE001
+        print(f"[scrape] cut scan FAILED on {Path(path).name}: "
+              f"{exc.__class__.__name__}: {str(exc)[:120]}")
+        return None
+    text = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if result.returncode != 0:
+        # A non-zero exit means ffmpeg gave up on the file. Any pts_time lines before that
+        # are a partial scan, which is still not an answer about the whole window.
+        print(f"[scrape] cut scan FAILED on {Path(path).name}: ffmpeg exit "
+              f"{result.returncode}")
+        return None
+    return sorted({
+        round(float(match), 3)
+        for match in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", text)
+        if float(match) > 0.08
+    })
 
 
 def stable_segment_profile(path, ffmpeg, ffprobe, seconds=DEFAULT_CLIP_SECONDS):
@@ -879,7 +896,9 @@ def stable_segment_profile(path, ffmpeg, ffprobe, seconds=DEFAULT_CLIP_SECONDS):
     wanted = max(0.5, float(seconds or DEFAULT_CLIP_SECONDS))
     duration = _probe_duration(path, ffprobe)
     scan = min(duration or max(24.0, wanted * 4.0), max(24.0, wanted * 4.0))
-    cuts = hard_cut_times(path, ffmpeg, scan_seconds=scan)
+    # Here "unknown" is harmless: the cuts only ADD candidate start points, so a failed
+    # scan costs some choices, never correctness.
+    cuts = hard_cut_times(path, ffmpeg, scan_seconds=scan) or []
     latest_start = max(0.0, (duration or scan) - wanted)
     starts = {0.0, latest_start}
     for cut in cuts:

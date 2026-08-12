@@ -283,6 +283,7 @@ class SegmentCandidate:
     motion_score: float = 0.0        # 0 = a held photograph, see _motion_score
     cleaned_path: str = ""           # blurred copy, when the captions were removable
     caption_over_subject: bool = False   # a penalty now, not a disqualifier
+    cut_scan_failed: bool = False        # the cut scan gave no answer; NOT "no cuts"
     micro_stutter_count: int = 0
     # semantics (filled by vision)
     semantic_score: float = 0.0
@@ -1622,7 +1623,9 @@ def discover_segments_v2(source: SourceVideoCandidate, proxy_path, ffmpeg, ffpro
     if duration <= float(cfg["min_segment_seconds"]):
         return []
     scan = min(duration, 90.0)
-    cuts = clip_scraper.hard_cut_times(proxy_path, ffmpeg, scan_seconds=scan)
+    # Segment discovery only uses cuts to place window boundaries, so an unknown scan
+    # costs variety, not correctness.
+    cuts = clip_scraper.hard_cut_times(proxy_path, ffmpeg, scan_seconds=scan) or []
     windows = _candidate_windows(duration, cuts, cfg)
     segs = []
     for (start, end) in windows:
@@ -1814,7 +1817,12 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     # footage cuts about that often, so the rule demanded a continuous take that most
     # uploads simply do not contain. One inherited cut inside a beat reads as pace; two
     # inside four seconds is someone else's edit showing through.
-    if stab["internal_cut_count"] >= 2:
+    if stab.get("cuts_unknown"):
+        # Not a rejection: throwing away good footage because ffmpeg hiccupped is worse
+        # than keeping a clip that might carry two cuts. But it is recorded, so a run whose
+        # cut scans were all failing is visible in the report instead of looking clean.
+        seg.cut_scan_failed = True
+    elif stab["internal_cut_count"] >= 2:
         reasons.append("rapid_internal_cuts")
 
     text_heaviness = max(text_heaviness_ocr, cap_text_heavy)
@@ -1940,13 +1948,21 @@ def _ocr_window(path, ffmpeg, start, end):
 
 
 def _window_stability(path, ffmpeg, ffprobe, start, end):
+    # This is the one caller where "unknown" must not read as "clean" - it decides whether
+    # a clip is rejected for carrying someone else's edit. One retry on a shorter scan,
+    # then the window is reported as UNKNOWN and the gate leaves it alone rather than
+    # passing it as continuous footage.
     cuts = clip_scraper.hard_cut_times(path, ffmpeg, scan_seconds=min(end + 1.0, 90.0))
+    if cuts is None:
+        cuts = clip_scraper.hard_cut_times(path, ffmpeg, scan_seconds=min(end + 0.5, 30.0))
+    if cuts is None:
+        return {"internal_cut_count": 0, "stable": False, "cuts_unknown": True}
     inside = [c for c in cuts if start + 0.1 < c < end - 0.1]
     gaps = []
     bounds = [start] + inside + [end]
     for i in range(1, len(bounds)):
         gaps.append(bounds[i] - bounds[i - 1])
-    return {"internal_cut_count": len(inside),
+    return {"internal_cut_count": len(inside), "cuts_unknown": False,
             "stable": len(inside) == 0 and all(g >= 1.7 for g in (gaps or [end - start]))}
 
 

@@ -485,6 +485,41 @@ def test_one_inherited_cut_is_allowed_two_are_not():
             check(f"{label}: rejected={want_reject}", rejected == want_reject)
 
 
+def test_a_failed_cut_scan_is_not_reported_as_clean_footage():
+    """"unknown" and "no cuts" must stay different answers.
+
+    hard_cut_times used to return [] for both, so a heavily cut clip passed the
+    internal-cut gate whenever ffmpeg timed out - and an audit of that same gate flipped
+    between 56% and 0% on one pool of footage, which is how the bug surfaced.
+    """
+    import clip_scraper
+
+    real = clip_scraper.hard_cut_times
+    calls = [0]
+
+    def failing(*_a, **_k):
+        calls[0] += 1
+        return None                      # what a timeout or unreadable file now yields
+
+    clip_scraper.hard_cut_times = failing
+    try:
+        stab = v._window_stability("x.mp4", "ffmpeg", "ffprobe", 1.0, 4.8)
+        check("a failed scan is flagged unknown", stab.get("cuts_unknown") is True)
+        check("a failed scan is not called stable", stab.get("stable") is False)
+        check("the scan is retried once before giving up", calls[0] == 2)
+    finally:
+        clip_scraper.hard_cut_times = real
+
+    # and a real answer still reports itself as known
+    clip_scraper.hard_cut_times = lambda *_a, **_k: [2.0, 3.0]
+    try:
+        stab = v._window_stability("x.mp4", "ffmpeg", "ffprobe", 1.0, 4.8)
+        check("a real scan is not flagged unknown", stab.get("cuts_unknown") is False)
+        check("a real scan counts its cuts", stab.get("internal_cut_count") == 2)
+    finally:
+        clip_scraper.hard_cut_times = real
+
+
 def test_a_bare_json_array_does_not_kill_the_run():
     """The planner must survive the model ignoring the {"intents": [...]} envelope.
 
@@ -728,6 +763,7 @@ if __name__ == "__main__":
               test_ranking_relevance_over_likes, test_provenance_and_editorial_gates,
               test_relationship_scene_queries,
               test_a_bare_json_array_does_not_kill_the_run,
+              test_a_failed_cut_scan_is_not_reported_as_clean_footage,
               test_one_inherited_cut_is_allowed_two_are_not,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,
