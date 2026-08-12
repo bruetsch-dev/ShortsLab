@@ -69,7 +69,8 @@ except Exception:                        # pragma: no cover
 # ---------------------------------------------------------------- versioning + config
 
 PROXY_FETCH_WORKERS = 6   # proxy downloads are network wait; see _download_and_segment
-V2_ANALYSIS_VERSION = 2   # v2 adds provenance and editorial gates; old vision cache is unsafe
+V2_ANALYSIS_VERSION = 3   # v3 judges the CUT WINDOW, not the whole upload; older
+                          # caches hold whole-clip caption verdicts and must not be reused
 
 SCRAPE_V2_CONFIG = {
     # COST (user 2026-07-22: "$2 LLM pro Mini-Run, was soll das"): the old budgets let one
@@ -1949,8 +1950,16 @@ def describe_segments_v2(segments, project_dir, ffmpeg, reasoning_model=None, st
         if not sheet:
             continue
         prompt = (
-            "Describe each numbered segment tile (seg_00, seg_01, ...); each tile is several frames "
-            "across ONE short clip. Judge the whole clip. Return STRICT JSON keyed by index.\n"
+            "Describe each numbered segment tile (seg_00, seg_01, ...); each tile is a few "
+            "frames sampled across ONE candidate CUT - the exact window that would be used.\n"
+            "Judge ONLY what is visible in that tile. Do not judge the upload it came from: "
+            "a tile is a few seconds out of a much longer video, and the intro, the title "
+            "card and the end screen are not in it.\n"
+            "This matters most for burned_captions and visible_text - set them true only "
+            "when text is on screen IN THESE FRAMES. Japanese creators caption their "
+            "openings by convention, so judging whole uploads threw away nearly every "
+            "usable Japanese result even when the middle of the video was clean.\n"
+            "Return STRICT JSON keyed by index.\n"
             'For each: {"subjects":[".."],"subject_count":int,"action":"..","location":"..",'
             '"camera_style":"..","shot_size":"..","motion":"low|moderate|high","visible_text":"..",'
             '"creator_overlay":true|false,"burned_captions":true|false,"raw_footage_score":0-10,'
@@ -2025,10 +2034,25 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
     age = str(desc.get("age_confidence") or "").casefold()
     if age in {"child", "minor", "teen", "underage"}:
         return "minor or uncertain-age creator footage"
-    if bool(desc.get("burned_captions")) or bool(desc.get("creator_overlay")):
-        return "burned-in creator captions/overlay"
-    if float(seg.text_heaviness or 0) >= 2.5:
-        return "text-heavy footage"
+    if bool(desc.get("creator_overlay")):
+        # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
+        # shot. Captions can.
+        return "creator reaction overlay"
+    # Burned-in captions are NOT fatal on their own any more.
+    #
+    # Measured on 20 clips this scraper had just downloaded for a Japanese topic: 17 of them
+    # (85%) carry on-screen text inside the exact three-second window that would be cut. The
+    # rule that any burned caption disqualifies a clip therefore threw away five sixths of
+    # the Japanese pool, which is what "TikTok has heaps of this and the app finds nothing"
+    # actually was. Rejecting on position rather than presence keeps the two cases that
+    # genuinely cannot be used:
+    #   * text sitting ON the subject -> already a hard segment reason
+    #     ("burned_caption_over_subject"), caught by the quality-gate check above
+    #   * so much text that the frame is a slide, not footage -> text_heaviness below
+    # Everything in between is a lower-third the render already blurs: scenes default to
+    # blur_captions on, and agent_core builds a capblur_ pre-pass for them.
+    if float(seg.text_heaviness or 0) >= 4.5:
+        return "text-heavy footage (a slide, not footage)"
     if intent is not None and requires_japanese_context(intent):
         if not seg.japanese_context:
             return "no Japanese source-context signal"

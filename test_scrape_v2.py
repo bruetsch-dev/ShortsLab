@@ -202,9 +202,29 @@ def test_provenance_and_editorial_gates():
     teen = v.SegmentCandidate(**{**good.__dict__, "segment_id": "teen",
                                  "visual_description": {"age_confidence": "teen"}})
     check("teen creator footage rejected", "minor" in v.editorial_rejection_reason(teen, japanese_intent))
+    # Burned captions alone no longer disqualify a clip. Measured on 20 clips the scraper
+    # had just downloaded for a Japanese topic, 17 carried on-screen text inside the exact
+    # window that would be cut - the old blanket rule threw away 85% of the pool, which is
+    # why the search kept coming back empty on a topic TikTok is full of. The render blurs
+    # a lower third; what it cannot fix is text ON the subject, or a frame that is a slide.
     captions = v.SegmentCandidate(**{**good.__dict__, "segment_id": "caption",
                                      "visual_description": {"age_confidence": "adult", "burned_captions": True}})
-    check("burned creator captions rejected", "captions" in v.editorial_rejection_reason(captions, japanese_intent))
+    check("an ordinary burned caption is kept for the blur pass",
+          v.editorial_rejection_reason(captions, japanese_intent) == "")
+    over_subject = v.SegmentCandidate(**{**good.__dict__, "segment_id": "over",
+                                         "rejection_reasons": ["burned_caption_over_subject"],
+                                         "visual_description": {"age_confidence": "adult"}})
+    check("a caption sitting ON the subject is still rejected",
+          v.editorial_rejection_reason(over_subject, japanese_intent) != "")
+    slide = v.SegmentCandidate(**{**good.__dict__, "segment_id": "slide", "text_heaviness": 6.0,
+                                  "visual_description": {"age_confidence": "adult"}})
+    check("a frame that is mostly text is still rejected",
+          "text-heavy" in v.editorial_rejection_reason(slide, japanese_intent))
+    overlay = v.SegmentCandidate(**{**good.__dict__, "segment_id": "pip",
+                                    "visual_description": {"age_confidence": "adult",
+                                                           "creator_overlay": True}})
+    check("a creator reaction overlay is still rejected (it cannot be blurred away)",
+          v.editorial_rejection_reason(overlay, japanese_intent) != "")
     no_provenance = v.SegmentCandidate(**{**good.__dict__, "segment_id": "generic",
                                           "japanese_context": False})
     check("Japan scene rejects clip without native provenance",
