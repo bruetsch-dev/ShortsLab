@@ -152,20 +152,22 @@ THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
 
   * Each prompt must produce a clip that contains {cuts_per_clip} HARD CUTS inside it.
     Not a pan, not a dissolve, not a camera move: a hard cut to a different place in the
-    same world. Write them explicitly, with times, in the prompt text - for example
-    "hold for {phrase} seconds, then hard cut to ..., hold for {phrase} seconds, then hard
-    cut to ...".
-  * Use these exact hold lengths: {hold} seconds per shot. That is one musical phrase of
-    the track this gets cut to, plus a small margin - generators never honour a hold time
-    to the frame, and it is far better to have half a second too much (which is trimmed)
-    than half a second too little (which has to be slowed).
+    same world. Write them explicitly, with times, in the prompt text.
+  * The clip is about {clip_seconds} seconds long, and the hold times are FIXED:
+    {hold_sequence}, in that order. Write exactly those numbers into the prompt. They are
+    musical phrases of the track this gets cut to, plus a small margin - generators never
+    honour a hold to the frame, and half a second too much is trimmed away while half a
+    second too little has to be slowed down.
+  * Do not add a shot beyond that list. Three full phrases do not fit in a ten-second
+    clip, and an extra shot is simply cut off at the end of the generation.
   * Every shot inside a clip is a DIFFERENT place in the same world - a different room, a
     different corridor, a different level - never the same room from another angle.
 
 HOLDING THE WORLD TOGETHER:
-  * Write a WORLD sentence first: the place-type, palette, light source, era, film look,
-    and the level of decay. Be specific enough that two separate generations land in the
-    same building.
+  * Write a WORLD sentence first: the place-type, the SATURATED palette (dominant colour
+    plus contrasting accent, both named), the coloured light sources, era, film look, and
+    how long it has stood empty. Be specific enough that two separate generations land in
+    the same building under the same lamps.
   * Begin every prompt with that exact same world sentence, word for word. Do not
     paraphrase it between prompts.
 
@@ -198,8 +200,25 @@ DREAMCORE SPECIFICS that carry the aesthetic:
   * Light comes from inside the frame: fluorescent tubes, exit signs, pool lights, a TV.
   * Slight wrongness beats obvious horror: a door where a wall should be, a corridor that
     repeats, water indoors, a ceiling too low.
-  * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed, no
-    cinematic colour grade.
+  * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed. The
+    camera is cheap; the WORLD is not colourless.
+
+COLOUR - commit to it, this is what the look lives on:
+  * Name a SATURATED dominant colour and one contrasting accent in the world sentence,
+    and let every shot sit inside them. Dreamcore is a colour aesthetic: sodium orange
+    against pool cyan, sickly fluorescent green against black, deep teal water under
+    warm amber tubes, magenta dusk through a grey doorway, aquamarine tile with a red
+    exit sign burning in the corner.
+  * The colour comes from the LIGHT SOURCES, so name their colour, not just their
+    presence: "sodium lamps burning amber", "underwater lamps glowing hard cyan", "a
+    green exit sign", "a television throwing blue across the carpet".
+  * Words like washed-out, desaturated, muted, flat grey, neutral, colourless and
+    "no colour grade" are what turn this aesthetic into a documentary about concrete.
+    A drained, overcast, all-grey palette is the single most common way these prompts
+    come back sad rather than uncanny - if the brief is a grey place, put the colour in
+    the light and let the grey be what it falls on.
+  * Deep shadow is allowed and wanted. High contrast between a coloured light and near
+    black is what makes it read as a memory rather than as a photograph of a corridor.
 
 HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
   Write 60-110 words FOR EACH SHOT, not for the whole prompt. A generator fills
@@ -256,18 +275,48 @@ def safety_review(text: str) -> list:
     return hits
 
 
+def shot_plan(clip_seconds: float, phrase: float, max_shots: int = 4) -> list:
+    """Hold times for one generated clip, as many musical shots as its length allows.
+
+    A generator makes clips of a fixed length, and asking for more shots than fit gets the
+    last one truncated - three full phrases need 11.55s, so in a 10s clip the third shot
+    simply is not there. Full phrases are used while they fit; a HALF phrase is added if
+    the remainder can carry one, because half-grid points are still on the music and the
+    editor already places shots on them. Each hold carries HOLD_MARGIN so the editor trims
+    rather than stretches.
+    """
+    budget = max(phrase, float(clip_seconds or 0) or phrase)
+    holds, used = [], 0.0
+    while len(holds) < max_shots and used + phrase + HOLD_MARGIN <= budget + 0.35:
+        holds.append(round(phrase + HOLD_MARGIN, 1))
+        used += phrase
+    half = phrase / 2.0
+    if len(holds) < max_shots and used + half + HOLD_MARGIN <= budget + 0.35:
+        holds.append(round(half + HOLD_MARGIN, 1))
+    return holds or [round(phrase + HOLD_MARGIN, 1)]
+
+
 def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
-                phrase: float = 3.85, status_cb=None, model: str = PROMPT_MODEL) -> dict:
+                phrase: float = 3.85, clip_seconds: float = 10.0,
+                status_cb=None, model: str = PROMPT_MODEL) -> dict:
     """Copy-ready prompts, each producing one clip that already contains its own cuts."""
     _log(status_cb, f"Writing {clip_count} prompts, {cuts_per_clip} cuts inside each...")
     agent_core.assert_wavespeed_balance(status_cb=status_cb)
+    # How many shots fit is arithmetic, not a preference: the generator makes clips of a
+    # fixed length, and three full phrases need 11.55s. Asking for more than fits loses the
+    # last shot in every clip.
+    holds = shot_plan(clip_seconds, phrase, max_shots=int(cuts_per_clip) + 1)
+    hold_text = " then ".join(f"{h:.1f}s" for h in holds)
     system = (PROMPT_SYSTEM
-              .replace("{cuts_per_clip}", str(int(cuts_per_clip)))
+              .replace("{cuts_per_clip}", str(max(1, len(holds) - 1)))
+              .replace("{hold_sequence}", hold_text)
+              .replace("{clip_seconds}", f"{float(clip_seconds):.0f}")
               .replace("{hold}", f"{phrase + HOLD_MARGIN:.1f}")
               .replace("{phrase}", f"{phrase:.1f}"))
-    ask = (f"The idea: {str(brief or '').strip() or 'liminal spaces, no people'}\n"
-           f"Write exactly {int(clip_count)} prompts. Each produces one clip holding "
-           f"{int(cuts_per_clip) + 1} shots separated by {int(cuts_per_clip)} hard cuts.")
+    ask = (f"The idea: {str(brief or '').strip() or 'empty liminal spaces'}\n"
+           f"Write exactly {int(clip_count)} prompts. Each produces ONE clip of about "
+           f"{float(clip_seconds):.0f} seconds holding {len(holds)} shots with hold times "
+           f"{hold_text}, separated by {max(1, len(holds) - 1)} hard cuts.")
     # max_tokens has to carry clip_count x (world sentence + 3 shots x ~100 words). At 4000
     # the last prompt came back truncated mid-shot, and a truncated prompt is a silently
     # worse video rather than an error.

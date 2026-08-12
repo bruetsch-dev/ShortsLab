@@ -15568,6 +15568,7 @@ class Handler(BaseHTTPRequestHandler):
                     clip_count=max(1, min(12, int(body.get("clips") or 4))),
                     cuts_per_clip=max(1, min(4, int(body.get("cuts") or 2))),
                     phrase=float(grid.get("phrase") or 3.85),
+                    clip_seconds=max(3.0, min(30.0, float(body.get("clip_seconds") or 10))),
                     model=str(body.get("model") or "") or dreamcore_mode.PROMPT_MODEL)
                 out["bed"] = str(bed)
                 out["grid"] = {k: grid[k] for k in ("phrase", "offset", "duration")}
