@@ -111,3 +111,7 @@ _stretched_risers/
 physics_mode/scenes/generated/
 lowpoly_mode/generated/
 lowpoly_mode/**/probe/
+
+# downloaded reference footage (media, not code) - SOURCES.md keeps the links
+reference/**/*.mp4
+reference/**/*.wav

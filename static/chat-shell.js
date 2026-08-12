@@ -94,7 +94,8 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 // What a project's `kind` is CALLED on screen. The raw key doubles as a CSS class, so it stays
 // lowercase; only the badge text lives here. An ordinary generated/scraped project has no kind
 // and so no badge.
-const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch", motion_loop: "Loop" };
+const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch", motion_loop: "Loop",
+                     dreamcore: "Dreamcore" };
 function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
 // STATE is separate from KIND: a failed Sketch used to show only "failed" and lose its
 // category. State sits top-right, kind top-left; both can show at once.
@@ -209,6 +210,7 @@ const FLOW_STEPS = {
   enhance: ["choose"],
   aishort: ["choose"],
   aicore: ["brief", "pick", "clips"],
+  dreamcore: ["brief", "clips"],
   project: ["summary"],
 };
 function isCultureFacts() { return S.flow === "script" && !!S.values.culture_facts_mode; }
@@ -325,6 +327,7 @@ function renderAll() {
      enhance: renderEnhanceFlow,
      aishort: renderAIShortPicker,
      aicore: renderAICoreFlow,
+     dreamcore: renderDreamcoreFlow,
      project: renderProjectFlow }[S.flow] || renderModeMenu)();
 
   if (prototypeMode && !S.jobId) decoratePrototypeFlow();
@@ -1758,7 +1761,13 @@ function renderAIShortPicker() {
     <span class="ai-choice-copy"><small>PROMPTS OUT · CLIPS BACK IN</small><strong>AI Core</strong>
     <em>Describe a short, pick a storyline, copy three prompts that share one world — then drop the generated clips back in.</em></span>`;
   motion.addEventListener("click", () => selectMode("aicore"));
-  grid.append(classic, motion); c.appendChild(grid);
+  const dream = el("button", "ai-short-choice dreamcore");
+  dream.type = "button";
+  dream.innerHTML = `<span class="ai-choice-preview dc-preview"><i class="dc-glow"></i></span>
+    <span class="ai-choice-copy"><small>PROMPTS WITH CUTS · EDIT ON THE MELODY</small><strong>Dreamcore</strong>
+    <em>Empty liminal places, no voice. The prompts already contain their own cuts, and the upload is cut so every cut lands on a note of the music.</em></span>`;
+  dream.addEventListener("click", () => selectMode("dreamcore"));
+  grid.append(classic, motion, dream); c.appendChild(grid);
   const foot = el("div", "card-foot"); foot.appendChild(btn("All modes", resetToMode, "ghost")); c.appendChild(foot);
   c.querySelectorAll("video").forEach(v => { v.muted = true; v.play().catch(() => {}); });
   setComposer("off");
@@ -1784,11 +1793,12 @@ function renderAICoreFlow() {
     msgA("Describe the short in a sentence or two. Everything else is built from it.");
     const c = card("aicore-brief");
     const label = el("label", "aicore-label");
-    label.innerHTML = `<span>Your idea</span><small>Name the character and the point of view first — "SpongeBob one day POV", "dreamcore retro bicycle POV". Three clips will be written for one world.</small>`;
+    // Dreamcore has its own mode now, so the examples here no longer point at it.
+    label.innerHTML = `<span>Your idea</span><small>Name the character and the point of view first — "SpongeBob one day POV", "a courier's helmet cam through Tokyo". Three clips will be written for one world.</small>`;
     const ta = document.createElement("textarea");
     ta.rows = 5;
     ta.id = "aicore-brief-input";
-    ta.placeholder = "e.g. dreamcore retro bicycle POV riding to an abandoned station";
+    ta.placeholder = "e.g. SpongeBob one day POV, morning to closing time at the Krusty Krab";
     ta.value = A.brief || "";
     ta.addEventListener("input", () => { A.brief = ta.value; persist(); });
     label.appendChild(ta);
@@ -1967,6 +1977,212 @@ async function submitAICore(go) {
     startJob(d.job_id, "aicore");
   } catch (e) {
     go.disabled = false; go.textContent = "Assemble video";
+    errorCard(T.err_generic, String(e));
+  }
+}
+
+/* Dreamcore: prompts that already contain their cuts, then an edit locked to the melody.
+
+   Two steps only. There is no storyline to pick because there is no story: a dreamcore
+   short is a series of empty places, and what makes it work is the cut rhythm, not the
+   narrative. The prompts therefore carry hold times taken from the chosen music, and the
+   upload step hands the clips straight to the editor that snaps them to it. */
+let DREAMCORE_FILES = [];
+
+function dreamcoreState() {
+  if (!S.dreamcore) {
+    S.dreamcore = { brief: "", world: "", prompts: [], bed: "", grid: null,
+                    clips: 4, cuts: 2 };
+  }
+  return S.dreamcore;
+}
+
+function renderDreamcoreFlow() {
+  const D = dreamcoreState();
+  msgU("Dreamcore");
+  if (S.jobId) return;
+
+  /* ---- step 1: the place, the music, how many cuts ---- */
+  if (S.step === "brief") {
+    msgA("Name the kind of place. No people, no story — just where we are.");
+    const c = card("dreamcore-brief");
+    const label = el("label", "aicore-label");
+    label.innerHTML = `<span>The world</span><small>One or two lines. "Empty indoor swimming pools at 3am", "a hotel corridor that never ends". Every clip stays inside this one place.</small>`;
+    const ta = document.createElement("textarea");
+    ta.rows = 4;
+    ta.id = "dreamcore-brief-input";
+    ta.placeholder = "e.g. drained public swimming baths, sodium light, nobody there";
+    ta.value = D.brief || "";
+    ta.addEventListener("input", () => { D.brief = ta.value; persist(); });
+    label.appendChild(ta);
+    c.appendChild(label);
+
+    const row = el("div", "dc-row");
+    const bedWrap = el("label", "aicore-label dc-bed");
+    bedWrap.innerHTML = `<span>Music</span><small>The cut grid is read from this track.</small>`;
+    const bedSel = document.createElement("select");
+    bedSel.id = "dreamcore-bed";
+    bedWrap.appendChild(bedSel);
+    fetch("/music-list").then(r => r.json()).then(d => {
+      (d.tracks || []).forEach(t => {
+        const o = document.createElement("option");
+        o.value = t.file; o.textContent = t.name;
+        if ((D.bed && D.bed === t.file) || (!D.bed && /dreamcore/i.test(t.file))) {
+          o.selected = true; D.bed = t.file;
+        }
+        bedSel.appendChild(o);
+      });
+    }).catch(() => {});
+    bedSel.addEventListener("change", () => { D.bed = bedSel.value; persist(); });
+
+    const num = (key, text, hint, min, max) => {
+      const w = el("label", "aicore-label dc-num");
+      w.innerHTML = `<span>${text}</span><small>${hint}</small>`;
+      const inp = document.createElement("input");
+      inp.type = "number"; inp.min = String(min); inp.max = String(max);
+      inp.value = String(D[key]);
+      inp.addEventListener("input", () => {
+        D[key] = Math.max(min, Math.min(max, parseInt(inp.value, 10) || min));
+        persist();
+      });
+      w.appendChild(inp);
+      return w;
+    };
+    row.append(bedWrap, num("clips", "Clips", "How many you will generate", 1, 12),
+               num("cuts", "Cuts inside each", "2 gives three shots per clip", 1, 4));
+    c.appendChild(row);
+
+    const foot = el("div", "card-foot");
+    foot.appendChild(btn("All modes", resetToMode, "ghost"));
+    const go = btn("Write the prompts", async () => {
+      const brief = (D.brief || "").trim();
+      if (!brief) { errorCard(T.err_generic, "Name the place first."); return; }
+      go.disabled = true; go.textContent = "Writing…";
+      const wait = card("dreamcore-wait");
+      wait.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
+      try {
+        const d = await jpost("/dreamcore-prompts", {
+          brief, bed: D.bed || "", clips: D.clips, cuts: D.cuts });
+        if (d.error) throw new Error(d.error);
+        D.prompts = d.prompts || []; D.world = d.world || "";
+        D.grid = d.grid || null;
+        DREAMCORE_FILES = new Array(D.prompts.length).fill(null);
+        wait.remove();
+        editStep("clips");
+      } catch (e) {
+        wait.remove();
+        go.disabled = false; go.textContent = "Write the prompts";
+        errorCard(T.err_generic, String(e));
+      }
+    }, "primary");
+    foot.appendChild(go);
+    c.appendChild(foot);
+    setComposer("off");
+    return;
+  }
+
+  /* ---- step 2: copy the prompts, drop the generated clips back in ---- */
+  if (S.step === "clips") {
+    const phrase = D.grid && D.grid.phrase ? Number(D.grid.phrase).toFixed(2) : "3.85";
+    msgA(`Generate each clip, then drop it on its slot. Every cut will be moved onto the music — a phrase is ${phrase}s.`);
+    const c = card("dreamcore-prompts");
+    if (D.world) {
+      const w = el("div", "aicore-world");
+      w.innerHTML = `<span class="aw-k">Shared world · already at the start of every prompt</span>`;
+      w.appendChild(el("p", "aw-v", esc(D.world)));
+      c.appendChild(w);
+    }
+    if (DREAMCORE_FILES.length !== (D.prompts || []).length) {
+      DREAMCORE_FILES = new Array((D.prompts || []).length).fill(null);
+    }
+    const footRow = el("div", "card-foot aicore-foot");
+    const go = btn("Cut to the music", () => submitDreamcore(go), "primary");
+    const refresh = () => {
+      const ready = DREAMCORE_FILES.filter(Boolean).length;
+      go.disabled = ready < 1;
+      go.textContent = ready >= (D.prompts || []).length
+        ? "Cut to the music"
+        : `Cut to the music (${ready}/${(D.prompts || []).length} clips)`;
+    };
+
+    (D.prompts || []).forEach((p, i) => {
+      const row = el("div", "aicore-prompt");
+      const head = el("div", "ap-head");
+      head.innerHTML = `<span class="ap-num">Clip ${i + 1}</span><strong>${esc(p.label || "")}</strong>`;
+      const copy = el("button", "btn small ap-copy", "Copy prompt");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(p.text || ""); }
+        catch (e) {
+          const box = row.querySelector(".ap-text");
+          if (box) {
+            const r = document.createRange(); r.selectNodeContents(box);
+            const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+          }
+        }
+        copy.textContent = "Copied ✓"; copy.classList.add("ok");
+        setTimeout(() => { copy.textContent = "Copy prompt"; copy.classList.remove("ok"); }, 1600);
+      });
+      head.appendChild(copy);
+      row.appendChild(head);
+      if ((p.shots || []).length) {
+        const shots = el("div", "dc-shots");
+        shots.innerHTML = (p.shots || [])
+          .map((s, n) => `<span class="dc-shot"><i>${n + 1}</i>${esc(s)}</span>`).join("");
+        row.appendChild(shots);
+      }
+      row.appendChild(el("pre", "ap-text", esc(p.text || "")));
+
+      const drop = el("div", "aicore-drop");
+      const setName = (f) => {
+        drop.classList.toggle("filled", !!f);
+        const size = f && (f.size >= 1048576
+          ? (f.size / 1048576).toFixed(1) + " MB"
+          : Math.max(1, Math.round(f.size / 1024)) + " KB");
+        drop.innerHTML = f
+          ? `<b>${esc(f.name)}</b><small>${size} · click to replace</small>`
+          : `<b>Drop clip ${i + 1} here</b><small>or click to choose a file</small>`;
+      };
+      setName(null);
+      const take = (f) => { if (f) { DREAMCORE_FILES[i] = f; setName(f); refresh(); } };
+      drop.addEventListener("click", () => pickFile("video/*,.mp4,.mov,.webm", take));
+      drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+      drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+      drop.addEventListener("drop", e => {
+        e.preventDefault(); drop.classList.remove("over");
+        take((e.dataTransfer.files || [])[0]);
+      });
+      row.appendChild(drop);
+      c.appendChild(row);
+    });
+
+    footRow.appendChild(btn(T.back, () => editStep("brief"), "ghost"));
+    footRow.appendChild(go);
+    c.appendChild(footRow);
+    refresh();
+    setComposer("off");
+  }
+}
+
+async function submitDreamcore(go) {
+  const D = dreamcoreState();
+  const files = DREAMCORE_FILES.filter(Boolean);
+  if (!files.length) { errorCard(T.err_generic, "Add at least one clip."); return; }
+  go.disabled = true; go.textContent = "Uploading…";
+  const fd = new FormData();
+  DREAMCORE_FILES.forEach((f, i) => { if (f) fd.append(`clip${String(i + 1).padStart(2, "0")}`, f, f.name); });
+  fd.append("title", (D.brief || "Dreamcore").slice(0, 60));
+  fd.append("brief", D.brief || "");
+  fd.append("world", D.world || "");
+  fd.append("bed", D.bed || "");
+  fd.append("prompts", JSON.stringify(D.prompts || []));
+  try {
+    const r = await fetch("/dreamcore-edit", { method: "POST", body: fd });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    startJob(d.job_id, "dreamcore");
+  } catch (e) {
+    go.disabled = false; go.textContent = "Cut to the music";
     errorCard(T.err_generic, String(e));
   }
 }

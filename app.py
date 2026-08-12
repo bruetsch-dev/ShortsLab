@@ -5814,6 +5814,14 @@ AICORE_STEPS = [
     ("Finish", ("Assembled",)),
 ]
 
+DREAMCORE_STEPS = [
+    ("Read music", ("Music: a phrase", "Music: too few")),
+    ("Find cuts", ("Clip 1:", "Clip 2:", "Clip 3:")),
+    ("Lay on grid", ("Edit:",)),
+    ("Render", ("Done:",)),
+    ("Verify", ("Verify:",)),
+]
+
 
 CAPTION_STEPS = [
     ("Load video", ("Started", "Extracting audio")),
@@ -5882,6 +5890,7 @@ def compute_step_view(status, logs, log_times=None, job_kind=None, clip_source=N
              else PHYSICS_STEPS if job_kind == "physics"
              else LOWPOLY_STEPS if job_kind == "lowpoly"
              else AICORE_STEPS if job_kind == "aicore"
+             else DREAMCORE_STEPS if job_kind == "dreamcore"
              else CAPTION_STEPS if job_kind == "caption"
              else DISCOVERY_RUN_STEPS if _is_discovery_run(logs)
              else SCRAPE_RUN_STEPS if is_scrape else RUN_STEPS)
@@ -13128,6 +13137,12 @@ except Exception as _exc:  # noqa: BLE001
     print("[ai_core] module unavailable:", _exc)
     ai_core = None
 
+try:
+    import dreamcore_mode
+except Exception as _exc:  # noqa: BLE001
+    print("[dreamcore] module unavailable:", _exc)
+    dreamcore_mode = None
+
 REDDIT_STORY_DIR = ROOT / "outputs" / "reddit_story"
 REDDIT_SESSION_FILE = REDDIT_STORY_DIR / "session_stories.json"
 
@@ -13391,6 +13406,148 @@ def start_aicore_job(clip_paths, title="", meta=None):
 
     threading.Thread(target=worker, daemon=True).start()
     return job_id
+
+
+def _dreamcore_bed_path(name):
+    """Resolve a picked track name to a file inside the background-music folder.
+
+    Only names from that folder are accepted: the value arrives from the browser, and a
+    raw path would let any file on disk be read back through the project config.
+    """
+    tracks = []
+    try:
+        tracks = list(pipeline.background_music_files({}))
+    except Exception:  # noqa: BLE001
+        tracks = []
+    wanted = str(name or "").strip()
+    for path in tracks:
+        if wanted and path.name.lower() == wanted.lower():
+            return path
+    for path in tracks:                       # default: the dreamcore bed if it is there
+        if "dreamcore" in path.name.lower():
+            return path
+    if tracks:
+        return tracks[0]
+    raise RuntimeError("No background music found - put a track in the "
+                       "'background music' folder first.")
+
+
+def start_dreamcore_job(clip_paths, title="", bed="", meta=None):
+    """Cut the user's generated clips to the melody of the chosen music bed."""
+    if dreamcore_mode is None:
+        raise RuntimeError("Dreamcore is unavailable (module failed to import).")
+    meta = dict(meta or {})
+    slug = "dreamcore_" + (re.sub(r"[^a-z0-9]+", "_", str(title or "short")[:40].lower())
+                           .strip("_") or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
+    project_dir = agent_core.PROJECTS_DIR / slug
+    work_dir = ROOT / "outputs" / "dreamcore_work" / slug
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job_id = str(int(time.time() * 1000))
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "logs": [f"Cutting {len(clip_paths)} clip(s) to the music."],
+            "log_times": [time.time()],
+            "result": None, "error": None,
+            "cancel_event": cancel_event,
+            "project_dir": None,
+            "created_at": time.time(),
+            "job_kind": "dreamcore",
+        }
+
+    def status_cb(message):
+        with JOB_LOCK:
+            j = JOBS.get(job_id)
+            if not j or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            j["logs"].append(str(message))
+            j.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            (project_dir / "renders").mkdir(parents=True, exist_ok=True)
+            final = project_dir / "renders" / f"{slug}.mp4"
+            report = dreamcore_mode.edit_to_music(
+                clip_paths, bed, final, status_cb=status_cb, work_dir=work_dir,
+                target_seconds=(float(meta.get("target_seconds"))
+                                if str(meta.get("target_seconds") or "").strip() else None))
+            # The claim of this whole mode is "the cuts are on the melody". Measure it on
+            # the rendered file and keep the number in the report, so a drifting edit is
+            # visible instead of merely intended.
+            try:
+                report["verify"] = dreamcore_mode.verify_edit(final, bed, status_cb=status_cb)
+            except Exception as exc:  # noqa: BLE001
+                report["verify"] = {"error": str(exc)}
+            report.update({"title": title or slug, "project_dir": str(project_dir),
+                           "mode": "dreamcore", "bed": str(bed), **meta})
+            _write_dreamcore_project_config(project_dir, slug, report)
+            (project_dir / "agent_report.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            with JOB_LOCK:
+                JOBS[job_id]["project_dir"] = str(project_dir)
+                JOBS[job_id]["status"] = "done"
+                JOBS[job_id]["result"] = report
+        except RunCancelled:
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "cancelled"
+                JOBS[job_id]["logs"].append("Cancelled.")
+        except Exception as exc:  # noqa: BLE001
+            with JOB_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = f"{exc}"
+                JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def _write_dreamcore_project_config(project_dir, slug, report):
+    """One scene per SHOT, not per uploaded file.
+
+    A dreamcore upload holds two or three shots inside one generated clip, and the whole
+    point of the mode is where those internal cuts land. A scene per file would open the
+    timeline on three long blocks and hide exactly the thing the user came to adjust.
+    """
+    clips = project_dir / "seedance 2.0"
+    clips.mkdir(parents=True, exist_ok=True)
+    (project_dir / "config").mkdir(parents=True, exist_ok=True)
+    work = Path(report.get("work_dir") or "")
+    scenes = []
+    for i, part in enumerate(report.get("parts") or []):
+        name = f"shot{i + 1:02d}.mp4"
+        src = (work / name) if work else Path("")
+        if not src.exists():
+            src = Path(str(report.get("video") or "")).parent.parent / "_dreamcore" / name
+        dst = clips / name
+        try:
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+            pipeline.extract_poster_frame(dst, dst.with_suffix(".poster.jpg"))
+        except Exception:  # noqa: BLE001
+            pass
+        at = float(part.get("at") or 0.0)
+        slot = float(part.get("slot") or part.get("take") or 0.0)
+        scenes.append({
+            "id": f"s{i}", "start": round(at, 3), "end": round(at + slot, 3),
+            "clip": name, "asset": name, "seedance": True,
+            "name": f"Shot {i + 1}",
+            "prompt": "", "caption": "", "exact_voice_text": "", "word_timings": [],
+        })
+    grid = report.get("grid") or {}
+    config = {
+        "title": report.get("title") or slug.replace("_", " ").title(),
+        "captions_baked": True,
+        "clip_source": "manual",
+        "sfx_enabled": False,
+        "smart_overlays": False,
+        "background_music_file": Path(str(report.get("bed") or "")).name,
+        "background_music_enabled": True,
+        "dreamcore_phrase": grid.get("phrase"),
+        "scenes": scenes,
+    }
+    (project_dir / "config" / "project.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _write_aicore_project_config(project_dir, slug, report):
@@ -15388,6 +15545,64 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:  # noqa: BLE001
                     meta["prompts"] = []
                 out = {"job_id": start_aicore_job(saved, title=title, meta=meta)}
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        if parsed.path == "/dreamcore-prompts":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except Exception:  # noqa: BLE001
+                body = {}
+            try:
+                if dreamcore_mode is None:
+                    raise RuntimeError("Dreamcore is unavailable.")
+                bed = _dreamcore_bed_path(body.get("bed"))
+                # The hold time written into the prompts is the phrase length of the
+                # actual bed, so the clips come back already cut to this track.
+                grid = dreamcore_mode.music_grid(bed)
+                out = dreamcore_mode.prompts_for(
+                    str(body.get("brief") or ""),
+                    clip_count=max(1, min(12, int(body.get("clips") or 4))),
+                    cuts_per_clip=max(1, min(4, int(body.get("cuts") or 2))),
+                    phrase=float(grid.get("phrase") or 3.85),
+                    model=str(body.get("model") or "") or dreamcore_mode.PROMPT_MODEL)
+                out["bed"] = str(bed)
+                out["grid"] = {k: grid[k] for k in ("phrase", "offset", "duration")}
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)}
+            self.send_bytes(json.dumps(out).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        if parsed.path == "/dreamcore-edit":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                fields, files = parse_multipart(self.headers.get("Content-Type", ""), raw)
+                if not files:
+                    raise RuntimeError("Upload the generated clips first.")
+                title = str(fields.get("title") or "").strip()
+                stage = ROOT / "outputs" / "dreamcore_uploads" / time.strftime("%Y%m%d_%H%M%S")
+                stage.mkdir(parents=True, exist_ok=True)
+                saved = []
+                for key in sorted(files, key=lambda k: str(k)):
+                    item = files[key]
+                    name = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                                  str(item.get("filename") or key))[-80:]
+                    dest = stage / f"{len(saved) + 1}_{name or 'clip.mp4'}"
+                    dest.write_bytes(item.get("data") or b"")
+                    saved.append(str(dest))
+                meta = {k: fields[k] for k in ("brief", "world", "target_seconds")
+                        if fields.get(k)}
+                try:
+                    meta["prompts"] = json.loads(fields.get("prompts") or "[]")
+                except Exception:  # noqa: BLE001
+                    meta["prompts"] = []
+                out = {"job_id": start_dreamcore_job(
+                    saved, title=title, bed=str(_dreamcore_bed_path(fields.get("bed"))),
+                    meta=meta)}
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)}
             self.send_bytes(json.dumps(out).encode("utf-8"),

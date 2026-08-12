@@ -1140,7 +1140,8 @@ audio.inline-audio { width: 100%; margin-top: 8px; }
 /* AI Short progressive disclosure: keep the familiar narrated mode and the new
    single-shot motion workflow distinct before exposing either configuration. */
 .ai-short-picker{max-width:1040px!important;padding:18px!important;background:linear-gradient(145deg,rgba(19,23,20,.98),rgba(8,11,9,.98))!important}
-.ai-short-choice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+/* auto-fit, not a fixed 2: a third mode used to wrap to a lonely full-width row */
+.ai-short-choice-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:16px}
 .ai-short-choice{position:relative;display:grid;grid-template-rows:260px auto;min-width:0;padding:0;overflow:hidden;text-align:left;color:var(--text);background:#0a0d0b;border:1px solid rgba(167,187,173,.16);border-radius:22px;cursor:pointer;transition:transform .42s cubic-bezier(.16,1,.3,1),border-color .25s,box-shadow .42s}
 .ai-short-choice:hover{transform:translateY(-7px) scale(1.018);border-color:rgba(130,255,101,.42);box-shadow:0 28px 70px rgba(0,0,0,.42),0 0 0 1px rgba(130,255,101,.08)}
 .ai-choice-preview{position:relative;display:block;overflow:hidden;background:radial-gradient(circle at 50% 50%,#26342b,#080b09 70%)}
@@ -1165,8 +1166,25 @@ audio.inline-audio { width: 100%; margin-top: 8px; }
 .motion-fixed-duration{display:flex;flex-direction:column;justify-content:center;gap:3px;padding:11px 14px;border:1px solid rgba(132,255,101,.16);border-radius:12px;background:rgba(113,255,91,.045)}.motion-fixed-duration b{font-size:14px;color:var(--text)}.motion-fixed-duration span{font-size:11px;color:var(--muted)}
 .motion-speed-control{display:grid!important;grid-template-columns:1fr auto!important;gap:7px 12px!important;padding:11px 14px;border:1px solid rgba(167,187,173,.16);border-radius:12px;background:rgba(5,8,6,.55)}.motion-speed-control input{grid-column:1/-1;accent-color:#7ee969;cursor:pointer}.motion-speed-control b{font-size:12px;color:#93ed7e}
 .motion-loop-toggle{grid-column:1/-1!important;display:grid!important;grid-template-columns:42px 1fr!important;align-items:center!important;position:relative;padding:13px 15px;border:1px solid rgba(167,187,173,.15);border-radius:14px;background:rgba(5,8,6,.55);cursor:pointer}.motion-loop-toggle input{position:absolute;opacity:0}.motion-loop-toggle>i{width:38px;height:22px;border-radius:99px;background:#29312b;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);transition:.2s}.motion-loop-toggle>i:after{content:"";display:block;width:16px;height:16px;margin:3px;border-radius:50%;background:#a6aea8;transition:.25s cubic-bezier(.16,1,.3,1)}.motion-loop-toggle input:checked+i{background:#63cf50}.motion-loop-toggle input:checked+i:after{transform:translateX(16px);background:white}.motion-loop-toggle>span{display:flex;flex-direction:column;gap:2px}.motion-loop-toggle b{color:var(--text);font-size:13px}.motion-loop-toggle small{font-size:11px;color:var(--muted)}
-@media(max-width:760px){.ai-short-choice-grid,.motion-profile-grid{grid-template-columns:1fr}.ai-short-choice{grid-template-rows:190px auto}.motion-inline-controls{grid-template-columns:1fr}.motion-tag-group{grid-template-columns:1fr;gap:3px}}
-@media(prefers-reduced-motion:reduce){.ai-short-choice,.ai-choice-preview video{transition:none}.ai-loop-orbit{animation:none}}
+/* Dreamcore: the card has no clip to show, so the tile IS the mood - a sodium-lit haze
+   drifting behind a corridor of light, which is what the mode makes. */
+.ai-short-choice.dreamcore .dc-preview{background:radial-gradient(120% 80% at 50% 18%,#2b2340,#0d0a16 62%,#05040a)}
+.dc-glow{position:absolute;left:50%;top:56%;width:150px;height:190px;transform:translate(-50%,-50%) perspective(320px) rotateX(24deg);background:linear-gradient(#ffe8a8,rgba(255,232,168,.06) 72%,transparent);filter:blur(1px);box-shadow:0 0 70px 26px rgba(255,214,132,.16);animation:dcDrift 7s ease-in-out infinite alternate}
+.dc-preview:before{content:"";position:absolute;inset:0;background:repeating-linear-gradient(transparent 0 3px,rgba(0,0,0,.22) 3px 4px);opacity:.5}
+@keyframes dcDrift{from{transform:translate(-50%,-50%) perspective(320px) rotateX(24deg) scale(.94);opacity:.72}to{transform:translate(-50%,-52%) perspective(320px) rotateX(24deg) scale(1.06);opacity:1}}
+.ai-short-choice.dreamcore:hover{border-color:rgba(198,164,255,.5);box-shadow:0 28px 70px rgba(0,0,0,.5),0 0 0 1px rgba(198,164,255,.1)}
+.ai-short-choice.dreamcore .ai-choice-copy small{color:#c7a8ff}
+/* brief step: music picker and the two counts sit on one row */
+.dc-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr);gap:14px;margin-top:16px}
+.dc-row .aicore-label>span{font-size:13px;font-weight:750}
+.dc-row select,.dc-row input{width:100%;box-sizing:border-box;margin-top:8px;padding:11px 13px;border-radius:12px;border:1px solid rgba(167,187,173,.18);background:#0b0f0c;color:var(--text);font:inherit}
+.dc-row select:focus,.dc-row input:focus{border-color:rgba(198,164,255,.55);outline:none}
+/* the shot list of one prompt, so the internal cuts are readable before generating */
+.dc-shots{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0 2px}
+.dc-shot{display:inline-flex;align-items:center;gap:7px;padding:5px 11px 5px 5px;border:1px solid rgba(198,164,255,.22);border-radius:999px;background:rgba(120,90,190,.1);font-size:12px;color:var(--text)}
+.dc-shot i{display:grid;place-items:center;width:19px;height:19px;border-radius:50%;background:rgba(198,164,255,.2);font-style:normal;font-size:10px;font-weight:750;color:#d9c4ff}
+@media(max-width:760px){.ai-short-choice-grid,.motion-profile-grid{grid-template-columns:1fr}.ai-short-choice{grid-template-rows:190px auto}.motion-inline-controls{grid-template-columns:1fr}.motion-tag-group{grid-template-columns:1fr;gap:3px}.dc-row{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){.ai-short-choice,.ai-choice-preview video{transition:none}.ai-loop-orbit,.dc-glow{animation:none}}
 .proto-tool-physics { justify-content:flex-start; }
 .proto-tool-physics .proto-tool-copy { margin-top:0; }
 .proto-tool-longform { background:#171810; color:#fff; }
