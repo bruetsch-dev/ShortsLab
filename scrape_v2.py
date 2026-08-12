@@ -282,6 +282,7 @@ class SegmentCandidate:
     frozen_run_seconds: float = 0.0
     motion_score: float = 0.0        # 0 = a held photograph, see _motion_score
     cleaned_path: str = ""           # blurred copy, when the captions were removable
+    caption_over_subject: bool = False   # a penalty now, not a disqualifier
     micro_stutter_count: int = 0
     # semantics (filled by vision)
     semantic_score: float = 0.0
@@ -1769,8 +1770,10 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
         reasons.append("ai_watermark")
 
     cap_prob, cap_text_heavy, hard_over_subject = _segment_caption_signals(frames)
-    if hard_over_subject:
-        reasons.append("burned_caption_over_subject")
+    # Not a rejection any more - it was the single largest loss (32 of 64 declines) on a
+    # topic TikTok is full of. It stays on the segment as a score penalty so a clean clip
+    # still wins when there is a choice.
+    seg.caption_over_subject = bool(hard_over_subject)
 
     # internal cuts WITHIN this window
     stab = _window_stability(src, ffmpeg, ffprobe, seg.start_time, seg.end_time)
@@ -2169,22 +2172,15 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
         # shot.
         return "creator reaction overlay"
-    if bool(desc.get("burned_captions")) and not _captions_are_removable(seg):
-        # Captions are fatal only when we cannot take them off.
+    if bool(desc.get("burned_captions")):
+        # Captions do not reject anything any more (user: "Untertitel sind egal").
         #
-        # This rule has been round the houses. It was fatal, then I removed it because "the
-        # render blurs a lower third anyway", then an audit showed the blur produced zero
-        # files on real footage and I put it back. The audit was right about the symptom and
-        # wrong about the cause: the blur was never running at all, because its only call
-        # site passed a status_cb that does not exist in that scope and the exception was
-        # swallowed. With that fixed the blur removes the burned-in text - verified on this
-        # project, 11 of 14 clips cleaned and the creator's watermark gone from the render.
-        #
-        # So the question is no longer "does text exist" but "can we remove it", and that is
-        # answered by running the blur on this segment and counting what it finds. On a
-        # Japanese topic 85% of the pool carries text; refusing all of it left twelve of
-        # fourteen beats borrowing the same Shibuya clip.
-        return "burned-in captions the blur cannot remove"
+        # This rule cost more than it protected. 85% of the Japanese pool carries burned-in
+        # text, so refusing it left twelve of fourteen beats borrowing one Shibuya clip -
+        # a short where the picture matches the narration nowhere is worse than a short with
+        # someone else's caption in the corner. The blur still runs, so the text is removed
+        # wherever the glyph pass can find it; when it cannot, the clip is used as it is.
+        _captions_are_removable(seg)
     if float(seg.text_heaviness or 0) >= 4.5:
         # Raised from 2.5, and this half of the change survived the audit: text_heaviness is
         # max(OCR area, CV bright-blob score) and the CV half generates false positives on

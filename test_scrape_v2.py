@@ -247,16 +247,11 @@ def test_provenance_and_editorial_gates():
     # blurs a lower third. An audit showed the blur fails silently when its OCR finds
     # nothing, cannot handle word-by-word or vertical or coloured captions, and produced zero
     # blurred files on the one real artefact on disk. Captions are fatal again.
-    # Captions are fatal only when the blur cannot take them off. The segment below has no
-    # real file, so the blur cannot run and it stays rejected - which is also the safe
-    # default when anything about the removal path is broken.
-    check("captions the blur cannot remove are still rejected",
-          "captions" in v.editorial_rejection_reason(captions, japanese_intent))
-    over_subject = v.SegmentCandidate(**{**good.__dict__, "segment_id": "over",
-                                         "rejection_reasons": ["burned_caption_over_subject"],
-                                         "visual_description": {"age_confidence": "adult"}})
-    check("a caption sitting ON the subject is still rejected",
-          v.editorial_rejection_reason(over_subject, japanese_intent) != "")
+    # Captions no longer reject anything (user: "Untertitel sind egal"). 85% of the
+    # Japanese pool carries text; refusing it left twelve of fourteen beats borrowing one
+    # clip. The blur still runs, so the text goes wherever the glyph pass can find it.
+    check("a burned caption no longer rejects a clip",
+          v.editorial_rejection_reason(captions, japanese_intent) == "")
     slide = v.SegmentCandidate(**{**good.__dict__, "segment_id": "slide", "text_heaviness": 6.0,
                                   "visual_description": {"age_confidence": "adult"}})
     check("a frame that is mostly text is still rejected",
