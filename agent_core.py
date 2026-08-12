@@ -8699,12 +8699,19 @@ def apply_timeline_edits_to_config(config, edits, slug, prepare_media=True):
                             # touches only detected letter strokes; if it cannot identify text we
                             # preserve the source instead of creating a visible blur patch.
                             import clip_scraper as _cs_blur
+                            # No status_cb in this function's scope - passing one raised
+                            # NameError on every single call, the except below swallowed it,
+                            # and the copy was then deleted as "no captions found". The blur
+                            # toggle has therefore never done anything from the timeline
+                            # editor. A silent except around a feature's only call site is
+                            # how a feature disappears without anyone noticing.
                             found = _cs_blur.blur_caption_regions(
                                 dest, pipeline.find_ffmpeg(),
                                 seconds=max(1.0, float(scene.get("end", 0) or 0)
-                                            - float(scene.get("start", 0) or 0)),
-                                status_cb=status_cb)
-                        except Exception:
+                                            - float(scene.get("start", 0) or 0)))
+                        except Exception as _blur_exc:      # noqa: BLE001
+                            print(f"[capblur] scene {sid}: {type(_blur_exc).__name__}: "
+                                  f"{_blur_exc}")
                             found = 0
                         if not found:
                             # no burned-in captions detected -> drop the useless copy
