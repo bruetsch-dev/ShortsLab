@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -141,10 +142,11 @@ _WORLD_RULES = """Write prompts that work in any modern video generator.
 
 PROMPT_SYSTEM = """You write prompts for dreamcore / liminal-space short videos.
 
-A dreamcore short is a series of empty, uncanny, half-remembered places. No people, no
-story, no dialogue. The feeling is "somewhere you have been but cannot place, and nobody
-is there". Carpeted corridors, drained pools, stairwells, parking decks at 3am, hotel
-lobbies with no guests, playgrounds under sodium light, endless indoor pools.
+A dreamcore short is a series of empty, uncanny, half-remembered places, held by
+architecture and light alone - no story, no dialogue. The feeling is "somewhere you have
+been but cannot place, long after everyone has gone". Carpeted corridors, pool halls out
+of season, stairwells, parking decks at 3am, hotel lobbies between guests, playgrounds
+under sodium light, waiting rooms, service tunnels, foyers with the lights left on.
 
 THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
 
@@ -169,19 +171,89 @@ HOLDING THE WORLD TOGETHER:
 
 """ + _WORLD_RULES + """
 
+KEEPING THE PROMPT CLEAR OF SAFETY FILTERS - this costs nothing and saves whole clips:
+  * Write what IS there, never what is absent. "No people anywhere" and "if anyone
+    appears" put a person into the prompt, and generators act on the noun, not the
+    negation - the project has the same rule for every other model it drives. Say
+    "the architecture and the light are the only subjects", "the space stands
+    unoccupied", "stillness broken only by the air".
+  * Stay out of rooms that read as surveillance of undressed people even when empty:
+    changing cubicles, locker aisles, shower rooms, saunas, toilets, fitting rooms,
+    bedrooms. The liminal feeling comes from the corridor OUTSIDE them, and a hallway,
+    stairwell, foyer, pool hall, car park, waiting room or plant room carries it just as
+    well with none of the risk.
+  * Avoid wording that reads as a body or a crime scene: skin, flesh, bare, naked,
+    blood, stains that "spread", a footprint trail "that stops", something "dragged".
+    Wet floors and condensation are fine; describe them as water, not as traces.
+  * Prefer "closed for the night", "long empty", "out of season" to "abandoned",
+    "derelict", "decaying" - same mood, and the first set does not co-occur with
+    disaster imagery in a filter's training data.
+  * The camera is a camera, not a hidden one. Never "hidden camera", "security
+    footage of", "spy cam", "found tape of someone". Locked-off, handheld-free, a
+    consumer camcorder on a tripod.
+
 DREAMCORE SPECIFICS that carry the aesthetic:
   * Camera: locked off or a very slow push. No handheld, no whip pans.
-  * Emptiness is the subject. If a person appears the shot is wrong.
+  * Emptiness is the subject: the room, its light and its air are what the shot is of.
   * Light comes from inside the frame: fluorescent tubes, exit signs, pool lights, a TV.
   * Slight wrongness beats obvious horror: a door where a wall should be, a corridor that
     repeats, water indoors, a ceiling too low.
   * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed, no
     cinematic colour grade.
 
+HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
+  Write 60-110 words FOR EACH SHOT, not for the whole prompt. A generator fills
+  everything you leave unsaid with the average of its training data, and the average of
+  "empty corridor" is a stock office. Every shot names, concretely:
+    - the exact space and its dimensions in words (how long, how low the ceiling, how far
+      the far wall is)
+    - the materials and their condition: tile size and grout colour, paint blistering,
+      carpet pattern and wear, water stains, dust, chipped edges
+    - every light source IN the frame, its colour temperature and its behaviour (a tube
+      that flickers at a named rhythm, an exit sign's specific green, a pool lamp's
+      caustics)
+    - what MOVES, however small: a curtain in an unfelt draught, dust in a beam, water
+      surface breathing, a cable swinging, condensation running
+    - the air itself: humid, dusty, cold, chlorine haze, cigarette staleness
+    - the camera: locked off or how slowly it pushes, at what height, what lens feel
+    - the recording: grain size, chroma bleed, slight lens vignette, tape wobble, a
+      timestamp glow if it belongs
+    - the ambient sound of that space: a filtration hum, a tube's ballast buzz, a drip
+      with an interval, distant traffic through concrete
+  Do not repeat the world sentence's contents inside each shot - build ON it.
+
 Return JSON:
   {"world": "<the shared world sentence>",
    "prompts": [{"label": "<3-5 words>", "shots": ["<shot 1 place>", "<shot 2 place>"],
                 "text": "<the full one-line prompt, cuts and hold times included>"}]}"""
+
+
+# Wording that gets a perfectly innocent liminal prompt refused. Two kinds: rooms whose
+# name alone reads as surveillance of undressed people, and negations - a generator acts on
+# the noun in "no people", which is why the house rule everywhere else is positive framing.
+_SAFETY_PATTERNS = (
+    (r"\b(changing|dressing|fitting)\s+(room|cubicle|area|stall)s?\b", "changing room"),
+    (r"\block(er)?\s*(room|aisle|bank)s?\b", "locker room"),
+    (r"\bshower(s|\s+room|\s+block|\s+head)?\b", "shower"),
+    (r"\b(sauna|steam\s*room|changing\s*curtain|toilet|urinal|bathroom stall)\b", "washroom"),
+    (r"\b(bedroom|motel bed|unmade bed)\b", "bedroom"),
+    (r"\b(naked|nude|bare skin|flesh|body|bodies|corpse|blood)\b", "body word"),
+    (r"\b(hidden|spy|secret)\s+cam(era)?\b", "hidden camera"),
+    (r"\bsecurity (footage|cam)", "surveillance framing"),
+    (r"\bno (people|one|person|humans?)\b", "negation"),
+    (r"\b(nobody|no-one)\b", "negation"),
+    (r"\bwithout (any )?(people|humans)\b", "negation"),
+)
+
+
+def safety_review(text: str) -> list:
+    """Wording in a finished prompt that generators commonly refuse. Empty list = clean."""
+    low = str(text or "").lower()
+    hits = []
+    for pattern, label in _SAFETY_PATTERNS:
+        if re.search(pattern, low) and label not in hits:
+            hits.append(label)
+    return hits
 
 
 def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
@@ -196,9 +268,13 @@ def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
     ask = (f"The idea: {str(brief or '').strip() or 'liminal spaces, no people'}\n"
            f"Write exactly {int(clip_count)} prompts. Each produces one clip holding "
            f"{int(cuts_per_clip) + 1} shots separated by {int(cuts_per_clip)} hard cuts.")
+    # max_tokens has to carry clip_count x (world sentence + 3 shots x ~100 words). At 4000
+    # the last prompt came back truncated mid-shot, and a truncated prompt is a silently
+    # worse video rather than an error.
+    budget = min(24000, 1800 + int(clip_count) * (int(cuts_per_clip) + 1) * 320)
     out = agent_core._post_llm_json(
         model, [{"role": "system", "content": system}, {"role": "user", "content": ask}],
-        max_tokens=4000, temperature=0.75, timeout=420) or {}
+        max_tokens=budget, temperature=0.75, timeout=900) or {}
     if isinstance(out, list):
         out = {"prompts": out}
     prompts = []
@@ -213,6 +289,13 @@ def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
             prompts.append({"label": label or f"Clip {i + 1}", "text": text, "shots": shots})
     if not prompts:
         raise RuntimeError("No prompts came back.")
+    flagged = [(p["label"], hits) for p in prompts
+               if (hits := safety_review(p["text"]))]
+    if flagged:
+        # Reported, not rewritten. Editing a generator prompt behind the user's back is how
+        # a prompt stops matching the clip it produced; naming the words lets them decide.
+        _log(status_cb, "Dreamcore: wording that generators often refuse - "
+             + "; ".join(f"{label}: {', '.join(h)}" for label, h in flagged))
     _log(status_cb, f"{len(prompts)} prompts ready "
                     f"({len(prompts) * (cuts_per_clip + 1)} shots at {phrase:.2f}s each = "
                     f"{len(prompts) * (cuts_per_clip + 1) * phrase:.1f}s of video).")
