@@ -433,6 +433,58 @@ def test_uncovered_beats_borrow_motion():
           and only_stills[0]["assignment_type"] == "uncovered_still")
 
 
+def test_one_inherited_cut_is_allowed_two_are_not():
+    """An assigned clip may contain ONE original cut inside it, never two.
+
+    Rejecting on the first cut was measured as the largest single loss on a live run -
+    56% of all candidate windows - and it is unmeetable anyway: the window is ~3.8s and
+    social footage cuts about that often. Real files here, made with ffmpeg, because the
+    rule is enforced by an ffmpeg scene-score pass and a fabricated stub would only test
+    the fixture.
+    """
+    import subprocess
+    ffmpeg = str(v.pipeline.find_ffmpeg() or "ffmpeg")
+
+    # 1.3s per colour, so that with three colours BOTH cuts fall inside one ~3.8s window.
+    # A first version used 2.2s pieces and the second cut landed past the window end, so the
+    # test reported a pass for the wrong reason - the code never saw two cuts at all.
+    PIECE = 1.3
+
+    def build(path, colours):
+        """One video, PIECE seconds per colour - every colour change is a hard cut."""
+        parts = []
+        for i, colour in enumerate(colours):
+            piece = path.parent / f"p{i}.mp4"
+            subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-f", "lavfi",
+                 "-i", f"color=c={colour}:s=360x640:d={PIECE}:r=30",
+                 "-vf", "noise=alls=8:allf=t",          # so it is not a frozen still
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(piece)],
+                check=True, timeout=300)
+            parts.append(piece)
+        listing = path.parent / "l.txt"
+        listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+        subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                        "-i", str(listing), "-c", "copy", str(path)], check=True, timeout=300)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        cases = [("no cut", ["red"], 0, False),
+                 ("one cut", ["red", "blue"], 1, False),
+                 ("two cuts", ["red", "blue", "green"], 2, True)]
+        for label, colours, want_cuts, want_reject in cases:
+            clip = root / f"{want_cuts}.mp4"
+            build(clip, colours)
+            # a window that spans the whole thing, so every cut is inside it
+            end = min(3.8, PIECE * len(colours) - 0.2)
+            seg = v.SegmentCandidate(segment_id=label, source_id="s", platform="tiktok",
+                                     source_path=str(clip), start_time=0.2, end_time=end,
+                                     duration=round(end - 0.2, 3))
+            out = v.analyze_segment_v2(seg, ffmpeg, "ffprobe")
+            rejected = "rapid_internal_cuts" in (out.rejection_reasons or [])
+            check(f"{label}: rejected={want_reject}", rejected == want_reject)
+
+
 def test_a_bare_json_array_does_not_kill_the_run():
     """The planner must survive the model ignoring the {"intents": [...]} envelope.
 
@@ -676,6 +728,7 @@ if __name__ == "__main__":
               test_ranking_relevance_over_likes, test_provenance_and_editorial_gates,
               test_relationship_scene_queries,
               test_a_bare_json_array_does_not_kill_the_run,
+              test_one_inherited_cut_is_allowed_two_are_not,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,
               test_borrowed_beat_survives_the_render_gate,

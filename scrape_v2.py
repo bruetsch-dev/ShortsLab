@@ -1806,8 +1806,15 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     # internal cuts WITHIN this window
     stab = _window_stability(src, ffmpeg, ffprobe, seg.start_time, seg.end_time)
     edit_stability = 10.0 if stab["stable"] else max(0.0, 8.0 - stab["internal_cut_count"] * 3.0)
-    # One source edit inside a planned shot already creates an unintended double-cut.
-    if stab["internal_cut_count"] >= 1:
+    # ONE original cut inside an assigned clip is allowed; two is not.
+    #
+    # This used to reject on the first cut, and measured on a real run that was the single
+    # largest loss: 56% of all candidate windows died here, before anything asked what the
+    # footage showed. It is also unmeetable on the material - a window is ~3.8s and social
+    # footage cuts about that often, so the rule demanded a continuous take that most
+    # uploads simply do not contain. One inherited cut inside a beat reads as pace; two
+    # inside four seconds is someone else's edit showing through.
+    if stab["internal_cut_count"] >= 2:
         reasons.append("rapid_internal_cuts")
 
     text_heaviness = max(text_heaviness_ocr, cap_text_heavy)
