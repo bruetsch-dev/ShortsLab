@@ -599,8 +599,13 @@ def _relationship_scene_seeds_v2(intent: VisualIntent):
     signal on TikTok.  These are observable actions a human editor would search for instead.
     They supplement, rather than replace, the model's scene-specific plan.
     """
+    # THIS beat's own words only. story_subject is the recurring subject of the whole
+    # script, so including it made every scene of a couples script look like a couples
+    # scene: on a live plan, the beat about photo booths and the beat about love hotels
+    # both came out searching "カップル デート vlog", and scenes 1-3 ended up with
+    # identical query sets while the word プリクラ never appeared once.
     text = " ".join(str(getattr(intent, key, "") or "") for key in (
-        "scene_text", "story_subject", "local_claim", "subject", "action", "location",
+        "scene_text", "local_claim", "subject", "action", "location",
     )).casefold()
     relationship_markers = (
         "girlfriend", "boyfriend", "couple", "dating", "date", "romance", "romantic",
@@ -1384,6 +1389,19 @@ Examples: "no free time" -> student asleep at desk or massive textbook pile. "st
 -> perfectly synchronized drill. "romance banned" -> awkward teenage couple or teacher intervening.
 Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
 visible subject, visible action and plausible location.
+
+NAME THE THING, THEN SEARCH FOR IT. Before writing queries for a scene, decide what the
+ONE concrete noun of that beat is - the object, machine, room or place the sentence is
+actually about (a photo booth, a love hotel, a vending machine, a pachinko parlour, a
+drain, a lane rope). At least one query per scene MUST be that noun on its own, in the
+local language, with nothing else attached. Native speakers tag their footage with the
+name of the thing, not with a description of the mood around it.
+
+WHY THIS IS A RULE AND NOT A SUGGESTION: on a live plan, three beats about photo booths,
+love hotels and public distance were all given the same searches - "shibuya crowds",
+"couple date vlog", "#tokyo" - and the word for photo booth never appeared once. Every
+one of those searches returns real footage; none of it shows what the sentence says.
+Mood and place words are what you add AFTER the noun, never instead of it.
 
 Also choose one communication_role:
 - proof: a named place, event, sign, rule or factual object must be visibly proven.
