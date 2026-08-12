@@ -397,15 +397,43 @@ def _llm_json(messages, max_tokens=4000, temperature=0.3, reasoning_model=None,
 
     NEVER fail silently: a swallowed matcher error used to collapse a whole run into
     emergency fallbacks with no trace (every scene filled with random off-topic clips).
+
+    ALWAYS a dict, even when the model ignores the requested envelope and answers with a
+    bare JSON array - every caller here does data.get(...), so a list killed the whole run
+    with "'list' object has no attribute 'get'" (it killed one live). A bare array is kept
+    under __rows__ so callers that want a list can still find it.
     """
     ac = _ac()
     try:
-        return ac._post_llm_json(reasoning_model or ac.GPT55_MODEL, messages,
-                                 max_tokens, temperature) or {}
+        data = ac._post_llm_json(reasoning_model or ac.GPT55_MODEL, messages,
+                                 max_tokens, temperature)
     except Exception as exc:
         _log(status_cb, "Scrape V2: %s call FAILED (%s: %s) - continuing without its result."
              % (label, exc.__class__.__name__, str(exc)[:160]))
         return {}
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"__rows__": data}
+    return {}
+
+
+def _rows_of(data, key):
+    """The list a caller asked for, whichever shape the model wrapped it in."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if not isinstance(data, dict):
+        return []
+    for candidate in (data.get(key), data.get("__rows__")):
+        if isinstance(candidate, list):
+            return [r for r in candidate if isinstance(r, dict)]
+    # last resort: the model renamed the key but the payload is unmistakable
+    for value in data.values():
+        if (isinstance(value, list) and value
+                and all(isinstance(r, dict) for r in value)
+                and any(("scene_id" in r or "subject" in r) for r in value)):
+            return list(value)
+    return []
 
 
 def _vision_json(prompt_text, sheet_path, max_tokens=4000, temperature=0.1, reasoning_model=None):
@@ -1060,7 +1088,7 @@ def _build_social_search_plan_v2_legacy(title, script, scenes, understanding=Non
         '"jp_location":"..","camera_style":"..","mood":".."}]}]}')
     data = _llm_json([{"role": "system", "content": sys}, {"role": "user", "content": user}],
                      max_tokens=8000, temperature=0.3, reasoning_model=reasoning_model)
-    rows = data.get("intents") if isinstance(data.get("intents"), list) else []
+    rows = _rows_of(data, "intents")
     intents = []
     seen_ids = set()
     for r in rows:
@@ -1392,7 +1420,7 @@ Return exactly:
                          max_tokens=10000, temperature=temperature,
                          reasoning_model=reasoning_model,
                          status_cb=status_cb, label="architect")
-        return data.get("intents") if isinstance(data.get("intents"), list) else []
+        return _rows_of(data, "intents")
 
     rows = []
     all_ids = list(range(len(scenes)))

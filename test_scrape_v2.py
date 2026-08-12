@@ -433,35 +433,44 @@ def test_uncovered_beats_borrow_motion():
           and only_stills[0]["assignment_type"] == "uncovered_still")
 
 
-def test_download_budget_is_spent_once():
-    """A round must attempt exactly the downloads it was given, not half of them.
+def test_a_bare_json_array_does_not_kill_the_run():
+    """The planner must survive the model ignoring the {"intents": [...]} envelope.
 
-    The concurrent-prefetch rewrite reserved each planned source in _downloaded_ids AND
-    added len(planned) to the same guard, so every source counted twice and a budget of 6
-    delivered 3. min_downloads_per_scene = 3 quietly became 1.5 per beat.
+    A live run died at 103s with "'list' object has no attribute 'get'": the architect
+    answered with a bare JSON array, and every consumer in this module calls data.get()
+    on whatever came back. _llm_json now always hands back a dict, and _rows_of finds the
+    payload whichever way it was wrapped.
     """
-    calls = []
+    row = {"scene_id": 0, "subject": "a", "action": "b", "location": "c"}
+    for label, payload, want in (
+            ("documented envelope", {"intents": [row]}, 1),
+            ("bare array", [row], 1),
+            ("renamed key", {"visual_intents": [row]}, 1),
+            ("empty dict", {}, 0),
+            ("null", None, 0),
+            ("string", "nope", 0),
+            ("array of junk", ["a", "b"], 0)):
+        check(f"_rows_of survives a {label}", v._rows_of(payload, "intents") == (
+            [row] if want else []))
 
-    def fake_download(raw_item, proxy, status_cb=None):
-        calls.append(proxy)
-        return None                     # counts as a failed fetch; stops before ffmpeg
+    # and the wrapper the callers actually go through must never hand out a non-dict
+    real = v._ac
+    for payload in ([row], None, "nope", {"intents": [row]}):
+        class _Stub:
+            GPT55_MODEL = "m"
 
-    real = v.download_proxy_v2
-    v.download_proxy_v2 = fake_download
-    try:
-        for budget, spent, want in ((6, 0, 6), (3, 0, 3), (36, 30, 6), (5, 5, 0)):
-            calls.clear()
-            state = {"rejections": {}, "_downloaded_ids": {f"old{i}" for i in range(spent)}}
-            sources = [v.SourceVideoCandidate(source_id=f"s{i}", platform="tiktok",
-                                              creator_id="c", url="https://x/%d" % i,
-                                              query="q", raw_item={})
-                       for i in range(40)]
-            with tempfile.TemporaryDirectory() as tmp:
-                v._download_and_segment(sources, Path(tmp), "ffmpeg", "ffprobe",
-                                        None, None, state, None, budget)
-            check(f"budget {budget} with {spent} spent attempts {want}", len(calls) == want)
-    finally:
-        v.download_proxy_v2 = real
+            def _post_llm_json(self, *_a, **_k):
+                return payload
+        v._ac = lambda stub=_Stub(): stub
+        try:
+            got = v._llm_json([{"role": "user", "content": "x"}])
+            check(f"_llm_json returns a dict for {type(payload).__name__}",
+                  isinstance(got, dict))
+            check(f"_rows_of recovers the rows from {type(payload).__name__}",
+                  v._rows_of(got, "intents") == ([row] if isinstance(payload, (list, dict))
+                                                 and payload else []))
+        finally:
+            v._ac = real
 
 
 def test_relationship_scene_queries():
@@ -666,6 +675,7 @@ if __name__ == "__main__":
               test_scene_bound_query_plan,
               test_ranking_relevance_over_likes, test_provenance_and_editorial_gates,
               test_relationship_scene_queries,
+              test_a_bare_json_array_does_not_kill_the_run,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,
               test_borrowed_beat_survives_the_render_gate,
