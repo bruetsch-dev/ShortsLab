@@ -1390,6 +1390,13 @@ Examples: "no free time" -> student asleep at desk or massive textbook pile. "st
 Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
 visible subject, visible action and plausible location.
 
+SEARCH THE REMARKABLE VERSION OF THE THING. Native platforms are full of footage of any
+subject; almost all of it is a shopfront, a street or someone walking past. What gets
+filmed and posted is the extreme of the thing - the fullest hall, the biggest payout, the
+loudest moment, the strangest machine, the process at its most satisfying. After the bare
+noun, write queries for THAT: the quantity, the record, the mess, the close-up of the
+mechanism, the reaction. A correct but empty shot is a wasted beat.
+
 NAME THE THING, THEN SEARCH FOR IT. Before writing queries for a scene, decide what the
 ONE concrete noun of that beat is - the object, machine, room or place the sentence is
 actually about (a photo booth, a love hotel, a vending machine, a pachinko parlour, a
@@ -2197,10 +2204,17 @@ def describe_segments_v2(segments, project_dir, ffmpeg, reasoning_model=None, st
             '"creator_overlay":true|false,"burned_captions":true|false,"raw_footage_score":0-10,'
             '"edit_stability":0-10,"visual_quality":0-10,"action_visibility":0-10,'
             '"age_confidence":"adult|teen|child|unknown","sexualized_content":true|false,'
-            '"absurdity":0-10,"intensity":0-10,"usable":true|false}\n'
+            '"absurdity":0-10,"intensity":0-10,"striking":0-10,"usable":true|false}\n'
             '(absurdity: how exaggerated/meme-like/bizarre the clip is - 0 mundane, 10 '
             'alien-costume level. intensity: visual energy/craziness, used for escalation '
-            'ordering within a topic block.)\n'
+            'ordering within a topic block.\n'
+            'striking: would a scroller STOP for this shot? Not whether it is pretty and '
+            'not whether it is on topic - whether it is worth looking at. 8-10: a scale or '
+            'quantity that is hard to believe, something genuinely strange, a satisfying '
+            'process at its best moment, a detail nobody has seen before. 4-7: clearly '
+            'interesting, a real thing happening, but familiar. 0-3: a correct but empty '
+            'shot - a street, a shopfront, a wall, someone walking. Two clips can both '
+            'show the subject and only one of them is worth a beat of a short.)\n'
             'Return {"segments": {"0": {..}, "1": {..}, ...}}')
         data = _vision_json(prompt, sheet, max_tokens=4000, temperature=0.1,
                             reasoning_model=reasoning_model)
@@ -2480,14 +2494,28 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                     continue
             elif not passes_match_floors(script_m, overall, it.visual_type, _rel):
                 continue
+            try:
+                striking = float((seg.visual_description or {}).get("striking") or 0.0)
+            except (TypeError, ValueError):
+                striking = 0.0
             scored.append({
                 "segment": seg, "subject_match": subj, "action_match": act, "location_match": loc,
                 "mood_match": mood, "script_match": script_m, "style_match": style_m,
-                "semantic_match": overall, "overall_match": overall,
+                "semantic_match": overall, "overall_match": overall, "striking": striking,
                 "match_class": match_class_for(overall, it.visual_type, _rel),
                 "reason": str(c.get("reason", ""))[:160]})
             seg.semantic_score = max(seg.semantic_score, overall)
-        scored.sort(key=lambda r: (r["overall_match"], r["segment"].quality_score), reverse=True)
+        # Among clips that all fit the beat, prefer the one worth stopping for. `striking`
+        # ranks but never gates: a correct-and-dull shot still beats no shot, and blocking
+        # on it would be the caption gate all over again.
+        #
+        # The match is rounded to a WHOLE point first. Half-point buckets were tried and
+        # are useless here - 7.4 and 7.2 fall either side of 7.5, so a two-tenths scoring
+        # wobble still outranked a clip that was seven points more watchable, which is the
+        # exact situation this tie-break exists for.
+        scored.sort(key=lambda r: (round(r["overall_match"]),
+                                   r["striking"],
+                                   r["segment"].quality_score), reverse=True)
         out[sid] = scored
     matched = sum(1 for v in out.values() if v)
     _log(status_cb, f"Scrape V2: matched {matched}/{len(intents)} scene(s) after floors.")
