@@ -2473,6 +2473,16 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         out[sid] = scored
     matched = sum(1 for v in out.values() if v)
     _log(status_cb, f"Scrape V2: matched {matched}/{len(intents)} scene(s) after floors.")
+    # Two very different failures look identical in that count, and the near-miss report
+    # below can only describe one of them: a scene the matcher OFFERED candidates for that
+    # then failed the floor, versus a scene it declined to offer anything for at all. The
+    # first is a threshold to argue about, the second is the model saying the footage is
+    # off-topic - opposite fixes, so say which happened.
+    silent = [it.scene_id for it in intents if it.scene_id not in near_misses]
+    if silent:
+        _log(status_cb, "Scrape V2: the matcher offered NO candidate at all for "
+                        f"{len(silent)}/{len(intents)} scene(s): {silent[:12]} - it judged "
+                        "the segments off-topic for them, which no threshold will change.")
     if matched < len(intents) and near_misses:
         # Say HOW FAR the misses were, in the same breath as the count.
         misses = [(sid, n) for sid, n in near_misses.items() if not out.get(sid)]
