@@ -2080,22 +2080,31 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         return "minor or uncertain-age creator footage"
     if bool(desc.get("creator_overlay")):
         # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
-        # shot. Captions can.
+        # shot.
         return "creator reaction overlay"
-    # Burned-in captions are NOT fatal on their own any more.
-    #
-    # Measured on 20 clips this scraper had just downloaded for a Japanese topic: 17 of them
-    # (85%) carry on-screen text inside the exact three-second window that would be cut. The
-    # rule that any burned caption disqualifies a clip therefore threw away five sixths of
-    # the Japanese pool, which is what "TikTok has heaps of this and the app finds nothing"
-    # actually was. Rejecting on position rather than presence keeps the two cases that
-    # genuinely cannot be used:
-    #   * text sitting ON the subject -> already a hard segment reason
-    #     ("burned_caption_over_subject"), caught by the quality-gate check above
-    #   * so much text that the frame is a slide, not footage -> text_heaviness below
-    # Everything in between is a lower-third the render already blurs: scenes default to
-    # blur_captions on, and agent_core builds a capblur_ pre-pass for them.
+    if bool(desc.get("burned_captions")):
+        # This rejection was removed and is back. The removal rested on "the render blurs a
+        # lower third anyway", and an audit took that apart:
+        #   * the blur is best-effort and fails SILENTLY - if its OCR finds nothing it
+        #     deletes its own copy and the scene falls back to the untouched original. On the
+        #     one real scrape artefact on disk it produced zero blurred files.
+        #   * its mask is a single static PNG built from a union of 8 sampled frames, so
+        #     word-by-word captions survive and ghost patches smear over where text used to be
+        #   * the box detector thresholds gray > 205 and demands 65% white-or-yellow, so
+        #     coloured captions are invisible to it; so are vertical Japanese columns, text in
+        #     the top 22% of frame, and stickers, which are not text at all
+        #   * nothing downstream re-checks: the matcher prompt is never sent burned_captions
+        #     or visible_text, and a fully captioned clip scores 6.52 against a 6.3 floor, so
+        #     it is not even marked soft
+        # Five sixths of the Japanese pool carrying text is a real problem, but shipping
+        # footage with someone else's captions burned into it is a worse answer than a
+        # smaller pool. The fix belongs upstream, in queries that find uncaptioned footage,
+        # or in a blur that reports whether it actually worked.
+        return "burned-in creator captions"
     if float(seg.text_heaviness or 0) >= 4.5:
+        # Raised from 2.5, and this half of the change survived the audit: text_heaviness is
+        # max(OCR area, CV bright-blob score) and the CV half generates false positives on
+        # ordinary bright detail, so the old bar rejected clean footage.
         return "text-heavy footage (a slide, not footage)"
     if intent is not None and requires_japanese_context(intent):
         if not seg.japanese_context:

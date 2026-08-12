@@ -243,8 +243,12 @@ def test_provenance_and_editorial_gates():
     # a lower third; what it cannot fix is text ON the subject, or a frame that is a slide.
     captions = v.SegmentCandidate(**{**good.__dict__, "segment_id": "caption",
                                      "visual_description": {"age_confidence": "adult", "burned_captions": True}})
-    check("an ordinary burned caption is kept for the blur pass",
-          v.editorial_rejection_reason(captions, japanese_intent) == "")
+    # This assertion was the other way round for one commit, on the theory that the render
+    # blurs a lower third. An audit showed the blur fails silently when its OCR finds
+    # nothing, cannot handle word-by-word or vertical or coloured captions, and produced zero
+    # blurred files on the one real artefact on disk. Captions are fatal again.
+    check("burned creator captions are rejected",
+          "captions" in v.editorial_rejection_reason(captions, japanese_intent))
     over_subject = v.SegmentCandidate(**{**good.__dict__, "segment_id": "over",
                                          "rejection_reasons": ["burned_caption_over_subject"],
                                          "visual_description": {"age_confidence": "adult"}})
