@@ -1705,6 +1705,11 @@ def _is_native_9_16(width, height):
 # survivable, and rejecting good footage everywhere to fix the hook would be a bad trade.
 MOTION_DEAD = 0.45        # a photograph with sensor noise on it; fatal anywhere
 MOTION_HOOK_MIN = 1.35    # the opening shot has to move: it is the whole scroll-stop
+# Cadence hitches PER SECOND at which a window is refused. 0.8 lets a ~3.8s shot carry
+# three of them - measured on a real pool, that keeps ordinary phone footage (a pan easing
+# off, a subject pausing) and still refuses a duplicated-frame re-encode, which produces a
+# hitch several times a second.
+CADENCE_HITCH_RATE = 0.8
 
 
 def _motion_score(frames_bgr):
@@ -1777,7 +1782,14 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
         reasons.append("no_motion")
     cadence_hitches = pipeline.micro_stutter_events(src, seg.start_time, seg.end_time)
     seg.micro_stutter_count = len(cadence_hitches)
-    if cadence_hitches:
+    # A hitch is one frame whose motion drops below a quarter of its neighbours'. ONE of
+    # those is not a defect, it is a pan decelerating or a person pausing, and rejecting on
+    # the first one killed 31% of every candidate window measured on a real pool - before
+    # anything asked what the footage showed. What is worth refusing is a source whose
+    # cadence is broken THROUGHOUT: a re-encode with duplicated frames, or a slideshow.
+    # That shows up as a rate, not a single event, so the rule is per second of window.
+    _window = max(0.5, float(seg.end_time) - float(seg.start_time))
+    if len(cadence_hitches) / _window >= CADENCE_HITCH_RATE:
         reasons.append("cadence_stutter")
 
     fv = clip_scraper.detect_fake_vertical_or_black_bars(src, ffmpeg, seconds=seg.end_time)
