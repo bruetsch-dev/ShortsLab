@@ -485,6 +485,32 @@ def test_one_inherited_cut_is_allowed_two_are_not():
             check(f"{label}: rejected={want_reject}", rejected == want_reject)
 
 
+def test_the_matcher_reads_every_shape_the_model_answers_with():
+    """Only the documented envelope was accepted, and everything else scored 0.
+
+    On a live run this produced "matcher total 0/14 scene(s) across 3 batches" - every
+    segment scoring 0 for every scene - which is indistinguishable from footage that
+    genuinely does not fit, and sent the investigation at the match thresholds instead.
+    """
+    cand = {"seg": 0, "subject_match": 8, "action_match": 7, "script_match": 7}
+    want = {"1": [cand]}
+    for label, payload in (
+            ("documented envelope", {"scenes": {"1": [cand]}}),
+            ("list of scene objects", {"scenes": [{"scene": 1, "candidates": [cand]}]}),
+            ("list with scene_id/matches", {"scenes": [{"scene_id": 1, "matches": [cand]}]}),
+            ("bare array (wrapped by _llm_json)",
+             {"__rows__": [{"scene": 1, "candidates": [cand]}]}),
+            ("map without the wrapper", {"1": [cand]}),
+            ("raw list", [{"scene": 1, "segments": [cand]}])):
+        got = v._scene_candidate_map(payload)
+        check(f"matcher reads a {label}", got == want)
+
+    for label, payload in (("empty dict", {}), ("null", None), ("string", "no"),
+                           ("unrelated dict", {"note": "none fitted"})):
+        check(f"a {label} yields nothing rather than crashing",
+              v._scene_candidate_map(payload) == {})
+
+
 def test_a_failed_cut_scan_is_not_reported_as_clean_footage():
     """"unknown" and "no cuts" must stay different answers.
 
@@ -764,6 +790,7 @@ if __name__ == "__main__":
               test_relationship_scene_queries,
               test_a_bare_json_array_does_not_kill_the_run,
               test_a_failed_cut_scan_is_not_reported_as_clean_footage,
+              test_the_matcher_reads_every_shape_the_model_answers_with,
               test_one_inherited_cut_is_allowed_two_are_not,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,

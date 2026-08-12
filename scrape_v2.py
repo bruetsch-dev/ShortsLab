@@ -419,6 +419,56 @@ def _llm_json(messages, max_tokens=4000, temperature=0.3, reasoning_model=None,
     return {}
 
 
+def _scene_candidate_map(data):
+    """scene id -> candidate list, out of whatever shape the matcher answered with.
+
+    The matcher is asked for {"scenes": {"1": [...]}} and only that shape was accepted.
+    Everything else - a LIST of per-scene objects, the map without its wrapper, a bare
+    array - was silently dropped, which set every segment's score to 0 for every scene.
+    On a live run that produced "matcher total 0/14 scene(s)" and looked exactly like
+    footage that did not fit the script, which is the wrong thing to go and fix.
+    """
+    if not isinstance(data, (dict, list)):
+        return {}
+
+    def _rows(value):
+        return [r for r in value if isinstance(r, dict)] if isinstance(value, list) else []
+
+    def _from_list(items):
+        """[{"scene": 1, "candidates": [...]}, ...] -> {"1": [...]}"""
+        out = {}
+        for row in _rows(items):
+            sid = None
+            for key in ("scene", "scene_id", "id", "scene_number", "index"):
+                if row.get(key) is not None:
+                    sid = row.get(key)
+                    break
+            cands = None
+            for key in ("candidates", "segments", "matches", "results", "items"):
+                if isinstance(row.get(key), list):
+                    cands = row[key]
+                    break
+            if sid is not None and cands is not None:
+                out.setdefault(str(sid), []).extend(_rows(cands))
+        return out
+
+    if isinstance(data, list):
+        return _from_list(data)
+    scenes = data.get("scenes")
+    if isinstance(scenes, dict):
+        return scenes
+    if isinstance(scenes, list):
+        return _from_list(scenes)
+    if isinstance(data.get("__rows__"), list):          # the model answered a bare array
+        return _from_list(data["__rows__"])
+    # the map itself, without its wrapper: {"0": [...], "1": [...]}
+    digitish = {k: v for k, v in data.items()
+                if isinstance(v, list) and re.search(r"\d", str(k))}
+    if digitish:
+        return digitish
+    return {}
+
+
 def _rows_of(data, key):
     """The list a caller asked for, whichever shape the model wrapped it in."""
     if isinstance(data, list):
@@ -2338,10 +2388,16 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                       {"role": "user", "content": prompt}],
                      max_tokens=6000, temperature=0.1, reasoning_model=reasoning_model,
                      status_cb=status_cb, label="scene matcher")
-    smap = data.get("scenes") if isinstance(data.get("scenes"), dict) else {}
+    smap = _scene_candidate_map(data)
     if not smap:
+        # Say WHAT came back. "no usable data" with no shape named is how this sat
+        # undiagnosed: every segment scored 0 for every scene, the run reported "matched
+        # 0/14", and it looked like footage that did not fit.
+        _shape = (f"{type(data).__name__} keys={sorted(data)[:6]}" if isinstance(data, dict)
+                  else type(data).__name__)
         _log(status_cb, "Scrape V2: WARNING - scene matcher returned NO usable data for "
-                        f"{len(described)} segment(s); these segments scored 0 for every scene.")
+                        f"{len(described)} segment(s) (got {_shape}); these segments scored "
+                        "0 for every scene.")
     intent_by_id = {it.scene_id: it for it in intents}
     out = {}
     near_misses = {}          # scene_id -> best scores seen, matched or not
