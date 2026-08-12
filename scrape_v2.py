@@ -2344,6 +2344,7 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                         f"{len(described)} segment(s); these segments scored 0 for every scene.")
     intent_by_id = {it.scene_id: it for it in intents}
     out = {}
+    near_misses = {}          # scene_id -> best scores seen, matched or not
     for sid_str, cands in smap.items():
         try:
             # models routinely answer with "scene 3" / "Scene_3" instead of "3" - a strict
@@ -2377,6 +2378,15 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
             overall = semantic_match_score(subj, act, loc, mood, script_m)
             _cat = str(getattr(it, "match_category", "") or "").lower()
             _rel = getattr(it, "script_relevancy", 70)
+            # Remember the best REJECTED pair too. "matched 0/6 after floors" is not
+            # diagnosable on its own: a run where the best candidate scored 5.4 against a
+            # 5.9 floor and a run where it scored 1.8 need opposite fixes, and the report
+            # could not tell them apart.
+            _near = near_misses.setdefault(sid, {"best_script": 0.0, "best_overall": 0.0,
+                                                 "judged": 0})
+            _near["judged"] += 1
+            _near["best_script"] = max(_near["best_script"], float(script_m or 0))
+            _near["best_overall"] = max(_near["best_overall"], float(overall or 0))
             if _cat == "shock":
                 th_s = match_thresholds_for_relevancy("shock", _rel)
                 try:
@@ -2399,6 +2409,18 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         out[sid] = scored
     matched = sum(1 for v in out.values() if v)
     _log(status_cb, f"Scrape V2: matched {matched}/{len(intents)} scene(s) after floors.")
+    if matched < len(intents) and near_misses:
+        # Say HOW FAR the misses were, in the same breath as the count.
+        misses = [(sid, n) for sid, n in near_misses.items() if not out.get(sid)]
+        if misses:
+            worst = sorted(misses, key=lambda kv: -kv[1]["best_overall"])[:4]
+            th = match_thresholds_for_relevancy("context",
+                                                getattr(intents[0], "script_relevancy", 70))
+            _log(status_cb, "Scrape V2 near misses (floor script>=%.1f overall>=%.1f): %s"
+                 % (th["script_floor"], th["overall"],
+                    "; ".join("scene %s best %.1f/%.1f of %d judged"
+                              % (sid, n["best_script"], n["best_overall"], n["judged"])
+                              for sid, n in worst)))
     return out
 
 
