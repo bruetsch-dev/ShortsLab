@@ -269,6 +269,37 @@ def test_provenance_and_editorial_gates():
           "previously rejected" in v.editorial_rejection_reason(declined, japanese_intent))
 
 
+def test_download_budget_is_spent_once():
+    """A round must attempt exactly the downloads it was given, not half of them.
+
+    The concurrent-prefetch rewrite reserved each planned source in _downloaded_ids AND
+    added len(planned) to the same guard, so every source counted twice and a budget of 6
+    delivered 3. min_downloads_per_scene = 3 quietly became 1.5 per beat.
+    """
+    calls = []
+
+    def fake_download(raw_item, proxy, status_cb=None):
+        calls.append(proxy)
+        return None                     # counts as a failed fetch; stops before ffmpeg
+
+    real = v.download_proxy_v2
+    v.download_proxy_v2 = fake_download
+    try:
+        for budget, spent, want in ((6, 0, 6), (3, 0, 3), (36, 30, 6), (5, 5, 0)):
+            calls.clear()
+            state = {"rejections": {}, "_downloaded_ids": {f"old{i}" for i in range(spent)}}
+            sources = [v.SourceVideoCandidate(source_id=f"s{i}", platform="tiktok",
+                                              creator_id="c", url="https://x/%d" % i,
+                                              query="q", raw_item={})
+                       for i in range(40)]
+            with tempfile.TemporaryDirectory() as tmp:
+                v._download_and_segment(sources, Path(tmp), "ffmpeg", "ffprobe",
+                                        None, None, state, None, budget)
+            check(f"budget {budget} with {spent} spent attempts {want}", len(calls) == want)
+    finally:
+        v.download_proxy_v2 = real
+
+
 def test_uncovered_beats_borrow_motion():
     """Clips only: a beat the search could not cover must never show a still."""
     scenes = [
@@ -503,6 +534,7 @@ if __name__ == "__main__":
               test_ranking_relevance_over_likes, test_provenance_and_editorial_gates,
               test_relationship_scene_queries,
               test_uncovered_beats_borrow_motion,
+              test_download_budget_is_spent_once,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)

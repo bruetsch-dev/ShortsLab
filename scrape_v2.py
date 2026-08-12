@@ -2713,7 +2713,10 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
     # discovery and vision stay sequential because they are CPU and paid-API work.
     planned = []
     for src in sources:
-        if len(state.setdefault("_downloaded_ids", set())) + len(planned) >= download_budget:
+        # The id is reserved in _downloaded_ids below, so len() already counts what this
+        # loop has planned. Adding len(planned) as well counted every source twice and
+        # delivered half the intended budget - min_downloads_per_scene 3 became 1.5.
+        if len(state.setdefault("_downloaded_ids", set())) >= download_budget:
             break
         if src.source_id in state["_downloaded_ids"]:
             continue
@@ -3549,7 +3552,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 and len(all_segments) >= len(body_intents) * 2):
             break
         uncovered_now = [it for it in body_intents if not scene_candidates.get(it.scene_id)]
-        if state.get("downloaded_sources", 0) >= cfg["max_downloaded_analysis_videos"]:
+        # Compare ATTEMPTS against the cap, because attempts are what _round_budget spends.
+        # downloaded_sources counts only successful fetches; with any dead links the two
+        # diverge permanently, the raise below never fires, and every later round plans zero
+        # downloads in silence while the queue and the clock still have room.
+        if len(state.get("_downloaded_ids") or ()) >= cfg["max_downloaded_analysis_videos"]:
             if not uncovered_now:
                 break
             # Beats with nothing at all outrank the pool cap. The Tokyo run hit this break
