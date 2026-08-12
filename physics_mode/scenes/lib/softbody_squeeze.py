@@ -83,11 +83,15 @@ PARAMS = {
     },
     "gap_ratio": {
         "range": [0.30, 0.95],
-        "default": 0.55,
-        "note": "Hole width as a fraction of the body's width. Below ~0.45 even full "
-                "jelly stalls; above ~0.8 a stiff body already fits and the sweep shows "
-                "nothing. 0.55 puts the boundary near the middle of a 0-100 sweep, which "
-                "is what makes the three takes different from each other.",
+        "default": 0.66,
+        "note": "Hole width as a fraction of the body's width. This number decides whether "
+                "the sweep says anything, and it was found by rendering rather than "
+                "reasoning: at 0.55 even 100% jelly only necked into the hole and hung "
+                "there, so all three takes ended the same way. At 0.66, measured over an "
+                "8s take, 0% sits on the plate (lowest point +0.04 above it), 55% dips in "
+                "and stalls (-0.10), and 100% necks to a fifth of its width and drops "
+                "clear on frame 77. Above ~0.85 a stiff body fits too and the sweep is "
+                "flat again.",
     },
     "body_size": {
         "range": [0.30, 1.20],
@@ -118,11 +122,12 @@ PARAMS = {
                 "honey is dark amber and the slowest to render.",
     },
     "seconds": {
-        "range": [3.0, 9.0],
-        "default": 5.0,
+        "range": [3.0, 12.0],
+        "default": 7.0,
         "note": "Length of ONE take. A soft body needs about two seconds after contact to "
-                "finish giving; below 4s the stiff end of a sweep is still moving when "
-                "the take ends, which reads as a cut rather than a result.",
+                "finish giving, and the soft end of the sweep needs roughly 2.5s MORE to "
+                "finish going through - at 5s it was still in the hole when the take "
+                "ended, which reads as a cut rather than a result.",
     },
     "backdrop": {
         "default": True,
