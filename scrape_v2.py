@@ -280,6 +280,7 @@ class SegmentCandidate:
     source_height: int = 0
     native_9_16: bool = False
     frozen_run_seconds: float = 0.0
+    motion_score: float = 0.0        # 0 = a held photograph, see _motion_score
     micro_stutter_count: int = 0
     # semantics (filled by vision)
     semantic_score: float = 0.0
@@ -1662,6 +1663,39 @@ def _is_native_9_16(width, height):
     return abs((width / float(height)) - (9.0 / 16.0)) <= 0.04
 
 
+# Measured on the run that produced a motionless hook, with _motion_score below:
+#   the dead street sign that shipped   1.02
+#   the weakest clip that looked fine   1.72
+#   ordinary handheld footage           2.3 - 7.0
+# 1.35 sits between the two with room on both sides. It is a thin margin and it is drawn
+# from one project, so it is a floor for the OPENING shot only - mid-video the same clip is
+# survivable, and rejecting good footage everywhere to fix the hook would be a bad trade.
+MOTION_DEAD = 0.45        # a photograph with sensor noise on it; fatal anywhere
+MOTION_HOOK_MIN = 1.35    # the opening shot has to move: it is the whole scroll-stop
+
+
+def _motion_score(frames_bgr):
+    """0-10: how much of the FRAME changes across the window. 0 is a held photograph.
+
+    Mean pixel difference was the first attempt and it was wrong: compression noise and one
+    pedestrian crossing a locked-off shot both raise it, so a motionless street sign scored
+    3.3 out of 10 and passed. What a viewer calls "still" is that the picture's AREA does not
+    change, so this measures the share of pixels that move by more than noise. A handheld or
+    walking shot moves most of the frame; a tripod on a sign moves a few percent of it.
+    """
+    if np is None or not frames_bgr or len(frames_bgr) < 2:
+        return 0.0
+    shares = []
+    for a, b in zip(frames_bgr, frames_bgr[1:]):
+        if a is None or b is None or a.shape != b.shape:
+            continue
+        diff = np.abs(a.astype("int16") - b.astype("int16")).max(axis=2)
+        shares.append(float((diff > 24).mean()))       # 24/255 clears sensor noise
+    if not shares:
+        return 0.0
+    return round(min(10.0, (sum(shares) / len(shares)) * 14.0), 2)
+
+
 def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     """Segment-level quality: sample frames INSIDE [start,end] only, run the reusable primitives,
     produce a soft quality_score. Hard-reject only genuinely unusable material. Returns the segment
@@ -1697,6 +1731,17 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     seg.frozen_run_seconds = round(frozen_run, 3)
     if frozen_run >= 0.15:
         reasons.append("frozen_frames")
+
+    # How much does the picture actually MOVE?
+    #
+    # The duplicate-run check above only catches byte-identical frames, and a camera phone
+    # never produces those - sensor noise and compression make every frame differ by a hair
+    # while nothing in the shot moves. A real run put a motionless street sign on the hook of
+    # a short: 1 of its 92 frames showed any change, it passed every gate, and the opening
+    # two seconds read as a photograph. "Not duplicated" is not "moving".
+    seg.motion_score = _motion_score(frames)
+    if seg.motion_score < MOTION_DEAD:
+        reasons.append("no_motion")
     cadence_hitches = pipeline.micro_stutter_events(src, seg.start_time, seg.end_time)
     seg.micro_stutter_count = len(cadence_hitches)
     if cadence_hitches:
@@ -2078,6 +2123,18 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
     age = str(desc.get("age_confidence") or "").casefold()
     if age in {"child", "minor", "teen", "underage"}:
         return "minor or uncertain-age creator footage"
+    _sid = getattr(intent, "scene_id", None) if intent is not None else None
+    # Only judge motion on a segment that was actually measured. analyze_segment_v2 fills
+    # source_width, so an unset width means nobody looked - a library clip reused without a
+    # fresh analysis would otherwise read as motionless and be barred from every hook.
+    _measured = bool(getattr(seg, "source_width", 0))
+    if _sid is not None and int(_sid) == 0 and _measured:   # `or -1` would swallow scene 0
+        # The opening shot is the scroll-stop. A near-motionless clip there kills the short
+        # before the first sentence lands, and a real run put a static street sign on it -
+        # technically a video, visually a photograph. Mid-video the same clip is survivable;
+        # in the hook it is not.
+        if float(getattr(seg, "motion_score", 0) or 0) < MOTION_HOOK_MIN:
+            return "opening shot barely moves"
     if bool(desc.get("creator_overlay")):
         # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
         # shot.
@@ -2845,6 +2902,7 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
                 for r in hard_reasons:
                     key = {"massive_black_bars": "black_bars", "ai_watermark": "ai_content",
                            "burned_caption_over_subject": "burned_captions",
+                           "no_motion": "no_motion",
                             "rapid_internal_cuts": "rapid_edits",
                             "frozen_frames": "micro_freezes",
                             "cadence_stutter": "micro_stutters"}.get(r, r)

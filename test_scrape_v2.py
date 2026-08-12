@@ -273,6 +273,46 @@ def test_provenance_and_editorial_gates():
           "previously rejected" in v.editorial_rejection_reason(declined, japanese_intent))
 
 
+def test_a_motionless_shot_cannot_open_the_short():
+    """A clip can be a video file and still be a photograph.
+
+    A real run put a locked-off street sign on the hook: 1 of its 92 frames showed any
+    change, and it passed every gate because the duplicate-frame check only catches
+    byte-identical frames, which a camera phone never produces.
+    """
+    import numpy as _np
+    still = [_np.full((40, 30, 3), 120, dtype=_np.uint8) for _ in range(5)]
+    for f in still[1:]:                       # sensor noise, nothing moving
+        f[::3, ::3] = 123
+    moving = [_np.full((40, 30, 3), 120, dtype=_np.uint8) for _ in range(5)]
+    for i, f in enumerate(moving):            # a bright band sweeping the frame
+        f[:, (i * 5):(i * 5 + 12)] = 240
+
+    dead = v._motion_score(still)
+    alive = v._motion_score(moving)
+    check(f"a noisy held frame scores low ({dead})", dead < v.MOTION_HOOK_MIN)
+    check(f"a shot with real movement scores high ({alive})", alive >= v.MOTION_HOOK_MIN)
+
+    hook = v.VisualIntent(scene_id=0, scene_text="Why do Japanese couples not touch?",
+                          subject="couple", action="walking", location="street")
+    seg = v.SegmentCandidate(segment_id="s", source_id="x", platform="tiktok", source_path="",
+                             start_time=0, end_time=3, duration=3, query="カップル 距離感",
+                             japanese_context=True,
+                             visual_description={"age_confidence": "adult"})
+    seg.source_width = 1080        # marks the segment as analysed
+    seg.motion_score = dead
+    check("a motionless clip is refused for the opening shot",
+          "barely moves" in v.editorial_rejection_reason(seg, hook))
+    seg.motion_score = alive
+    check("a moving clip is accepted for the opening shot",
+          v.editorial_rejection_reason(seg, hook) == "")
+    body = v.VisualIntent(scene_id=4, scene_text="They walk apart.", subject="couple",
+                          action="walking", location="street")
+    seg.motion_score = dead
+    check("mid-video the same clip is survivable",
+          v.editorial_rejection_reason(seg, body) == "")
+
+
 def test_borrowed_beat_survives_the_render_gate():
     """The shape that killed a real run: two matched beats, the rest borrowed.
 
@@ -631,6 +671,7 @@ if __name__ == "__main__":
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,
               test_borrowed_beat_survives_the_render_gate,
+              test_a_motionless_shot_cannot_open_the_short,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)
