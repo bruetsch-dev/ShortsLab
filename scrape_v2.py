@@ -3787,12 +3787,36 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             scene_candidates[sid].sort(key=lambda row: row["overall_match"], reverse=True)
             scene_candidates[sid] = scene_candidates[sid][:6]
         covered_from_library = {sid for sid, candidates in scene_candidates.items() if candidates}
+        # A library clip can only be USED ONCE - the final assignment never puts the same
+        # footage on two beats. Coverage, though, was counted per scene independently, so
+        # three library clips that each matched nine beats cancelled the search for all
+        # nine. Six of them then reached the end with nothing of their own and borrowed
+        # from a neighbour, having never been searched even once. (Measured on
+        # romance_down_to_yen: 124 queries planned, 8 executed, 10 of 12 beats borrowed.)
+        # So claim a scene as covered only while a DISTINCT clip is left for it, scarcest
+        # scenes first.
         if covered_from_library:
+            taken, truly_covered = set(), set()
+            for sid in sorted(covered_from_library,
+                              key=lambda s: len(scene_candidates.get(s) or [])):
+                for row in (scene_candidates.get(sid) or []):
+                    seg = row.get("segment")
+                    key = getattr(seg, "segment_id", None) or id(seg)
+                    if key in taken:
+                        continue
+                    taken.add(key)
+                    truly_covered.add(sid)
+                    break
+            starved = len(covered_from_library) - len(truly_covered)
+            covered_from_library = truly_covered
             coverage_queries = [query for query in coverage_queries
                                 if not any(sid in covered_from_library
                                            for sid in (query.scene_ids or []))]
-            _log(status_cb, "Fact Short library-first: %d scene(s) already covered; scraping only "
-                 "the remaining visual beats." % len(covered_from_library))
+            _log(status_cb, "Fact Short library-first: %d scene(s) covered by a clip of their "
+                 "own; scraping the remaining visual beats.%s"
+                 % (len(covered_from_library),
+                    (" %d more matched the same clips and are still searched, because that "
+                     "footage can only be used once." % starved) if starved else ""))
     # --- OPENING HOOK gathering (RE-ADDED 2026-07-11): a dedicated search for a young-adult
     # Japanese female creator dancing / idol / playfully acting cute to camera. This is the
     # universal scroll-stopper for scene 0 and is gathered separately from the topical body pool.
