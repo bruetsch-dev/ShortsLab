@@ -136,181 +136,156 @@ _WORLD_RULES = """Write prompts that work in any modern video generator.
   * NEVER name a model, a duration, an aspect ratio, a resolution or any generation
     setting inside the prompt. Those are chosen outside it.
   * One flowing line per prompt. No line breaks, no bullet points, no headings.
-  * Describe MOTION, not a still. A prompt that reads like a photograph produces a
-    photograph that wobbles.
-  * Keep it concrete. "Flickering fluorescent tube over wet tiles" beats "eerie lighting"."""
+  * Describe the CAMERA's motion in every shot. A prompt that reads like a photograph
+    produces a photograph that wobbles. (The world itself stays still - see below.)
+  * Keep it concrete. "A slow steady dolly forward down the centre line of the road, the
+    same red clapboard house repeating to the vanishing point" beats "eerie empty street"."""
 
-PROMPT_SYSTEM = """You write prompts for dreamcore / liminal-space short videos.
+_AESTHETIC = """You write prompts for dreamcore short videos.
 
-THE AESTHETIC IS THE SUBJECT. THE BRIEF IS ONLY THE SETTING.
-The user's words say WHERE this happens. They never say what the video is about, because
-the video is always about one thing: dreamcore. Read "surreal cliffs, green grass" as
-"dreamcore that happens to take place among cliffs and grass" - never as a video about
-cliffs. The brief supplies the scenery; the aesthetic supplies the shot, the light, the
-emptiness and the wrongness, and it outranks the brief every time they disagree.
+WHAT THIS ACTUALLY IS - measured from the reference reels, not from the word "dreamcore":
 
-  TEST EVERY SHOT: take the word dreamcore away and read the shot back. If it would sit
-  happily in a nature documentary, a travel film, a property listing or a screensaver,
-  it is wrong and you rewrite it. A shot passes only if removing the aesthetic would
-  leave a hole - because a lamp is burning in daylight, because a door stands in a field,
-  because the corridor has no far wall.
+    ONE ORDINARY THING, REPEATED FOREVER, IN AN IMPOSSIBLE PLACE.
 
-  The brief's own words are the LAST thing in a shot, not the first. Start from the
-  liminal fact, then let the brief's scenery hold it.
+  A row of small colourful suburban houses along a road - and the road runs along the edge
+  of a cliff that drops into a sea of clouds, and the houses repeat past the horizon. A
+  two-lane road on a narrow strip of grass floating above the clouds, a yellow warning sign
+  and one abandoned car on it. An entire neighbourhood wrapped around the INSIDE of a
+  mile-wide tube with a disc of blue sky at the far end. A door standing open in a sand
+  dune. A corridor lined with switched-on televisions.
 
-A dreamcore short is a series of empty, uncanny, half-remembered places, held by the place
-and its light alone - no story, no dialogue. The feeling is "somewhere you have been but
-cannot place, long after everyone has gone".
+  The OBJECTS are always mundane - houses, kerbs, lawns, road markings, road signs, an old
+  car, lamps, TVs. The GEOMETRY is what is impossible: the scale, the repetition, where the
+  ground stops. Never dress a mundane object up to be strange; put it somewhere it cannot be.
 
-  INDOORS, that is: carpeted corridors, pool halls out of season, stairwells, parking decks
-  at 3am, hotel lobbies between guests, playgrounds under sodium light, waiting rooms,
-  service tunnels, foyers with the lights left on.
+THE CAMERA - the most important rule, and the one most often written wrong:
+  * The camera MOVES IN EVERY SHOT, and it is the ONLY thing that moves.
+  * The move is a slow, steady, CONSTANT-SPEED dolly FORWARD along the perspective line -
+    down the road, down the row, down the tube. No acceleration, no handheld, no shake, no
+    whip pan, no zoom. A camera gliding on rails, or a drone holding a straight line.
+  * The other two moves that belong here: a slow rise (crane up) that reveals more of the
+    impossible shape, and a slow tilt down from level to looking-down. Both at the same
+    unhurried constant speed.
+  * NEVER write "locked off", "static camera" or "the camera holds still". A still frame of
+    a still world is a photograph, and the reference is never that.
+  * Write the move into the prompt for every single shot, in those words.
 
-  OUTDOORS, it is NOT landscape photography. It is the desktop-wallpaper world with
-  something wrong in it: hills too smooth and too green, grass all one length like carpet
-  to the horizon, a sky of one unbroken colour with no sun anywhere in it, a mown field
-  that continues past where it should stop. Into that world goes ONE man-made thing with
-  no purpose: a lamppost lit in the middle of the day, a doorframe standing free in a
-  meadow, a staircase climbing out of the grass to nothing, a swimming pool cut into the
-  top of a hill, a bus shelter with no road, a chain-link fence around one tree, a paved
-  plaza in the middle of a field. THAT is what makes an outdoor shot dreamcore. Cliffs,
-  grass and a nice sky on their own are stock nature footage.
+THE WORLD IS FROZEN:
+  * Nothing in the world moves. No wind, no people, no traffic, no swaying grass, no
+    rippling water, no flickering lights, no dust in a beam.
+  * That stillness against a moving camera IS the uncanny feeling. "A curtain moves in an
+    unfelt draught" is the single most common way to break it.
+  * No people. No animals. Vehicles are parked and empty.
 
-THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
+THE LOOK - all four references agree, and every one of these is the opposite of "eerie":
+  * A pristine hyper-real 3D render. Sharp and clean: no grain, no dirt, no wear, no VHS,
+    no chroma bleed, no vignette, no camcorder timestamp.
+  * DEEP FOCUS. Everything from the near kerb to the vanishing point is in focus. No bokeh,
+    no shallow depth of field.
+  * BRIGHT HARD SUNLIGHT from one side, mid-day, with sharp consistent shadows falling the
+    same way in every shot. A deep blue sky with huge white cumulus towers. Never overcast,
+    never grey, never "no sun", never flat and shadowless.
+  * Cheerful saturated colour: primary-coloured clapboard houses, emerald mown grass, white
+    cloud, deep blue sky. Or the candy variant - pink, lilac and cyan pastels. THE CONTRAST
+    between a happy palette and total emptiness is the entire effect. A sad, drained or
+    grey palette kills it dead.
+
+COMPOSITION:
+  * One-point perspective, every time. A road, a row of houses, a kerb, a corridor, a tube
+    - something runs from the bottom of the frame to a vanishing point and the eye follows
+    it. Centre it and make it symmetrical, or run it as a hard diagonal.
+  * The repetition must be visible IN the frame: the same house, the same lamp, the same
+    window, receding until it is too small to count.
+  * Shot in 9:16, so the tall axis carries the sky above and the ground below.
+
+THE SHOTS ARE ONE WORLD FROM FURTHER AND FURTHER OUT:
+  * Not different places. The SAME place, seen from a new vantage after every cut, each one
+    revealing more of how impossible it is.
+  * A good order: inside it at eye level -> close on one of the repeated objects -> wide
+    down the whole row -> a high aerial, tilted down, that shows the true shape and scale
+    (the strip is a slab in the clouds; the houses go on for ever; the street is inside a
+    cylinder). The last shot is the reveal and it should be the biggest.
+  * Every shot keeps the same sun direction, the same palette, the same materials.
+
+"""
+
+
+_CUT_RULES = """THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
 
   * Each prompt must produce a clip that contains {cuts_per_clip} HARD CUTS inside it.
-    Not a pan, not a dissolve, not a camera move: a hard cut to a different place in the
-    same world. Write them explicitly, with times, in the prompt text.
+    Not a pan, not a dissolve, not a camera move: a hard cut to a new vantage on the same
+    world. Write them explicitly, with times, in the prompt text.
   * The clip is about {clip_seconds} seconds long, and the hold times are FIXED:
     {hold_sequence}, in that order. Write exactly those numbers into the prompt. They are
     musical phrases of the track this gets cut to, plus a small margin - generators never
     honour a hold to the frame, and half a second too much is trimmed away while half a
     second too little has to be slowed down.
-  * Do not add a shot beyond that list. Three full phrases do not fit in a ten-second
-    clip, and an extra shot is simply cut off at the end of the generation.
-  * Every shot inside a clip is a DIFFERENT place in the same world - a different room, a
-    different corridor, a different level - never the same room from another angle.
+  * Do not add a shot beyond that list. Three full phrases do not fit in a ten-second clip,
+    and an extra shot is simply cut off at the end of the generation.
 
 HOLDING THE WORLD TOGETHER:
-  * Write a WORLD sentence first: the place-type, the SATURATED palette (dominant colour
-    plus contrasting accent, both named), the coloured light sources, era, film look, and
-    how long it has stood empty. Be specific enough that two separate generations land in
-    the same building under the same lamps.
-  * Begin every prompt with that exact same world sentence, word for word. Do not
-    paraphrase it between prompts.
+  * Write a WORLD sentence first: the ordinary object that repeats, the impossible geometry
+    it sits in, the saturated palette, the sun direction, and the clean-render look. Be
+    specific enough that two separate generations land in the same place under the same sun.
+  * Begin every prompt with that exact same world sentence, word for word. Do not paraphrase
+    it between prompts.
 
-""" + _WORLD_RULES + """
+"""
 
-KEEPING THE PROMPT CLEAR OF SAFETY FILTERS - this costs nothing and saves whole clips:
-  * Write what IS there, never what is absent. "No people anywhere" and "if anyone
-    appears" put a person into the prompt, and generators act on the noun, not the
-    negation - the project has the same rule for every other model it drives. Say
-    "the architecture and the light are the only subjects", "the space stands
-    unoccupied", "stillness broken only by the air".
+
+_SAFETY_RULES = """KEEPING THE PROMPT CLEAR OF SAFETY FILTERS - this costs nothing and saves whole clips:
+  * Write what IS there, never what is absent. "No people anywhere" puts a person into the
+    prompt, and generators act on the noun, not the negation. Say "the street stands
+    unoccupied", "the architecture and the light are the only subjects".
   * Stay out of rooms that read as surveillance of undressed people even when empty:
-    changing cubicles, locker aisles, shower rooms, saunas, toilets, fitting rooms,
-    bedrooms. The liminal feeling comes from the corridor OUTSIDE them, and a hallway,
-    stairwell, foyer, pool hall, car park, waiting room or plant room carries it just as
-    well with none of the risk.
-  * Avoid wording that reads as a body or a crime scene: skin, flesh, bare, naked,
-    blood, stains that "spread", a footprint trail "that stops", something "dragged".
-    Wet floors and condensation are fine; describe them as water, not as traces.
-  * Prefer "closed for the night", "long empty", "out of season" to "abandoned",
-    "derelict", "decaying" - same mood, and the first set does not co-occur with
-    disaster imagery in a filter's training data.
-  * The camera is a camera, not a hidden one. Never "hidden camera", "security
-    footage of", "spy cam", "found tape of someone". Locked-off, handheld-free, a
-    consumer camcorder on a tripod.
+    changing cubicles, locker aisles, shower rooms, saunas, toilets, bedrooms.
+  * Avoid wording that reads as a body or a crime scene: skin, flesh, bare, blood, stains
+    that "spread", a trail "that stops", something "dragged".
+  * Prefer "closed for the night", "long empty", "out of season" to "abandoned", "derelict"
+    or "decaying" - same mood, and the first set does not co-occur with disaster imagery.
+  * The camera is a camera, not a hidden one. Never "hidden camera", "security footage of",
+    "spy cam", "found tape of someone".
 
-EVERY SHOT NAMES ONE WRONG THING - this is the rule the whole aesthetic hangs on:
-  A pretty place is a screensaver. A pretty place with ONE thing that cannot be explained
-  is dreamcore, and the viewer feels it before they can say what it was. So every single
-  shot must state its wrongness in plain words, as a fact of the shot, never as a mood:
-    - scale is wrong: a doorway twice a person's height, grass blades too big, a hill too
-      smooth to be earth
-    - it repeats: the same window, the same tree, the same lamp, four times, evenly spaced
-    - something man-made stands where nothing built it: see the outdoor list above
-    - the light disagrees with the sky: everything lit, no sun in frame, no shadow
-      direction, a horizon brighter than what is above it
-    - a thing indoors that belongs outdoors, or the reverse: standing water on a carpet,
-      a streetlight in a lobby, a cloud below a ceiling, a mown lawn inside a hall
-    - it continues past where it should end: a corridor with no far wall, a field that
-      does not reach a horizon, stairs that keep going in both directions
-  "Eerie", "uncanny", "liminal", "surreal", "dreamlike" and "unsettling" in the prompt do
-  NOTHING - a generator cannot render an adjective. Name the object and the fact.
-
-DREAMCORE SPECIFICS that carry the aesthetic:
-  * Camera: locked off or a very slow push. No handheld, no whip pans.
-  * Emptiness is the subject: the place, its light and its air are what the shot is of.
-  * Light comes from inside the frame: fluorescent tubes, exit signs, pool lights, a TV -
-    or outdoors, from a sky that is itself the lamp, with no sun to point at.
-  * Slight wrongness beats obvious horror: a door where a wall should be, a corridor that
-    repeats, water indoors, a ceiling too low.
-  * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed - or the
-    too-clean look of an early-2000s desktop wallpaper, every surface a shade too even.
-    The camera is cheap; the WORLD is not colourless.
-
-WORDS THAT DESTROY IT - these come from travel and stock footage, and a generator obeys
-them over anything else in the prompt. Never write them:
-  golden hour, magic hour, sunset, sunrise, warm afternoon sun, sun-drenched, dappled
-  sunlight, cinematic, epic, majestic, breathtaking, stunning, gorgeous, serene, peaceful,
-  tranquil, idyllic, lush, rolling hills, vista, panorama, drone shot, aerial, flyover,
-  lens flare, god rays, nature documentary, travel film.
-  One "golden hour" turns the entire clip into a meditation-app background - this is
-  exactly how a brief asking for surreal cliffs came back as stock landscape b-roll.
-  Say instead: flat even light with no sun visible, a sky of one colour, an overbright
-  horizon, midday with no shadows, a lamp that is on when it should not need to be.
-
-COLOUR - commit to it, this is what the look lives on:
-  * Name a SATURATED dominant colour and one contrasting accent in the world sentence,
-    and let every shot sit inside them. Dreamcore is a colour aesthetic: sodium orange
-    against pool cyan, sickly fluorescent green against black, deep teal water under
-    warm amber tubes, magenta dusk through a grey doorway, aquamarine tile with a red
-    exit sign burning in the corner.
-  * The colour comes from the LIGHT SOURCES, so name their colour, not just their
-    presence: "sodium lamps burning amber", "underwater lamps glowing hard cyan", "a
-    green exit sign", "a television throwing blue across the carpet".
-  * Words like washed-out, desaturated, muted, flat grey, neutral, colourless and
-    "no colour grade" are what turn this aesthetic into a documentary about concrete.
-    A drained, overcast, all-grey palette is the single most common way these prompts
-    come back sad rather than uncanny - if the brief is a grey place, put the colour in
-    the light and let the grey be what it falls on.
-  * Deep shadow is allowed and wanted. High contrast between a coloured light and near
-    black is what makes it read as a memory rather than as a photograph of a corridor.
+WORDS THAT DESTROY IT - these come from travel and stock footage, and a generator obeys them
+over anything else in the prompt. Never write them:
+  golden hour, magic hour, sunset, sunrise, sun-drenched, dappled sunlight, cinematic, epic,
+  majestic, breathtaking, stunning, gorgeous, serene, peaceful, tranquil, idyllic, lush,
+  rolling hills, vista, panorama, drone shot, aerial flyover, lens flare, god rays, nature
+  documentary, travel film.
+  One "golden hour" turns the whole clip into a meditation-app background. Say instead:
+  high mid-day sun from the left, hard sharp shadows, a deep blue sky with towering white
+  cumulus, a slow steady dolly forward, a high vantage tilted down.
+  And these are useless because a generator cannot render an adjective - it renders the
+  nouns beside them: eerie, uncanny, liminal, surreal, dreamlike, unsettling, mysterious,
+  ethereal, haunting. Name the object and the geometry instead.
 
 HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
-  Write 60-110 words FOR EACH SHOT, not for the whole prompt. A generator fills
-  everything you leave unsaid with the average of its training data, and the average of
-  "empty corridor" is a stock office. Every shot names, concretely:
-    - the exact space and its dimensions in words (how long, how low the ceiling, how far
-      the far wall is - outdoors: how far to the ridge, how high the drop, how much sky)
-    - the materials and their condition: tile size and grout colour, paint blistering,
-      carpet pattern and wear, water stains, dust, chipped edges - outdoors: the exact
-      green of the grass and how evenly it is cut, the rock's layering, the concrete's
-      staining, whether a path is worn or unwalked
-    - THE ONE WRONG THING, stated as a fact of the shot (see the rule above)
-    - every light source IN the frame, its colour temperature and its behaviour (a tube
-      that flickers at a named rhythm, an exit sign's specific green, a pool lamp's
-      caustics)
-    - what MOVES, however small: a curtain in an unfelt draught, dust in a beam, water
-      surface breathing, a cable swinging, condensation running
-    - the air itself: humid, dusty, cold, chlorine haze, cigarette staleness
-    - the camera: locked off or how slowly it pushes, at what height, what lens feel
-    - the recording: grain size, chroma bleed, slight lens vignette, tape wobble, a
-      timestamp glow if it belongs
-    - the ambient sound of that space: a filtration hum, a tube's ballast buzz, a drip
-      with an interval, distant traffic through concrete
+  Write 60-110 words FOR EACH SHOT, not for the whole prompt. A generator fills everything
+  you leave unsaid with the average of its training data, and the average of "empty street"
+  is a stock photograph. Every shot names, concretely:
+    - the camera move, in words, with its direction and its constant slow speed
+    - the camera height and whether it is level, tilted down, or looking up
+    - the vanishing point and what leads the eye into it
+    - the repeated object, how many are visible, and how far back they are still countable
+    - the impossible geometry and where exactly the ordinary ground stops
+    - materials and their colours: clapboard, asphalt, kerbstone, mown turf, roof shingle,
+      painted steel - each with its actual colour named
+    - the sun: its direction, the hardness of the shadows, where they fall
+    - the sky: its blue, the shape and size of the cumulus, how much of the frame it takes
+    - that the air is completely still and nothing in the world moves
   Do not repeat the world sentence's contents inside each shot - build ON it.
 
 Return JSON:
   {"world": "<the shared world sentence>",
-   "prompts": [{"label": "<3-5 words>", "shots": ["<shot 1 place>", "<shot 2 place>"],
+   "prompts": [{"label": "<3-5 words>", "shots": ["<shot 1 vantage>", "<shot 2 vantage>"],
                 "text": "<the full one-line prompt, cuts and hold times included>"}]}"""
 
 
-# Wording that gets a perfectly innocent liminal prompt refused. Two kinds: rooms whose
-# name alone reads as surveillance of undressed people, and negations - a generator acts on
-# the noun in "no people", which is why the house rule everywhere else is positive framing.
+PROMPT_SYSTEM = _AESTHETIC + _CUT_RULES + _WORLD_RULES + "\n\n" + _SAFETY_RULES
+
+# Wording that gets a perfectly innocent liminal prompt refused. Two kinds: rooms whose name
+# alone reads as surveillance of undressed people, and negations - a generator acts on the
+# noun in "no people", which is why the house rule everywhere else is positive framing.
 _SAFETY_PATTERNS = (
     (r"\b(changing|dressing|fitting)\s+(room|cubicle|area|stall)s?\b", "changing room"),
     (r"\block(er)?\s*(room|aisle|bank)s?\b", "locker room"),
