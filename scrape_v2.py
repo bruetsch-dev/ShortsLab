@@ -1501,11 +1501,36 @@ def download_proxy_v2(item, dest, status_cb=None, fmt=None):
         "ignoreerrors": True, "postprocessors": [],
     }
     clip_scraper._apply_cookies(opts)
+    # Give this download its OWN copy of the cookie jar.
+    #
+    # yt-dlp rewrites the cookiefile from scratch when the YoutubeDL context closes - open(
+    # path, "w"), no lock, no atomic rename - and it does so even for a failed download.
+    # Six of these run at once now, all pointed at the one merged jar, so a reader could
+    # land mid-truncate. Measured over repeated open/close cycles: 12-17% of them raised
+    # "does not look like a Netscape format cookies file", and one load silently returned
+    # 151 of 420 cookies, which is a download running half logged out. The damaged jar is
+    # then written BACK, so the shared file shrinks for every later download and the session
+    # decays. A private copy costs one file write and makes the whole class impossible.
+    jar = opts.get("cookiefile")
+    scratch = None
+    if jar and Path(jar).is_file():
+        scratch = dest.parent / (".cookies_" + dest.stem + ".txt")
+        try:
+            shutil.copyfile(jar, scratch)
+            opts["cookiefile"] = str(scratch)
+        except OSError:
+            scratch = None          # fall back to the shared jar rather than losing cookies
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except Exception:
         return None
+    finally:
+        if scratch:
+            try:
+                scratch.unlink(missing_ok=True)
+            except OSError:
+                pass
     for cand in sorted(dest.parent.glob(dest.stem + ".*")):
         if cand.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm") and cand.stat().st_size > 8192:
             if cand != dest:
@@ -2713,6 +2738,11 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
     # discovery and vision stay sequential because they are CPU and paid-API work.
     planned = []
     for src in sources:
+        # Check before PLANNING, not only before analysing. The serial loop tested both per
+        # source and broke before spending anything; batching moved the download ahead of
+        # the old checks, so a cancelled or timed-out run could still fetch a whole batch.
+        if (cancel_check and cancel_check()) or (deadline and time.monotonic() >= deadline):
+            break
         # The id is reserved in _downloaded_ids below, so len() already counts what this
         # loop has planned. Adding len(planned) as well counted every source twice and
         # delivered half the intended budget - min_downloads_per_scene 3 became 1.5.
