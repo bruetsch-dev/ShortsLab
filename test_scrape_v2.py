@@ -247,7 +247,10 @@ def test_provenance_and_editorial_gates():
     # blurs a lower third. An audit showed the blur fails silently when its OCR finds
     # nothing, cannot handle word-by-word or vertical or coloured captions, and produced zero
     # blurred files on the one real artefact on disk. Captions are fatal again.
-    check("burned creator captions are rejected",
+    # Captions are fatal only when the blur cannot take them off. The segment below has no
+    # real file, so the blur cannot run and it stays rejected - which is also the safe
+    # default when anything about the removal path is broken.
+    check("captions the blur cannot remove are still rejected",
           "captions" in v.editorial_rejection_reason(captions, japanese_intent))
     over_subject = v.SegmentCandidate(**{**good.__dict__, "segment_id": "over",
                                          "rejection_reasons": ["burned_caption_over_subject"],

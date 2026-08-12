@@ -281,6 +281,7 @@ class SegmentCandidate:
     native_9_16: bool = False
     frozen_run_seconds: float = 0.0
     motion_score: float = 0.0        # 0 = a held photograph, see _motion_score
+    cleaned_path: str = ""           # blurred copy, when the captions were removable
     micro_stutter_count: int = 0
     # semantics (filled by vision)
     semantic_score: float = 0.0
@@ -2103,6 +2104,35 @@ def _segment_strip(seg: SegmentCandidate, frames_dir, idx, ffmpeg):
         return None
 
 
+def _captions_are_removable(seg) -> bool:
+    """Can the caption blur actually take the text off THIS segment?
+
+    Runs the real glyph blur on a scratch copy of the cut and keeps the result only if it
+    found letters. Guessing was tried twice and was wrong both times, in opposite
+    directions. The blurred file is kept beside the source so the render can use it.
+    """
+    src = Path(str(seg.source_path or ""))
+    if not src.is_file():
+        return False
+    cleaned = src.with_name("nocap_" + src.name)
+    if cleaned.is_file() and cleaned.stat().st_size > 4096:
+        seg.cleaned_path = str(cleaned)
+        return True
+    try:
+        shutil.copyfile(src, cleaned)
+        found = clip_scraper.blur_caption_regions(
+            str(cleaned), pipeline.find_ffmpeg(),
+            seconds=max(1.0, float(seg.duration or 0) + 0.5))
+    except Exception as exc:      # noqa: BLE001 - a broken blur must be visible, not silent
+        print(f"[nocap] {src.name}: {type(exc).__name__}: {exc}")
+        found = 0
+    if not found:
+        cleaned.unlink(missing_ok=True)
+        return False
+    seg.cleaned_path = str(cleaned)
+    return True
+
+
 def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualIntent] = None) -> str:
     """Non-negotiable editorial checks applied before a clip can reach a timeline.
 
@@ -2139,25 +2169,22 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
         # shot.
         return "creator reaction overlay"
-    if bool(desc.get("burned_captions")):
-        # This rejection was removed and is back. The removal rested on "the render blurs a
-        # lower third anyway", and an audit took that apart:
-        #   * the blur is best-effort and fails SILENTLY - if its OCR finds nothing it
-        #     deletes its own copy and the scene falls back to the untouched original. On the
-        #     one real scrape artefact on disk it produced zero blurred files.
-        #   * its mask is a single static PNG built from a union of 8 sampled frames, so
-        #     word-by-word captions survive and ghost patches smear over where text used to be
-        #   * the box detector thresholds gray > 205 and demands 65% white-or-yellow, so
-        #     coloured captions are invisible to it; so are vertical Japanese columns, text in
-        #     the top 22% of frame, and stickers, which are not text at all
-        #   * nothing downstream re-checks: the matcher prompt is never sent burned_captions
-        #     or visible_text, and a fully captioned clip scores 6.52 against a 6.3 floor, so
-        #     it is not even marked soft
-        # Five sixths of the Japanese pool carrying text is a real problem, but shipping
-        # footage with someone else's captions burned into it is a worse answer than a
-        # smaller pool. The fix belongs upstream, in queries that find uncaptioned footage,
-        # or in a blur that reports whether it actually worked.
-        return "burned-in creator captions"
+    if bool(desc.get("burned_captions")) and not _captions_are_removable(seg):
+        # Captions are fatal only when we cannot take them off.
+        #
+        # This rule has been round the houses. It was fatal, then I removed it because "the
+        # render blurs a lower third anyway", then an audit showed the blur produced zero
+        # files on real footage and I put it back. The audit was right about the symptom and
+        # wrong about the cause: the blur was never running at all, because its only call
+        # site passed a status_cb that does not exist in that scope and the exception was
+        # swallowed. With that fixed the blur removes the burned-in text - verified on this
+        # project, 11 of 14 clips cleaned and the creator's watermark gone from the render.
+        #
+        # So the question is no longer "does text exist" but "can we remove it", and that is
+        # answered by running the blur on this segment and counting what it finds. On a
+        # Japanese topic 85% of the pool carries text; refusing all of it left twelve of
+        # fourteen beats borrowing the same Shibuya clip.
+        return "burned-in captions the blur cannot remove"
     if float(seg.text_heaviness or 0) >= 4.5:
         # Raised from 2.5, and this half of the change survived the audit: text_heaviness is
         # max(OCR area, CV bright-blob score) and the CV half generates false positives on
@@ -2950,7 +2977,12 @@ def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
         if source_duration + 0.05 < want:
             return ""
         start = min(start, max(0.0, source_duration - want - 0.03))
-    final = clip_scraper.normalize_clip(seg.source_path, dest, ffmpeg, seconds=want, start=start)
+    # Cut from the de-captioned copy when the blur managed to make one, so the accepted
+    # clip is the clean version rather than the one with someone else's text on it.
+    cut_from = str(getattr(seg, "cleaned_path", "") or seg.source_path)
+    if cut_from != seg.source_path and not Path(cut_from).is_file():
+        cut_from = seg.source_path
+    final = clip_scraper.normalize_clip(cut_from, dest, ffmpeg, seconds=want, start=start)
     seg.final_path = str(final) if final else ""
     if final:
         final_duration = float(clip_scraper._probe_duration(final, ffprobe) or 0.0)
