@@ -2513,7 +2513,17 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         # are useless here - 7.4 and 7.2 fall either side of 7.5, so a two-tenths scoring
         # wobble still outranked a clip that was seven points more watchable, which is the
         # exact situation this tie-break exists for.
+        # Someone else's burned-in captions rank LAST among equals. The OCR area score is
+        # useless for this - it read 0.00 on a romance_down_to_yen clip with a Japanese
+        # subtitle across the middle of frame - but the vision stage already answers
+        # burned_captions per segment, and that is the signal used here. It ranks, it never
+        # gates: a captioned clip still beats no clip, so this cannot starve a beat.
+        def _clean(row):
+            d = row["segment"].visual_description or {}
+            return 0 if (d.get("burned_captions") or d.get("creator_overlay")) else 1
+
         scored.sort(key=lambda r: (round(r["overall_match"]),
+                                   _clean(r),
                                    r["striking"],
                                    r["segment"].quality_score), reverse=True)
         out[sid] = scored
@@ -2657,11 +2667,27 @@ def borrow_motion_for_uncovered(scenes, scene_clips=None):
               if sc.get("clip") and str(sc.get("assignment_type") or "") != "uncovered_still"]
     if not donors:
         return 0
+    # SPREAD THE BORROWS. Taking the nearest donor every time put ONE clip on eight
+    # consecutive beats of romance_down_to_yen - thirty-six seconds of video containing two
+    # pictures. Least-used donor first, nearest as the tie-break: locality is kept where it
+    # is free, but no single source can carry the whole short.
+    def _donor_key(row):
+        sc = row[1]
+        return str(sc.get("scrape_clip_id") or sc.get("clip") or row[0])
+
+    uses = {}
+    for _i, sc in enumerate(scenes):
+        if sc.get("clip") and str(sc.get("assignment_type") or "") != "uncovered_still":
+            uses[str(sc.get("scrape_clip_id") or sc.get("clip") or _i)] = uses.get(
+                str(sc.get("scrape_clip_id") or sc.get("clip") or _i), 0) + 1
+
     borrowed = 0
     for idx, scene in enumerate(scenes):
         if str(scene.get("assignment_type") or "") != "uncovered_still":
             continue
-        donor_idx, donor = min(donors, key=lambda row: abs(row[0] - idx))
+        donor_idx, donor = min(donors, key=lambda row: (uses.get(_donor_key(row), 0),
+                                                        abs(row[0] - idx)))
+        uses[_donor_key((donor_idx, donor))] = uses.get(_donor_key((donor_idx, donor)), 0) + 1
         scene["clip"] = donor["clip"]
         scene["asset"] = donor.get("asset") or donor["clip"]
         scene["assignment_type"] = "borrowed_clip"
