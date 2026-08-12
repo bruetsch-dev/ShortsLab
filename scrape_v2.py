@@ -2382,15 +2382,28 @@ def borrow_motion_for_uncovered(scenes, scene_clips=None):
         scene["assignment_type"] = "borrowed_clip"
         scene["match_class"] = "BORROWED"
         scene["borrowed_from_scene"] = donor_idx
+        # Carry the donor's identity, or nothing downstream can tell these apart. The
+        # caption pre-pass renames each scene's clip to capblur_<sid>_<hash>.mp4 - a
+        # different filename per scene - and both the duplicate guard and the renderer's
+        # continuity offset key off the filename when scrape_clip_id is missing. Without
+        # this, a timeline that is one clip fourteen times reports zero repeats and every
+        # beat starts at the same frame.
+        scene["scrape_clip_id"] = donor.get("scrape_clip_id")
         if scene_clips is not None and donor_idx < len(scene_clips):
             # the resolved path, not the basename - this is what the renderer reads
             scene_clips[idx] = scene_clips[donor_idx]
         src_len = _clip_seconds(scene_clips[donor_idx] if (scene_clips is not None
                                                           and donor_idx < len(scene_clips))
                                 else donor.get("clip"))
-        if src_len > 4.0:
-            step = max(1.0, min(3.0, src_len / 4.0))
-            scene["source_trim"] = round(abs(idx - donor_idx) * step % max(1.0, src_len - 2.0), 2)
+        # Shift the in-point so two beats are not the same seconds twice. The first version
+        # required src_len > 4.0 and wrote "source_trim": the donor is cut to roughly its own
+        # beat length, so that gate could never be true, and source_trim is an SFX/editor key
+        # the renderer never reads. seedance_start_trim is the one it honours.
+        if src_len > 1.2:
+            room = max(0.0, src_len - 1.0)
+            if room > 0.1:
+                step = max(0.3, min(1.5, room / 3.0))
+                scene["seedance_start_trim"] = round((abs(idx - donor_idx) * step) % room, 2)
         borrowed += 1
     return borrowed
 
@@ -2481,6 +2494,8 @@ def build_debug_report(state: dict) -> dict:
         "segments_discovered": state.get("segments_discovered", 0),
         "segments_quality_passed": state.get("segments_quality_passed", 0),
         "segments_soft_quality_kept": state.get("segments_soft_quality_kept", 0),
+        "scenes_borrowed_motion": state.get("scenes_borrowed_motion", 0),
+        "scenes_still_fallback": state.get("scenes_still_fallback", 0),
         "segments_soft_artifact_kept": state.get("segments_soft_artifact_kept", 0),
         "segments_semantic_passed": state.get("segments_semantic_passed", 0),
         "scenes_exact_matched": state.get("scenes_exact_matched", 0),
@@ -2994,7 +3009,8 @@ def relationship_recovery_queries_v2(uncovered):
     return out
 
 def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffprobe, cancel_check,
-                              deadline, state, seen_source_ids, reasoning_model=None, status_cb=None):
+                              deadline, state, seen_source_ids, reasoning_model=None,
+                              status_cb=None, download_budget=None):
     """Targeted re-search for scenes with no usable match: NEW queries from ALTERNATIVE visuals +
     unused tiers, search only for those, discover+describe+match new sources."""
     if not weak_intents:
@@ -3066,14 +3082,17 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
     sources = _search_sources(new_queries, platforms, cancel_check, deadline, seen_source_ids,
                               state, status_cb)
     segs = _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
-                                 status_cb, download_budget=SCRAPE_V2_CONFIG["max_downloaded_analysis_videos"])
+                                 status_cb,
+                                 download_budget=(download_budget
+                                                  or SCRAPE_V2_CONFIG["max_downloaded_analysis_videos"]))
     describe_segments_v2(segs, project_dir, ffmpeg, reasoning_model=reasoning_model, status_cb=status_cb)
     return match_segments_to_scenes_v2(weak_intents, segs, reasoning_model=reasoning_model,
                                        status_cb=status_cb)
 
 
 def escalate_platform_pivot_v2(uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check,
-                               deadline, state, seen_source_ids, reasoning_model=None, status_cb=None):
+                               deadline, state, seen_source_ids, reasoning_model=None,
+                               status_cb=None, download_budget=None):
     """ESCALATION STAGE 1 - cross-platform pivot: re-send each uncovered scene's OWN terms to
     ALL connected platforms. X's Media tab is strong for proof/news, Instagram for hashtag reach,
     so a term that only ran on TikTok now also hits X and IG. Returns new scene->candidate map."""
@@ -3093,7 +3112,9 @@ def escalate_platform_pivot_v2(uncovered, platforms, project_dir, ffmpeg, ffprob
     state["escalation_stage1"] = state.get("escalation_stage1", 0) + 1
     sources = _search_sources(qs, platforms, cancel_check, deadline, seen_source_ids, state, status_cb)
     segs = _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
-                                 status_cb, download_budget=SCRAPE_V2_CONFIG["max_downloaded_analysis_videos"])
+                                 status_cb,
+                                 download_budget=(download_budget
+                                                  or SCRAPE_V2_CONFIG["max_downloaded_analysis_videos"]))
     if not segs:
         return {}
     describe_segments_v2(segs, project_dir, ffmpeg, reasoning_model=reasoning_model, status_cb=status_cb)
@@ -3371,7 +3392,10 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     per_scene_downloads = int(cfg.get("min_downloads_per_scene", 3))
     if scene_count * per_scene_downloads > cfg["max_downloaded_analysis_videos"]:
         cfg = dict(cfg)
-        cfg["max_downloaded_analysis_videos"] = scene_count * per_scene_downloads
+        # +6 headroom for the opening-hook gather, which runs before any beat and used to
+        # take a quarter of the pool off the top - beats 12 and 13 then downloaded nothing
+        # on their first and only search.
+        cfg["max_downloaded_analysis_videos"] = scene_count * per_scene_downloads + 6
         _log(status_cb, "Scrape V2: %d beats -> download pool raised to %d so every beat can "
                         "reach footage." % (scene_count, cfg["max_downloaded_analysis_videos"]))
 
@@ -3502,9 +3526,13 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 _log(status_cb, f"Scrape V2 hook: no candidate met the strict {hi_likes:,}-like floor; "
                                 "the app will not substitute a low-engagement cute/dance clip.")
             if hook_sources:
+                # The hook gather runs BEFORE any beat and used to be handed the whole
+                # pool, taking a quarter of it off the top; beats 12 and 13 then had nothing
+                # left to download with on their only search. One beat's share is plenty for
+                # an opener.
                 hook_presenter_segments = _download_and_segment(
                     hook_sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
-                    status_cb, cfg["max_downloaded_analysis_videos"]) or []
+                    status_cb, _round_budget(2)) or []
                 if hook_presenter_segments:
                     _log(status_cb, "Scrape V2: gathered %d hook-presenter clip(s)." % len(hook_presenter_segments))
     # SCENE-COVERAGE WAVE: search one topical query for every body intent under relevance before
@@ -3763,7 +3791,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                         "unique clip - re-sending their terms to X + Instagram..." % len(uncovered))
         _merge_matches(escalate_platform_pivot_v2(
             uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
-            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb))
+            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb,
+            download_budget=_round_budget(len(uncovered))))
         uncovered = _uncovered_intents()
 
     if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:
@@ -3771,7 +3800,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                         "fresh creative queries (numbers / cringe / trends)..." % len(uncovered))
         _merge_matches(retry_unmatched_scenes_v2(
             uncovered, platforms, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
-            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb))
+            seen_source_ids, reasoning_model=reasoning_model, status_cb=status_cb,
+            download_budget=_round_budget(len(uncovered))))
         uncovered = _uncovered_intents()
 
     if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:

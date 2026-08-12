@@ -11658,7 +11658,14 @@ def run_project(form, status_cb=None):
                 allow_seedance = False
                 seedance_clip_count = 0
                 log(status_cb, "Scrape: no usable TikTok clips found after all search rounds.")
-            unmatched_scenes = [i for i, sc in enumerate(scenes_override) if not sc.get("clip")]
+            # A borrowed beat carries a clip and is still an uncovered beat. Deriving this
+            # from "has no clip" meant that the moment the borrow started working, the only
+            # user-facing uncovered warning stopped printing entirely and the run looked
+            # like a clean sweep.
+            unmatched_scenes = [i for i, sc in enumerate(scenes_override)
+                                if not sc.get("clip")
+                                or str(sc.get("assignment_type") or "") in
+                                ("borrowed_clip", "uncovered_still")]
             if unmatched_scenes and placed and not _v2:
                 details = ", ".join(str(i) for i in unmatched_scenes[:12])
                 report_path = project_dir / "review" / "scrape_v2_report.json"
@@ -11771,7 +11778,10 @@ def run_project(form, status_cb=None):
                      "text_heaviness_score": sc.get("text_heaviness_score"),
                      "black_bar_score": sc.get("black_bar_score"),
                      "is_fake_vertical": sc.get("is_fake_vertical"),
-                     "accepted": bool(sc.get("clip")),
+                     # A borrowed beat HAS a clip and is still an unmatched beat. Keying acceptance off
+                # the clip made the report claim 14/14 matched on a run that matched 2.
+                "accepted": bool(sc.get("clip")) and str(sc.get("assignment_type") or "")
+                            not in ("borrowed_clip", "uncovered_still"),
                      "shown_in_media_panel": bool(sc.get("clip"))}
                     for i, sc in enumerate(scenes_override)],
             })
@@ -11786,6 +11796,8 @@ def run_project(form, status_cb=None):
                                 # run raised instead, which is why a scrape that reported 13
                                 # uncovered beats left an empty renders/ folder.
                                 "assignment_type": sc.get("assignment_type"),
+                                "scrape_clip_id": sc.get("scrape_clip_id"),
+                                "seedance_start_trim": sc.get("seedance_start_trim"),
                                 "borrowed_from_scene": sc.get("borrowed_from_scene"),
                                 "match_class": sc.get("match_class"),
                                 "script_match_score": sc.get("script_match_score"),
@@ -11959,6 +11971,13 @@ def run_project(form, status_cb=None):
                 # known-uncovered one or a broken run. Dropping it here made that branch
                 # unreachable and turned every uncovered beat into a hard render failure.
                 _cs["assignment_type"] = _sm[_i].get("assignment_type")
+                # Without these two a borrowed beat is indistinguishable from a fresh clip:
+                # the duplicate guard keys on the filename when scrape_clip_id is missing,
+                # and the caption pre-pass renames every scene to a different capblur_ file.
+                if _sm[_i].get("scrape_clip_id"):
+                    _cs["scrape_clip_id"] = _sm[_i].get("scrape_clip_id")
+                if _sm[_i].get("seedance_start_trim") is not None:
+                    _cs["seedance_start_trim"] = _sm[_i].get("seedance_start_trim")
                 _cs["borrowed_from_scene"] = _sm[_i].get("borrowed_from_scene")
     config["use_seedance_clips"] = bool(out_clips) and config.get("use_seedance_clips", True)
     config["render_captions"] = bool(out_caps)

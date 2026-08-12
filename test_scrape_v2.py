@@ -382,8 +382,12 @@ def test_uncovered_beats_borrow_motion():
     # clip of anything absent from it. A borrow that only edits the scene dict is erased.
     check("the borrow is written into the scene_clips list the renderer reads",
           scene_clips[1] == scene_clips[0] and scene_clips[2] == scene_clips[3])
+    # seedance_start_trim, not source_trim: the latter is an SFX/editor payload key that the
+    # renderer never reads, so the shift was written into a field nothing consumed.
     check("a borrowed beat starts at a different in-point than its donor",
-          scenes[1].get("source_trim", 0) > 0)
+          scenes[1].get("seedance_start_trim", 0) > 0)
+    check("the borrow carries the donor's clip identity, so the duplicate guard can see it",
+          "scrape_clip_id" in scenes[1])
 
     only_stills = [{"id": 0, "assignment_type": "uncovered_still"}]
     check("with no footage at all the still fallback survives",
