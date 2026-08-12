@@ -6625,7 +6625,9 @@ def project_summary(project_dir):
     # No render is NOT failure for a scrape clip-short: its run intentionally skips the final
     # render and hands the edit to the timeline editor. Only a project with neither a render nor
     # a timeline edit is actually broken.
-    failed = not bool(video) and not project_has_timeline_edit(project_dir.name)
+    awaiting = project_awaiting_material(project_dir)
+    failed = (not bool(video) and not project_has_timeline_edit(project_dir.name)
+              and not awaiting)
     return {
         "title": report.get("title") or project_title_from_files(project_dir),
         "slug": project_dir.name,
@@ -6645,6 +6647,7 @@ def project_summary(project_dir):
         "web_images": count_media(project_dir / "web images", {".jpg", ".jpeg", ".png", ".webp"}),
         "seedance": count_media(project_dir / "seedance 2.0", {".mp4", ".webm", ".mov", ".m4v"}),
         "failed": failed,
+        "awaiting": awaiting,
     }
 
 
@@ -13433,13 +13436,24 @@ def _dreamcore_bed_path(name):
                        "'background music' folder first.")
 
 
-def start_dreamcore_job(clip_paths, title="", bed="", meta=None):
-    """Cut the user's generated clips to the melody of the chosen music bed."""
+def start_dreamcore_job(clip_paths, title="", bed="", meta=None, slug=""):
+    """Cut the user's generated clips to the melody of the chosen music bed.
+
+    `slug` is the project the prompts were written into. The clips finish THAT project
+    rather than starting a second one, so the library shows one dreamcore short per idea
+    instead of an orphaned "waiting" folder beside every finished video.
+    """
     if dreamcore_mode is None:
         raise RuntimeError("Dreamcore is unavailable (module failed to import).")
     meta = dict(meta or {})
-    slug = "dreamcore_" + (re.sub(r"[^a-z0-9]+", "_", str(title or "short")[:40].lower())
-                           .strip("_") or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
+    existing = safe_project_dir(slug) if slug else None
+    if existing is not None and not dreamcore_state_of(existing):
+        existing = None                      # not a dreamcore project; do not write into it
+    if existing is not None:
+        slug = existing.name
+    else:
+        slug = "dreamcore_" + (re.sub(r"[^a-z0-9]+", "_", str(title or "short")[:40].lower())
+                               .strip("_") or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
     project_dir = agent_core.PROJECTS_DIR / slug
     work_dir = ROOT / "outputs" / "dreamcore_work" / slug
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -13483,6 +13497,15 @@ def start_dreamcore_job(clip_paths, title="", bed="", meta=None):
             report.update({"title": title or slug, "project_dir": str(project_dir),
                            "mode": "dreamcore", "bed": str(bed), **meta})
             _write_dreamcore_project_config(project_dir, slug, report)
+            # The project stops waiting: it now has a render, so the library treats it like
+            # any other finished short, and reopening it goes to the timeline, not back to
+            # the prompt list.
+            saved_state = dreamcore_state_of(project_dir)
+            if saved_state:
+                saved_state["stage"] = "edited"
+                saved_state["video"] = str(report.get("video") or "")
+                (project_dir / "config" / "dreamcore.json").write_text(
+                    json.dumps(saved_state, indent=2, ensure_ascii=False), encoding="utf-8")
             (project_dir / "agent_report.json").write_text(
                 json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
             with JOB_LOCK:
@@ -13501,6 +13524,62 @@ def start_dreamcore_job(clip_paths, title="", bed="", meta=None):
 
     threading.Thread(target=worker, daemon=True).start()
     return job_id
+
+
+DREAMCORE_STATE = "config/dreamcore.json"
+
+
+def dreamcore_state_of(project_dir):
+    """The saved brief/prompts of a dreamcore project, or None if it is not one."""
+    try:
+        path = Path(project_dir) / "config" / "dreamcore.json"
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def project_awaiting_material(project_dir):
+    """True while a project is legitimately waiting for the user to bring something back.
+
+    A dreamcore project has no render and no timeline edit for as long as it takes the user
+    to generate their clips elsewhere. Without this it is indistinguishable from a crashed
+    run and the library labels it FAILED.
+    """
+    state = dreamcore_state_of(project_dir)
+    return bool(state) and str(state.get("stage") or "") == "awaiting_clips"
+
+
+def _save_dreamcore_project(brief, out, bed=""):
+    """Write the prompts into a real project folder so the work survives the browser."""
+    title = str(out.get("world") or brief or "Dreamcore")[:60]
+    slug = "dreamcore_" + (re.sub(r"[^a-z0-9]+", "_", str(brief or "short")[:40].lower())
+                           .strip("_") or "short") + "_" + time.strftime("%Y%m%d_%H%M%S")
+    project_dir = agent_core.PROJECTS_DIR / slug
+    (project_dir / "config").mkdir(parents=True, exist_ok=True)
+    state = {
+        "stage": "awaiting_clips",
+        "brief": str(brief or ""),
+        "world": str(out.get("world") or ""),
+        "prompts": out.get("prompts") or [],
+        "grid": out.get("grid") or {},
+        "bed": bed,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (project_dir / "config" / "dreamcore.json").write_text(
+        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    # A minimal report so the library has a title and a date to show for it. It goes in
+    # review/, which is where read_project_report looks - a copy in the project root is
+    # never read and the list falls back to the slug.
+    (project_dir / "review").mkdir(parents=True, exist_ok=True)
+    (project_dir / "review" / "agent_report.json").write_text(json.dumps({
+        "title": f"Dreamcore: {brief or title}"[:80],
+        "mode": "dreamcore",
+        "created_at": state["created_at"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    return slug
 
 
 def _write_dreamcore_project_config(project_dir, slug, report):
@@ -15289,6 +15368,16 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/chat-state":
             self.send_bytes(json.dumps(chat_ui.load_chat_state()).encode("utf-8"),
                             "application/json; charset=utf-8")
+        elif parsed.path == "/dreamcore-project":
+            slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
+            project_dir = safe_project_dir(slug)
+            state = dreamcore_state_of(project_dir) if project_dir else None
+            if not state:
+                self.send_error(404)
+                return
+            state["slug"] = project_dir.name
+            self.send_bytes(json.dumps(state).encode("utf-8"),
+                            "application/json; charset=utf-8")
         elif parsed.path == "/physics-scenes":
             # Every simulation the app can actually run, read from the scene files
             # themselves. The interface used to name three presets by hand and went stale
@@ -15627,6 +15716,14 @@ class Handler(BaseHTTPRequestHandler):
                     model=str(body.get("model") or "") or dreamcore_mode.PROMPT_MODEL)
                 out["bed"] = str(bed)
                 out["grid"] = {k: grid[k] for k in ("phrase", "offset", "duration")}
+                # The project exists from HERE, not from the upload. Everything between the
+                # two is the user leaving to generate clips somewhere else, which is the
+                # slow part of this mode - and until now the prompts lived only in the
+                # browser's chat state, which the app deliberately does not restore. Close
+                # the window and an hour of prompt writing was gone, with nothing in the
+                # sidebar to come back to.
+                out["slug"] = _save_dreamcore_project(str(body.get("brief") or ""), out,
+                                                      bed=str(bed))
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)}
             self.send_bytes(json.dumps(out).encode("utf-8"),
@@ -15658,7 +15755,7 @@ class Handler(BaseHTTPRequestHandler):
                     meta["prompts"] = []
                 out = {"job_id": start_dreamcore_job(
                     saved, title=title, bed=str(_dreamcore_bed_path(fields.get("bed"))),
-                    meta=meta)}
+                    meta=meta, slug=str(fields.get("slug") or ""))}
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)}
             self.send_bytes(json.dumps(out).encode("utf-8"),

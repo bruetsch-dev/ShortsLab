@@ -198,6 +198,10 @@ body.sb-resizing .sidebar { transition: none; }
 .sb-proj .st { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 99px; flex: 0 0 auto; }
 .st.ok { color: var(--success); background: rgba(82,210,115,.12); }
 .st.fail { color: var(--danger); background: rgba(239,102,92,.12); }
+/* Waiting for the user to come back with generated clips - a normal state, not a fault. */
+.st.wait { color: var(--warning); background: rgba(230,180,80,.14); }
+.pv-tag-awaiting { color: var(--warning); background: rgba(230,180,80,.16);
+  border-color: rgba(230,180,80,.34); }
 /* Active-job chip: compact, one clean status word, a pulsing dot + a live equalizer wave. */
 .sb-job { position: relative; display: flex; align-items: center; gap: 9px; padding: 9px 11px; border-radius: 11px;
   border: 1px solid var(--border); background: var(--sidebar-raised); cursor: pointer; text-align: left; overflow: hidden;

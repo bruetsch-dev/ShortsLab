@@ -99,9 +99,14 @@ const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch", motion_loop: "L
 function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
 // STATE is separate from KIND: a failed Sketch used to show only "failed" and lose its
 // category. State sits top-right, kind top-left; both can show at once.
-const STATE_LABEL = { running: "Running", failed: "Failed", editing: "In edit" };
+const STATE_LABEL = { running: "Running", failed: "Failed", editing: "In edit",
+                      awaiting: "Needs clips" };
 function projState(p) {
   if (p.running) return "running";
+  // Waiting for the user to bring generated clips back is the normal middle of a dreamcore
+  // project, and it can last days. Before this it read as "Failed", because the only test
+  // was "has no render".
+  if (p.awaiting) return "awaiting";
   if (p.failed) return "failed";
   if (p.has_timeline && !p.has_video) return "editing";   // clip short living in the timeline
   return "";
@@ -440,6 +445,8 @@ function stepCopy(step) {
     concept:["CONCEPT", "Build the world", "Describe one surreal place, subject or point of view."],
     motion:["MOTION", "Direct the loop", "Choose the camera path and intensity; the coded pass keeps it fluid."],
     summary:["PROJECT", "Project overview", "Choose the next action."],
+    brief:["WORLD", "Name the place", "One or two lines. The aesthetic is the subject; this is only where it happens."],
+    clips:["CLIPS", "Generate, then drop them back in", "Copy each prompt into your generator and bring the clips here. The project waits for you."],
     scene:["SIMULATION", "Choose what gets simulated", "Every one is a real Blender scene, solved not animated."],
     shot:["THE SHOT", "Set it up", "Materials, counts, masses, camera - the numbers the scene was built to accept."],
   }[step] || ["SETTINGS", "Configure this step", "Make your choices and continue."]);
@@ -826,7 +833,8 @@ async function refreshPrototypeHomeData() {
       const b = el("button", "proto-project");
       const fallback = `<span class="proto-poster-fallback proto-poster-${idx + 1}">${protoIcon("folder")}</span>`;
       const preview = p.thumb_url ? `<img loading="lazy" src="${esc(p.thumb_url)}" alt="">` : fallback;
-      const status = p.running ? "Run in progress" : p.failed ? "Needs attention" : p.has_timeline ? "Ready to edit" : "In progress";
+      const status = p.running ? "Run in progress" : p.awaiting ? "Waiting for your clips"
+        : p.failed ? "Needs attention" : p.has_timeline ? "Ready to edit" : "In progress";
       b.innerHTML = `<span class="proto-project-poster">${preview}${kindLabel(p.kind) ? `<i>${esc(kindLabel(p.kind))}</i>` : ""}</span>
         <span class="proto-project-copy"><b>${esc(p.title || p.slug)}</b><small>${esc(status)} · ${esc(fmtDate(p.edited))}</small></span>${protoIcon("more")}`;
       b.addEventListener("click", () => loadProject(p.slug));
@@ -1995,7 +2003,7 @@ let DREAMCORE_FILES = [];
 function dreamcoreState() {
   if (!S.dreamcore) {
     S.dreamcore = { brief: "", world: "", prompts: [], bed: "", grid: null,
-                    clips: 4, cuts: 2 };
+                    clips: 4, cuts: 2, slug: "" };
   }
   return S.dreamcore;
 }
@@ -2069,6 +2077,11 @@ function renderDreamcoreFlow() {
         if (d.error) throw new Error(d.error);
         D.prompts = d.prompts || []; D.world = d.world || "";
         D.grid = d.grid || null;
+        // The server wrote these prompts into a real project. Holding its slug means the
+        // clips finish THAT project later instead of starting a second one, and it is what
+        // the sidebar entry reopens.
+        D.slug = d.slug || "";
+        if (d.slug) { S.projectSlug = d.slug; S.projectTitle = (D.brief || "Dreamcore").slice(0, 60); }
         DREAMCORE_FILES = new Array(D.prompts.length).fill(null);
         wait.remove();
         editStep("clips");
@@ -2179,6 +2192,7 @@ async function submitDreamcore(go) {
   fd.append("world", D.world || "");
   fd.append("bed", D.bed || "");
   fd.append("prompts", JSON.stringify(D.prompts || []));
+  fd.append("slug", D.slug || S.projectSlug || "");
   try {
     const r = await fetch("/dreamcore-edit", { method: "POST", body: fd });
     const d = await r.json();
@@ -3087,6 +3101,10 @@ async function loadProject(slug) {
     const plist = await jget("/projects-list");
     const info = (plist.projects || []).find(p => p.slug === slug) || {};
     if (info.longform) { openLongformProject(info); return; }
+    // A dreamcore project that is still waiting for its clips has no render and no
+    // timeline to open - it reopens on its own prompt list, which is the whole reason it
+    // is saved at all.
+    if (info.dreamcore && info.awaiting) { await openDreamcoreProject(slug); return; }
     const d = await jget("/project-preset?slug=" + encodeURIComponent(slug));
     S.projectSlug = d.slug; S.projectTitle = d.title || d.slug;
     const st = d.state || {};
@@ -3103,6 +3121,24 @@ async function loadProject(slug) {
     renderAll(); persist();
   } catch (e) { hideLoading(); errorCard(T.err_generic, String(e)); }
 }
+async function openDreamcoreProject(slug) {
+  const d = await jget("/dreamcore-project?slug=" + encodeURIComponent(slug));
+  const D = dreamcoreState();
+  D.slug = d.slug || slug;
+  D.brief = d.brief || "";
+  D.world = d.world || "";
+  D.prompts = d.prompts || [];
+  D.grid = d.grid || null;
+  D.bed = (d.bed || "").split(/[\/]/).pop();
+  DREAMCORE_FILES = new Array(D.prompts.length).fill(null);
+  S.projectSlug = D.slug;
+  S.projectTitle = d.title || ("Dreamcore: " + (D.brief || slug));
+  S.flow = "dreamcore"; S.step = "clips"; S.completed = ["brief"]; S.draft = true;
+  S.view = "chat"; S.jobId = null; S.jobStatus = "";
+  hideLoading();
+  renderAll(); persist();
+}
+
 // Longform has no "project overview" of its own: it resumes by re-running the same script, and the
 // pipeline reuses the voiceover it already paid for. So opening one lands you in its Production
 // step with the script and narrator restored - Create picks up exactly where the run stopped.
@@ -4449,7 +4485,7 @@ async function openProjectPicker() {
     const st = projState(p);
     b.innerHTML = `${projThumb(p, "th")}
       <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
-      ${st ? `<span class="st ${st === "failed" ? "fail" : "ok"}">${STATE_LABEL[st]}</span>` : ""}`;
+      ${st ? `<span class="st ${st === "failed" ? "fail" : st === "awaiting" ? "wait" : "ok"}">${STATE_LABEL[st]}</span>` : ""}`;
     b.addEventListener("click", () => { close(); loadProject(p.slug); });
     list.appendChild(b);
   });
@@ -4524,7 +4560,8 @@ function assetCard(p) {
   body.appendChild(pills);
   c.appendChild(body);
   const act = el("div", "aact");
-  if (p.failed) act.appendChild(btn("▶ " + T.continue, () => continueProject(p.slug), "primary small"));
+  if (p.awaiting) act.appendChild(btn("▶ " + T.continue, () => loadProject(p.slug), "primary small"));
+  else if (p.failed) act.appendChild(btn("▶ " + T.continue, () => continueProject(p.slug), "primary small"));
   else if (p.results_url) act.appendChild(linkBtn("▶ " + T.check_results, p.results_url, "small"));
   // Opening a finished project goes STRAIGHT into the timeline editor (its render exists);
   // only projects without a render fall back to the project overview.
@@ -4714,7 +4751,8 @@ function paintSidebarProjects() {
       const b = el("button", "sb-proj");
       b.innerHTML = `${projThumb(p, "th")}
         <span class="meta"><b>${esc(p.title)}</b><span>${esc(fmtDate(p.edited))}</span></span>
-        ${p.failed ? '<span class="st fail" title="Failed - open to see what went wrong">!</span>' : ""}`;
+        ${p.awaiting ? '<span class="st wait" title="Waiting for your generated clips">○</span>'
+          : p.failed ? '<span class="st fail" title="Failed - open to see what went wrong">!</span>' : ""}`;
       b.title = p.title;
       row.classList.toggle("pinned", pins.has(p.slug));
       row.addEventListener("contextmenu", e => openProjectContextMenu(e, p));

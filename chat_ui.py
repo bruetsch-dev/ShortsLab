@@ -514,6 +514,10 @@ def projects_list_payload(show_hidden=False, limit=200):
                     "title": s.get("title"),
                     "edited": s.get("edited_at") or s.get("created_at") or "",
                     "failed": bool(s.get("failed")) and not running,
+                    # Waiting for the user to bring generated clips back is a normal state
+                    # of a dreamcore project, not a broken run.
+                    "awaiting": bool(s.get("awaiting")) and not running,
+                    "dreamcore": bool(app.dreamcore_state_of(s.get("project_dir"))),
                     "running": running,
                     "hidden": hidden,
                     "has_video": has_video,
