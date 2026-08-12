@@ -2302,6 +2302,103 @@ body.mode-arriving-clip .proto-active-card.proto-flight-landed,
 .physics-preview-shot { display:block; width:100%; max-width:280px; margin:12px auto 4px;
   border-radius:12px; background:#111; aspect-ratio:9/16; object-fit:contain; }
 
+/* What the run settled on, under the preview still: the scene and its numbers. */
+.phys-pickfacts { display:flex; flex-wrap:wrap; gap:6px; justify-content:center;
+  margin:10px 0 2px; }
+.phys-pickfacts b { padding:4px 10px; border-radius:999px; font:600 11px/1.5 var(--mono);
+  color:var(--accent-ink); background:var(--accent); }
+.phys-pickfacts span { padding:4px 9px; border-radius:999px; font:500 11px/1.5 var(--mono);
+  color:var(--text-secondary); background:var(--surface-raised);
+  border:1px solid var(--border); }
+.phys-pickfacts span i { font-style:normal; color:var(--text-primary); font-weight:650; }
+
+/* ---- Physics: the scene library, then the knobs of the one you picked ----
+   Every tile is a real file in physics_mode/scenes/lib/, so the grid is as long as the
+   library is. The numbers are the interface here - a physics scene is chosen by what it
+   does and then TUNED, which the old three-preset list could not express at all. */
+.phys-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(232px, 1fr));
+  gap:10px; }
+.phys-tile { display:flex; flex-direction:column; gap:8px; padding:14px 15px 12px;
+  text-align:left; color:var(--text-primary); background:var(--surface);
+  border:1px solid var(--border); border-radius:var(--r-md); cursor:pointer;
+  transition:transform var(--tr), border-color var(--tr), background var(--tr); }
+.phys-tile:hover { transform:translateY(-2px); border-color:var(--border-hover);
+  background:var(--surface-hover); }
+.phys-tile.on { border-color:var(--border-active); background:var(--accent-soft); }
+.phys-tile .pt-head { display:flex; align-items:baseline; justify-content:space-between;
+  gap:8px; }
+.phys-tile .pt-head strong { font-size:15px; line-height:1.2; }
+.phys-tile .pt-kind { flex:none; font:600 10px/1 var(--mono); font-style:normal;
+  letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); }
+.phys-tile .pt-kind.sweep { color:var(--accent); }
+.phys-tile p { margin:0; flex:1; color:var(--text-secondary); font-size:12.5px;
+  line-height:1.5; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;
+  overflow:hidden; }
+.phys-tile .pt-foot { display:flex; align-items:center; justify-content:space-between;
+  gap:8px; padding-top:8px; border-top:1px solid var(--border); }
+.phys-tile .pt-foot code { font:600 10.5px/1.4 var(--mono); color:var(--text-primary);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.phys-tile .pt-foot i { flex:none; font-style:normal; font:500 10.5px/1.4 var(--mono);
+  color:var(--text-muted); }
+
+.phys-or { display:flex; align-items:center; gap:12px; margin:18px 0 10px;
+  color:var(--text-muted); font-size:11.5px; letter-spacing:.06em;
+  text-transform:uppercase; }
+.phys-or::before, .phys-or::after { content:""; flex:1; height:1px; background:var(--border); }
+textarea.phys-prompt { width:100%; }
+
+.phys-loading { display:flex; gap:6px; justify-content:center; padding:26px 0; }
+.phys-loading i { width:7px; height:7px; border-radius:50%; background:var(--text-muted);
+  animation:phys-bounce 1s infinite ease-in-out; }
+.phys-loading i:nth-child(2) { animation-delay:.15s; }
+.phys-loading i:nth-child(3) { animation-delay:.3s; }
+@keyframes phys-bounce { 0%,80%,100% { opacity:.25; transform:translateY(0); }
+  40% { opacity:1; transform:translateY(-5px); } }
+
+.phys-shot-head { padding-bottom:14px; margin-bottom:4px; border-bottom:1px solid var(--border); }
+.phys-shot-head strong { display:block; font-size:19px; }
+.phys-shot-head p { margin:6px 0 0; color:var(--text-secondary); font-size:13px; line-height:1.5; }
+
+.phys-param { padding:12px 0; border-bottom:1px solid var(--border); }
+.phys-param:last-of-type { border-bottom:0; }
+.pp-head span { font-weight:600; font-size:13.5px; }
+.pp-note { margin:7px 0 0; color:var(--text-muted); font-size:11.5px; line-height:1.55;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.phys-param:hover .pp-note { -webkit-line-clamp:12; }
+
+.phys-seg { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.phys-seg-b { padding:7px 13px; min-height:34px; color:var(--text-secondary);
+  background:var(--surface); border:1px solid var(--border); border-radius:999px;
+  font:600 12px/1 var(--sans); cursor:pointer; transition:all var(--tr); }
+.phys-seg-b:hover { color:var(--text-primary); border-color:var(--border-hover); }
+.phys-seg-b.on { color:var(--accent-ink); background:var(--accent); border-color:var(--accent); }
+
+.phys-slide { display:flex; align-items:center; gap:12px; margin-top:8px; }
+.phys-slide input[type=range] { flex:1; accent-color:var(--accent); }
+.phys-slide output { min-width:56px; text-align:right; font:650 13px/1 var(--mono);
+  color:var(--text-primary); }
+.phys-dice { flex:none; padding:5px 10px; color:var(--text-secondary);
+  background:var(--surface); border:1px solid var(--border); border-radius:999px;
+  font:600 11px/1 var(--sans); cursor:pointer; }
+.phys-dice:hover { color:var(--accent); border-color:var(--border-active); }
+input.phys-values { width:100%; margin-top:8px; font-family:var(--mono); }
+
+.phys-more { margin:4px 0 0; }
+.phys-more > summary { padding:9px 0; color:var(--text-secondary); font-size:12.5px;
+  cursor:pointer; }
+.phys-more > summary:hover { color:var(--accent); }
+
+.phys-estimate { display:flex; align-items:baseline; gap:12px; margin-top:14px;
+  padding:12px 14px; background:var(--surface-raised); border:1px solid var(--border);
+  border-radius:var(--r-md); }
+.phys-estimate span { flex:none; font:650 15px/1 var(--mono); color:var(--text-primary); }
+.phys-estimate em { font-style:normal; color:var(--text-muted); font-size:12px;
+  line-height:1.5; }
+@media (max-width: 560px) {
+  .phys-grid { grid-template-columns:1fr; }
+  .phys-estimate { flex-direction:column; gap:6px; }
+}
+
 /* ---- AI Core: idea -> storyline -> three prompts -> drop the clips back in ---- */
 .aicore-label { display:block; }
 .aicore-label > span { display:block; font-weight:600; margin-bottom:2px; }

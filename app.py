@@ -13635,7 +13635,8 @@ def _write_physics_project_config(project_dir, slug, video, report):
 
 
 def start_physics_job(preset, values, samples=24, seconds=4.0, prompt="",
-                      brief_model=""):
+                      brief_model="", scene="", params=None, sweep=True,
+                      sweep_values=None):
     """Render a Blender physics sweep in the background.
 
     The output lands in a normal project folder (renders/) so the finished short shows up
@@ -13644,7 +13645,7 @@ def start_physics_job(preset, values, samples=24, seconds=4.0, prompt="",
     """
     if physics_run is None:
         raise RuntimeError("Physics mode is unavailable (module failed to import).")
-    name = str(prompt or preset)[:40]
+    name = str(scene or prompt or preset)[:40]
     slug = "physics_" + (re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "scene")         + "_" + time.strftime("%Y%m%d_%H%M%S")
     project_dir = agent_core.PROJECTS_DIR / slug
     # Built outside PROJECTS_DIR: a project folder with no render in it is listed as a
@@ -13682,64 +13683,103 @@ def start_physics_job(preset, values, samples=24, seconds=4.0, prompt="",
             # A sweep is the better part of an hour of GPU time. Show one cheap frame and
             # let the user reject the shot before committing to the whole thing.
             custom = None
-            if prompt:
+            picked = None
+            authored_shot = None
+            if scene:
+                # The user chose the scene and set its numbers themselves. Nothing to
+                # decide, so no model is asked - this path costs nothing and cannot pick
+                # wrong.
+                picked = physics_library.resolve(scene, params, sweep=sweep,
+                                                 seconds=seconds,
+                                                 sweep_values=sweep_values)
+                status_cb(f"Scene: {scene} - {picked['params']}")
+            elif prompt:
                 # The LIBRARY first. Hand-written scenes get composition, scale and camera
                 # right every time; a model writing one from scratch produced, in one
                 # afternoon, a target too small to read, a chain that was a single rod,
                 # half a frame of unlit floor, a ball parked outside the frame and finally
                 # a camera inside the wall. Variation now comes from the parameters, which
                 # are wide, rather than from letting it invent geometry.
-                picked = None
                 if physics_library is not None:
                     try:
                         picked = physics_library.select(prompt, status_cb=status_cb)
                     except Exception as exc:  # noqa: BLE001
                         status_cb(f"Scene library unavailable ({exc}); writing one instead.")
-                if picked:
-                    custom = {"scene_path": picked["path"], "params": picked["params"],
-                              "title": picked["title"], "seconds": picked["seconds"],
-                              "kind": "loop" if picked.get("loop") else "single"}
-                    if picked.get("sweep"):
-                        # A comparison short: the same setup rendered once per value and
-                        # joined, each take labelled. This is the format that made the
-                        # wrecking-ball video work - the contrast IS the video.
-                        sw = picked["sweep"]
-                        custom["kind"] = "sweep"
-                        custom["param"] = sw.get("param")
-                        custom["values"] = sw.get("values") or []
-                        custom["unit"] = sw.get("unit", "")
-                    status_cb("Rendering a preview frame for approval...")
-                    shot = physics_run.preview_frame(work_dir, custom=custom,
-                                                     status_cb=status_cb)
-                else:
+                if not picked:
                     # An authored scene is proved by running it, so its test frame IS the
                     # preview - no second render just to show the user something.
                     custom = physics_authoring.author_scene(
                         prompt, status_cb=status_cb, work_dir=work_dir,
                         **({"brief_model": brief_model} if brief_model else {}))
-                    shot = custom["preview"]
-            else:
-                status_cb("Rendering a preview frame for approval...")
-                shot = physics_run.preview_frame(work_dir, preset=preset, values=values,
-                                                 status_cb=status_cb)
-            with JOB_LOCK:
-                JOBS[job_id]["physics_preview"] = str(shot)
-                JOBS[job_id]["status"] = "awaiting_approval"
-            approval.clear()
-            approval.wait()
-            with JOB_LOCK:
-                decision = JOBS[job_id].get("physics_decision")
-                JOBS[job_id]["status"] = "running"
-                JOBS[job_id]["physics_preview"] = None
+                    authored_shot = custom["preview"]
+            if picked:
+                custom = {"scene_path": picked["path"], "params": picked["params"],
+                          "title": picked["title"], "seconds": picked["seconds"],
+                          "kind": "loop" if picked.get("loop") else "single"}
+                if picked.get("sweep"):
+                    # A comparison short: the same setup rendered once per value and
+                    # joined, each take labelled. This is the format that made the
+                    # wrecking-ball video work - the contrast IS the video.
+                    sw = picked["sweep"]
+                    custom["kind"] = "sweep"
+                    custom["param"] = sw.get("param")
+                    custom["values"] = sw.get("values") or []
+                    custom["unit"] = sw.get("unit", "")
+                with JOB_LOCK:
+                    JOBS[job_id]["physics_pick"] = {
+                        "scene": picked["scene"], "title": picked["title"],
+                        "params": dict(picked["params"]),
+                        "sweep": (dict(picked["sweep"]) if picked.get("sweep") else None),
+                        "seconds": picked["seconds"],
+                    }
+            # A sweep is the better part of an hour of GPU time, and the seed alone changes
+            # the whole take. "Another take" re-rolls it and shows a new frame rather than
+            # making the user cancel and re-answer the form.
+            while True:
+                if authored_shot:
+                    shot, authored_shot = authored_shot, None
+                else:
+                    status_cb("Rendering a preview frame for approval...")
+                    shot = physics_run.preview_frame(work_dir, preset=preset,
+                                                     values=values, custom=custom,
+                                                     status_cb=status_cb)
+                with JOB_LOCK:
+                    JOBS[job_id]["physics_preview"] = str(shot)
+                    JOBS[job_id]["status"] = "awaiting_approval"
+                approval.clear()
+                approval.wait()
+                with JOB_LOCK:
+                    decision = JOBS[job_id].get("physics_decision")
+                    JOBS[job_id]["status"] = "running"
+                    JOBS[job_id]["physics_preview"] = None
+                if decision == "retry" and custom is not None:
+                    import secrets
+                    new_seed = secrets.randbelow(10000)
+                    if "seed" in (custom.get("params") or {}):
+                        custom["params"]["seed"] = new_seed
+                        with JOB_LOCK:
+                            pick = JOBS[job_id].get("physics_pick")
+                            if pick:
+                                pick["params"]["seed"] = new_seed
+                        status_cb(f"Another take - seed {new_seed}.")
+                    else:
+                        status_cb("Another take.")
+                    continue
+                break
             if decision != "approve":
                 with JOB_LOCK:
                     JOBS[job_id]["status"] = "cancelled"
                     JOBS[job_id]["logs"].append("Declined at the preview frame.")
                 return
             status_cb("Preview approved - rendering the full sequence.")
+            # A library scene declares its own length (the jelly needs 7s to settle, the
+            # loop scenes size a whole period). Passing the form's default 4.0 down here
+            # overrode it, so the preview frame and the render disagreed about how long
+            # the shot was - custom's length wins whenever there is one.
+            take_seconds = float((custom or {}).get("seconds") or seconds)
             report = physics_run.build(work_dir, preset=preset, values=values,
-                                       samples=samples, seconds=seconds, custom=custom,
-                                       status_cb=status_cb)
+                                       samples=samples, seconds=take_seconds,
+                                       custom=custom, status_cb=status_cb)
             src = Path(report["video"])
             (project_dir / "renders").mkdir(parents=True, exist_ok=True)
             final = project_dir / "renders" / f"{slug}.mp4"
@@ -14600,6 +14640,9 @@ def job_status_payload(job_id):
         "physics_preview_url": (link_for(Path(job["physics_preview"]))
                                 if job.get("physics_preview")
                                 and Path(job["physics_preview"]).is_file() else ""),
+        # What the run actually settled on: which scene, with which numbers. Shown at the
+        # approval gate, where "does this look right" is unanswerable without it.
+        "physics_pick": job.get("physics_pick") or None,
         "thumbnail_generation": bool(job.get("thumbnail_generation")),
         "project_slug": (Path(job["project_dir"]).name
                          if job.get("project_dir") and Path(job["project_dir"]).exists() else ""),
@@ -15246,6 +15289,17 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/chat-state":
             self.send_bytes(json.dumps(chat_ui.load_chat_state()).encode("utf-8"),
                             "application/json; charset=utf-8")
+        elif parsed.path == "/physics-scenes":
+            # Every simulation the app can actually run, read from the scene files
+            # themselves. The interface used to name three presets by hand and went stale
+            # the moment a scene was added.
+            try:
+                scenes = physics_library.describe() if physics_library else []
+                payload = {"scenes": scenes}
+            except Exception as exc:  # noqa: BLE001
+                payload = {"scenes": [], "error": str(exc)}
+            self.send_bytes(json.dumps(payload).encode("utf-8"),
+                            "application/json; charset=utf-8")
         elif parsed.path == "/timeline":
             slug = urllib.parse.parse_qs(parsed.query).get("slug", [""])[0]
             self.send_bytes(timeline_page(slug))
@@ -15625,12 +15679,29 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     continue
             prompt = str(body.get("prompt") or "").strip()
+            scene = str(body.get("scene") or "").strip()
+            params = body.get("params") if isinstance(body.get("params"), dict) else {}
             try:
-                if not prompt and preset not in (physics_run.PRESETS if physics_run else {}):
+                secs = float(body.get("seconds") or 0) or None
+            except (TypeError, ValueError):
+                secs = None
+            try:
+                samples = max(8, min(96, int(body.get("samples") or 24)))
+            except (TypeError, ValueError):
+                samples = 24
+            try:
+                if not (prompt or scene) and preset not in (
+                        physics_run.PRESETS if physics_run else {}):
                     raise RuntimeError(f"Unknown physics preset: {preset}")
                 job_id = start_physics_job(
                     preset, vals or None, prompt=prompt,
-                    brief_model=str(body.get("brief_model") or ""))
+                    brief_model=str(body.get("brief_model") or ""),
+                    scene=scene, params=params,
+                    sweep=body.get("sweep", True) is not False,
+                    sweep_values=(body.get("sweep_values")
+                                  if isinstance(body.get("sweep_values"), list) else None),
+                    samples=samples,
+                    **({"seconds": secs} if secs else {}))
                 out = {"job_id": job_id}
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)}
@@ -15968,11 +16039,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/approve-physics":
             _q = urllib.parse.parse_qs(parsed.query)
             job_id = _q.get("id", [""])[0]
-            ok = _q.get("action", ["approve"])[0] == "approve"
+            act = _q.get("action", ["approve"])[0]
+            if act not in ("approve", "retry"):
+                act = "decline"
             with JOB_LOCK:
                 job = JOBS.get(job_id)
                 if job and job.get("status") == "awaiting_approval":
-                    job["physics_decision"] = "approve" if ok else "decline"
+                    job["physics_decision"] = act
             if job and job.get("approval_event"):
                 job["approval_event"].set()
             self.send_bytes(json.dumps({"ok": True}).encode("utf-8"),

@@ -201,7 +201,7 @@ const FLOW_STEPS = {
   script: ["script", "source", "reasoning", "outputs", "review"],
   viraltrans: ["topic", "review"],
   reddit: ["discover", "pick"],
-  physics: ["setup"],
+  physics: ["scene", "shot"],
   lowpoly: ["setup"],
   longform: ["script", "settings"],
   sfx: ["upload", "settings"],
@@ -440,6 +440,8 @@ function stepCopy(step) {
     concept:["CONCEPT", "Build the world", "Describe one surreal place, subject or point of view."],
     motion:["MOTION", "Direct the loop", "Choose the camera path and intensity; the coded pass keeps it fluid."],
     summary:["PROJECT", "Project overview", "Choose the next action."],
+    scene:["SIMULATION", "Choose what gets simulated", "Every one is a real Blender scene, solved not animated."],
+    shot:["THE SHOT", "Set it up", "Materials, counts, masses, camera - the numbers the scene was built to accept."],
   }[step] || ["SETTINGS", "Configure this step", "Make your choices and continue."]);
 }
 let _lastStepIdx = null;   // for slide direction between steps
@@ -681,8 +683,9 @@ function renderPrototypeHome() {
   labelCard("visualscript", "AI VISUAL SHORT", "AI Short",
     "Create a short using AI-generated visuals and scraped web imagery matching the script.", "Build AI Short");
   labelCard("physics", "SIMULATED IN BLENDER", "Physics Sweep",
-    "Sweep one value - 1kg, 10kg, 50kg - through a real rigid-body simulation, with ASMR "
-    + "impact sound landing on the frame the collision happens.", "Set up a simulation");
+    "Choose a hand-built Blender scene - dropped, crushed, rolled, magnetised - set its "
+    + "materials and masses, and let the solver do the rest. ASMR impact sound lands on "
+    + "the frame it hits.", "Choose a simulation");
   const longform = home.querySelector('[data-mode="longform"]');
   if (longform) {
     longform.className = "proto-tool proto-creator-card proto-tool-longform";
@@ -2449,17 +2452,51 @@ const PHYS_BRIEF_MODELS = [
   { id: "google/gemini-3.5-flash", t: "Gemini 3.5 Flash" },
   { id: "anthropic/claude-opus-4.8", t: "Claude Opus 4.8 (most detailed)" },
 ];
-const PHYS_PRESETS = [
-  { id: "wrecking_ball", t: "Wrecking ball vs block",
-    d: "A steel ball on a swing hits a brick tower. Sweeping the ball's mass.",
-    unit: "kg", values: "1, 10, 50", sweep: true },
-  { id: "tumbling_cube", t: "Tumbling cube into gaps",
-    d: "A cube rolls along a tiled floor, dropping into glowing gaps. Seamless loop.",
-    unit: "", values: "", sweep: false },
-  { id: "__prompt__", t: "Describe your own",
-    d: "Write what should happen and the app builds the 3D scene for it.",
-    unit: "", values: "", sweep: false, prompt: true },
+/* The scene library, read from the scene FILES at /physics-scenes. Nothing about the
+   simulations is written down here: the app used to name three presets by hand, two of
+   which no longer existed and nine of which were missing, so the newest scene was always
+   the one you could not reach. A scene added to physics_mode/scenes/lib/ now appears in
+   this list on the next page load. */
+let PHYS_LIB = null, PHYS_LIB_ERR = "", physLibPending = false;
+function physFetchLibrary(then) {
+  if (physLibPending) return;
+  physLibPending = true;
+  fetch("/physics-scenes").then(r => r.json()).then(d => {
+    PHYS_LIB = d.scenes || []; PHYS_LIB_ERR = d.error || "";
+  }).catch(e => { PHYS_LIB = []; PHYS_LIB_ERR = String(e); })
+    .then(() => { physLibPending = false; then && then(); });
+}
+const PHYS_QUALITY = [
+  { s: 12, t: "Draft", d: "grainy, quickest" },
+  { s: 24, t: "Standard", d: "what the finished shorts use" },
+  { s: 48, t: "Sharp", d: "clean, roughly twice the wait" },
 ];
+function physState() {
+  if (!S.physics) {
+    S.physics = { scene: "", params: {}, sweep: true, sweepValues: "",
+                  seconds: 0, samples: 24, prompt: "" };
+  }
+  return S.physics;
+}
+// Scene keys are snake_case; only the first letter is raised. CSS capitalize would title-case
+// every word, which turns "ball mass per take (kg)" into "(Kg)".
+function physCap(s) {
+  const t = String(s || "").replace(/_/g, " ");
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+function physSceneOf(P) {
+  return (PHYS_LIB || []).find(s => s.scene === P.scene) || null;
+}
+function physTakeCount(sc, P) {
+  if (!sc || !sc.sweep || !P.sweep) return 1;
+  const v = physSweepValues(sc, P);
+  return v.length || (sc.sweep.values || []).length || 1;
+}
+function physSweepValues(sc, P) {
+  const raw = String(P.sweepValues || "").trim();
+  if (!raw) return (sc && sc.sweep ? sc.sweep.values : []) || [];
+  return raw.split(/[,;\s]+/).map(Number).filter(n => isFinite(n));
+}
 /* ------------------------------------------------------------------ low-poly story short
    Crude PS1-era 3D, written end to end by the models: story and shot list, then one whole
    Blender script per shot. Looking cheap is the point, so nothing here is hand-authored. */
@@ -2511,77 +2548,290 @@ function renderLowpolyFlow() {
   setComposer("off");
 }
 
-function renderPhysicsFlow() {
-  msgU(esc(T.mode_physics_t));
-  msgA(esc(T.physics_intro));
-  if (S.jobId) return;
-  const c = card();
-  const preset = S.values.phys_preset || PHYS_PRESETS[0].id;
-  const cur = PHYS_PRESETS.find(p => p.id === preset) || PHYS_PRESETS[0];
-  PHYS_PRESETS.forEach(p => {
-    const b = el("button", "choice" + (p.id === preset ? " on" : ""),
-      `<b>${esc(p.t)}</b><p>${esc(p.d)}</p>`);
-    b.addEventListener("click", () => { S.values.phys_preset = p.id; renderAll(); persist(); });
-    c.appendChild(b);
+/* ---- step 1: which simulation ---------------------------------------------------- */
+function physRenderGrid(host, P) {
+  host.innerHTML = "";
+  if (!PHYS_LIB) {
+    host.appendChild(el("div", "phys-loading", "<i></i><i></i><i></i>"));
+    return;
+  }
+  if (!PHYS_LIB.length) {
+    host.appendChild(el("div", "hint",
+      esc(PHYS_LIB_ERR || "No scenes found in physics_mode/scenes/lib.")));
+    return;
+  }
+  PHYS_LIB.forEach(sc => {
+    const on = P.scene === sc.scene;
+    const b = el("button", "phys-tile" + (on ? " on" : ""));
+    const takes = sc.sweep ? (sc.sweep.values || []).length : 0;
+    const kind = takes > 1 ? `${takes} takes` : (sc.loop ? "loops" : "one take");
+    const sweepLine = sc.sweep
+      ? `${sc.sweep.param.replace(/_/g, " ")} · ${(sc.sweep.values || []).join(" · ")}${sc.sweep.unit || ""}`
+      : "";
+    b.innerHTML =
+      `<span class="pt-head"><strong>${esc(sc.title)}</strong>` +
+      `<em class="pt-kind${takes > 1 ? " sweep" : ""}">${esc(kind)}</em></span>` +
+      `<p>${esc(sc.does)}</p>` +
+      `<span class="pt-foot">${sweepLine ? `<code>${esc(sweepLine)}</code>` : "<code></code>"}` +
+      `<i>${sc.params.length} setting${sc.params.length === 1 ? "" : "s"}</i></span>`;
+    b.addEventListener("click", () => {
+      P.scene = on ? "" : sc.scene;
+      P.params = {};
+      P.sweepValues = "";
+      P.seconds = 0;
+      if (P.scene) P.prompt = "";
+      renderAll(); persist();
+    });
+    host.appendChild(b);
   });
-  if (cur.prompt) {
-    const row = el("div", "field");
-    row.innerHTML = `<label>${esc(T.physics_prompt_label)}</label>`;
-    const ta = el("textarea", "");
-    ta.rows = 4;
-    ta.placeholder = T.physics_prompt_ph;
-    ta.value = S.values.phys_prompt || "";
-    ta.addEventListener("input", () => { S.values.phys_prompt = ta.value; persist(); });
-    row.appendChild(ta);
-    row.appendChild(el("div", "hint", esc(T.physics_prompt_hint)));
-    c.appendChild(row);
-    // Which model turns the note into a shot brief. The scene CODE is always written by
-    // the strongest model - that step is where a wrong choice costs a failed render.
-    const mrow = el("div", "field");
-    mrow.innerHTML = `<label>${esc(T.physics_brief_model)}</label>`;
+}
+
+/* ---- step 2: the knobs of the chosen scene ----------------------------------------- */
+function physParamControl(spec, P) {
+  const val = P.params[spec.key] !== undefined ? P.params[spec.key] : spec.default;
+  const row = el("div", "phys-param");
+  const head = el("div", "pp-head");
+  head.innerHTML = `<span>${esc(physCap(spec.label))}</span>`;
+  row.appendChild(head);
+  if (spec.choices && spec.choices.length) {
+    const seg = el("div", "phys-seg");
+    spec.choices.forEach(ch => {
+      const b = el("button", "phys-seg-b" + (String(ch) === String(val) ? " on" : ""),
+                   esc(physCap(ch)));
+      b.addEventListener("click", () => {
+        P.params[spec.key] = ch; renderAll(); persist();
+      });
+      seg.appendChild(b);
+    });
+    row.appendChild(seg);
+  } else if (spec.range && spec.range.length === 2) {
+    const [lo, hi] = spec.range.map(Number);
+    const whole = Number.isInteger(lo) && Number.isInteger(hi) && Number.isInteger(Number(spec.default));
+    const wrap = el("div", "phys-slide");
+    const inp = el("input", "");
+    inp.type = "range"; inp.min = String(lo); inp.max = String(hi);
+    inp.step = whole ? "1" : String(Math.max(0.01, (hi - lo) / 200));
+    inp.value = String(val);
+    const out = el("output", "", String(val));
+    inp.addEventListener("input", () => {
+      const n = whole ? Math.round(Number(inp.value)) : Math.round(Number(inp.value) * 100) / 100;
+      P.params[spec.key] = n; out.textContent = String(n); persist();
+    });
+    wrap.append(inp, out);
+    if (spec.key === "seed") {
+      const dice = el("button", "phys-dice", "new");
+      dice.title = "A different seed is a visibly different take";
+      dice.addEventListener("click", () => {
+        const n = Math.floor(Math.random() * (hi - lo + 1)) + lo;
+        P.params[spec.key] = n; inp.value = String(n); out.textContent = String(n); persist();
+      });
+      wrap.appendChild(dice);
+    }
+    row.appendChild(wrap);
+  } else {
+    return null;                       // free-form parameter: leave it at its default
+  }
+  if (spec.note) {
+    const n = el("p", "pp-note", esc(spec.note));
+    row.appendChild(n);
+  }
+  return row;
+}
+
+function physShotCard(P) {
+  const sc = physSceneOf(P);
+  const c = card("phys-shot");
+  if (sc) {
+    const head = el("div", "phys-shot-head");
+    head.innerHTML = `<strong>${esc(sc.title)}</strong><p>${esc(sc.does)}</p>`;
+    c.appendChild(head);
+
+    // Format. A scene that declares a sweep can be either the comparison - the same setup
+    // once per value, joined - or a single event.
+    if (sc.sweep) {
+      const f = el("div", "phys-param");
+      f.appendChild(el("div", "pp-head", "<span>Format</span>"));
+      const seg = el("div", "phys-seg");
+      [[true, "Comparison"], [false, "Single take"]].forEach(([on, label]) => {
+        const b = el("button", "phys-seg-b" + (P.sweep === on ? " on" : ""), label);
+        b.addEventListener("click", () => { P.sweep = on; renderAll(); persist(); });
+        seg.appendChild(b);
+      });
+      f.appendChild(seg);
+      f.appendChild(el("p", "pp-note", P.sweep
+        ? `The same setup rendered once per value and joined, each take labelled. The contrast IS the video.`
+        : `One event, rendered once. ${esc(physCap(sc.sweep.param))} stays at its default.`));
+      c.appendChild(f);
+      if (P.sweep) {
+        const vr = el("div", "phys-param");
+        vr.appendChild(el("div", "pp-head",
+          `<span>${esc(physCap(sc.sweep.param))} per take${sc.sweep.unit ? " (" + esc(sc.sweep.unit) + ")" : ""}</span>`));
+        const inp = el("input", "phys-values");
+        inp.type = "text";
+        inp.value = P.sweepValues || (sc.sweep.values || []).join(", ");
+        inp.addEventListener("input", () => { P.sweepValues = inp.value; persist(); });
+        vr.appendChild(inp);
+        vr.appendChild(el("p", "pp-note",
+          "Comma separated. Three or four reads best - each one is a full render."));
+        c.appendChild(vr);
+      }
+    }
+
+    // Everything the scene declares, minus the value being swept (that one is the format).
+    const swept = P.sweep && sc.sweep ? sc.sweep.param : "";
+    // Declaration order, except the seed - the scene files put it first, but it is the
+    // "give me another one of these" knob, not the first decision about the shot.
+    const knobs = sc.params.filter(p => p.key !== swept)
+                           .sort((a, b) => (a.key === "seed") - (b.key === "seed"));
+    const main = knobs.slice(0, 4), rest = knobs.slice(4);
+    main.forEach(spec => { const r = physParamControl(spec, P); if (r) c.appendChild(r); });
+    if (rest.length) {
+      const more = el("details", "phys-more");
+      more.appendChild(el("summary", "", `${rest.length} more setting${rest.length === 1 ? "" : "s"}`));
+      rest.forEach(spec => { const r = physParamControl(spec, P); if (r) more.appendChild(r); });
+      c.appendChild(more);
+    }
+  } else {
+    const head = el("div", "phys-shot-head");
+    head.innerHTML = `<strong>The app picks the scene</strong>` +
+      `<p>${esc(P.prompt)}</p>`;
+    c.appendChild(head);
+    const m = el("div", "phys-param");
+    m.appendChild(el("div", "pp-head", `<span>${esc(T.physics_brief_model)}</span>`));
     const sel = el("select", "");
-    PHYS_BRIEF_MODELS.forEach(m => {
-      const o = el("option", "", esc(m.t));
-      o.value = m.id;
-      if ((S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id) === m.id) o.selected = true;
+    PHYS_BRIEF_MODELS.forEach(mo => {
+      const o = el("option", "", esc(mo.t));
+      o.value = mo.id;
+      if ((S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id) === mo.id) o.selected = true;
       sel.appendChild(o);
     });
-    sel.addEventListener("change", () => {
-      S.values.phys_brief_model = sel.value; persist();
-    });
-    mrow.appendChild(sel);
-    c.appendChild(mrow);
-  } else if (cur.sweep) {
-    const row = el("div", "field");
-    row.innerHTML = `<label>Values to sweep (${esc(cur.unit)})</label>`;
-    const inp = el("input", "");
-    inp.type = "text";
-    inp.value = S.values.phys_values || cur.values;
-    inp.addEventListener("input", () => { S.values.phys_values = inp.value; persist(); });
-    row.appendChild(inp);
-    row.appendChild(el("div", "hint", esc(T.physics_hint)));
-    c.appendChild(row);
+    sel.addEventListener("change", () => { S.values.phys_brief_model = sel.value; persist(); });
+    m.appendChild(sel);
+    m.appendChild(el("p", "pp-note",
+      "Only used if no scene in the library fits, in which case one is written from scratch. "
+      + "The library is tried first, always."));
+    c.appendChild(m);
   }
-  const go = btn(T.physics_go, async () => {
-    if (cur.prompt && !(S.values.phys_prompt || "").trim()) {
-      errorCard(T.err_generic, T.physics_prompt_missing); return;
-    }
+
+  // Length and quality apply to both paths.
+  const secDefault = sc && sc.seconds ? Number(sc.seconds) : 4;
+  const lr = el("div", "phys-param");
+  lr.appendChild(el("div", "pp-head", "<span>Seconds per take</span>"));
+  const wrap = el("div", "phys-slide");
+  const sl = el("input", "");
+  sl.type = "range"; sl.min = "2"; sl.max = "12"; sl.step = "0.5";
+  sl.value = String(P.seconds || secDefault);
+  const out = el("output", "", String(P.seconds || secDefault) + "s");
+  sl.addEventListener("input", () => {
+    P.seconds = Number(sl.value); out.textContent = sl.value + "s"; persist();
+  });
+  wrap.append(sl, out);
+  lr.appendChild(wrap);
+  c.appendChild(lr);
+
+  const qr = el("div", "phys-param");
+  qr.appendChild(el("div", "pp-head", "<span>Render quality</span>"));
+  const qseg = el("div", "phys-seg");
+  PHYS_QUALITY.forEach(q => {
+    const b = el("button", "phys-seg-b" + (Number(P.samples) === q.s ? " on" : ""), esc(q.t));
+    b.title = q.d;
+    b.addEventListener("click", () => { P.samples = q.s; renderAll(); persist(); });
+    qseg.appendChild(b);
+  });
+  qr.appendChild(qseg);
+  c.appendChild(qr);
+
+  const takes = physTakeCount(sc, P);
+  const secs = P.seconds || secDefault;
+  const note = el("div", "phys-estimate");
+  note.innerHTML = `<span>${takes} × ${secs}s</span>` +
+    `<em>One cheap frame is rendered first — nothing long starts until you approve it.</em>`;
+  c.appendChild(note);
+
+  const foot = el("div", "card-foot");
+  foot.appendChild(btn(T.back, () => editStep("scene"), "ghost"));
+  const go = btn("Render the preview frame", async () => {
     go.disabled = true; go.textContent = "…";
     try {
-      const d = await jpost("/physics-run", {
-        preset: cur.prompt ? "" : cur.id,
-        prompt: cur.prompt ? (S.values.phys_prompt || "") : "",
-        values: cur.sweep ? (S.values.phys_values || cur.values) : "",
-        brief_model: cur.prompt ? (S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id) : "",
-      });
+      const body = { seconds: secs, samples: P.samples || 24 };
+      if (P.scene) {
+        body.scene = P.scene;
+        body.params = P.params;
+        body.sweep = !!P.sweep;
+        if (sc && sc.sweep && P.sweep) body.sweep_values = physSweepValues(sc, P);
+      } else {
+        body.prompt = P.prompt || "";
+        body.brief_model = S.values.phys_brief_model || PHYS_BRIEF_MODELS[0].id;
+      }
+      const d = await jpost("/physics-run", body);
       if (d.error) throw new Error(d.error);
       startJob(d.job_id, "physics");
     } catch (e) {
-      go.disabled = false; go.textContent = T.physics_go;
+      go.disabled = false; go.textContent = "Render the preview frame";
       errorCard(T.err_generic, String(e));
     }
   }, "primary");
-  c.appendChild(go);
+  foot.appendChild(go);
+  c.appendChild(foot);
+}
+
+function renderPhysicsFlow() {
+  const P = physState();
+  msgU(esc(T.mode_physics_t));
+  if (S.jobId) return;
+  if (PHYS_LIB === null) physFetchLibrary(() => renderAll());
+
+  if (S.step === "shot" && (P.scene || (P.prompt || "").trim())) {
+    // The knobs come from the scene file, so there is nothing to draw until it is here.
+    if (P.scene && !PHYS_LIB) {
+      card("phys-pick").appendChild(el("div", "phys-loading", "<i></i><i></i><i></i>"));
+      setComposer("off");
+      return;
+    }
+    const picked = physSceneOf(P);
+    if (P.scene && !picked) {          // scene renamed or removed since it was chosen
+      P.scene = ""; P.params = {};
+      goto("scene");
+      return;
+    }
+    msgU(esc(picked ? picked.title : P.prompt), "scene");
+    msgA("Set the shot. Every number here is one the scene was built to accept.");
+    physShotCard(P);
+    setComposer("off");
+    return;
+  }
+
+  msgA(esc(T.physics_intro));
+  const c = card("phys-pick");
+  const grid = el("div", "phys-grid");
+  c.appendChild(grid);
+  physRenderGrid(grid, P);
+
+  const or = el("div", "phys-or");
+  or.innerHTML = `<span>or describe it and let the app choose</span>`;
+  c.appendChild(or);
+  const ta = el("textarea", "phys-prompt");
+  ta.rows = 2;
+  ta.placeholder = T.physics_prompt_ph;
+  ta.value = P.prompt || "";
+  ta.addEventListener("input", () => {
+    P.prompt = ta.value;
+    if (ta.value.trim() && P.scene) { P.scene = ""; renderAll(); }
+    persist();
+  });
+  c.appendChild(ta);
+
+  const foot = el("div", "card-foot");
+  foot.appendChild(btn(T.back, resetToMode, "ghost"));
+  const next = btn(T.continue, () => {
+    if (!P.scene && !(P.prompt || "").trim()) {
+      errorCard(T.err_generic, "Pick a simulation or describe one.");
+      return;
+    }
+    completeStep("scene", "shot");
+  }, "primary");
+  foot.appendChild(next);
+  c.appendChild(foot);
   setComposer("off");
 }
 
@@ -3510,16 +3760,39 @@ async function pollJob() {
       shot.src = d.physics_preview_url;
       shot.alt = "";
       c.appendChild(shot);
+      // What is actually about to be rendered. "Does this look right" cannot be answered
+      // from a still alone - a wrong scene and a wrong mass look equally plausible.
+      const pk = d.physics_pick;
+      if (pk) {
+        const facts = el("div", "phys-pickfacts");
+        const chips = [`<b>${esc(pk.title || pk.scene || "")}</b>`];
+        if (pk.sweep && (pk.sweep.values || []).length) {
+          chips.push(`<span>${esc(String(pk.sweep.param || "").replace(/_/g, " "))}: ` +
+                     `${esc((pk.sweep.values || []).join(" · "))}${esc(pk.sweep.unit || "")}</span>`);
+        }
+        const sweptKey = pk.sweep ? pk.sweep.param : "";
+        Object.keys(pk.params || {}).filter(k => k !== sweptKey).slice(0, 8).forEach(k => {
+          chips.push(`<span>${esc(k.replace(/_/g, " "))} ` +
+                     `<i>${esc(String(pk.params[k]).replace(/_/g, " "))}</i></span>`);
+        });
+        facts.innerHTML = chips.join("");
+        c.appendChild(facts);
+      }
       const actions = el("div", "sa-actions");
       const decide = async (action, b, label) => {
         b.disabled = true; b.textContent = "…";
         try {
           await fetch("/approve-physics?id=" + encodeURIComponent(S.jobId) + "&action=" + action,
                       { method: "POST" });
+          if (action === "retry") { sp.innerHTML = ""; delete sp.dataset.physDone; }
         } catch (e) { b.disabled = false; b.textContent = label; }
       };
       actions.appendChild(btn(T.physics_approve_yes,
         ev => decide("approve", ev.currentTarget, T.physics_approve_yes), "primary"));
+      // The seed alone changes the whole take. Re-rolling it beats cancelling the run and
+      // filling the form in again, which was the only way to see a second option.
+      actions.appendChild(btn("Another take",
+        ev => decide("retry", ev.currentTarget, "Another take"), "secondary"));
       actions.appendChild(btn(T.physics_approve_no,
         ev => decide("decline", ev.currentTarget, T.physics_approve_no), "danger"));
       c.appendChild(actions); scrollDown();

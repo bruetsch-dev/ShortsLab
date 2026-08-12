@@ -78,7 +78,14 @@ def _summary_of(path: Path) -> str:
         doc = ast.get_docstring(ast.parse(path.read_text(encoding="utf-8"))) or ""
     except (OSError, SyntaxError):
         return ""
-    return doc.strip().splitlines()[0] if doc.strip() else ""
+    line = doc.strip().splitlines()[0] if doc.strip() else ""
+    # Some files open with "grass_roll - a heavy cylinder rolls..."; the name is already the
+    # heading everywhere this line is shown, so repeating it just eats the width.
+    for sep in (" - ", " — ", ": "):
+        head, _, tail = line.partition(sep)
+        if tail and head.strip().casefold() in (path.stem, path.stem.replace("_", " ")):
+            return tail.strip()[:1].upper() + tail.strip()[1:]
+    return line
 
 
 def catalogue() -> dict:
@@ -92,6 +99,10 @@ def catalogue() -> dict:
         params = _params_of(f)
         if not params:
             continue
+        # How long ONE take of this scene needs, as the scene itself declares it. The jelly
+        # takes seven seconds to settle and a loop scene sizes a whole period, so a caller
+        # that substitutes its own default renders a shot that is cut off before it happens.
+        declared = params.get("seconds") if isinstance(params.get("seconds"), dict) else {}
         params = {k: v for k, v in params.items() if k not in RUNNER_KEYS}
         if not params:
             continue
@@ -100,7 +111,8 @@ def catalogue() -> dict:
         # the app renders the scene, so they travel with the catalogue entry.
         out[f.stem] = {"summary": _summary_of(f), "params": params, "path": str(f),
                        "sweep": _literal_of(f, "SWEEP"),
-                       "loop": bool(_literal_of(f, "LOOP"))}
+                       "loop": bool(_literal_of(f, "LOOP")),
+                       "seconds": declared.get("default")}
     return out
 
 
@@ -213,6 +225,84 @@ def _listing_for(cat: dict, budget: int = LISTING_BUDGET) -> str:
     return text          # every scene named, even if the budget is simply too small
 
 
+def title_of(scene: str) -> str:
+    return scene.replace("_", " ").capitalize()
+
+
+def describe() -> list[dict]:
+    """The catalogue in the shape the UI needs: one entry per scene, ready to render.
+
+    The app used to show three hand-typed presets that predate this library, so nine of
+    eleven scenes were unreachable from the interface and the two that were named did not
+    exist as files any more. Everything the user sees now comes from here, which means a
+    scene added to scenes/lib/ shows up in the app without a second edit.
+    """
+    out = []
+    for name, entry in catalogue().items():
+        params = []
+        for key, spec in (entry.get("params") or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            params.append({
+                "key": key,
+                "label": key.replace("_", " "),
+                "choices": spec.get("choices"),
+                "range": spec.get("range"),
+                "default": spec.get("default"),
+                "note": str(spec.get("note") or ""),
+            })
+        sweep = entry.get("sweep") or None
+        out.append({
+            "scene": name,
+            "title": title_of(name),
+            "does": entry.get("summary", ""),
+            "seconds": entry.get("seconds"),
+            "params": params,
+            "sweep": ({"param": sweep.get("param"), "values": sweep.get("values") or [],
+                       "unit": sweep.get("unit", "")} if sweep else None),
+            "loop": bool(entry.get("loop")),
+        })
+    return out
+
+
+def resolve(scene: str, values: dict | None = None, *, sweep: bool = True,
+            seconds: float | None = None, sweep_values=None) -> dict:
+    """A scene the user picked themselves, in the same shape select() returns.
+
+    No model call: the choice and the numbers are already made. Everything downstream -
+    preview frame, sweep, render - reads this one shape, so a hand-picked scene and a
+    chosen-by-model scene cannot drift apart.
+    """
+    cat = catalogue()
+    if scene not in cat:
+        raise RuntimeError(f"Unknown physics scene: {scene}")
+    entry = cat[scene]
+    params = clamp(scene, values or {}, cat)
+    if "seed" in (entry.get("params") or {}) and not (values or {}).get("seed"):
+        import secrets
+        params["seed"] = secrets.randbelow(10000)
+    try:
+        secs = max(2.0, min(12.0, float(seconds or entry.get("seconds") or 4.0)))
+    except (TypeError, ValueError):
+        secs = float(entry.get("seconds") or 4.0)
+    sw = dict(entry.get("sweep") or {}) if sweep and entry.get("sweep") else None
+    if sw and sweep_values:
+        # The swept values ARE the video - "1kg / 10kg / 50kg" is the whole idea - so the
+        # user may set them. Each one is clamped by the same rule as any other value of
+        # that parameter, because the sweep writes straight into it.
+        clean = []
+        for v in sweep_values:
+            got = clamp(scene, {sw.get("param"): v}, cat).get(sw.get("param"))
+            if isinstance(got, (int, float)) and got not in clean:
+                clean.append(got)
+        if clean:
+            sw["values"] = clean
+    return {"scene": scene, "params": params, "seconds": secs,
+            "title": title_of(scene), "path": entry["path"],
+            "sweep": sw,
+            "loop": bool(entry.get("loop"))}
+
+
 def select(prompt: str, status_cb=None, model: str = SELECT_MODEL) -> dict:
     """Free text -> {scene, params, seconds, title}. Raises if no scene fits at all."""
     log = status_cb or print
@@ -240,10 +330,11 @@ def select(prompt: str, status_cb=None, model: str = SELECT_MODEL) -> dict:
     if "seed" in ((cat[scene].get("params")) or {}) and not out.get("pin_seed"):
         import secrets
         params["seed"] = secrets.randbelow(10000)
+    declared = cat[scene].get("seconds")
     try:
-        seconds = max(2.0, min(10.0, float(out.get("seconds") or 4.0)))
+        seconds = max(2.0, min(12.0, float(out.get("seconds") or declared or 4.0)))
     except (TypeError, ValueError):
-        seconds = 4.0
+        seconds = float(declared or 4.0)
     if out.get("compromise"):
         log(f"Note: {out['compromise']}")
     entry = cat[scene]
