@@ -142,11 +142,23 @@ _WORLD_RULES = """Write prompts that work in any modern video generator.
 
 PROMPT_SYSTEM = """You write prompts for dreamcore / liminal-space short videos.
 
-A dreamcore short is a series of empty, uncanny, half-remembered places, held by
-architecture and light alone - no story, no dialogue. The feeling is "somewhere you have
-been but cannot place, long after everyone has gone". Carpeted corridors, pool halls out
-of season, stairwells, parking decks at 3am, hotel lobbies between guests, playgrounds
-under sodium light, waiting rooms, service tunnels, foyers with the lights left on.
+A dreamcore short is a series of empty, uncanny, half-remembered places, held by the place
+and its light alone - no story, no dialogue. The feeling is "somewhere you have been but
+cannot place, long after everyone has gone".
+
+  INDOORS, that is: carpeted corridors, pool halls out of season, stairwells, parking decks
+  at 3am, hotel lobbies between guests, playgrounds under sodium light, waiting rooms,
+  service tunnels, foyers with the lights left on.
+
+  OUTDOORS, it is NOT landscape photography. It is the desktop-wallpaper world with
+  something wrong in it: hills too smooth and too green, grass all one length like carpet
+  to the horizon, a sky of one unbroken colour with no sun anywhere in it, a mown field
+  that continues past where it should stop. Into that world goes ONE man-made thing with
+  no purpose: a lamppost lit in the middle of the day, a doorframe standing free in a
+  meadow, a staircase climbing out of the grass to nothing, a swimming pool cut into the
+  top of a hill, a bus shelter with no road, a chain-link fence around one tree, a paved
+  plaza in the middle of a field. THAT is what makes an outdoor shot dreamcore. Cliffs,
+  grass and a nice sky on their own are stock nature footage.
 
 THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
 
@@ -194,14 +206,44 @@ KEEPING THE PROMPT CLEAR OF SAFETY FILTERS - this costs nothing and saves whole 
     footage of", "spy cam", "found tape of someone". Locked-off, handheld-free, a
     consumer camcorder on a tripod.
 
+EVERY SHOT NAMES ONE WRONG THING - this is the rule the whole aesthetic hangs on:
+  A pretty place is a screensaver. A pretty place with ONE thing that cannot be explained
+  is dreamcore, and the viewer feels it before they can say what it was. So every single
+  shot must state its wrongness in plain words, as a fact of the shot, never as a mood:
+    - scale is wrong: a doorway twice a person's height, grass blades too big, a hill too
+      smooth to be earth
+    - it repeats: the same window, the same tree, the same lamp, four times, evenly spaced
+    - something man-made stands where nothing built it: see the outdoor list above
+    - the light disagrees with the sky: everything lit, no sun in frame, no shadow
+      direction, a horizon brighter than what is above it
+    - a thing indoors that belongs outdoors, or the reverse: standing water on a carpet,
+      a streetlight in a lobby, a cloud below a ceiling, a mown lawn inside a hall
+    - it continues past where it should end: a corridor with no far wall, a field that
+      does not reach a horizon, stairs that keep going in both directions
+  "Eerie", "uncanny", "liminal", "surreal", "dreamlike" and "unsettling" in the prompt do
+  NOTHING - a generator cannot render an adjective. Name the object and the fact.
+
 DREAMCORE SPECIFICS that carry the aesthetic:
   * Camera: locked off or a very slow push. No handheld, no whip pans.
-  * Emptiness is the subject: the room, its light and its air are what the shot is of.
-  * Light comes from inside the frame: fluorescent tubes, exit signs, pool lights, a TV.
+  * Emptiness is the subject: the place, its light and its air are what the shot is of.
+  * Light comes from inside the frame: fluorescent tubes, exit signs, pool lights, a TV -
+    or outdoors, from a sky that is itself the lamp, with no sun to point at.
   * Slight wrongness beats obvious horror: a door where a wall should be, a corridor that
     repeats, water indoors, a ceiling too low.
-  * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed. The
-    camera is cheap; the WORLD is not colourless.
+  * Look: consumer-camcorder or early digital, soft grain, slight chroma bleed - or the
+    too-clean look of an early-2000s desktop wallpaper, every surface a shade too even.
+    The camera is cheap; the WORLD is not colourless.
+
+WORDS THAT DESTROY IT - these come from travel and stock footage, and a generator obeys
+them over anything else in the prompt. Never write them:
+  golden hour, magic hour, sunset, sunrise, warm afternoon sun, sun-drenched, dappled
+  sunlight, cinematic, epic, majestic, breathtaking, stunning, gorgeous, serene, peaceful,
+  tranquil, idyllic, lush, rolling hills, vista, panorama, drone shot, aerial, flyover,
+  lens flare, god rays, nature documentary, travel film.
+  One "golden hour" turns the entire clip into a meditation-app background - this is
+  exactly how a brief asking for surreal cliffs came back as stock landscape b-roll.
+  Say instead: flat even light with no sun visible, a sky of one colour, an overbright
+  horizon, midday with no shadows, a lamp that is on when it should not need to be.
 
 COLOUR - commit to it, this is what the look lives on:
   * Name a SATURATED dominant colour and one contrasting accent in the world sentence,
@@ -225,9 +267,12 @@ HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
   everything you leave unsaid with the average of its training data, and the average of
   "empty corridor" is a stock office. Every shot names, concretely:
     - the exact space and its dimensions in words (how long, how low the ceiling, how far
-      the far wall is)
+      the far wall is - outdoors: how far to the ridge, how high the drop, how much sky)
     - the materials and their condition: tile size and grout colour, paint blistering,
-      carpet pattern and wear, water stains, dust, chipped edges
+      carpet pattern and wear, water stains, dust, chipped edges - outdoors: the exact
+      green of the grass and how evenly it is cut, the rock's layering, the concrete's
+      staining, whether a path is worn or unwalked
+    - THE ONE WRONG THING, stated as a fact of the shot (see the rule above)
     - every light source IN the frame, its colour temperature and its behaviour (a tube
       that flickers at a named rhythm, an exit sign's specific green, a pool lamp's
       caustics)
@@ -263,6 +308,46 @@ _SAFETY_PATTERNS = (
     (r"\b(nobody|no-one)\b", "negation"),
     (r"\bwithout (any )?(people|humans)\b", "negation"),
 )
+
+
+# Travel-and-stock vocabulary. A generator weighs "golden hour" far above "liminal", so one
+# of these words is enough to turn a surreal-cliffs brief into meditation-app b-roll - which
+# is exactly what happened: the clip came back as terraced hills in warm sunlight, and
+# Gemini named it "stock nature b-roll, meditation video background".
+_STOCK_PATTERNS = (
+    (r"\bgolden[- ]hour\b|\bmagic hour\b", "golden hour"),
+    (r"\bsun(set|rise)\b|\bsetting sun\b", "sunset"),
+    (r"\bsun[- ]drenched\b|\bdappled sun\w*|\bwarm (afternoon |evening )?sun\w*", "warm sun"),
+    (r"\bcinematic\b|\bepic\b|\bmajestic\b|\bbreathtaking\b|\bstunning\b", "ad language"),
+    (r"\bserene\b|\bpeaceful\b|\btranquil\b|\bidyllic\b|\blush\b", "ad language"),
+    (r"\brolling hills\b|\bvista\b|\bpanorama\b|\bsweeping landscape\b", "postcard"),
+    (r"\bdrone (shot|footage)\b|\baerial (shot|view)\b|\bfly[- ]?over\b", "drone shot"),
+    (r"\blens flare\b|\bgod rays\b|\bsun ?beams? (streaming|pouring)", "flare"),
+    (r"\bnature documentary\b|\btravel (film|video)\b|\bnational geographic\b", "stock genre"),
+)
+
+# Adjectives that name the FEELING instead of the fact. A generator cannot render "uncanny";
+# it renders the nouns around it, which is a normal room.
+_VAGUE_PATTERNS = (
+    (r"\bliminal\b", "liminal"), (r"\buncanny\b", "uncanny"), (r"\beerie\b", "eerie"),
+    (r"\bsurreal\b", "surreal"), (r"\bdream-?like\b", "dreamlike"),
+    (r"\bunsettling\b", "unsettling"), (r"\bmysterious\b", "mysterious"),
+    (r"\bethereal\b", "ethereal"), (r"\bhaunting\b", "haunting"),
+)
+
+
+def stock_review(text: str) -> list:
+    """Words in a finished prompt that pull it toward stock landscape footage.
+
+    Reported, never rewritten - same rule as safety_review. Knowing WHY a clip came back
+    looking like a screensaver is worth more than a silent edit.
+    """
+    low = str(text or "").lower()
+    hits = []
+    for pattern, label in _STOCK_PATTERNS + _VAGUE_PATTERNS:
+        if re.search(pattern, low) and label not in hits:
+            hits.append(label)
+    return hits
 
 
 def safety_review(text: str) -> list:
@@ -345,6 +430,11 @@ def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
         # a prompt stops matching the clip it produced; naming the words lets them decide.
         _log(status_cb, "Dreamcore: wording that generators often refuse - "
              + "; ".join(f"{label}: {', '.join(h)}" for label, h in flagged))
+    stock = [(p["label"], hits) for p in prompts if (hits := stock_review(p["text"]))]
+    if stock:
+        _log(status_cb, "Dreamcore: stock-footage wording (this is what makes a clip come "
+             "back as a screensaver) - "
+             + "; ".join(f"{label}: {', '.join(h)}" for label, h in stock))
     _log(status_cb, f"{len(prompts)} prompts ready "
                     f"({len(prompts) * (cuts_per_clip + 1)} shots at {phrase:.2f}s each = "
                     f"{len(prompts) * (cuts_per_clip + 1) * phrase:.1f}s of video).")
