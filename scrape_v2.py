@@ -1760,6 +1760,9 @@ MOTION_HOOK_MIN = 1.35    # the opening shot has to move: it is the whole scroll
 # off, a subject pausing) and still refuses a duplicated-frame re-encode, which produces a
 # hitch several times a second.
 CADENCE_HITCH_RATE = 0.8
+# Longest run of byte-identical frames a window may contain. Below this it is a held beat;
+# above it the viewer sees a still. _motion_score already refuses footage that never moves.
+FROZEN_RUN_FATAL = 0.5
 
 
 def _motion_score(frames_bgr):
@@ -1817,7 +1820,12 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
 
     frozen_run = _detect_duplicate_frame_run(src, seg.start_time, seg.end_time)
     seg.frozen_run_seconds = round(frozen_run, 3)
-    if frozen_run >= 0.15:
+    # 0.15s is four identical frames at 30fps - every held beat, every editor's freeze on
+    # a punchline, every source that repeats a frame across a speed ramp. The live search
+    # controller diagnosed its own failures as "high micro-freeze rejections" while the
+    # motion gate above already refuses genuinely dead footage. Half a second is the point
+    # where a viewer sees a still rather than a hold.
+    if frozen_run >= FROZEN_RUN_FATAL:
         reasons.append("frozen_frames")
 
     # How much does the picture actually MOVE?
