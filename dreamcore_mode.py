@@ -142,6 +142,22 @@ _WORLD_RULES = """Write prompts that work in any modern video generator.
 
 PROMPT_SYSTEM = """You write prompts for dreamcore / liminal-space short videos.
 
+THE AESTHETIC IS THE SUBJECT. THE BRIEF IS ONLY THE SETTING.
+The user's words say WHERE this happens. They never say what the video is about, because
+the video is always about one thing: dreamcore. Read "surreal cliffs, green grass" as
+"dreamcore that happens to take place among cliffs and grass" - never as a video about
+cliffs. The brief supplies the scenery; the aesthetic supplies the shot, the light, the
+emptiness and the wrongness, and it outranks the brief every time they disagree.
+
+  TEST EVERY SHOT: take the word dreamcore away and read the shot back. If it would sit
+  happily in a nature documentary, a travel film, a property listing or a screensaver,
+  it is wrong and you rewrite it. A shot passes only if removing the aesthetic would
+  leave a hole - because a lamp is burning in daylight, because a door stands in a field,
+  because the corridor has no far wall.
+
+  The brief's own words are the LAST thing in a shot, not the first. Start from the
+  liminal fact, then let the brief's scenery hold it.
+
 A dreamcore short is a series of empty, uncanny, half-remembered places, held by the place
 and its light alone - no story, no dialogue. The feeling is "somewhere you have been but
 cannot place, long after everyone has gone".
@@ -398,7 +414,11 @@ def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
               .replace("{clip_seconds}", f"{float(clip_seconds):.0f}")
               .replace("{hold}", f"{phrase + HOLD_MARGIN:.1f}")
               .replace("{phrase}", f"{phrase:.1f}"))
-    ask = (f"The idea: {str(brief or '').strip() or 'empty liminal spaces'}\n"
+    # The brief is named as SCENERY, not as the subject. Called "the idea" it was treated
+    # as the thing to depict, and a brief about cliffs and grass came back as a landscape
+    # film with a dreamcore label on it.
+    ask = (f"The setting these take place in - scenery only, dreamcore is still the "
+           f"subject: {str(brief or '').strip() or 'empty liminal spaces'}\n"
            f"Write exactly {int(clip_count)} prompts. Each produces ONE clip of about "
            f"{float(clip_seconds):.0f} seconds holding {len(holds)} shots with hold times "
            f"{hold_text}, separated by {max(1, len(holds) - 1)} hard cuts.")
