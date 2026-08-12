@@ -600,11 +600,10 @@ def queries_for_intent(intent: VisualIntent):
             for language, key in (("ja", "japanese"), ("en", "english")):
                 cleaned = _clean_queries_for_platform(platform, values.get(key), language, limit=4)
                 for text in cleaned:
-                    # Label the language from the TEXT, not from the JSON key the Architect
-                    # happened to file it under. On the Tokyo run the Architect put native
-                    # strings in the "english" array - 渋谷デート, スクランブル交差点,
-                    # カップルフォト - and the Japanese-context gate then threw away 39 of
-                    # them for "requires a native Japanese query". They were Japanese.
+                    # The Architect files native strings under its "english" array, so the
+                    # key is not evidence of the language. The gate in
+                    # build_scene_bound_query_plan reads the text; labelling correctly here
+                    # as well keeps the plan audit honest about what it actually sent.
                     add_direct([text], "ja" if _contains_japanese(text) else language,
                                tier, subject, action, location, [platform])
             # Instagram exposes keyword/tag discovery rather than a useful TikTok-style phrase
@@ -798,7 +797,16 @@ def build_scene_bound_query_plan(intents, project_dir, script_text, use_influenc
         for query in queries_for_intent(intent):
             # Do not use an English person-search as a rescue path for a Japan-specific story.
             # It was the direct source of Western/generic creator footage in the Bangs run.
-            if needs_japanese_context and query.language not in ("ja", "hashtag"):
+            #
+            # Judge the TEXT, not the label. The language field is set by whichever producer
+            # built the query, and several of them get it wrong - the Architect files native
+            # strings under its "english" array, so 渋谷 イルミネーション, 代々木公園 and
+            # 新宿駅 arrived tagged "en". On the tokyo project that discarded 62 perfectly
+            # native queries before a single search ran. Labelling this at each producer was
+            # tried first and missed most of them; there is one gate, so the check belongs
+            # here.
+            if (needs_japanese_context and query.language not in ("ja", "hashtag")
+                    and not _contains_japanese(query.query)):
                 rejected.append({
                     "text": query.query, "scene_ids": [intent.scene_id],
                     "visual_intent_id": intent.intent_id,
@@ -1096,7 +1104,11 @@ def _build_social_search_plan_v2_legacy(title, script, scenes, understanding=Non
 
 # latin letters are allowed ONLY as short unit/trend tokens (40kg, 150cm, BMI, GRWM) - a real
 # English word (5+ latin chars) still disqualifies the string as a native Japanese query
-_JP_QUERY_ALLOWED_RE = re.compile(r"^[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f0-9A-Za-z#\s]+$")
+# 々-〇 are the iteration mark and its neighbours - 々 alone appears in
+# 代々木, 人々, 時々, 様々. It sits below the kana block, so leaving it out silently
+# rejected whole place names: 代々木公園 failed this fullmatch and was dropped before
+# any search on the tokyo project.
+_JP_QUERY_ALLOWED_RE = re.compile(r"^[\u3005-\u3007\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f0-9A-Za-z#\s]+$")
 _JP_LATIN_WORD_RE = re.compile(r"[A-Za-z]{5,}")
 
 
@@ -1224,14 +1236,21 @@ def _clean_queries_for_platform(platform, values, language="auto", limit=4):
             query = "#" + tag if tag else ""
         else:
             has_japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", query))
-            if language == "ja" and (not has_japanese or not _JP_QUERY_ALLOWED_RE.fullmatch(query)
+            # The declared language names the array the Architect filed the string under. It
+            # is not a fact about the string, and the Architect puts native terms in its
+            # "english" array constantly. Believing the label deleted 62 usable queries on
+            # the tokyo project before any search: \u4ee3\u3005\u6728\u516c\u5712, \u65b0\u5bbf\u99c5 and
+            # \u6e0b\u8c37 \u30a4\u30eb\u30df\u30cd\u30fc\u30b7\u30e7\u30f3 have no Latin words at all, so the two-Latin-word rule
+            # below threw them out. Read the text.
+            effective = "ja" if has_japanese else language
+            if effective == "ja" and (not _JP_QUERY_ALLOWED_RE.fullmatch(query)
                                       or _JP_LATIN_WORD_RE.search(query)):
                 continue
-            if language == "en" and len(re.findall(r"[A-Za-z0-9]+", query)) < 2:
+            if effective == "en" and len(re.findall(r"[A-Za-z0-9]+", query)) < 2:
                 continue
             toks = query.split()
             max_tokens = 2 if platform == "tiktok" else (3 if platform == "instagram" else 4)
-            if language == "en" or (language == "auto" and not has_japanese):
+            if effective == "en" or (effective == "auto" and not has_japanese):
                 useful = [token for token in toks if token.casefold() not in _EN_QUERY_FILLER]
                 if len(useful) >= 2:
                     toks = useful

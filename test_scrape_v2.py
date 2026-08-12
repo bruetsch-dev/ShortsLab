@@ -153,6 +153,40 @@ def test_scene_bound_query_plan():
     check("search plan audit persists current script hash",
           saved["script_sha256"] == audit["script_sha256"] and saved["coverage_by_scene"]["1"] > 0)
 
+    # A Japanese-context beat must not lose native queries because a producer mislabelled
+    # them. The Architect files native strings under its "english" array, and on the tokyo
+    # project that discarded 62 usable queries - 渋谷 イルミネーション, 代々木公園, 新宿駅 -
+    # before a single search ran. The gate reads the text now, not the label.
+    jp_beat = v.VisualIntent(
+        scene_id=2, scene_text="Japanese couples keep a gap on Tokyo streets.",
+        visual_type="concrete", subject="Japanese couple", action="walking apart",
+        location="Tokyo street",
+        platform_queries={"tiktok": {"english": ["カップル 距離感", "tokyo couple gap"],
+                                     "japanese": ["人混み デート"]}})
+    with tempfile.TemporaryDirectory() as tmp:
+        by_scene2, audit2 = v.build_scene_bound_query_plan(
+            [jp_beat], Path(tmp), "Japanese couples keep a gap on Tokyo streets.")
+    kept = {q.query for q in by_scene2.get(2, [])}
+    dropped = {r["text"] for r in audit2["rejected_before_search"]}
+    check("a native query filed under 'english' survives the Japanese-context gate",
+          "カップル 距離感" in kept and "カップル 距離感" not in dropped)
+    # A bare place name is still dropped - but for being too general, not for "not being
+    # Japanese". The distinction matters: the first is a real editorial rule, the second was
+    # a bug that silently deleted native terms.
+    bare = v.VisualIntent(
+        scene_id=3, scene_text="Japanese couples keep a gap on Tokyo streets.",
+        visual_type="concrete", subject="Japanese couple", action="walking apart",
+        location="Tokyo street",
+        platform_queries={"tiktok": {"english": ["代々木公園"]}})
+    with tempfile.TemporaryDirectory() as tmp:
+        _by3, audit3 = v.build_scene_bound_query_plan(
+            [bare], Path(tmp), "Japanese couples keep a gap on Tokyo streets.")
+    why = {r["text"]: r["reason"] for r in audit3["rejected_before_search"]}
+    check("a bare place name is dropped for generality, not for its language",
+          "too general" in why.get("代々木公園", ""))
+    check("a genuinely English query is still dropped for a Japanese-context beat",
+          "tokyo couple gap" not in kept)
+
 
 # ---- relevance-first ranking ----------------------------------------------
 def test_ranking_relevance_over_likes():
