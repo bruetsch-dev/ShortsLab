@@ -273,6 +273,38 @@ def test_provenance_and_editorial_gates():
           "previously rejected" in v.editorial_rejection_reason(declined, japanese_intent))
 
 
+def test_borrowed_beat_survives_the_render_gate():
+    """The shape that killed a real run: two matched beats, the rest borrowed.
+
+    The borrow wrote only the scene dict, agent_core rebuilt the scenes from its scene_clips
+    list and popped the clip, and the gate then raised because assignment_type never reached
+    the config either. The live run died on exactly this with "scene 6 has no segment clip".
+    """
+    scenes = [
+        {"id": 0, "clip": "a.mp4", "assignment_type": "exact", "match_class": "B_MATCH",
+         "visual_role": "hook_topic", "native_9_16": True, "black_bar_score": 0.5},
+        {"id": 1, "clip": "a.mp4", "assignment_type": "borrowed_clip", "match_class": "BORROWED",
+         "visual_role": "body", "native_9_16": True, "black_bar_score": 0.5},
+        {"id": 2, "assignment_type": "uncovered_still", "match_class": "UNMATCHED",
+         "visual_role": "body"},
+    ]
+    cfg = {"voice_speed": 1.20, "scenes": scenes, "influencer_hook": False}
+    ok = True
+    try:
+        v.validate_scrape_render_v2(cfg)
+    except Exception:
+        ok = False
+    check("a borrowed beat and a still beat both pass the render gate", ok)
+
+    scenes[1].pop("clip")          # the exact corruption the old borrow produced
+    raised = False
+    try:
+        v.validate_scrape_render_v2(cfg)
+    except Exception:
+        raised = True
+    check("a borrowed beat WITHOUT its clip is still a hard error", raised)
+
+
 def test_download_budget_is_spent_once():
     """A round must attempt exactly the downloads it was given, not half of them.
 
@@ -594,6 +626,7 @@ if __name__ == "__main__":
               test_relationship_scene_queries,
               test_uncovered_beats_borrow_motion,
               test_download_budget_is_spent_once,
+              test_borrowed_beat_survives_the_render_gate,
               test_segment_windows, test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)
