@@ -6163,6 +6163,15 @@ def project_media_files(project_dir):
             if "_declined" in lower_parts:
                 items.append(("declined", path))
                 continue
+            # Scrape V2 keeps every source it downloaded here. They are real, watchable,
+            # already-paid-for footage - on the suppin run 54 clips against the 16 the edit
+            # used - and the panel skipped them because the folder starts with an
+            # underscore. A beat that came out wrong is fixed by dragging one of these in,
+            # so every clip short gets them in its library from now on.
+            if "_v2_proxies" in lower_parts:
+                if is_video_path(path):
+                    items.append(("scraped_pool", path))
+                continue
             # every other underscore-prefixed folder/file holds INTERNAL working artifacts
             # (review/_clip_match frames, _hook_match, _fx_frames, contact sheets, _debug...)
             # - hundreds of JPGs that are not project media and bloated the panel.
@@ -6257,12 +6266,14 @@ def media_tabs_html(items, replaceable_paths=None, queued_paths=None, input_name
     # footage first, then supporting assets, then renders; declined and internals last
     order = ["accepted_tiktok", "accepted_twitter", "assigned", "tiktok", "twitter",
              "seedance", "web", "wikimedia", "gpt source", "speaker", "local",
-             "render", "declined", "review", "web rejected", "web replaced", "media"]
+             "scraped_pool", "render", "declined", "review", "web rejected",
+             "web replaced", "media"]
     labels = {"accepted_tiktok": "TikTok accepted", "accepted_twitter": "X accepted",
               "assigned": "Assigned", "tiktok": "TikTok clips", "twitter": "X clips",
               "seedance": "AI clips", "web": "Web images",
               "wikimedia": "Wikimedia", "gpt source": "AI images", "speaker": "Speaker",
               "local": "Local", "render": "Renders", "declined": "Declined",
+              "scraped_pool": "Downloaded pool",
               "review": "Review", "web rejected": "Web rejected",
               "web replaced": "Web replaced", "media": "Other"}
     keys = [key for key in order if key in groups] + sorted([key for key in groups if key not in order])
