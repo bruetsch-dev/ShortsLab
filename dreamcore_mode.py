@@ -372,7 +372,7 @@ def shot_plan(clip_seconds: float, phrase: float, max_shots: int = 4) -> list:
     return holds or [round(phrase + HOLD_MARGIN, 1)]
 
 
-def prompts_for(brief: str, clip_count: int = 4, cuts_per_clip: int = 2,
+def prompts_for(brief: str, clip_count: int = 2, cuts_per_clip: int = 2,
                 phrase: float = 3.85, clip_seconds: float = 10.0,
                 status_cb=None, model: str = PROMPT_MODEL) -> dict:
     """Copy-ready prompts, each producing one clip that already contains its own cuts."""
@@ -528,6 +528,20 @@ def plan_edit(shots: list, grid: dict, target_seconds: float | None = None) -> d
     phrase = float(grid.get("phrase") or 3.85)
     half = phrase / 2.0
     limit = float(target_seconds or grid.get("duration") or 0.0)
+    # SNAP TO THE NOTE, NOT TO THE ARITHMETIC. The grid is perfectly regular; the music is
+    # not. On the supplied bed 7 of 49 grid points sit on no note at all, and a cut placed
+    # there is audibly beside the melody - measured on the first real edit, one of two cuts
+    # was 135 ms off. The onsets are where the notes actually start, so each boundary is
+    # pulled to the nearest one within tolerance and the shot is cut to match.
+    ons = [float(o) for o in (grid.get("onsets") or [])]
+    offset = float(grid.get("offset") or 0.0)
+
+    def _snap(boundary):
+        if not ons:
+            return boundary
+        near = min(ons, key=lambda o: abs((o - offset) - boundary))
+        return near - offset if abs((near - offset) - boundary) <= ONSET_TOLERANCE else boundary
+
     placed, dropped = [], []
     t = 0.0
     for shot in shots:
@@ -539,6 +553,13 @@ def plan_edit(shots: list, grid: dict, target_seconds: float | None = None) -> d
         else:
             dropped.append({**shot, "reason": f"only {have:.2f}s, shorter than half a phrase"})
             continue
+        # Pull the END of this shot onto a real note. Only accept the snap while the shot
+        # still has the material to fill it - a longer slot than the clip can cover would
+        # be a slow-down beyond SPEED_SLACK, which is visible.
+        snapped = _snap(t + slot)
+        if abs(snapped - (t + slot)) > 1e-6 and snapped - t >= MIN_SHOT:
+            if have >= (snapped - t) * (1.0 - SPEED_SLACK):
+                slot = round(snapped - t, 3)
         if limit and t + slot > limit + 0.01:
             dropped.append({**shot, "reason": "past the end of the music"})
             continue

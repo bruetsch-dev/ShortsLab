@@ -2003,7 +2003,7 @@ let DREAMCORE_FILES = [];
 function dreamcoreState() {
   if (!S.dreamcore) {
     S.dreamcore = { brief: "", world: "", prompts: [], bed: "", grid: null,
-                    clips: 4, cuts: 2, slug: "" };
+                    clips: 2, cuts: 2, slug: "" };
   }
   return S.dreamcore;
 }

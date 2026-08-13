@@ -15709,7 +15709,7 @@ class Handler(BaseHTTPRequestHandler):
                 grid = dreamcore_mode.music_grid(bed)
                 out = dreamcore_mode.prompts_for(
                     str(body.get("brief") or ""),
-                    clip_count=max(1, min(12, int(body.get("clips") or 4))),
+                    clip_count=max(1, min(12, int(body.get("clips") or 2))),
                     cuts_per_clip=max(1, min(4, int(body.get("cuts") or 2))),
                     phrase=float(grid.get("phrase") or 3.85),
                     clip_seconds=max(3.0, min(30.0, float(body.get("clip_seconds") or 10))),
