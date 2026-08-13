@@ -198,7 +198,22 @@ COMPOSITION:
     window, receding until it is too small to count.
   * Shot in 9:16, so the tall axis carries the sky above and the ground below.
 
-THE SHOTS ARE ONE WORLD FROM FURTHER AND FURTHER OUT:
+EVERY PROMPT IS THE SAME SCENE. NOT A SHARED "WORLD" - THE SAME PLACE:
+  * All of the prompts together are ONE location, filmed from different positions in it.
+    Not a lamppost scene and then a swimming-pool scene and then a staircase scene. One
+    road, one row of houses, one cliff - and every shot of every clip stands somewhere on
+    that same ground, looking at the same things from a new spot.
+  * The WORLD sentence names the actual place and everything permanent in it. No shot in
+    any prompt may introduce a landmark, building or object that the world sentence did
+    not already name. A new object means a new scene, and the clips stop cutting together.
+  * What changes between prompts is only WHERE THE CAMERA IS and HOW MUCH IT SEES: at the
+    kerb, at the far end of the row, low over the grass, high above the whole thing. The
+    label of a prompt is a vantage ("from the road", "from above the row"), never a new
+    subject.
+  * Cut the finished clips together in any order and it must play as one continuous walk
+    through a single place.
+
+THE SHOTS GO FROM FURTHER AND FURTHER OUT:
   * Not different places. The SAME place, seen from a new vantage after every cut, each one
     revealing more of how impossible it is.
   * A good order: inside it at eye level -> close on one of the repeated objects -> wide
@@ -227,6 +242,8 @@ HOLDING THE WORLD TOGETHER:
   * Write a WORLD sentence first: the ordinary object that repeats, the impossible geometry
     it sits in, the saturated palette, the sun direction, and the clean-render look. Be
     specific enough that two separate generations land in the same place under the same sun.
+    It must also name EVERY permanent thing in the scene, because no prompt may add one
+    later - this sentence is the whole inventory of the location.
   * Begin every prompt with that exact same world sentence, word for word. Do not paraphrase
     it between prompts.
 
@@ -277,7 +294,8 @@ HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
 
 Return JSON:
   {"world": "<the shared world sentence>",
-   "prompts": [{"label": "<3-5 words>", "shots": ["<shot 1 vantage>", "<shot 2 vantage>"],
+   "prompts": [{"label": "<3-5 words naming a VANTAGE, not a new subject>",
+                "shots": ["<shot 1 vantage>", "<shot 2 vantage>"],
                 "text": "<the full one-line prompt, cuts and hold times included>"}]}"""
 
 
