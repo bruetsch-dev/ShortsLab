@@ -3776,6 +3776,23 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     coverage_queries = [chosen[depth] for depth in range(max((len(c) for c in coverage_by_scene),
                                                             default=0))
                         for chosen in coverage_by_scene if len(chosen) > depth]
+    # The coverage wave was NOT deduplicated, only the queue behind it was. One browser
+    # search costs about two minutes, and the run is deadline-bound: on the suppin short
+    # six of the sixteen searches that fit were repeats ("身だしなみ チェック" three times,
+    # for scenes 9, 10 and 11), while scenes 12-15 were never searched at all. The matcher
+    # assigns whatever a text finds to EVERY scene it fits, so searching it once is not a
+    # loss of coverage - it is the same pool for a third of the price.
+    _cov_seen, _cov = set(), []
+    for q in coverage_queries:
+        key = _query_identity(q)
+        if key in _cov_seen:
+            continue
+        _cov_seen.add(key)
+        _cov.append(q)
+    if len(_cov) != len(coverage_queries):
+        _log(status_cb, "Scrape V2: coverage wave %d -> %d searches after dropping repeated "
+                        "terms (each one costs a full search)." % (len(coverage_queries), len(_cov)))
+    coverage_queries = _cov
     query_queue.sort(key=lambda q: V2_QUERY_TIERS.index(q.tier) if q.tier in V2_QUERY_TIERS else 9)
     # BROAD-DISCOVERY DEDUPE (2026-07-12): after the 2/3-token trim many intents collapse onto
     # the same broad query (東京 / 日本 学校 ...). Search each text ONCE globally - the vision
