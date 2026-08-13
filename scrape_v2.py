@@ -72,6 +72,11 @@ PROXY_FETCH_WORKERS = 6   # proxy downloads are network wait; see _download_and_
 V2_ANALYSIS_VERSION = 3   # v3 judges the CUT WINDOW, not the whole upload; older
                           # caches hold whole-clip caption verdicts and must not be reused
 
+# A beat that clears no floor does not go blank - it replays a neighbour's clip. Below
+# this score a segment really is unrelated and a repeat is the lesser evil; above it, the
+# clip at least shows what the line is talking about.
+NEAR_MISS_FLOOR = 4.5
+
 SCRAPE_V2_CONFIG = {
     # COST (user 2026-07-22: "$2 LLM pro Mini-Run, was soll das"): the old budgets let one
     # 25s mini short download 65 sources and push 174 segments through paid vision. Halved.
@@ -2452,6 +2457,7 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         if it is None or not isinstance(cands, list):
             continue
         scored = []
+        near_rows = []          # below the floor, used only to stop a beat being empty
         for c in cands:
             if not isinstance(c, dict):
                 continue
@@ -2493,6 +2499,21 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                         and _absurd >= 6.0):
                     continue
             elif not passes_match_floors(script_m, overall, it.visual_type, _rel):
+                # KEEP THE NEAR MISS. It is only used if this beat would otherwise end up
+                # with nothing, and "nothing" does not mean a blank - it means the beat
+                # borrows a neighbour's clip. Measured on the suppin run: 96 segments
+                # passed quality, 7 cleared these floors, and twelve beats then replayed
+                # two clips. A 6.4 that shows the thing being narrated beats the same
+                # phone for the eighth time, so the honest comparison is not
+                # "match vs no match" but "weak match vs a repeat".
+                if overall >= NEAR_MISS_FLOOR:
+                    near_rows.append({
+                        "segment": seg, "subject_match": subj, "action_match": act,
+                        "location_match": loc, "mood_match": mood, "script_match": script_m,
+                        "style_match": style_m, "semantic_match": overall,
+                        "overall_match": overall, "striking": 0.0,
+                        "below_floor": True, "match_class": "WEAK",
+                        "reason": "below the floor, kept in case the beat would be empty"})
                 continue
             try:
                 striking = float((seg.visual_description or {}).get("striking") or 0.0)
@@ -2526,6 +2547,16 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                                    _clean(r),
                                    r["striking"],
                                    r["segment"].quality_score), reverse=True)
+        # A beat with nothing does not go blank - it replays a neighbour's clip. So when
+        # nothing cleared the floor, the best near miss is carried forward instead, marked
+        # WEAK. It is still a picture of what is being said; a repeat is not.
+        if not scored and near_rows:
+            near_rows.sort(key=lambda r: (r["overall_match"], r["segment"].quality_score),
+                           reverse=True)
+            scored = near_rows[:1]
+            _log(status_cb, "Scrape V2: scene %s had no clip over the floor; keeping its best "
+                            "near miss at %.1f rather than repeating another beat's footage."
+                 % (sid, scored[0]["overall_match"]))
         out[sid] = scored
     matched = sum(1 for v in out.values() if v)
     _log(status_cb, f"Scrape V2: matched {matched}/{len(intents)} scene(s) after floors.")
@@ -2970,6 +3001,18 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
     if preferred not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "ALL"):
         preferred = "MOST_LIKED"
     # backend_search expands ALL internally and deduplicates the combined pool.
+    #
+    # ...which means ONE query under "ALL" is FOUR browser searches: most-liked, relevance,
+    # most-viewed, most-recent, run in sequence. That is depth on a single term, and the
+    # coverage wave is the one round whose whole job is BREADTH - one search for every beat
+    # before any beat gets a second. Spending four searches per term there is why 162
+    # planned queries became 16 executed in a 30-minute deadline, with beats 12-15 never
+    # searched at all. The coverage pass now takes one sort order; the other three stay
+    # available to the later rounds, which target beats that are still empty.
+    #
+    # coverage_pass was already a parameter here and had simply never been read.
+    if coverage_pass and preferred == "ALL":
+        preferred = "RELEVANCE"
     sort_passes = [preferred]
     selected_platforms = clip_scraper.normalize_platforms(platforms)
 

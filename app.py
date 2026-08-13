@@ -12344,9 +12344,20 @@ def all_projects_scraped_media(current_slug=None, limit=5000):
             continue
         title = project_title_from_files(proj) or proj.name
         is_current = (proj.name == current_slug)
-        for path in clip_dir.glob("*.mp4"):
+        # Everything the run actually downloaded, not only what it assigned. Scrape V2 keeps
+        # its sources in _v2_proxies - on the suppin run that is 54 clips against the 16 the
+        # edit used - and the library only ever looked at the top level, so the user could
+        # not reach any of them. They are real, watchable footage that was paid for; a beat
+        # that came out wrong should be fixable by dragging one in.
+        paths = list(clip_dir.glob("*.mp4"))
+        proxies = clip_dir / "_v2_proxies"
+        if proxies.is_dir():
+            paths.extend(sorted(proxies.glob("*.mp4")))
+        for path in paths:
             name = path.name
-            if name.startswith(skip_prefixes) or not name.startswith(keep_prefixes):
+            in_proxies = path.parent.name == "_v2_proxies"
+            if not in_proxies and (name.startswith(skip_prefixes)
+                                   or not name.startswith(keep_prefixes)):
                 continue
             try:
                 mtime = path.stat().st_mtime
