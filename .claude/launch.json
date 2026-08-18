@@ -8,6 +8,12 @@
       "port": 7866
     },
     {
+      "name": "shorts-app-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["app.py", "--host", "127.0.0.1", "--port", "7899"],
+      "port": 7899
+    },
+    {
       "name": "sfx-trainer",
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "tools.sfx_trainer", "serve", "--port", "7871"],

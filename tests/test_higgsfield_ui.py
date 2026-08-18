@@ -71,6 +71,26 @@ class _Page:
         pass
 
 
+class _CaptchaPage:
+    def __init__(self, result):
+        self.result = result
+        self.script = ""
+
+    def evaluate(self, script):
+        self.script = script
+        return self.result
+
+
+class _VideoSettingsPage:
+    def __init__(self, state):
+        self.state = state
+        self.script = ""
+
+    def evaluate(self, script):
+        self.script = script
+        return self.state
+
+
 class HiggsfieldUiTest(unittest.TestCase):
     def setUp(self):
         # These methods do not depend on a running browser/context.
@@ -118,6 +138,18 @@ class HiggsfieldUiTest(unittest.TestCase):
 
         self.assertFalse(self.session._set_unlimited(page))
         self.assertEqual(unrelated.clicks, 0)
+
+    def test_human_verification_detector_covers_visible_verify_human_overlay(self):
+        page = _CaptchaPage(True)
+        self.assertTrue(self.session._has_captcha(page))
+        self.assertIn("verify you are human", page.script.lower())
+        self.assertIn("turnstile", page.script.lower())
+
+    def test_video_preflight_never_accepts_unconfirmed_seedance_settings(self):
+        page = _VideoSettingsPage({"model": True, "duration": False, "aspect": False})
+        self.assertEqual(self.session._video_setting_issues(page), ["10 seconds", "9:16"])
+        self.assertIn("seedance", page.script.lower())
+        self.assertIn("10", page.script)
 
 
 if __name__ == "__main__":

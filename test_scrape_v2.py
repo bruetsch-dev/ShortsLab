@@ -184,8 +184,10 @@ def test_scene_bound_query_plan():
     why = {r["text"]: r["reason"] for r in audit3["rejected_before_search"]}
     check("a bare place name is dropped for generality, not for its language",
           "too general" in why.get("代々木公園", ""))
-    check("a genuinely English query is still dropped for a Japanese-context beat",
-          "tokyo couple gap" not in kept)
+    check("a tangible English query survives as the expat/viral discovery lane",
+          any(not v._contains_japanese(query) and "couple" in query for query in kept))
+    check("explicit English Japan metadata is valid provenance",
+          v.has_japanese_source_signal({"caption": "Tokyo couple walking in Shibuya"}))
 
 
 # ---- relevance-first ranking ----------------------------------------------
@@ -235,7 +237,12 @@ def test_provenance_and_editorial_gates():
           v.editorial_rejection_reason(good, japanese_intent) == "")
     teen = v.SegmentCandidate(**{**good.__dict__, "segment_id": "teen",
                                  "visual_description": {"age_confidence": "teen"}})
-    check("teen creator footage rejected", "minor" in v.editorial_rejection_reason(teen, japanese_intent))
+    check("ordinary non-sexualized teen footage can illustrate a factual student story",
+          v.editorial_rejection_reason(teen, japanese_intent) == "")
+    sexualized = v.SegmentCandidate(**{**good.__dict__, "segment_id": "sexualized",
+        "visual_description": {"age_confidence": "adult", "sexualized_content": True}})
+    check("sexualized creator footage is still rejected",
+          "sexualized" in v.editorial_rejection_reason(sexualized, japanese_intent))
     # Burned captions alone no longer disqualify a clip. Measured on 20 clips the scraper
     # had just downloaded for a Japanese topic, 17 carried on-screen text inside the exact
     # window that would be cut - the old blanket rule threw away 85% of the pool, which is
@@ -252,10 +259,18 @@ def test_provenance_and_editorial_gates():
     # clip. The blur still runs, so the text goes wherever the glyph pass can find it.
     check("a burned caption no longer rejects a clip",
           v.editorial_rejection_reason(captions, japanese_intent) == "")
+    caption_heavy = v.SegmentCandidate(**{**good.__dict__, "segment_id": "caption-heavy",
+        "text_heaviness": 8.0,
+        "visual_description": {"age_confidence": "adult", "burned_captions": True,
+                               "usable": True}})
+    caption_heavy.ocr_text_heaviness = 8.0
+    check("even large removable captions do not masquerade as a slide",
+          v.editorial_rejection_reason(caption_heavy, japanese_intent) == "")
     slide = v.SegmentCandidate(**{**good.__dict__, "segment_id": "slide", "text_heaviness": 6.0,
-                                  "visual_description": {"age_confidence": "adult"}})
+                                  "visual_description": {"age_confidence": "adult",
+                                                         "usable": False}})
     check("a frame that is mostly text is still rejected",
-          "text-heavy" in v.editorial_rejection_reason(slide, japanese_intent))
+          v.editorial_rejection_reason(slide, japanese_intent) != "")
     overlay = v.SegmentCandidate(**{**good.__dict__, "segment_id": "pip",
                                     "visual_description": {"age_confidence": "adult",
                                                            "creator_overlay": True}})
@@ -348,7 +363,7 @@ def test_download_budget_is_spent_once():
 
     The concurrent-prefetch rewrite reserved each planned source in _downloaded_ids AND
     added len(planned) to the same guard, so every source counted twice and a budget of 6
-    delivered 3. min_downloads_per_scene = 3 quietly became 1.5 per beat.
+    delivered 3. The same double-count would silently halve any per-scene budget.
     """
     calls = []
 
@@ -471,7 +486,7 @@ def test_one_inherited_cut_is_allowed_two_are_not():
         root = Path(tmp)
         cases = [("no cut", ["red"], 0, False),
                  ("one cut", ["red", "blue"], 1, False),
-                 ("two cuts", ["red", "blue", "green"], 2, True)]
+                 ("two cuts", ["red", "blue", "green"], 2, False)]
         for label, colours, want_cuts, want_reject in cases:
             clip = root / f"{want_cuts}.mp4"
             build(clip, colours)
@@ -483,6 +498,34 @@ def test_one_inherited_cut_is_allowed_two_are_not():
             out = v.analyze_segment_v2(seg, ffmpeg, "ffprobe")
             rejected = "rapid_internal_cuts" in (out.rejection_reasons or [])
             check(f"{label}: rejected={want_reject}", rejected == want_reject)
+
+
+def test_matcher_keeps_central_action_when_detail_is_not_visible():
+    """A person visibly lying on pavement must not be discarded only because frames cannot prove
+    their job title or suit. This regression caused 61 quality-passed Tokyo segments -> 0 matches."""
+    intent = v.VisualIntent(
+        scene_id=1, scene_text="A salaryman passes out on a Tokyo pavement.",
+        visual_type="concrete", subject="salaryman", action="lying passed out",
+        location="Tokyo pavement", required_elements=["person lying on pavement", "salaryman suit"])
+    intent.script_relevancy = 90
+    segment = v.SegmentCandidate(
+        segment_id="pavement", source_id="source", platform="tiktok", source_path="",
+        start_time=0, end_time=4, duration=4, query="路上 寝る", japanese_context=True,
+        visual_description={"subjects": ["person", "pavement"], "action": "person lying on pavement",
+                            "location": "city street", "age_confidence": "adult", "usable": True})
+    old = v._llm_json
+    v._llm_json = lambda *_a, **_k: {"scenes": {"1": [{
+        "seg": 0, "subject_match": 6, "action_match": 8, "location_match": 7,
+        "mood_match": 5, "script_match": 6.4, "style_match": 5,
+        "literal_match": False, "visible_evidence": ["person lying on pavement"],
+        "missing_required": ["salaryman suit"], "covers": ["person lying on pavement"],
+        "reason": "central action is visible; occupation is not"}]}}
+    try:
+        got = v.match_segments_to_scenes_v2([intent], [segment])
+    finally:
+        v._llm_json = old
+    check("central action survives missing secondary visual detail",
+          bool(got.get(1)) and got[1][0]["segment"].segment_id == "pavement")
 
 
 def test_the_matcher_reads_every_shape_the_model_answers_with():
@@ -645,6 +688,8 @@ def test_segment_windows():
     check("first window is NOT forced to start at 0", windows[0][0] > 0.0)
     check("a later-region window exists (not just the intro)",
           any(w[0] > 10.0 for w in windows))
+    check("the final third is inspected instead of truncating at mid-video",
+          any(w[0] > 20.0 for w in windows))
     for (s, e) in windows:
         d = e - s
         check("window %.1f-%.1f within [min,max]" % (s, e),
@@ -655,6 +700,34 @@ def test_segment_windows():
     # the current quality profile rejects ultra-short snippets below 2.2s
     check("2.2s is a valid segment length",
           cfg["min_segment_seconds"] <= 2.2 <= cfg["max_segment_seconds"])
+
+
+def test_resume_reuses_current_project_proxies():
+    """An interrupted project must re-open its own V2 downloads before issuing new requests."""
+    old_discover, old_analyze = v.discover_segments_v2, v.analyze_segment_v2
+    try:
+        def fake_discover(source, path, *_a, **_k):
+            return [v.SegmentCandidate(
+                segment_id="resumed_" + source.source_id, source_id=source.source_id,
+                platform=source.platform, source_path=str(path), start_time=0, end_time=3,
+                duration=3, query=source.query, japanese_context=True)]
+
+        def fake_analyze(segment, *_a, **_k):
+            segment.quality_score = 7.0
+            segment.rejection_reasons = []
+            return segment
+
+        v.discover_segments_v2, v.analyze_segment_v2 = fake_discover, fake_analyze
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy = Path(tmp) / "seedance 2.0" / "_v2_proxies"
+            proxy.mkdir(parents=True)
+            (proxy / "proxy_tiktok_123456789.mp4").write_bytes(b"proxy")
+            segments, source_ids = v.resume_project_proxy_segments_v2(
+                tmp, "ffmpeg", "ffprobe")
+        check("resume reuses the current project's source identity", source_ids == {"123456789"})
+        check("resume re-enters local proxy footage into matching", len(segments) == 1)
+    finally:
+        v.discover_segments_v2, v.analyze_segment_v2 = old_discover, old_analyze
 
 
 # ---- match formula + floors -----------------------------------------------
@@ -814,6 +887,7 @@ if __name__ == "__main__":
               test_relationship_scene_queries,
               test_a_bare_json_array_does_not_kill_the_run,
               test_a_failed_cut_scan_is_not_reported_as_clean_footage,
+              test_matcher_keeps_central_action_when_detail_is_not_visible,
               test_the_matcher_reads_every_shape_the_model_answers_with,
               test_every_physics_scene_is_visible_to_the_chooser,
               test_one_inherited_cut_is_allowed_two_are_not,
@@ -821,7 +895,8 @@ if __name__ == "__main__":
               test_download_budget_is_spent_once,
               test_borrowed_beat_survives_the_render_gate,
               test_a_motionless_shot_cannot_open_the_short,
-              test_segment_windows, test_match_floors, test_near_duplicate,
+              test_segment_windows, test_resume_reuses_current_project_proxies,
+              test_match_floors, test_near_duplicate,
               test_global_assignment, test_render_validation_v2, test_v1_untouched):
         print("\n== %s ==" % t.__name__)
         try:

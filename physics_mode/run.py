@@ -62,6 +62,7 @@ def preview_frame(out_dir, preset: str = "wrecking_ball", *, values=None,
         params["label"] = f"{mid:g}{cfg['unit']}"
         # ~2/3 through: the collision has happened and the result is visible
         params["preview_frame"] = frame or int(cfg["seconds"] * 30 * 0.62)
+    params.update(cfg.get("params") or {})
     ok, msg = run_scene(_scene_path(cfg), out, params, blender=blender,
                         status_cb=status_cb)
     shot = out / "preview.png"
@@ -91,10 +92,25 @@ def config_for(preset: str = "wrecking_ball", custom: dict | None = None) -> dic
     """
     if not custom:
         return PRESETS[preset]
+    kind = str(custom.get("kind") or "single")
+    if kind == "sweep":
+        # A library scene rendered once per swept value, joined and labelled - the same
+        # machinery the built-in wrecking-ball preset uses, pointed at a library file.
+        return {"title": custom.get("title") or "Custom physics scene",
+                "scene": Path(custom["scene_path"]),
+                "param": custom.get("param") or "value",
+                "values": list(custom.get("values") or []),
+                "unit": custom.get("unit", ""),
+                "seconds": float(custom.get("seconds") or 4.0),
+                "params": dict(custom.get("params") or {})}
     return {"title": custom.get("title") or "Custom physics scene",
             "scene": Path(custom["scene_path"]),
-            "kind": "loop" if custom.get("kind") == "loop" else "single",
+            "kind": "loop" if kind == "loop" else "single",
             "seconds": float(custom.get("seconds") or 4.0),
+            # Parameters chosen for a LIBRARY scene. They ride along into every run_scene
+            # call so the same numbers drive the preview frame and the full render - a
+            # preview rendered with different values approves a shot nobody gets.
+            "params": dict(custom.get("params") or {}),
             "unit": "", "authored": True}
 
 
@@ -151,7 +167,7 @@ def build(out_dir, preset: str = "wrecking_ball", *, values=None,
         _scene_path(cfg), out / "runs",
         param=cfg["param"], values=values, labels=labels,
         base_params={"res_x": res[0], "res_y": res[1], "samples": samples,
-                     "fps": fps, "seconds": secs},
+                     "fps": fps, "seconds": secs, **(cfg.get("params") or {})},
         blender=blender, status_cb=status_cb)
 
     ok = [r for r in results if r.ok]
@@ -193,12 +209,19 @@ def _build_loop(cfg, preset, out: Path, *, res, samples, fps, seconds, status_cb
     The scene guarantees its last frame continues into its first, so this is a hard cut
     with no crossfade and no visible seam - and an 8 second video costs one 2.4 second
     render.
+
+    `seconds` is the length of ONE PERIOD, not of the finished video: a looping scene sizes
+    its own period and the repeat below fills the rest. cfg["params"] has to travel with it
+    for the same reason it does in _build_single - they are the values the user approved on
+    the preview frame, and a loop rendered without them is a different video from the one
+    that was shown.
     """
     _log(status_cb, f"Physics: {cfg['title']} - rendering one seamless loop")
     sub = out / "runs" / "loop"
     ok, msg = run_scene(_scene_path(cfg), sub,
                         {"res_x": res[0], "res_y": res[1], "samples": samples,
-                         "fps": fps},
+                         "fps": fps, "seconds": float(cfg.get("seconds") or 4.0),
+                         **(cfg.get("params") or {})},
                         blender=blender, status_cb=status_cb)
     if not ok:
         raise RuntimeError(f"Physics: the loop failed to render - {msg[-400:]}")
@@ -238,7 +261,7 @@ def _build_single(cfg, preset, out: Path, *, res, samples, fps, seconds, status_
     sub = out / "runs" / "scene"
     ok, msg = run_scene(_scene_path(cfg), sub,
                         {"res_x": res[0], "res_y": res[1], "samples": samples,
-                         "fps": fps, "seconds": seconds},
+                         "fps": fps, "seconds": seconds, **(cfg.get("params") or {})},
                         blender=blender, status_cb=status_cb)
     if not ok:
         raise RuntimeError(f"Physics: the scene failed to render - {msg[-400:]}")

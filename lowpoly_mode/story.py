@@ -15,13 +15,18 @@ from __future__ import annotations
 
 import agent_core
 
+from . import models_library
+
 # Cheap on purpose. This is a form-filling job against a fixed catalogue, not a reasoning
 # one, and it runs once per video.
 WRITER_MODEL = "google/gemini-3.5-flash"
 
-CREATURES = ("cat", "dog", "mouse", "bear", "cow", "bird", "human", "robot")
+# The characters are whatever is installed in lowpoly_mode/models/, not a wish list: the
+# writer may only name a model the renderer can actually load. That list is read live from
+# models_library on every call - a constant here would be a snapshot taken at import, and
+# a model dropped in while the app runs would never appear.
 PROPS = ("box", "bowl", "ball", "table", "sofa", "window", "wall", "rug", "plant")
-ACTIONS = ("sit", "walk_to", "run", "jump_on", "paw_at", "look_around", "sleep")
+ACTIONS = models_library.ACTIONS
 SHOTS = ("wide", "medium", "close")
 ANGLES = ("front", "side", "high", "low", "three_quarter")
 COLOURS = ("wood", "cream", "red", "blue", "green", "grey", "white", "black",
@@ -55,6 +60,10 @@ SHOTS
     shot     : {shots}          (how tight the framing is)
     angle    : {angles}
 
+  * The only characters that exist are: {creatures}. Write the story about one of THEM.
+    Do not name any other animal in the narration - anything else on the "creature" line is
+    replaced by one of these at render time, and the narration would then be describing
+    something the viewer cannot see.
   * Coordinates are metres on a flat floor, roughly -3..3 in x and y. The creature starts
     at "at" and, for walk_to / run / jump_on, ends at "to". Put props where they belong in
     the story - a bowl in front of the cat, a box it jumps onto - and keep everything
@@ -79,12 +88,16 @@ def write_story(prompt: str, seconds: float = 30.0, status_cb=None,
     """Turn the user's idea into {title, narration, shots[{text, seconds, spec}]}."""
     log = status_cb or print
     log("Writing the story and shot specs...")
+    # Before the model call and before the voiceover: without a character there is no video
+    # to make, and finding that out after buying the audio helps nobody.
+    models_library.require_models()
     agent_core.assert_wavespeed_balance(status_cb=status_cb)
     out = agent_core._post_llm_json(
         model,
         [{"role": "system", "content": SYSTEM.format(
-            seconds=int(seconds), creatures=", ".join(CREATURES), furs=", ".join(FURS),
-            actions=", ".join(ACTIONS), props=", ".join(PROPS),
+            seconds=int(seconds), creatures=models_library.creature_choices(),
+            furs=", ".join(FURS), actions=", ".join(playable_actions()),
+            props=", ".join(PROPS),
             colours=", ".join(COLOURS), shots=", ".join(SHOTS),
             angles=", ".join(ANGLES))},
          {"role": "user", "content": str(prompt or "").strip()}],
@@ -102,6 +115,9 @@ def write_story(prompt: str, seconds: float = 30.0, status_cb=None,
         except (TypeError, ValueError):
             s["seconds"] = 2.5
         s["spec"] = clean_spec(s.get("spec"), index=i)
+        note = s["spec"]["cat"].pop("note", "")
+        if note:
+            log(f"  {note} (shot {i + 1})")
     log(f"Story: {out.get('title') or 'untitled'} - {len(shots)} shots, "
         f"{len(narration.split())} words")
     return {"title": str(out.get("title") or "Low poly short"),
@@ -118,6 +134,31 @@ def _pair(value, default=(0.0, 0.0)):
 def _one_of(value, allowed, default):
     v = str(value or "").strip().lower()
     return v if v in allowed else default
+
+
+def _num(value, lo, hi, default):
+    """A number the writer supplied, or the default. Never raises.
+
+    "size": "big" used to come out of the writer as a ValueError from clean_spec, through
+    write_story, and killed the whole build before the voiceover - while every field around
+    it was defensive.
+    """
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def playable_actions() -> tuple:
+    """The verbs the installed models can actually perform, for the prompt.
+
+    Every action always renders - a missing joint is a no-op, not an error - so this narrows
+    what we ASK for, not what we accept. A model with no legs should not be sent a walk.
+    """
+    playable = set()
+    for mid in models_library.MODELS:
+        playable.update(models_library.describe(mid).get("actions") or ())
+    return tuple(a for a in ACTIONS if a in playable) or ACTIONS
 
 
 def clean_spec(spec, index: int = 0) -> dict:
@@ -138,7 +179,7 @@ def clean_spec(spec, index: int = 0) -> dict:
         props.append({"kind": _one_of(item.get("kind"), PROPS, "box"),
                       "at": _pair(item.get("at"), (1.0, 0.5)),
                       "colour": _one_of(item.get("colour"), COLOURS, "wood"),
-                      "size": max(0.4, min(2.5, float(item.get("size", 1.0) or 1.0)))})
+                      "size": _num(item.get("size"), 0.4, 2.5, 1.0)})
     # alternate the framing when the model repeats itself, so cuts still read as cuts
     shot = _one_of(spec.get("shot"), SHOTS, SHOTS[index % len(SHOTS)])
     angle = _one_of(spec.get("angle"), ANGLES, ANGLES[index % len(ANGLES)])
@@ -146,12 +187,21 @@ def clean_spec(spec, index: int = 0) -> dict:
         facing = float(spec.get("facing", 0) or 0)
     except (TypeError, ValueError):
         facing = 0.0
+    # The character is validated against the models on DISK, not against a wish list: the id
+    # that comes out of here is one the renderer can load, or the shot has no character.
+    picked = models_library.resolve(spec.get("model") or spec.get("creature"))
+    character = {"kind": picked.model,
+                 "colour": _one_of(spec.get("fur"), FURS, "ginger"),
+                 "action": action, "at": at, "to": to, "facing": facing,
+                 "scale": _num(spec.get("scale"), 0.4, 2.5, 1.0)}
+    if picked.substituted:
+        # Informational, and carried into report.json so a run can be audited. Nothing
+        # downstream reads it; the note is popped by write_story once it has been logged.
+        character["requested"] = picked.requested
+        character["note"] = picked.note
     return {
         "id": index + 1,
-        "cat": {"kind": _one_of(spec.get("creature"), CREATURES, "cat"),
-                "colour": _one_of(spec.get("fur"), FURS, "ginger"),
-                "action": action, "at": at, "to": to, "facing": facing,
-                "scale": max(0.4, min(2.5, float(spec.get("scale", 1.0) or 1.0)))},
+        "cat": character,
         "props": props,
         "shot": shot,
         "angle": angle,

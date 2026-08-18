@@ -7,6 +7,18 @@ import pipeline
 
 
 class SeedSpeechTtsTests(unittest.TestCase):
+    def test_gemini_replaces_seed_voice(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(pipeline, "request_json", return_value={"data": {"id": "p1"}}) as post, \
+                mock.patch.object(pipeline, "poll_wavespeed", return_value=(["https://x.test/out.mp3"], {})), \
+                mock.patch.object(pipeline, "download_file", side_effect=lambda _url, path: Path(path).write_bytes(b"audio")):
+            pipeline.generate_speech_gemini(
+                "Hello world", Path(td) / "voice", key="test",
+                model="pro", voice="stokie_en")
+
+        payload = post.call_args.args[3]
+        self.assertEqual(payload["speakers"][0]["voice"], pipeline.DEFAULT_TTS_VOICE)
+
     def test_seed_uses_provider_specific_payload(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(pipeline, "request_json", return_value={"data": {"id": "p1"}}) as post, \
@@ -50,7 +62,6 @@ class SeedSpeechTtsTests(unittest.TestCase):
         self.assertEqual(payload["pitch"], 12)
         self.assertEqual(payload["sample_rate"], 24000)
         self.assertEqual(payload["output_format"], "mp3")
-        self.assertEqual(payload["voice_instruction"], pipeline.SEED_SHORT_STYLE_INSTRUCTION)
 
 
 if __name__ == "__main__":

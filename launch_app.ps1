@@ -1,5 +1,7 @@
 
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$pythonLauncher = "py"
+$pythonVersion = "3.11"
 $url = "http://127.0.0.1:7865/"
 $port = 7865
 
@@ -77,7 +79,7 @@ $errLog = Join-Path $logDir "server.err.log"
 # run_native.py starts the HTTP server AND the window in ONE process; closing the window quits
 # the app. Only fall through to the browser flow below if pywebview / WebView2 is unavailable.
 # Set SHORTSLAB_NO_NATIVE=1 to force the browser flow.
-py -c "import webview" *> $null
+& $pythonLauncher "-$pythonVersion" -c "import webview" *> $null
 $hasWebview = ($LASTEXITCODE -eq 0)
 if ($hasWebview -and (-not $env:SHORTSLAB_NO_NATIVE) -and (Test-Path (Join-Path $appDir "run_native.py"))) {
     # kill a leftover native instance so we don't stack windows / double-bind the port
@@ -88,8 +90,8 @@ if ($hasWebview -and (-not $env:SHORTSLAB_NO_NATIVE) -and (Test-Path (Join-Path 
         Start-Sleep -Milliseconds 300
     } catch {}
     Start-Process `
-        -FilePath "py" `
-        -ArgumentList @("-X", "faulthandler", "-B", "run_native.py", "--host", "127.0.0.1", "--port", [string]$port) `
+        -FilePath $pythonLauncher `
+        -ArgumentList @("-$pythonVersion", "-X", "faulthandler", "-B", "run_native.py", "--host", "127.0.0.1", "--port", [string]$port) `
         -WorkingDirectory $appDir `
         -WindowStyle Hidden `
         -RedirectStandardOutput $outLog `
@@ -102,8 +104,8 @@ if ($hasWebview -and (-not $env:SHORTSLAB_NO_NATIVE) -and (Test-Path (Join-Path 
 # abort) leaves a trace instead of vanishing with the hidden window. -X faulthandler dumps C-level
 # faults; the app also writes logs/crash.log itself.
 $pyProcess = Start-Process `
-    -FilePath "py" `
-    -ArgumentList @("-X", "faulthandler", "-B", "app.py", "--host", "127.0.0.1", "--port", [string]$port) `
+    -FilePath $pythonLauncher `
+    -ArgumentList @("-$pythonVersion", "-X", "faulthandler", "-B", "app.py", "--host", "127.0.0.1", "--port", [string]$port) `
     -WorkingDirectory $appDir `
     -WindowStyle Hidden `
     -RedirectStandardOutput $outLog `

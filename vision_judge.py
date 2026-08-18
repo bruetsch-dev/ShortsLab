@@ -40,8 +40,22 @@ def judge_frame(path, wanted: str, model: str = MODEL,
                  {"type": "image_url",
                   "image_url": {"url": agent_core.image_data_url(path)}}]}],
             max_tokens=300, temperature=0.0, timeout=180) or {}
-    except Exception:  # noqa: BLE001
-        return True, "vision check unavailable"
+    except Exception as exc:  # noqa: BLE001
+        # LOUD, not silent. The first version swallowed this and returned "passed", so a
+        # failing call was indistinguishable from a clean frame - a physics preview with
+        # the wrecking ball outside the frame sailed through the gate, and the same file
+        # was rejected the moment it was judged by hand. A check that cannot fail visibly
+        # is worse than no check, because it is trusted.
+        return True, f"UNCHECKED: vision call failed ({type(exc).__name__}: {exc})"
     if out.get("shows_it") is False:
         return False, str(out.get("reason") or "the frame does not show the shot")
     return True, str(out.get("reason") or "ok")
+
+
+def checked(reason: str) -> bool:
+    """False when judge_frame passed only because it could not run.
+
+    Callers that gate expensive work on a pass should tell the user which of the two it
+    was, rather than reporting an unchecked frame as approved.
+    """
+    return not str(reason or "").startswith("UNCHECKED")

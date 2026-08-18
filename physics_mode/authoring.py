@@ -290,8 +290,10 @@ def author_scene(prompt: str, status_cb=None, *, blender: str | None = None,
             # Pixel statistics cannot tell that the wrecking ball is above the frame edge
             # while its chain hangs into shot. One cheap vision call per preview can, and
             # it is the only check that compares the picture against what was ordered.
-            from vision_judge import judge_frame
+            from vision_judge import checked, judge_frame
             seen, why = judge_frame(shot, brief["brief"][:400])
+            if seen and not checked(why):
+                log(f"  {why} - the frame was NOT verified.")
             if not seen:
                 ok, msg = False, (
                     f"The frame renders, but it does not show the shot: {why}. Every object "

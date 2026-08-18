@@ -8,6 +8,25 @@ import agent_core
 
 
 class ScriptCreatorVarietyTests(unittest.TestCase):
+    def test_generated_fact_blocks_become_searchable_paragraphs(self):
+        data = {
+            "script": "This fallback should not flatten the chapter plan.",
+            "hook": "Three things in Japan just make sense.",
+            "visual_blocks": [
+                "First, a machine wraps wet umbrellas.",
+                "Second, ramen shops sell tickets before you sit down.",
+                "Third, Otohime buttons cover restroom noise.",
+            ],
+        }
+        script = agent_core._generated_fact_script_with_blocks(data)
+        self.assertEqual(len(script.split("\n\n")), 4)
+        self.assertIn("Otohime", script.split("\n\n")[-1])
+
+    def test_token_trim_preserves_existing_chapter_boundaries(self):
+        script = "Hook sentence.\n\nFirst visual sentence. More detail.\n\nSecond visual sentence."
+        trimmed = agent_core._trim_script_to_token_limit(script, 12)
+        self.assertIn("\n\n", trimmed)
+
     def test_similarity_recognizes_paraphrase_but_not_new_subject(self):
         repeated = agent_core._script_text_similarity(
             "Japanese schools inspect students' natural hair every morning.",
@@ -69,6 +88,23 @@ class ScriptCreatorVarietyTests(unittest.TestCase):
             self.assertIn("USER SCRIPT DIRECTIONS", captured[0])
             self.assertIn("Use three facts and make the language less exaggerated.", captured[0])
             self.assertIn("MAY override the default tone", captured[0])
+
+    def test_script_creator_uses_selected_reasoning_model(self):
+        called = []
+
+        def fake_post(model, messages, max_tokens, temperature, timeout=180):
+            called.append(model)
+            return {"topic": "Night Ritual", "script": "A visible Japanese night ritual surprises visitors. " * 12,
+                    "hook_keywords": []}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(agent_core, "_SCRIPT_TOPIC_HISTORY", Path(tmp) / "history.json"), \
+             patch.object(agent_core, "_post_llm_json", side_effect=fake_post):
+            result = agent_core.generate_viral_script(
+                reasoning_model="openai/gpt-5.6-luna")
+
+        self.assertEqual(called, ["openai/gpt-5.6-luna"])
+        self.assertEqual(result["reasoning_model"], "openai/gpt-5.6-luna")
 
     def test_default_prompt_demands_plain_spoken_language(self):
         with tempfile.TemporaryDirectory() as tmp:

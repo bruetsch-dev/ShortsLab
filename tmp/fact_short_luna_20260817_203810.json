@@ -1,0 +1,20 @@
+{
+  "topic": "First-Name Intimacy in Japanese Dating",
+  "script": "In Japan, a first-name switch can feel more intimate than kissing.\n\nAt a café, many new couples may still use family names, even after dating starts. In Japan, given names are commonly reserved for closer relationships, so switching can feel unusually personal.\n\nDuring a walk, one person might quietly ask, \"Can I use your given name?\" That request makes the tiny change visibly meaningful, instead of instantly turning romance into an anime-style scene.\n\nAt karaoke, friends may tease the couple when the new name appears. For many young people, the real romantic payoff is not fireworks, but one small change everyone can hear.",
+  "hook_keywords": [
+    "first-name",
+    "switch",
+    "intimate",
+    "family",
+    "names",
+    "quietly",
+    "ask",
+    "permission",
+    "anime",
+    "tease"
+  ],
+  "format_mode": "standard",
+  "estimated_tokens": 127,
+  "token_limit": 150,
+  "reasoning_model": "openai/gpt-5.6-luna"
+}

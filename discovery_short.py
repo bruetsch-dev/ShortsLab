@@ -29,68 +29,6 @@ MAX_CANDIDATES_TRIED_STORY = 26   # story mode screens a much wider pool (user: 
 # Curated fallback queries when the user gives no topic hint AND the query LLM fails
 # in a non-fatal way. ASIAN craft/process topics only (user rule: Chinese/Japanese style).
 CANDIDATE_LIBRARY_DIR = Path(__file__).parent / "candidate library"
-DISCOVERY_TOPIC_HISTORY = agent_core.ROOT / "generated_assets" / "discovery_topic_history.json"
-
-
-def _topic_key(value):
-    """A stable, language-agnostic enough key for preventing repeated discoveries."""
-    return " ".join(re.findall(r"[\w]+", str(value or "").casefold(), flags=re.UNICODE))
-
-
-def _discovery_topic_history():
-    try:
-        rows = json.loads(DISCOVERY_TOPIC_HISTORY.read_text(encoding="utf-8"))
-        return [r for r in rows if isinstance(r, dict) and str(r.get("topic") or "").strip()][-80:]
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def _topic_has_been_used(topic, history=None):
-    key = _topic_key(topic)
-    if not key:
-        return False
-    for row in (history if history is not None else _discovery_topic_history()):
-        old = _topic_key(row.get("topic"))
-        if key == old or (len(key) >= 12 and difflib.SequenceMatcher(None, key, old).ratio() >= 0.88):
-            return True
-    return False
-
-
-_TOPIC_FILLER = {"japan", "japanese", "how", "to", "use", "the", "a", "an", "in", "of",
-                 "and", "for", "with", "what", "why", "inside", "guide", "explained"}
-
-
-def _candidate_topic_key(info):
-    """Loose key for collapsing five search variants of the same subject into one pick."""
-    words = [w for w in _topic_key((info or {}).get("topic_title")).split()
-             if len(w) > 2 and w not in _TOPIC_FILLER]
-    return " ".join(words[:6]) or _topic_key((info or {}).get("premise"))
-
-
-def _same_candidate_topic(left, right):
-    a, b = _candidate_topic_key(left), _candidate_topic_key(right)
-    if not a or not b:
-        return False
-    aset, bset = set(a.split()), set(b.split())
-    overlap = len(aset & bset) / max(1, min(len(aset), len(bset)))
-    return overlap >= 0.60 or difflib.SequenceMatcher(None, a, b).ratio() >= 0.78
-
-
-def _remember_discovery_topic(topic, project_slug, requested_topic=""):
-    """Persist completed Discovery subjects so automatic discovery never repeats them."""
-    topic = re.sub(r"\s+", " ", str(topic or "")).strip()
-    if not topic or _topic_has_been_used(topic):
-        return
-    try:
-        history = _discovery_topic_history()
-        history.append({"topic": topic, "requested_topic": str(requested_topic or ""),
-                        "project": str(project_slug or ""),
-                        "at": time.strftime("%Y-%m-%d %H:%M")})
-        DISCOVERY_TOPIC_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        DISCOVERY_TOPIC_HISTORY.write_text(json.dumps(history[-80:], ensure_ascii=False, indent=1),
-                                           encoding="utf-8")
-    except Exception:  # noqa: BLE001 - topic memory must never block a completed render
-        pass
 
 
 def _record_candidates(accepted, style):
@@ -208,66 +146,10 @@ _FALLBACK_QUERIES = [
 ]
 
 
-def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region=""):
+def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region="",
+                  creative_direction=""):
     """LLM: turn 'find something fascinating' (or the user's rough hint) into TikTok
     search queries that surface LONG process/craft videos (or story skits in mini mode)."""
-    if style == "mixed":
-        history = _discovery_topic_history()
-        used = [str(row.get("topic") or "") for row in history[-40:]]
-        used_text = " | ".join(used) if used else "(none yet)"
-        sys_p = (
-            "You are the topic director for a viral real-footage Short. Find ONE specific, "
-            "visually obvious JAPANESE topic that can be told from real 9:16 TikTok footage. "
-            "The reference style is surprising everyday culture, unusual rules, jobs, dating or "
-            "school situations, strange shops/machines, food with a visible twist, and satisfying "
-            "craft/processes. The topic must have a concrete visible situation, not a vague theme.\n"
-            "A good topic can be described in one sharp line, such as an unusual restaurant rule, "
-            "a Japanese school-festival activity, a bizarre vending machine, a strict workplace "
-            "ritual, an unexpected dating custom, or a craft with a clear transformation. Avoid "
-            "generic tourism, generic street food, routine dances, ordinary how-to tutorials, "
-            "fake-food crafts without a surprising premise, talking heads, listicles, and subjects "
-            "that require text or dialogue to understand. Each automatic topic must contain a "
-            "visible contradiction, unusual rule, surprising mechanism, or strong transformation.\n"
-            "If the user gives a direction, return {\"topic\": \"specific short English subject\", "
-            "\"queries\": [12 strings]} for that one subject. If no direction is given, return "
-            "{\"topics\": [{\"topic\": \"specific subject\", \"queries\": [2 or 3 strings]}, ...]} "
-            "with exactly FIVE clearly different Japanese subjects. Every topic needs its own "
-            "coherent source-footage search. Use half native Japanese characters and half English "
-            "queries that explicitly say Japan/Japanese. Never use Korean, Chinese, or another "
-            "country. No hashtags and no word TikTok in a query.\n"
-            "Never choose, paraphrase, or substantially overlap a previously used topic. Previously "
-            "used topics: " + used_text)
-        user_p = ("Use this requested direction exactly, but make its visible situation concrete: " + hint
-                  if hint else
-                  "No direction was provided. Pick an unused topic yourself, prioritising a weird, "
-                  "instantly understandable visual premise with enough footage to recut.")
-        data = agent_core._post_llm_json(reasoning_model, [
-            {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-            max_tokens=1000, temperature=0.9)
-        clusters = [c for c in (data.get("topics") or []) if isinstance(c, dict)]
-        if clusters:
-            planned_topics = [str(c.get("topic") or "").strip() for c in clusters]
-            if len(clusters) != 5 or any(not t for t in planned_topics):
-                raise RuntimeError("Discovery: automatic topic planner did not return five usable topics.")
-            reused = [t for t in planned_topics if _topic_has_been_used(t, history)]
-            if reused:
-                raise RuntimeError("Discovery: automatic topic planner repeated a used topic; rerun to choose new topics.")
-            queries = [{"query": str(q).strip(), "topic_cluster": str(c.get("topic") or "").strip()}
-                       for c in clusters for q in (c.get("queries") or []) if str(q).strip()]
-            planned_topic = ""
-            log(status_cb, "Discovery topics: " + " | ".join(planned_topics))
-        else:
-            planned_topic = str(data.get("topic") or hint or "").strip()
-            queries = [{"query": str(q).strip(), "topic_cluster": planned_topic}
-                       for q in (data.get("queries") or []) if str(q).strip()]
-        if not queries:
-            raise RuntimeError("Discovery: the unified query planner returned no queries.")
-        if planned_topic and _topic_has_been_used(planned_topic, history):
-            raise RuntimeError("Discovery: the planner selected a topic that was already used; rerun to pick a new one.")
-        log(status_cb, f"Discovery topic: {planned_topic or 'auto-selected from footage'}")
-        log(status_cb, "Discovery queries: " + " | ".join(
-            str(q.get("query") if isinstance(q, dict) else q) for q in queries[:15]))
-        return queries[:15], planned_topic
     if style == "story":
         jp = region == "japan"
         # WIDE + SPECIFIC search (user 2026-07-25 "es müssen special videos sein, nicht 0815"):
@@ -305,6 +187,8 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
         user_p = (f"The user wants a video about: {hint}" if hint else
                   "No topic given - make the 16 queries as DIFFERENT from each other as "
                   "possible; each one should surface a different kind of video.")
+        if creative_direction:
+            user_p += "\nCreative direction: " + creative_direction
         data = agent_core._post_llm_json(reasoning_model, [
             {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
             max_tokens=1000, temperature=0.85)
@@ -313,7 +197,7 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
             raise RuntimeError("Discovery: the query planner returned no queries.")
         log(status_cb, f"Mini discovery: {len(queries)} angle-diverse queries planned.")
         log(status_cb, "  " + " | ".join(queries[:16]))
-        return queries[:16], hint
+        return queries[:16]
     sys_p = ("You find LONG TikTok videos (45s-10min) that show a complete fascinating process "
              "from EAST ASIA (China/Japan, also Korea/Taiwan/SE Asia): traditional crafts, "
              "old-school manufacturing, cooking from raw ingredients, restoration, temple/village "
@@ -325,6 +209,8 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
     user_p = (f"The user wants a video about: {hint}" if hint else
               "No topic given - pick fascinating ASIAN process topics yourself (vary them: bamboo, "
               "wood, metal, food, tea, fiber, ceramics, lacquer, old machines...).")
+    if creative_direction:
+        user_p += "\nCreative direction: " + creative_direction
     data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
         max_tokens=600, temperature=0.6)
@@ -332,7 +218,24 @@ def _plan_queries(hint, reasoning_model, status_cb=None, style="process", region
     if not queries:
         raise RuntimeError("Discovery: the query planner returned no queries.")
     log(status_cb, "Discovery queries: " + " | ".join(queries[:8]))
-    return queries[:8], hint
+    return queries[:8]
+
+
+def _combine_sources(sources, output, ff):
+    """Create one editable visual spine from several downloaded discovery sources."""
+    if len(sources) == 1:
+        return Path(sources[0])
+    manifest = Path(output).with_suffix(".concat.txt")
+    lines = []
+    for source in sources:
+        safe_path = Path(source).resolve().as_posix().replace("'", "'\\''")
+        lines.append(f"file '{safe_path}'\n")
+    manifest.write_text("".join(lines), encoding="utf-8")
+    subprocess.run([ff, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(manifest), "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", str(output)], check=True)
+    return Path(output)
 
 
 def _search_long(queries, status_cb=None, min_seconds=None, want=12, per_author=99):
@@ -344,11 +247,7 @@ def _search_long(queries, status_cb=None, min_seconds=None, want=12, per_author=
     import tiktok_login
     seen, out = set(), []
     by_author = {}
-    for q_spec in queries:
-        q = str(q_spec.get("query") or "") if isinstance(q_spec, dict) else str(q_spec)
-        cluster = str(q_spec.get("topic_cluster") or "") if isinstance(q_spec, dict) else ""
-        if not q:
-            continue
+    for q in queries:
         try:
             items = tiktok_login.search_sync(q, want=want, status_cb=status_cb,
                                              sort="MOST_LIKED", timeout_s=240)
@@ -381,23 +280,9 @@ def _search_long(queries, status_cb=None, min_seconds=None, want=12, per_author=
             by_author[author.lower()] = by_author.get(author.lower(), 0) + 1
             desc = str(it.get("desc") or "")[:180]
             out.append({"id": vid, "author": author, "likes": likes, "dur": dur,
-                        "desc": desc, "query": q, "topic_cluster": cluster,
+                        "desc": desc, "query": q,
                         "url": f"https://www.tiktok.com/@{author}/video/{vid}"})
     out.sort(key=lambda c: -(c["likes"] * math.log(max(c["dur"], 46))))
-    # Automatic Discovery has five planned topic clusters. Interleave their best
-    # results before any second/third result so one popular query can never monopolise
-    # the first download/screening batch.
-    clusters = [str(c.get("topic_cluster") or "") for c in out if c.get("topic_cluster")]
-    if len(set(clusters)) > 1:
-        grouped = {}
-        for item in out:
-            grouped.setdefault(str(item.get("topic_cluster") or item.get("query") or ""), []).append(item)
-        out, depth = [], 0
-        while any(depth < len(items) for items in grouped.values()):
-            for _topic, items in grouped.items():
-                if depth < len(items):
-                    out.append(items[depth])
-            depth += 1
     log(status_cb, f"Discovery: {len(out)} long candidates "
                    f"({MIN_SRC_SECONDS}-{MAX_SRC_SECONDS}s) across {len(queries)} queries.")
     return out
@@ -407,9 +292,6 @@ _WESTERN_HINT = re.compile(
     r"\b(the|and|with|my|his|her|our|your|prank|boyfriend|girlfriend|husband|wife|mom|dad|"
     r"guys|omg|lol|funny|reaction|challenge|couple|family|vlog|pov)\b", re.I)
 _CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
-_JAPANESE_SCRIPT = re.compile(r"[\u3040-\u30ff]")
-_JAPAN_CONTEXT = re.compile(r"\b(japan|japanese|tokyo|kyoto|osaka|shibuya|yokohama|hokkaido|"
-                            r"okinawa|nagoya|fukuoka|sapporo)\b", re.I)
 
 
 def _looks_western(desc):
@@ -419,12 +301,6 @@ def _looks_western(desc):
         return False
     return len(_WESTERN_HINT.findall(d)) >= 2 or bool(
         re.search(r"\b(USA|America|San Diego|New York|London|LA|Texas|California)\b", d, re.I))
-
-
-def _has_japan_context(candidate):
-    """Reject viral but unrelated search-feed leakage before we download it."""
-    text = " ".join(str((candidate or {}).get(k) or "") for k in ("desc", "query", "author"))
-    return bool(_JAPANESE_SCRIPT.search(text) or _JAPAN_CONTEXT.search(text))
 
 
 def _fallback_pool(cands, keep):
@@ -797,44 +673,6 @@ def _calmest_start(cuts, lo, hi, need, step=0.2):
 def _vision_stages(sheet, total, cand, reasoning_model, status_cb=None, style="process"):
     """Vision: rate the candidate + segment the process (or story beats) into stages."""
     import scrape_v2
-    if style == "mixed":
-        prompt = (
-            "You see a timestamped frame sheet from ONE vertical TikTok video. Caption: \""
-            + str(cand.get("desc") or "") + "\". Judge whether it can become a fast, "
-            "reference-style narrated Short about ONE concrete, visually understandable JAPANESE "
-            "subject. First confirm it is genuinely filmed in Japan or clearly shows a Japanese "
-            "place, rule, institution, product, language, or cultural practice. "
-            "It may be a process, a surprising everyday rule, a job, a place, a school/dating "
-            "situation, food, or an unusual object. The visual premise must be understandable "
-            "without reading the creator's captions or hearing the original dialogue.\n"
-            "Reject only when it is a talking head, static slideshow, screen recording, text-card "
-            "video, generic dance, ad, or has no visible progression/subject. Do NOT reject a "
-            "good unusual situation simply because it is not a craft process.\n"
-            "Return ONE JSON object: {\"appeal\": 1-10, \"is_japan\": true/false, \"is_process\": true/false, "
-            "\"topic_title\": \"specific English subject\", \"premise\": \"one concrete "
-            "visible hook\", \"stages\": [{\"start\": sec, \"end\": sec, \"action\": "
-            "\"only what is visibly on screen\", \"is_reveal\": true/false}]}.\n"
-            "Give 3-8 chronological stages. Never infer actions or dialogue between still frames. "
-            "is_process=true means visually tellable, not literally a manufacturing process. "
-            "Appeal 8-10 only for a premise with a strong visible curiosity hook.")
-        data = scrape_v2._vision_json(prompt, str(sheet), max_tokens=1500, temperature=0.1,
-                                      reasoning_model=reasoning_model)
-        stages = []
-        for st in (data.get("stages") or []):
-            try:
-                a, b = float(st.get("start")), float(st.get("end"))
-            except (TypeError, ValueError):
-                continue
-            if b - a >= 1.0 and 0 <= a < total:
-                stages.append({"start": max(0.0, a), "end": min(total, b),
-                               "action": str(st.get("action") or "").strip(),
-                               "is_reveal": bool(st.get("is_reveal"))})
-        stages.sort(key=lambda s: s["start"])
-        data["stages"] = stages
-        flag_invented_motion(stages, status_cb)
-        log(status_cb, f"Unified discovery vision: appeal {data.get('appeal')}/10, "
-                       f"{len(stages)} stages - {data.get('topic_title')}")
-        return data
     if style == "story":
         # The output schema must be the LAST thing in this prompt. When the numbered
         # judging steps came after it, the model answered with only the key named in the
@@ -950,7 +788,7 @@ def _source_copy_score(script, transcript):
 
 
 def _write_script(analysis, hint, reasoning_model, status_cb=None, style="process", feedback=None,
-                  copy_retry=0):
+                  copy_retry=0, creative_direction=""):
     """LLM: write the mini-short narration; every sentence is tied to one visual stage."""
     stages = analysis["stages"]
     # Stages whose description claims movement a contact sheet cannot prove. Marking them
@@ -996,23 +834,9 @@ def _write_script(analysis, hint, reasoning_model, status_cb=None, style="proces
            else "\nNo reveal stage exists: never describe the finished product's look."))
     user_p = (f"Video: {analysis.get('topic_title')}\nStages:\n{stage_lines}"
               + (f"\nUser's direction: {hint}" if hint else "")
+              + (f"\nCreative direction: {creative_direction}. Follow it while keeping every claim "
+                 "grounded in the visible stages." if creative_direction else "")
               + (f"\nCRITICAL FEEDBACK FROM PREVIOUS RUN: {feedback} YOU MUST MAKE THE OFFENDING SENTENCES SIGNIFICANTLY SHORTER OR REWRITE THEM ENTIRELY TO FIT!" if feedback else ""))
-    if style == "mixed":
-        sys_p = (
-            "You write a fast 20-35 second documentary Short from one real vertical source. "
-            "The video is about one surprising, concrete visual subject: an unusual rule, job, "
-            "place, food, object, ritual, relationship situation, or process.\n"
-            "Return JSON: {\"title\": str, \"slug\": \"kebab-case-slug\", "
-            "\"sentences\": [{\"text\": \"one sentence\", \"stage\": stage_index}], "
-            "\"hook_keywords\": [\"UPPERCASE words\"], \"impact_word\": \"one word\"}.\n"
-            "Rules: every sentence must be grounded in its assigned visible stage; open with a "
-            "specific curiosity hook, then explain only the visible situation in crisp plain "
-            "English. Use 5-8 sentences, 70-105 words, stages in non-decreasing order, a clear "
-            "payoff last, no captions/dialogue from the source, no generic history intro, no "
-            "hashtags, and never copy the source wording.")
-        user_p = (f"Topic: {analysis.get('topic_title')}\nVisible stages:\n{stage_lines}"
-                  + (f"\nUser direction: {hint}" if hint else "")
-                  + (f"\nRewrite feedback: {feedback}" if feedback else ""))
     if style == "story":
         # Mini-mode auto discovery: DUBBING-style voiceover over a skit/story with Asian
         # women/couples (user prompt 2026-07-24: professional voiceover writer + video
@@ -1246,18 +1070,22 @@ def _auto_phrases(counts):
     return sizes
 
 
-def run_discovery_short(form, status_cb=None, style="mixed"):
-    """Unified, scriptless Discovery for Clip Short.
-
-    It replaces the former split between Mini Story and craft-only Discovery.  A user may
-    provide a direction, but otherwise the agent chooses one unused, reference-style,
-    visually tellable topic and then finds its real footage before writing any narration.
-    """
+def run_discovery_short(form, status_cb=None, style="process"):
+    """Entry point for a Clip Short run WITHOUT a script. style="process" = classic
+    Discovery (craft/process docs); style="story" = the MINI mode's automatic discovery
+    (user 2026-07-23): skits/stories with Japanese/Korean/Chinese women or couples,
+    activated when the mini script AND topic are empty (never a selectable option)."""
     # Discovery bypasses agent_core.run_project, so it must establish the same proven
     # scrape voice profile itself. Preserve an explicit user override.
     form.setdefault("clip_source", "scrape")
     form.setdefault("voice_speed", agent_core.SCRAPE_VOICE_SPEED)
+    if style == "story" and not str(form.get("tts_voice_instruction") or "").strip():
+        form["tts_voice_instruction"] = (
+            "Upbeat, energetic, playful social-video delivery with bright enthusiasm, "
+            "quick natural reactions, and a smile in the voice; never calm or documentary."
+        )
     cancel_event = form.get("_cancel_event")
+    keep_original_audio = bool(form.get("discovery_keep_original_audio"))
 
     def _check_cancel():
         if cancel_event is not None and cancel_event.is_set():
@@ -1268,15 +1096,20 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
     # survived the vision review" (2026-07-25). Two seconds here saves all of it.
     agent_core.assert_wavespeed_balance(status_cb=status_cb)
 
-    hint = str(form.get("gen_topic") or "").strip()
+    hint, directives = _split_topic_directives(form.get("gen_topic"))
+    # Topic tags select the discovery family. <crafting> keeps the process/craft
+    # search; <social> opts into story/social footage instead.
+    if style == "process" and "social" in directives:
+        style = "story"
+    creative_direction = "; ".join(directives)
     region = str(form.get("region") or "").strip().lower()
     reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
-    if hint and _topic_has_been_used(hint):
-        raise RuntimeError("Discovery: this topic was already used. Pick a new direction or leave it blank "
-                           "for an unused topic to be selected automatically.")
-    log(status_cb, "UNIFIED DISCOVERY: no script given - " +
-        (f"finding real footage about '{hint}'." if hint else
-         "choosing an unused, reference-style topic and finding its real footage."))
+    log(status_cb, ("MINI DISCOVERY: empty script - hunting a story/skit TikTok with Asian "
+                    "women or couples " if style == "story" else
+                    "DISCOVERY MODE: no script given - the agent hunts a long process TikTok ")
+                   + (f"about '{hint}'." if hint else "on its own."))
+    if creative_direction:
+        log(status_cb, "Discovery direction: " + creative_direction)
 
     pinned_url = str(form.get("candidate_url") or "").strip()
     if pinned_url:
@@ -1297,20 +1130,15 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         }]
         log(status_cb, f"Discovery: using pinned candidate (local_file={candidates[0]['local_file']})")
     else:
-        queries, planned_topic = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region)
-        form["_discovery_planned_topic"] = planned_topic
+        queries = _plan_queries(hint, reasoning_model, status_cb, style=style, region=region,
+                                creative_direction=creative_direction)
         _check_cancel()
         # story mode searches WIDE (deeper scroll, max 2 clips per creator) and then
         # text-prescreens the whole pool - special beats popular (user 2026-07-25).
         candidates = _search_long(queries, status_cb,
-                                  min_seconds=25 if style == "mixed" else (40 if style == "story" else None),
-                                  want=20 if style == "mixed" else (25 if style == "story" else 12),
-                                  per_author=3 if style == "mixed" else (2 if style == "story" else 99))
-        if style == "mixed":
-            before = len(candidates)
-            candidates = [c for c in candidates if _has_japan_context(c)]
-            log(status_cb, f"Discovery: Japan-context gate kept {len(candidates)}/{before} "
-                           "search results before download.")
+                                  min_seconds=40 if style == "story" else None,
+                                  want=25 if style == "story" else 12,
+                                  per_author=2 if style == "story" else 99)
         if style == "story":
             _check_cancel()
             candidates = _prescreen_story(candidates, reasoning_model, status_cb)
@@ -1322,18 +1150,14 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
     work.mkdir(parents=True, exist_ok=True)
 
     # Screen a WIDE pool and rank it; the user then picks ONE of the best five.
-    # A strict auto-pass is useful for ranking, but it is not permission to silently
-    # discard usable footage. Candidates that only have warnings are kept as fallbacks
-    # and shown when the strict pass produces too few choices.
-    accepted, reviewable = [], []
-    _tried_cap = 1 if pinned_url else (24 if style == "mixed" else
-                                       (MAX_CANDIDATES_TRIED_STORY if style == "story"
-                                        else MAX_CANDIDATES_TRIED))
+    accepted = []
+    fallback = None
+    fallbacks = []
+    _tried_cap = 1 if pinned_url else (MAX_CANDIDATES_TRIED_STORY if style == "story"
+                                       else MAX_CANDIDATES_TRIED)
     _want_accepted = 1 if pinned_url else (10 if style == "story" else 5)
     for cand in candidates[:_tried_cap]:
-        # Unified auto-discovery needs to inspect enough results to find five DISTINCT
-        # subjects. Stopping after five parking videos is exactly what this avoids.
-        if style != "mixed" and len(accepted) >= _want_accepted:
+        if len(accepted) >= _want_accepted:
             break
         _check_cancel()
         log(status_cb, f"Discovery: trying @{cand['author']} ({cand['dur']}s, "
@@ -1355,21 +1179,20 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         # variants; the old process mode only checked the dimensions and could accept a
         # technically broken portrait upload.
         tech = _probe_technical(path, status_cb)
-        warnings = []
         if tech.get("letterbox", 0) > 0.22:
-            warnings.append(f"{tech['letterbox']*100:.0f}% letterbox/black bars")
+            log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                           f"{tech['letterbox']*100:.0f}% letterbox/black bars.")
+            continue
         if tech.get("frozen_run_seconds", 0) >= 0.15:
-            warnings.append(f"{tech['frozen_run_seconds']:.2f}s repeated-frame stall")
+            log(status_cb, f"Discovery: skipped @{cand['author']} - "
+                           f"{tech['frozen_run_seconds']:.2f}s repeated-frame stall.")
+            continue
         if tech.get("micro_stutter_count", 0):
-            if not pinned_url:
-                warnings.append(f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es)")
-            # A user-selected library candidate is not an unknown search result. Isolated
-            # duplicate frames are repairable by choosing the cut windows around them;
-            # do not turn the user's explicit pick into the misleading generic
-            # "no candidate survived" error. Sustained freezes are still rejected above.
-            log(status_cb, f"Discovery: candidate has {tech['micro_stutter_count']} "
-                           "isolated duplicate-frame hitch(es); the recut will avoid those "
-                           "source moments where possible.")
+            # Isolated duplicate frames are repairable by choosing cut windows around them;
+            # sustained freezes remain the hard rejection above.
+            log(status_cb, f"Discovery: @{cand['author']} has "
+                           f"{tech['micro_stutter_count']} isolated duplicate-frame hitch(es); "
+                           "keeping it for ranking.")
         if style == "story" and not pinned_url:
             # No scene changes = a talking head with no visual story. Process footage may
             # legitimately contain a long uninterrupted craft shot, so this is story-only.
@@ -1377,53 +1200,71 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
             # reactions measures ~2 cuts/min and is still good, so cuts are a RANKING
             # signal, not a gate. Only a literally single-shot video is rejected here.
             if tech.get("cuts_per_min", 0) < 1.0:
-                warnings.append("single static shot (no scene change in the first minute)")
+                log(status_cb, f"Discovery: skipped @{cand['author']} - single static shot "
+                               "(no scene change in the first minute).")
+                continue
         sheet, total = _frame_sheet(path, work, status_cb, tag=cand["id"])
         info = _vision_stages(sheet, total, cand, reasoning_model, status_cb, style=style)
+        _min_appeal = 0 if pinned_url else 8
         # Existing Candidate is an explicit user approval. Keep the quality analysis for
         # cutting, but do not re-apply the auto-discovery popularity/appeal threshold.
         # We still require usable stage data: without it there is no honest way to tie
         # the narration to the footage.
-        if not info.get("stages"):
-            log(status_cb, "Discovery: cannot offer candidate - vision analysis produced no usable stages.")
+        min_stages = 1 if pinned_url else 3
+        if (not pinned_url and not info.get("is_process")) \
+                or float(info.get("appeal") or 0) < _min_appeal \
+                or len(info["stages"]) < min_stages:
+            log(status_cb, "Discovery: rejected by vision review - next candidate.")
+            # A technically valid, downloaded source is still usable material. Do not
+            # abort the entire run just because the optional vision ranking could not
+            # find enough stages; keep the last such source as a deterministic fallback.
+            fallback_info = dict(info)
+            fallback_info["is_process"] = True
+            fallback_info["appeal"] = max(float(fallback_info.get("appeal") or 0), 1.0)
+            fallback_info["topic_title"] = (
+                str(fallback_info.get("topic_title") or cand.get("desc") or "Discovery footage")
+                .strip()[:120]
+            )
+            fallback_info["premise"] = (
+                str(fallback_info.get("premise") or cand.get("desc") or
+                    "Use the selected source footage as the visual basis for the discovery short.")
+                .strip()
+            )
+            fallback_info["stages"] = [{
+                "start": 0.0, "end": max(1.0, float(cand.get("dur") or total or 1.0)),
+                "action": "Selected source footage",
+            }]
+            if fallback is None:
+                fallback = {"cand": cand, "src": path, "info": fallback_info,
+                            "sheet": sheet, "tech": tech}
+            # Keep this candidate, not the first fallback repeatedly. This is what
+            # allows a thin vision pool to be topped up to the requested shortlist.
+            fallbacks.append({"cand": cand, "src": path, "info": fallback_info,
+                              "sheet": sheet, "tech": tech})
             continue
-        if style == "mixed" and not info.get("is_japan"):
-            log(status_cb, "Discovery: rejected candidate - visual review could not confirm a Japan connection.")
-            continue
-        if not pinned_url and not info.get("is_process"):
-            warnings.append("vision review did not identify a clear process/story")
-        if not pinned_url and float(info.get("appeal") or 0) < 8:
-            warnings.append(f"vision appeal {float(info.get('appeal') or 0):.0f}/10")
-        if not pinned_url and len(info["stages"]) < 3:
-            warnings.append(f"only {len(info['stages'])} usable visual stage(s)")
-        # Keep the exact source times for the recutter. This applies to a fallback
-        # candidate too: it lets a user choice avoid small defects rather than meeting
-        # the same defect again during the final render validation.
-        info["_micro_stutter_times"] = list(tech.get("micro_stutter_times") or [])
-        record = {"cand": cand, "src": path, "info": info, "sheet": sheet,
-                  "tech": tech, "warnings": warnings}
-        if warnings and not pinned_url:
-            reviewable.append(record)
-            log(status_cb, f"Discovery: keeping @{cand['author']} as a user-selectable "
-                           f"fallback ({'; '.join(warnings)}).")
-        else:
-            accepted.append(record)
-            log(status_cb, f"Discovery: candidate {len(accepted)}/{_want_accepted} accepted - "
-                           f"{info.get('topic_title')}"
-                           + (f" [{tech.get('cuts_per_min')} cuts/min]" if tech else ""))
+        if pinned_url:
+            info["_micro_stutter_times"] = list(tech.get("micro_stutter_times") or [])
+        accepted.append({"cand": cand, "src": path, "info": info, "sheet": sheet,
+                         "tech": tech})
+        log(status_cb, f"Discovery: candidate {len(accepted)}/{_want_accepted} accepted - "
+                       f"{info.get('topic_title')}"
+                       + (f" [{tech.get('cuts_per_min')} cuts/min]" if tech else ""))
     if not accepted:
-        if not reviewable:
-            raise RuntimeError("Discovery: no usable candidate could be downloaded and analysed. "
-                               "Try another topic or rerun the search.")
-        accepted = reviewable
-        reviewable = []
-        log(status_cb, "Discovery: no strict auto-passes; showing the best analysed candidates "
-                       "with their review warnings for your choice.")
-    elif not pinned_url and len(accepted) < _want_accepted and reviewable:
-        needed = _want_accepted - len(accepted)
-        accepted.extend(reviewable[:needed])
-        log(status_cb, f"Discovery: added {min(needed, len(reviewable))} review-warning "
-                       "candidate(s) so the picker has more real choices.")
+        if fallback is None:
+            raise RuntimeError("Discovery: no usable candidate could be downloaded - "
+                               "rerun or give a topic hint.")
+        accepted.append(fallback)
+        log(status_cb, "Discovery: vision review found no ranked match; continuing with "
+                       "the best technically valid source and a conservative single-shot plan.")
+    if not pinned_url and len(accepted) < _want_accepted:
+        for candidate in reversed(fallbacks):
+            if len(accepted) >= _want_accepted:
+                break
+            if candidate not in accepted:
+                accepted.append(candidate)
+        if len(accepted) > 1:
+            log(status_cb, f"Discovery: topped up shortlist with {len(accepted)} technically valid "
+                           "sources so the user can choose between multiple candidates.")
     # FINAL RANKING (user 2026-07-25): vision appeal alone was flat (everything scored 8),
     # so combine it with the text "special" score and the measured scene density, then keep
     # the best FIVE with a category spread so the picks are not five of the same thing.
@@ -1438,30 +1279,6 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         pace = (min(cuts, 15.0) / 5.0) - max(0.0, cuts - 30.0) / 6.0
         return appeal + special + pace
     accepted.sort(key=_rank, reverse=True)
-    if style == "mixed" and not pinned_url:
-        # A picker card is a TOPIC POOL: several independently filmed TikToks about the
-        # same planned Japanese subject. This is deliberately grouped by the planner's
-        # cluster, not fuzzy titles such as "fake egg" versus "wax lettuce".
-        all_records = accepted + reviewable
-        groups = {}
-        for record in all_records:
-            cluster = str(record["cand"].get("topic_cluster") or "").strip()
-            if not cluster:
-                cluster = _candidate_topic_key(record["info"])
-            groups.setdefault(cluster, []).append(record)
-        pooled = []
-        for cluster, records in groups.items():
-            records.sort(key=_rank, reverse=True)
-            primary = records[0]
-            primary["pool_sources"] = records[:5]
-            primary["related_sources"] = records[1:5]
-            primary["pool_topic"] = cluster or str(primary["info"].get("topic_title") or "")
-            pooled.append(primary)
-        pooled.sort(key=_rank, reverse=True)
-        accepted = pooled[:5]
-        log(status_cb, "Discovery: built " + ", ".join(
-            f"{a.get('pool_topic') or a['info'].get('topic_title')} ({len(a.get('pool_sources') or [])} sources)"
-            for a in accepted))
     if not pinned_url and style == "story" and len(accepted) > 5:
         picked, per_cat = [], {}
         for a in accepted:
@@ -1498,6 +1315,7 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
     # (frame sheets + stages shown) before any script/TTS money is spent.
     sel = 0
     gate = form.get("_discovery_gate")
+    multi_source = False
     if callable(gate) and not pinned_url:
         decision = gate({"candidates": [{
             "index": i,
@@ -1507,8 +1325,6 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
             "appeal": a["info"].get("appeal"), "sheet": str(a["sheet"]),
             "video": str(a.get("preview") or ""),
             "premise": str(a["info"].get("premise") or ""),
-            "source_count": len(a.get("pool_sources") or [a]),
-            "warnings": list(a.get("warnings") or []),
             "stages": [f"{s['start']:.0f}-{s['end']:.0f}s: {s['action']}"
                        for s in a["info"]["stages"]],
         } for i, a in enumerate(accepted)]})
@@ -1518,14 +1334,25 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         log(status_cb, f"Discovery: user picked candidate {sel + 1} - "
                        f"{accepted[sel]['info'].get('topic_title')}")
     chosen, src, analysis = accepted[sel]["cand"], accepted[sel]["src"], accepted[sel]["info"]
-
-    if style == "mixed" and not pinned_url:
-        selected_pool = accepted[sel].get("pool_sources") or [accepted[sel]]
-        pool_topic = str(accepted[sel].get("pool_topic") or analysis.get("topic_title") or hint)
-        log(status_cb, f"Discovery: building '{pool_topic}' from {len(selected_pool)} related TikTok source(s).")
-        return run_mini_topic_short(
-            form, status_cb, preselected_pool=[Path(item["src"]) for item in selected_pool],
-            subject_override=pool_topic, selected_records=selected_pool)
+    if multi_source:
+        log(status_cb, f"Discovery: combining {len(accepted)} independent sources into one topic montage.")
+        combined_stages = []
+        offset = 0.0
+        for item in accepted:
+            item_duration = max(1.0, _video_duration(item["src"]))
+            for stage in item["info"].get("stages") or []:
+                combined_stages.append({
+                    **stage,
+                    "start": round(offset + float(stage.get("start", 0)), 3),
+                    "end": round(offset + min(item_duration, float(stage.get("end", item_duration))), 3),
+                })
+            offset += item_duration
+        if combined_stages:
+            analysis = dict(analysis)
+            analysis["stages"] = combined_stages
+        src = _combine_sources([item["src"] for item in accepted],
+                               work / "discovery_multi_source.mp4", pipeline.find_ffmpeg())
+        chosen = dict(chosen, desc="Multi-source discovery montage")
 
     import shutil
     feedback = None
@@ -1534,7 +1361,8 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         # It is used as an anti-copy reference, never as wording the new script is allowed to use.
         if "transcript" not in analysis:
             analysis["transcript"] = _transcribe_source(src, status_cb)
-        plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style, feedback=feedback)
+        plan = _write_script(analysis, hint, reasoning_model, status_cb, style=style, feedback=feedback,
+                             creative_direction=creative_direction)
         script = plan["script"]
         slug = re.sub(r"[^a-z0-9_]+", "_", str(plan.get("slug") or plan.get("title") or "discovery")
                       .lower()).strip("_")[:48] or "discovery"
@@ -1584,25 +1412,6 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
             if j == sel:
                 entry["file"] = "seedance 2.0/_discovery_source.mp4"
                 _update_candidate_file(a["cand"].get("id"), str(src_final))
-                related_files = []
-                for k, related in enumerate(a.get("related_sources") or [], start=1):
-                    rp = Path(related["src"])
-                    if not rp.exists():
-                        continue
-                    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_",
-                                  str(related["cand"].get("author") or "related"))[:40]
-                    dest = dl_dir / f"related_{k}_{safe}.mp4"
-                    try:
-                        rp.replace(dest)
-                        related_files.append({"id": related["cand"].get("id"),
-                                              "title": related["info"].get("topic_title"),
-                                              "file": f"initial downloads/{dest.name}"})
-                    except OSError:
-                        related_files.append({"id": related["cand"].get("id"),
-                                              "title": related["info"].get("topic_title"),
-                                              "file": str(rp)})
-                if related_files:
-                    entry["related_sources"] = related_files
             else:
                 p = Path(a["src"])
                 if p.exists():
@@ -1620,6 +1429,12 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
 
         # ---- voiceover + word timings (same recipe as the hand-build factory)
         _check_cancel()
+        ff = pipeline.find_ffmpeg()
+        ffp = pipeline.find_ffprobe(ff)
+        _probe = subprocess.run([ffp, "-v", "error", "-select_streams", "a",
+                                 "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                                 str(src_final)], capture_output=True, text=True)
+        _src_has_audio = bool((_probe.stdout or "").strip())
         wav = agent_core.generate_project_voiceover(script, project_dir, form, status_cb=status_cb)
         if not wav:
             raise RuntimeError("Discovery: voiceover generation failed (TTS disabled or errored).")
@@ -1644,6 +1459,26 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         spans = [(bounds[i][0] if i else 0.0,
                   bounds[i + 1][0] if i + 1 < len(bounds) else total_vo)
                  for i in range(len(bounds))]
+        original_spans = (
+            {i for i in range(1, len(sentences), 2)}
+            if keep_original_audio and _src_has_audio else set()
+        )
+        if keep_original_audio and original_spans and _src_has_audio:
+            # Remove narration exactly over the beats where the source creator's
+            # audio is restored; this prevents voice and dialogue competing.
+            mute_expr = "+".join(
+                f"between(t,{spans[i][0]:.3f},{spans[i][1]:.3f})"
+                for i in sorted(original_spans) if i < len(spans)
+            )
+            masked_wav = project_dir / "input" / "voiceover_alternating.wav"
+            subprocess.run([
+                ff, "-y", "-loglevel", "error", "-i", str(wav),
+                "-af", f"volume=enable='{mute_expr}':volume=0",
+                "-c:a", "pcm_s16le", str(masked_wav),
+            ], check=True)
+            wav = masked_wav
+            total_vo = _video_duration(wav)
+            log(status_cb, "Discovery: voiceover muted during original-audio beats.")
 
         # ---- caption track (word timings RELATIVE to the row start - render re-anchors them).
         # Built from whatever word list we have: script-aligned tokens normally, raw whisper
@@ -1683,19 +1518,20 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
             break
 
     # ---- recut the long source: each sentence gets footage from ITS process stage
-    ff = pipeline.find_ffmpeg()
     stages = analysis["stages"]
     source_hitches = [float(t) for t in (analysis.get("_micro_stutter_times") or [])]
     stage_cursor = {}
     scenes = []
     # story mode keeps the source's own audio as a quiet bed under the voiceover
-    ffp = pipeline.find_ffprobe(ff)
-    _probe = subprocess.run([ffp, "-v", "error", "-select_streams", "a", "-show_entries",
-                             "stream=codec_type", "-of", "csv=p=0", str(src_final)],
-                            capture_output=True, text=True)
-    # Match the proven Clip Short mix: no source/ambient bed under the narration. Keeping
-    # random TikTok room sound made otherwise clean renders feel noisy and inconsistent.
-    _src_has_audio = False
+    # Match the proven Clip Short mix: no source/ambient bed under the narration unless
+    # alternating original audio was explicitly enabled.
+    original_spans = set()
+    if keep_original_audio and _src_has_audio:
+        # Let selected source beats breathe: every second explanatory beat is
+        # narrated, while the alternating beats use the creator's own audio.
+        original_spans = {i for i in range(1, len(sentences), 2)}
+        log(status_cb, f"Discovery: preserving original audio on {len(original_spans)} "
+                       "source beat(s); voiceover will mute during those beats.")
     _src_cuts = _source_cut_times(src_final, ff)
     if _src_cuts:
         log(status_cb, f"Discovery: source cuts {len(_src_cuts)} times "
@@ -1795,7 +1631,7 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
             cmd = [ff, "-y", "-loglevel", "error", "-ss", str(round(t0, 2)),
                    "-t", str(round(take + 0.1, 2)), "-i", str(src_final),
                    "-vf", vf, "-t", str(d + 0.05)]
-            if style == "story" and _src_has_audio and rate >= 0.999:
+            if _src_has_audio and (style == "story" or keep_original_audio) and rate >= 0.999:
                 cmd += ["-c:a", "aac", "-b:a", "128k"]   # dual audio: keep the original bed
             else:
                 cmd += ["-an"]
@@ -1810,7 +1646,9 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
                        "start": round(a, 2), "end": round(b, 2),
                        "clip": name, "asset": name, "seedance": True,
                        "seedance_start_trim": 0.0, "render_caption": False,
-                       "overlays": [], "blur_captions": False, "timeline_speed": 1.0})
+                       "overlays": [], "blur_captions": False, "timeline_speed": 1.0,
+                       "discovery_original_audio": i in original_spans,
+                       "seedance_audio_volume": 1.0 if i in original_spans else 0.0})
     scenes[-1]["end"] = round(total_vo, 2)
     # editing.timeline overlay: the stage recut decides WHICH footage each sentence gets;
     # this pass decides how it is CUT. It marks repeated angles and over-long holds with a
@@ -1861,11 +1699,6 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         "audio_path": str(wav), "speech_audio_in_final": True,
         "animated_captions": True, "render_captions": bool(caption_track),
         "timeline_editor_render": True, "timeline_caption_track": caption_track,
-        # Candidates are explicitly reviewed before the user picks them. Static signs
-        # and parking equipment frequently trigger false positive micro-hitch events;
-        # pipeline still blocks real repeated-frame stalls, but must not abort this run
-        # solely on the isolated-frame heuristic.
-        "allow_repairable_source_hitches": True,
         "pipeline_version": "v0.2",
         "hook_keywords": [str(k) for k in (plan.get("hook_keywords") or [])][:10],
         "caption_max_words": 3, "caption_uppercase": True,
@@ -1877,7 +1710,8 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         "voice_speed": agent_core.resolve_voice_speed(form, "scrape"),
         "background_music_enabled": False,
         # Source audio is deliberately off: no uncontrolled TikTok ambient bed.
-        "mix_seedance_audio_with_speech": _src_has_audio,
+        "mix_seedance_audio_with_speech": _src_has_audio and keep_original_audio,
+        "duck_original_under_voice": False if keep_original_audio else True,
         "seedance_audio_volume_with_speech": 0.12,
         "smart_overlays": [], "timeline_overlays_managed": True,
         "output_basename": f"{slug}_v1",
@@ -1896,10 +1730,6 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     _check_cancel()
     output = pipeline.render_video(config)
-    # Record the real subject only after the short successfully exists. The next automatic
-    # Discovery run receives this history and cannot recycle the same topic.
-    _remember_discovery_topic(analysis.get("topic_title") or form.get("_discovery_planned_topic"),
-                              slug, requested_topic=hint)
     log(status_cb, f"Discovery render complete: {Path(output).name}")
     try:  # tidy the temp download dir (chosen source was moved into the project)
         import shutil
@@ -1916,7 +1746,7 @@ def run_discovery_short(form, status_cb=None, style="mixed"):
 # material can actually show ("der agent soll ein script machen wos auch genug material
 # hat"), and builds the short from that pool. Same local finishing as discovery.
 
-def _mini_queries(topic, form, reasoning_model, status_cb=None):
+def _mini_queries(topic, form, reasoning_model, status_cb=None, creative_direction=""):
     langs = [c.strip() for c in str(form.get("search_languages") or "").split(",") if c.strip()]
     lang_hint = (" Search languages to mix: " + ", ".join(langs) + ".") if langs else \
         " Mix English with Japanese/Chinese when the topic is Asian."
@@ -1927,7 +1757,8 @@ def _mini_queries(topic, form, reasoning_model, status_cb=None):
             "(one machine, one place, one dish), not a broad topic collage. "
             "Return JSON: {\"subject\": \"the one concrete subject\", "
             "\"queries\": [6 search strings]}. No hashtags." + lang_hint},
-        {"role": "user", "content": f"Topic: {topic}"}],
+        {"role": "user", "content": f"Topic: {topic}"
+         + (f"\nCreative direction: {creative_direction}" if creative_direction else "")}],
         max_tokens=500, temperature=0.5)
     queries = [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()][:6]
     if not queries:
@@ -2002,6 +1833,16 @@ def _mini_script(subject, descs, reasoning_model, status_cb=None):
     return data
 
 
+def _split_topic_directives(value):
+    """Separate a fact-discovery subject from optional *creative directives*."""
+    raw = str(value or "").strip()
+    directives = [re.sub(r"\s+", " ", (a or b)).strip().lower()
+                  for a, b in re.findall(r"(?:\*([^*]+)\*|<([^>]+)>)", raw)]
+    topic = re.sub(r"\*[^*]+\*|<[^>]+>", " ", raw)
+    topic = re.sub(r"\s+", " ", topic).strip(" ,-:;")
+    return topic, directives
+
+
 def run_discovery_fact_short(form, status_cb=None):
     """Discovery mode for the full fact pipeline: topic only -> scrape clips -> vision-ground
     a fact script -> inject it and run agent_core.run_project as a normal fact Short.
@@ -2014,14 +1855,18 @@ def run_discovery_fact_short(form, status_cb=None):
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Run cancelled by user.")
 
-    topic = str(form.get("gen_topic") or "").strip()
+    topic, directives = _split_topic_directives(form.get("gen_topic"))
     if not topic:
         raise RuntimeError("Fact Discovery needs a topic in the Topic field.")
 
     reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
     log(status_cb, f"FACT DISCOVERY MODE: '{topic}' - gathering material first.")
+    if directives:
+        log(status_cb, "Fact Discovery direction: " + " | ".join(directives))
 
-    subject, queries = _mini_queries(topic, form, reasoning_model, status_cb)
+    direction = "; ".join(directives)
+    subject, queries = _mini_queries(topic, form, reasoning_model, status_cb,
+                                     creative_direction=direction)
     _check_cancel()
 
     import tiktok_login
@@ -2072,15 +1917,21 @@ def run_discovery_fact_short(form, status_cb=None):
         vdata = scrape_v2._vision_json(
             "You see a labeled contact sheet: each row = one TikTok clip ([index] name (dur), 3 "
             f"frames). Topic: {subject}.\n"
+            + (f"Creative direction: {direction}. Prefer clips that satisfy it.\n" if direction else "")
+            +
             "Return JSON: {{\"clips\": {{\"0\": {{\"desc\": \"what is LITERALLY visible "
-            "(objects, actions, setting, process steps)\", \"usable\": true/false}}, ...}}}}.\n"
-            "usable=false for: talking heads, text-card memes, anime, off-topic.",
+            "(objects, actions, setting, process steps)\", \"usable\": true/false, "
+            "\"topic_relevant\": true/false}}, ...}}}}.\n"
+            "usable=false for: talking heads, text-card memes, anime, off-topic. "
+            "topic_relevant=true only when the visible footage directly supports this topic; "
+            "do not accept generic Japan, cafe, robot, or technology footage.",
             str(sheet), max_tokens=2000, temperature=0.1,
             reasoning_model=reasoning_model)
         for k, v in (vdata.get("clips") or {}).items():
-            if str(k).isdigit() and isinstance(v, dict) and v.get("usable"):
+            if (str(k).isdigit() and isinstance(v, dict) and v.get("usable")
+                    and v.get("topic_relevant")):
                 descs[int(k)] = str(v.get("desc") or "")
-        log(status_cb, f"Fact Discovery: {len(descs)}/{len(pool)} clips inform the script.")
+        log(status_cb, f"Fact Discovery: {len(descs)}/{len(pool)} topic-relevant clips inform the script.")
 
     try:
         import shutil
@@ -2090,6 +1941,12 @@ def run_discovery_fact_short(form, status_cb=None):
 
     _check_cancel()
 
+    min_confirmed_clips = 4
+    if len(descs) < min_confirmed_clips:
+        raise RuntimeError(
+            f"Fact Discovery found only {len(descs)} topic-relevant usable clip(s), but needs at least "
+            f"{min_confirmed_clips}. No script or video was made; try a broader topic or different wording.")
+
     # Write a fact script grounded in the discovered material
     clip_context = ""
     if descs:
@@ -2098,15 +1955,23 @@ def run_discovery_fact_short(form, status_cb=None):
 
     script_data = agent_core._post_llm_json(reasoning_model, [
         {"role": "system", "content":
-            "You write punchy 30-35s fact short scripts (150-200 words) for Japan/Asia-focused "
-            "documentary Shorts. The script works as standalone narration over visuals. "
-            "Rules: open with the most surprising fact (never 'Did you know'); 5-7 sentences; "
-            "each sentence = one concrete visual fact; end with a payoff/twist. "
+            "You write original, punchy 25-35s Fact Short scripts for Japan-focused documentary "
+            "Shorts. Use 85-120 simple spoken words, never 150-200. The script works as standalone "
+            "narration over real vertical phone footage. Open with a concrete surprising claim "
+            "(never 'Did you know'), then give three escalating visual beats and a payoff. "
+            "First infer the recurring human subject and overall claim from the whole topic: the "
+            "hook may be only one example, so its noun must not hijack later scenes. Every sentence "
+            "must show a distinct physical person, action, object or place; no abstract filler, "
+            "technical language, copied source wording or repeated hook location. Write so a "
+            "13-year-old understands it on one listen. Keep every claim factual. "
             "Return JSON: {\"title\": str, \"script\": str, "
             "\"hook_keywords\": [4-8 UPPERCASE words from the script], "
             "\"impact_word\": \"one uppercase word from sentence 1\", "
             "\"scrape_terms\": [3-5 TikTok search terms for the visuals]}."},
-        {"role": "user", "content": f"Topic: {subject}{clip_context}"}],
+        {"role": "user", "content": f"Topic: {subject}"
+         + (f"\nCreative direction: {direction}. Follow this stylistic direction while keeping every claim factual."
+            if direction else "")
+         + clip_context}],
         max_tokens=600, temperature=0.4)
 
     script = str(script_data.get("script") or "").strip()
@@ -2119,6 +1984,8 @@ def run_discovery_fact_short(form, status_cb=None):
     fields = dict(form)
     fields["script"] = script
     fields["title"] = title
+    # Fact Discovery is material-first: unmatched scenes must fail rather than use generic footage.
+    fields["fact_discovery_material_only"] = True
     if script_data.get("hook_keywords"):
         fields["hook_keywords"] = json.dumps([str(k) for k in script_data["hook_keywords"]])
     if script_data.get("impact_word"):
@@ -2132,7 +1999,6 @@ def run_discovery_fact_short(form, status_cb=None):
     return agent_core.run_project(fields, status_cb)
 
 
-def run_mini_topic_short(form, status_cb=None, preselected_pool=None, subject_override="", selected_records=None):
     """Mini Story from a TOPIC only: material-first scripting over one subject cluster."""
     form.setdefault("clip_source", "scrape")
     form.setdefault("voice_speed", agent_core.SCRAPE_VOICE_SPEED)
@@ -2142,15 +2008,13 @@ def run_mini_topic_short(form, status_cb=None, preselected_pool=None, subject_ov
         if cancel_event is not None and cancel_event.is_set():
             raise pipeline.PipelineCancelled("Run cancelled by user.")
 
-    topic = str(subject_override or form.get("gen_topic") or "").strip()
+    topic = str(form.get("gen_topic") or "").strip()
     if not topic:
         raise RuntimeError("Mini Story without a script needs a topic.")
     reasoning_model = str(form.get("reasoning_model") or "") or "google/gemini-3.5-flash"
-    log(status_cb, f"DISCOVERY TOPIC POOL: building a multi-source Short about '{topic}'.")
+    log(status_cb, f"MINI TOPIC MODE: no script - scraping material for '{topic}' first.")
 
-    subject, queries = topic, []
-    if not preselected_pool:
-        subject, queries = _mini_queries(topic, form, reasoning_model, status_cb)
+    subject, queries = _mini_queries(topic, form, reasoning_model, status_cb)
     _check_cancel()
     import tiktok_login
     import clip_scraper
@@ -2162,41 +2026,37 @@ def run_mini_topic_short(form, status_cb=None, preselected_pool=None, subject_ov
     clip_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "input").mkdir(exist_ok=True)
     log(status_cb, f"PROJECT_DIR|{project_dir}")
-    if preselected_pool:
-        pool = [Path(p) for p in preselected_pool if Path(p).exists()]
-        log(status_cb, f"Discovery: reusing {len(pool)} screened source videos for this topic pool.")
-    else:
-        seen, picked = set(), []
-        for q in queries:
-            try:
-                items = tiktok_login.search_sync(q, want=10, status_cb=status_cb,
-                                                 sort="MOST_LIKED", timeout_s=240)
-            except Exception as exc:  # noqa: BLE001
-                log(status_cb, f"Mini topic search '{q}' failed: {exc.__class__.__name__}")
+    seen, picked = set(), []
+    for q in queries:
+        try:
+            items = tiktok_login.search_sync(q, want=10, status_cb=status_cb,
+                                             sort="MOST_LIKED", timeout_s=240)
+        except Exception as exc:  # noqa: BLE001
+            log(status_cb, f"Mini topic search '{q}' failed: {exc.__class__.__name__}")
+            continue
+        for it in items or []:
+            vid = str(it.get("id") or "")
+            author = it.get("author")
+            author = str((author.get("uniqueId") if isinstance(author, dict) else author) or "")
+            if not vid or vid in seen or not author:
                 continue
-            for it in items or []:
-                vid = str(it.get("id") or "")
-                author = it.get("author")
-                author = str((author.get("uniqueId") if isinstance(author, dict) else author) or "")
-                if not vid or vid in seen or not author:
-                    continue
-                seen.add(vid)
-                likes = int((it.get("stats") or {}).get("diggCount") or 0)
-                picked.append({"id": vid, "author": author, "likes": likes})
-        picked.sort(key=lambda x: -x["likes"])
-        log(status_cb, f"Mini topic: {len(picked)} unique results, downloading top 16...")
-        pool = []
-        for i, it in enumerate(picked[:16]):
-            _check_cancel()
-            url = f"https://www.tiktok.com/@{it['author']}/video/{it['id']}"
-            p = clip_scraper.download_raw(url, clip_dir, i, status_cb=status_cb)
-            if p and _is_portrait(p):
-                pool.append(Path(p))
-            elif p:
-                Path(p).unlink(missing_ok=True)
-    if len(pool) < 3:
-        raise RuntimeError(f"Discovery: only {len(pool)} usable sources found for this topic pool - "
-                           "not enough material.")
+            seen.add(vid)
+            likes = int((it.get("stats") or {}).get("diggCount") or 0)
+            picked.append({"id": vid, "author": author, "likes": likes})
+    picked.sort(key=lambda x: -x["likes"])
+    log(status_cb, f"Mini topic: {len(picked)} unique results, downloading top 16...")
+    pool = []
+    for i, it in enumerate(picked[:16]):
+        _check_cancel()
+        url = f"https://www.tiktok.com/@{it['author']}/video/{it['id']}"
+        p = clip_scraper.download_raw(url, clip_dir, i, status_cb=status_cb)
+        if p and _is_portrait(p):
+            pool.append(Path(p))
+        elif p:
+            Path(p).unlink(missing_ok=True)
+    if len(pool) < 5:
+        raise RuntimeError(f"Mini topic: only {len(pool)} portrait clips found - not enough "
+                           "material for this topic.")
     log(status_cb, f"Mini topic: {len(pool)} portrait clips in the pool.")
 
     import scrape_v2
@@ -2215,7 +2075,7 @@ def run_mini_topic_short(form, status_cb=None, preselected_pool=None, subject_ov
     for k, v in cinfo.items():
         if str(k).isdigit() and isinstance(v, dict) and v.get("usable"):
             descs[int(k)] = str(v.get("desc") or "")
-    if len(descs) < 3 or not vdata.get("enough_material", True):
+    if len(descs) < 4 or not vdata.get("enough_material", True):
         raise RuntimeError("Mini topic: not enough usable on-subject material - try another topic.")
     log(status_cb, f"Mini topic: {len(descs)}/{len(pool)} clips usable.")
 

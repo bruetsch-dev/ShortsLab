@@ -39,6 +39,7 @@ Public entry points (all real, no stubs):
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import hashlib
 import json
 import math
@@ -52,6 +53,7 @@ from typing import Optional
 
 import clip_scraper                      # V1 primitives (no cycle: clip_scraper never imports us)
 import pipeline                          # shared render/cadence helpers; pipeline does not import scrape_v2
+import reasoning_modes                   # model capability table (vision vs text-only)
 
 try:
     import cv2
@@ -69,8 +71,9 @@ except Exception:                        # pragma: no cover
 # ---------------------------------------------------------------- versioning + config
 
 PROXY_FETCH_WORKERS = 6   # proxy downloads are network wait; see _download_and_segment
-V2_ANALYSIS_VERSION = 3   # v3 judges the CUT WINDOW, not the whole upload; older
-                          # caches hold whole-clip caption verdicts and must not be reused
+V2_ANALYSIS_VERSION = 5   # v5 adds search-context vocabulary plus an explicit footage-vs-caption
+                          # contract, so older generic/over-restrictive descriptions are never
+                          # reused to reject visually correct clips during a resumed test run
 
 # A beat that clears no floor does not go blank - it replays a neighbour's clip. Below
 # this score a segment really is unrelated and a repeat is the lesser evil; above it, the
@@ -85,19 +88,30 @@ SCRAPE_V2_CONFIG = {
     # ...but 36 is a cap for a short script. A 14-beat fact short splitting it FIFO gave the
     # first two beats everything and the other twelve nothing, so the pool scales with the
     # beat count and every beat is guaranteed this many downloads of its own.
-    "min_downloads_per_scene": 3,
+    # Three downloads per chapter sounds reasonable on paper, but one dead URL plus one intro/
+    # slideshow leaves a chapter with a single real option.  The hand-made edits that consistently
+    # beat the automated run inspect several uploads before choosing a shot.  Give every chapter a
+    # six-source first-look pool; this is still bounded and the search stops once it has real choice.
+    "min_downloads_per_scene": 6,
+    "min_distinct_matches_per_scene": 3,
     "max_final_segments": 90,
-    "max_queries_per_bucket": 30,
-    "max_queries_per_scene_retry": 8,
+    "max_queries_per_bucket": 12,
+    # Manual sourcing consistently wins with three deliberate searches: native object, native
+    # action, then one English discovery phrase.  Large per-scene query trees drift into vibes and
+    # spend minutes re-sorting the same weak neighbourhood.
+    "max_initial_queries_per_chapter": 3,
+    "max_queries_per_scene_retry": 6,
     "max_bucket_time_seconds": 300,
     # STRICT no-reuse needs one UNIQUE source per scene, so the search must keep trying more
     # terms/queries - the user explicitly allowed longer runs to avoid ever reusing a clip.
     "max_total_scrape_time_seconds": 1800,
     "vision_batch_size": 8,
     "max_segments_per_source": 3,
-    "target_segment_seconds": 3.8,
+    # Visual chapters are intentionally longer than narration micro-beats.  Search for a coherent
+    # phone-video action that can hold the thought instead of forcing a fresh filler every 2s.
+    "target_segment_seconds": 6.5,
     "min_segment_seconds": 2.2,
-    "max_segment_seconds": 5.5,
+    "max_segment_seconds": 8.5,
     "proxy_max_height": 720,
     "proxy_max_filesize_mb": 60,
     # assignment diversity / reuse caps
@@ -497,7 +511,9 @@ def _vision_json(prompt_text, sheet_path, max_tokens=4000, temperature=0.1, reas
     ac = _ac()
     try:
         data = ac.post_json_url(ac.WAVESPEED_LLM_API, {
-            "model": reasoning_model or ac.GPT55_MODEL,
+            # A text-only pick (DeepSeek) would answer this from imagination, so every clip
+            # judgement would be a hallucination; route just the vision call to a model that sees.
+            "model": reasoning_modes.vision_model_for(reasoning_model or ac.GPT55_MODEL),
             "messages": [
                 {"role": "system", "content": "You describe short-form video segments precisely and "
                  "return STRICT JSON only."},
@@ -616,7 +632,15 @@ def _relationship_scene_seeds_v2(intent: VisualIntent):
         "girlfriend", "boyfriend", "couple", "dating", "date", "romance", "romantic",
         "confession", "kokuhaku", "hold hands", "relationship", "classmates", "恋", "告白",
     )
-    if not any(marker in text for marker in relationship_markers):
+    def _has_marker(marker):
+        # Word boundaries matter for short English markers: "dates and locations" in a card-
+        # collecting script is not a dating scene. Native text and multi-word actions still use
+        # direct containment because Japanese does not have whitespace word boundaries.
+        if re.fullmatch(r"[a-z ]+", marker):
+            return bool(re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", text))
+        return marker in text
+
+    if not any(_has_marker(marker) for marker in relationship_markers):
         return []
     if (("hand" in text and any(marker in text for marker in ("hold", "holding", "holds", "held", "interlock")))
             or "interlocking" in text or "hands in public" in text):
@@ -674,12 +698,17 @@ def queries_for_intent(intent: VisualIntent):
 
     def add_direct(values, language, tier, subject, action, location, platforms=None):
         for raw in values or []:
+            native = language == "ja" or _contains_japanese(raw)
             direct.append(SearchQueryV2(
                 query=raw, language=language, tier=tier, visual_intent_id=intent.intent_id,
                 scene_ids=[intent.scene_id], query_type=tier,
                 generated_from="scene_visual_intent",
                 reason=f"{subject} / {action} / {location}".strip(" /"),
-                expected_subject=subject, expected_action=action, expected_location=location,
+                # Native captions cannot overlap the Architect's English subject/action labels.
+                # Bind metadata ranking to the executable native phrase itself; vision still makes
+                # the later semantic decision against the full English intent.
+                expected_subject=(raw if native else subject),
+                expected_action=(raw if native else action), expected_location=location,
                 negative_terms=list(intent.avoid_elements or []), platforms=list(platforms or [])))
 
     def add_platform_plan(plan, subject, action, location, tier):
@@ -745,12 +774,12 @@ def queries_for_intent(intent: VisualIntent):
     if not direct:
         add_direct(_clean_english_queries(intent.english_queries), "en", primary_tier,
                    intent.subject, intent.action, intent.location)
-        add_direct(_clean_japanese_queries(intent.japanese_queries), "ja", primary_tier,
+        add_direct([_cap_tokens(query, 2) for query in _clean_japanese_queries(intent.japanese_queries)], "ja", primary_tier,
                    intent.subject, intent.action, intent.location)
         for alt in (intent.alternative_visuals or [])[:3]:
             add_direct(_clean_english_queries(alt.english_queries, 2), "en", "semantic_action",
                        alt.subject, alt.action, alt.location)
-            add_direct(_clean_japanese_queries(alt.japanese_queries, 2), "ja", "semantic_action",
+            add_direct([_cap_tokens(query, 2) for query in _clean_japanese_queries(alt.japanese_queries, 2)], "ja", "semantic_action",
                        alt.subject, alt.action, alt.location)
     if direct:
         out, seen = [], set()
@@ -849,6 +878,8 @@ def _intent_text(intent):
         intent.scene_text, intent.subject, intent.action, intent.location,
         intent.story_subject, intent.local_claim, " ".join(intent.required_elements or []),
         " ".join(intent.optional_elements or []),
+        getattr(intent, "jp_subject", ""), getattr(intent, "jp_action", ""),
+        getattr(intent, "jp_location", ""),
     )).casefold()
 
 
@@ -861,7 +892,13 @@ def validate_query_against_intent(query, intent):
     normalized = sanitize_platform_query(query.query)
     if not normalized:
         return False, "empty after normalization", normalized
-    if query.tier != "hashtag" and len(normalized.split()) < 2:
+    # Japanese compounds/hashtags such as 終電難民, 路上寝 or 飲みニケーション are complete,
+    # highly specific uploader language even though whitespace tokenisation calls them one word.
+    if (query.tier != "hashtag" and len(normalized.split()) < 2
+            and not _contains_japanese(normalized)):
+        return False, "too general for a scene-bound search", normalized
+    if (_contains_japanese(normalized) and len(normalized.split()) < 2
+            and any(marker in normalized for marker in ("公園", "駅", "街", "通り", "市", "区"))):
         return False, "too general for a scene-bound search", normalized
     intent_text = _intent_text(intent)
     query_text = normalized.casefold()
@@ -870,11 +907,22 @@ def validate_query_against_intent(query, intent):
         has_intent_concept = any(marker in intent_text for marker in markers)
         if has_query_concept and not has_intent_concept:
             return False, f"unrelated {concept} concept", normalized
+    if not _contains_japanese(normalized):
+        # English is the expat/viral discovery lane, but it still has to name one tangible part of
+        # this chapter. This keeps useful queries such as "Japan manhole card collector" while
+        # refusing drift such as "regional Japanese" that contains only a country adjective.
+        generic_context = {"japan", "japanese", "tokyo", "osaka", "kyoto", "viral", "tiktok"}
+        query_anchors = _tokens(normalized) - generic_context
+        intent_anchors = _tokens(" ".join((
+            intent.subject or "", intent.action or "", intent.location or "",
+            intent.story_subject or "", intent.local_claim or "", intent.scene_text or "")))
+        if not (query_anchors & intent_anchors):
+            return False, "English query has no tangible scene anchor", normalized
     return True, "", normalized
 
 
 def build_scene_bound_query_plan(intents, project_dir, script_text, use_influencer_hook=False,
-                                 status_cb=None):
+                                 status_cb=None, active_platforms=None):
     """Create, validate, and persist a fresh search plan for this exact script.
 
     V2 never reads a saved planner result. The persisted audit is diagnostic
@@ -883,28 +931,27 @@ def build_scene_bound_query_plan(intents, project_dir, script_text, use_influenc
     """
     script_hash = hashlib.sha256((script_text or "").strip().encode("utf-8")).hexdigest()
     by_scene, accepted, rejected = {}, [], []
+    active = ({_canonical_platform(value) for value in (active_platforms or [])}
+              if active_platforms is not None else None)
     for intent in intents:
         needs_japanese_context = requires_japanese_context(intent, script_text)
         scene_queries = []
         for query in queries_for_intent(intent):
-            # Do not use an English person-search as a rescue path for a Japan-specific story.
-            # It was the direct source of Western/generic creator footage in the Bangs run.
-            #
-            # Judge the TEXT, not the label. The language field is set by whichever producer
-            # built the query, and several of them get it wrong - the Architect files native
-            # strings under its "english" array, so 渋谷 イルミネーション, 代々木公園 and
-            # 新宿駅 arrived tagged "en". On the tokyo project that discarded 62 perfectly
-            # native queries before a single search ran. Labelling this at each producer was
-            # tried first and missed most of them; there is one gate, so the check belongs
-            # here.
-            if (needs_japanese_context and query.language not in ("ja", "hashtag")
-                    and not _contains_japanese(query.query)):
+            query_platforms = {_canonical_platform(value) for value in (query.platforms or [])}
+            if active is not None and query_platforms and not (query_platforms & active):
                 rejected.append({
                     "text": query.query, "scene_ids": [intent.scene_id],
                     "visual_intent_id": intent.intent_id,
-                    "reason": "Japanese-context scene requires a native Japanese query",
+                    "reason": "query platform is not enabled for this run",
                 })
                 continue
+            if active is not None:
+                # A query may advertise several backends. Preserve only the ones the user
+                # selected so an X/Instagram lane can never consume a TikTok-only budget.
+                query.platforms = sorted(query_platforms & active) if query_platforms else sorted(active)
+            # Keep the English expat/viral lane. Japan provenance is enforced on every returned
+            # source below, so an English query can discover English-captioned footage explicitly
+            # tagged Japan/Tokyo without opening the door to generic Western creators.
             ok, reason, normalized = validate_query_against_intent(query, intent)
             if not ok:
                 rejected.append({
@@ -916,8 +963,91 @@ def build_scene_bound_query_plan(intents, project_dir, script_text, use_influenc
             query.scene_ids = [intent.scene_id]
             query.requires_japanese_context = needs_japanese_context
             scene_queries.append(query)
-            accepted.append(query)
-        by_scene[intent.scene_id] = scene_queries
+
+        # Guarantee the dual discovery lane even when the Architect emits an empty or abstract
+        # English phrase.  Build a compact fallback from the tangible visible subject, never from
+        # the whole narration sentence ("regional Japanese" was the useless real-run example).
+        has_tangible_english = any(
+            not _contains_japanese(query.query) and query.language not in ("ja", "hashtag")
+            for query in scene_queries)
+        if not has_tangible_english and (active is None or "tiktok" in active):
+            subject_words = [word for word in re.findall(
+                r"[A-Za-z0-9]+", str(intent.subject or intent.story_subject or ""))
+                if len(word) >= 3 and word.casefold() not in _EN_STOP]
+            subject_words = subject_words[:3]
+            if subject_words:
+                fallback_text = "Japan " + " ".join(subject_words)
+                fallback = SearchQueryV2(
+                    query=fallback_text, language="en", tier="semantic_action",
+                    visual_intent_id=intent.intent_id, scene_ids=[intent.scene_id],
+                    query_type="english_subject_fallback",
+                    generated_from="deterministic_dual_lane",
+                    reason="English expat/viral fallback from the chapter's tangible subject",
+                    expected_subject=intent.subject or intent.story_subject or "",
+                    expected_action=intent.action or "", expected_location="Japan",
+                    platforms=["tiktok"], requires_japanese_context=needs_japanese_context)
+                ok, reason, normalized = validate_query_against_intent(fallback, intent)
+                if ok:
+                    fallback.query = normalized
+                    scene_queries.append(fallback)
+                else:
+                    rejected.append({
+                        "text": fallback_text, "scene_ids": [intent.scene_id],
+                        "visual_intent_id": intent.intent_id, "reason": reason,
+                    })
+
+        # Deliberate discovery lanes per visual chapter. Disabled platforms have already been
+        # removed above, so TikTok-only runs spend every slot on TikTok instead of silently
+        # sacrificing one third of their search budget to X/Instagram queries that cannot run.
+        def _priority(item):
+            platforms = {_canonical_platform(value) for value in (item.platforms or [])}
+            native = item.language == "ja" or _contains_japanese(item.query)
+            if "tiktok" in platforms and native:
+                lane = 0
+            elif "tiktok" in platforms:
+                lane = 1
+            elif native:
+                lane = 2
+            else:
+                lane = 3
+            tier = V2_QUERY_TIERS.index(item.tier) if item.tier in V2_QUERY_TIERS else 9
+            return lane, tier
+
+        budget = max(1, int(SCRAPE_V2_CONFIG.get("max_initial_queries_per_chapter", 3)))
+        selected, selected_keys = [], set()
+        ranked = sorted(scene_queries, key=_priority)
+        # The successful hand searches use native TikTok twice (bare object, then visible use)
+        # and English once. X/Instagram are fallbacks, not a mandatory third dead-end search.
+        # If one lane is unavailable, the later fill loop still uses the strongest remaining one.
+        for wanted_lane, lane_slots in ((0, 2), (1, 1), (2, 1)):
+            for query in ranked:
+                if lane_slots <= 0 or len(selected) >= budget:
+                    break
+                key = _query_identity(query)
+                if key in selected_keys or _priority(query)[0] != wanted_lane:
+                    continue
+                selected_keys.add(key)
+                selected.append(query)
+                lane_slots -= 1
+            if len(selected) >= budget:
+                break
+        for query in ranked:
+            if len(selected) >= budget:
+                break
+            key = _query_identity(query)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            selected.append(query)
+        for query in scene_queries:
+            if query not in selected:
+                rejected.append({
+                    "text": query.query, "scene_ids": [intent.scene_id],
+                    "visual_intent_id": intent.intent_id,
+                    "reason": "chapter query budget: lower-priority discovery variant",
+                })
+        by_scene[intent.scene_id] = selected
+        accepted.extend(selected)
 
     coverage = {
         str(scene_id): len(queries)
@@ -989,7 +1119,7 @@ def has_japanese_source_signal(meta: dict) -> bool:
         str(meta.get("author") or ""), str(meta.get("author_name") or ""),
         str(meta.get("location") or ""),
     ])
-    return _contains_japanese(blob)
+    return is_japan_context(blob)
 
 
 def requires_japanese_context(intent: VisualIntent, script_text: str = "") -> bool:
@@ -1103,6 +1233,46 @@ def rank_metadata_candidates_v2(candidates, query: SearchQueryV2, platform_count
         out.append(c)
     out.sort(key=lambda x: x.rank_score, reverse=True)
     return out
+
+
+def interleave_ranked_sources_by_scene(candidates):
+    """Preserve relevance order while giving every searched chapter a download slot.
+
+    A global sort can spend a 12-download coverage budget on one high-like query even though the
+    batch intentionally searched four different chapters. Manual sourcing always inspects a few
+    results from *each* query. This round-robin reproduces that behaviour without weakening the
+    per-query relevance ranking; candidates shared by merged queries are assigned to the least-fed
+    scene and every source still appears exactly once.
+    """
+    rows = list(candidates or [])
+    if len(rows) < 2:
+        return rows
+    buckets = {}
+    unscoped = []
+    for row in rows:
+        scene_ids = list(dict.fromkeys(getattr(row, "scene_ids", None) or []))
+        if not scene_ids:
+            unscoped.append(row)
+            continue
+        chosen = min(scene_ids, key=lambda sid: len(buckets.get(sid, [])))
+        buckets.setdefault(chosen, []).append(row)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda item: float(getattr(item, "rank_score", 0.0) or 0.0), reverse=True)
+    ordered = []
+    scene_order = sorted(buckets)
+    depth = 0
+    while True:
+        added = False
+        for scene_id in scene_order:
+            bucket = buckets[scene_id]
+            if depth < len(bucket):
+                ordered.append(bucket[depth])
+                added = True
+        if not added:
+            break
+        depth += 1
+    unscoped.sort(key=lambda item: float(getattr(item, "rank_score", 0.0) or 0.0), reverse=True)
+    return ordered + unscoped
 
 
 # ---------------------------------------------------------------- planner (LLM)
@@ -1279,7 +1449,9 @@ def _clean_english_queries(values, limit=4):
 
 def _clean_japanese_queries(values, limit=4):
     """Enforce raw native Japanese strings: no Romaji, translations or annotations can leak.
-    BROAD-DISCOVERY CAP: hard-trimmed to the first 2 tokens (what a real user types)."""
+    Keep compact event phrases intact here; callers that use the broad generic lane apply their
+    stricter two-token cap separately. This preserves a visible Japanese action such as
+    ``路上 酔っ払い 寝てる`` rather than silently turning it into generic street footage."""
     out = []
     for value in values if isinstance(values, list) else []:
         query = sanitize_platform_query(value)
@@ -1289,7 +1461,7 @@ def _clean_japanese_queries(values, limit=4):
             continue
         if not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]", query):
             continue
-        query = " ".join(query.split()[:2])
+        query = " ".join(query.split()[:4])
         if query not in out:
             out.append(query)
         if len(out) >= limit:
@@ -1373,6 +1545,36 @@ def _normalize_platform_query_plan(raw):
     return plan
 
 
+def _architect_primary_query_plan(row):
+    """Put the human-editor searches ahead of optional platform variants.
+
+    The action phrase deliberately precedes the bare noun. A live karaoke regression showed
+    why: ``個室カラオケ`` returned caption-adjacent stages, shops and unrelated creators, while
+    ``カラオケ 歌ってみた`` immediately returned people singing inside karaoke rooms. Round zero
+    executes only the first phrase, so putting the noun first effectively discarded the useful
+    query until a much later recovery round.
+    """
+    row = row if isinstance(row, dict) else {}
+    plan = _normalize_platform_query_plan(row.get("platform_queries"))
+    tiktok = dict(plan.get("tiktok") or {})
+    native = (_clean_japanese_queries([row.get("native_action_query")], 1)
+              + _clean_japanese_queries([row.get("native_object_query")], 1))
+    english = _clean_english_queries([row.get("english_discovery_query")], 1)
+    for key, primary in (("japanese", native), ("english", english)):
+        existing = list(tiktok.get(key) or [])
+        merged, seen = [], set()
+        for value in primary + existing:
+            identity = str(value).casefold()
+            if identity and identity not in seen:
+                seen.add(identity)
+                merged.append(value)
+        if merged:
+            tiktok[key] = merged
+    if tiktok:
+        plan["tiktok"] = tiktok
+    return plan
+
+
 def build_viral_search_plan_v2(title, script, scenes, understanding=None, reasoning_model=None,
                                 status_cb=None):
     """Architect Agent: tangible viral B-roll concepts + raw EN/JA platform search strings."""
@@ -1392,8 +1594,53 @@ For every scene choose exactly one visual_match_category:
 
 Examples: "no free time" -> student asleep at desk or massive textbook pile. "strict discipline"
 -> perfectly synchronized drill. "romance banned" -> awkward teenage couple or teacher intervening.
-Create one primary phone-filmable situation and TWO genuinely different alternatives. Each needs a
-visible subject, visible action and plausible location.
+Create one central phone-filmable TOPIC ANCHOR and TWO genuinely different coverage shots. Each
+needs a visible subject, visible action and plausible location. A scene can contain several
+sentences and actions. In that case, do not compress the entire chapter into one rare micro-action.
+Use `subject` and `action` for the common, unmistakable activity at the heart of the chapter, and
+put 2-4 separately filmable proof shots in `required_elements`. Example: a karaoke chapter about
+ordering food, trading songs and a sleeping friend should use the central activity "friends singing
+inside a private karaoke room" and coverage elements such as "person singing with microphone",
+"friends seated in karaoke room", "food on karaoke table", "person asleep on sofa". It must NOT
+make "presses room-phone buttons" the sole intent merely because that detail appeared first.
+
+SEARCH THE EVENT, NOT AN ADJECTIVE. If narration requires a person doing something, never reduce
+it to clothing + a state such as "dirty suit", "morning suit" or "tired student". Those searches
+mostly return fashion shops, cleaning advice and portraits. Use the native incident/action people
+actually caption instead: passed-out-on-the-street slang, missing-the-last-train language, pouring
+beer for a boss, waking up outside, or the equivalent concrete event for this scene. Include the
+person class only when it narrows that event; the verb/incident must remain in the query.
+
+BUILD A SEARCH LADDER, NOT FOUR SYNONYMS. The executable terms for every scene must cover four
+different ways real uploaders would expose the SAME visible claim:
+1. EXACT ANCHOR - the indispensable object/place by its native name.
+2. VISIBLE USE - that anchor plus the hand/person action the narration requires.
+3. NATIVE POST LANGUAGE - the compact colloquial phrase, review term, product name or あるある
+   phrase a local uploader would actually put in the caption.
+4. EVIDENCE ALTERNATIVE - a different filmable shot that proves the same local claim or human
+   consequence, without merely sharing a broad word.
+Do not fill this ladder with translations or near-identical variants. A query is useful only if
+its likely result page could visibly contain a required element. For example, a restaurant handbag
+basket needs terms for 荷物かご / バッグ置き / the act of placing a bag beneath a restaurant chair;
+"container", "restaurant vlog" and "Japan dining" are not recovery queries. A toilet-tank sink
+needs 手洗い付きトイレ / tank handwashing or visible water reuse; generic toilet tours are not proof.
+
+For the PRIMARY situation, also return three dedicated search strings. They are not prose:
+- native_object_query: the exact native name of the tangible object/place, optionally one context
+  word. It must work as a bare TikTok search.
+- native_action_query: that same native anchor plus the visible use/action OR the compact phrase
+  real uploaders use for filming themselves doing it (for example カラオケ 歌ってみた,
+  カラオケ 女子会, カラオケ 飯). This is the FIRST query the scraper executes. Prefer a populated
+  native content neighbourhood over a technically exact phrase nobody captions.
+- english_discovery_query: a compact 2-3 word English discovery fallback.
+These fields are mandatory and must describe the same local claim. Never substitute a mood,
+country-wide theme or generic creator type for the named object/action.
+
+SEARCH LIKE AN UPLOADER, NOT A DICTIONARY. Bare nouns are only the fallback. The primary TikTok
+query must normally combine the cultural anchor with an uploader-native action, format, group or
+result word such as 歌ってみた, 女子会, 開封, 使ってみた, やってみた, ルーティン, 飯, 寝落ち,
+あるある. Do not search an incidental prop (telephone, button, receipt) when the narration's
+central activity has a much richer native result neighbourhood.
 
 SEARCH THE REMARKABLE VERSION OF THE THING. Native platforms are full of footage of any
 subject; almost all of it is a shopfront, a street or someone walking past. What gets
@@ -1467,6 +1714,17 @@ Japanese strings must be what local users write, including useful native slang s
 digits or #. No Romaji, English, translation, parentheses, colons, slashes, labels or notes.
 Never translate the full narration sentence. Arrays contain strings only.
 
+SUBJECT/ACTION/LOCATION ARE FACTS THE LENS CAN SEE, NOT SHOT DIRECTION. `subject` names the
+thing or person, `action` names what it visibly does, `location` names where it is. No camera
+words (close-up, macro, cross-section, slow motion, aerial, POV), no quality adjectives
+(high-end, premium, perfect, fluffy, beautiful, satisfying), no editing terms. Those belong in
+camera_style and mood, and nowhere else. This is not cosmetic: the matcher has to confirm
+subject and action as VISIBLE EVIDENCE in the footage, so "Close-up of the fluffy texture and
+perfect cross-section" is unconfirmable by construction and scores every real clip at zero.
+Measured on one konbini run: the same 53 segments matched 0 of 4 beats written that way and 2
+of 4 when the same beats read "packaged sandwiches / a hand taking a pack from the chiller".
+Write what is in front of the camera, and let the camera fields describe the camera.
+
 Scenes:
 {{numbered}}
 
@@ -1475,6 +1733,8 @@ Return exactly:
 "visual_match_category":"literal|vibe|shock","communication_role":"proof|demonstration|human_consequence|emotion|pattern_interrupt",
 "story_subject":"recurring subject of full script","local_claim":"claim of this scene",
 "subject":"...","action":"...","location":"...",
+"native_object_query":"native object/place search","native_action_query":"native use/action search",
+"english_discovery_query":"2-3 word fallback",
 "camera_style":"pov|handheld|vlog|static|walking","mood":"...",
 "required_elements":["..."],"optional_elements":["..."],"avoid_elements":["..."],
 "platform_queries":{{"tiktok":{{"japanese":["日本語検索"],"english":["raw phrase"]}},
@@ -1556,7 +1816,7 @@ Return exactly:
             avoid_elements=list(row.get("avoid_elements") or []), alternative_visuals=alternatives,
             english_queries=_clean_english_queries(row.get("english_queries")),
             japanese_queries=_clean_japanese_queries(row.get("japanese_queries")),
-            platform_queries=_normalize_platform_query_plan(row.get("platform_queries"))))
+            platform_queries=_architect_primary_query_plan(row)))
     missing = [sid for sid in range(len(scenes)) if sid not in seen]
     if missing:
         _log(status_cb, f"Scrape V2 Architect omitted {len(missing)} scene(s); using the legacy visual "
@@ -1683,14 +1943,21 @@ def _candidate_windows(duration, cuts, cfg):
                     continue
         if end - start >= mn:
             windows.append((round(start, 2), round(min(end, start + mx), 2)))
-    # de-overlap
+    # Sample across the WHOLE upload. Returning the first three windows looked neutral but meant a
+    # long TikTok was only inspected near its opening/middle and the end was never seen. Candidate
+    # windows are alternatives (only one source window can ship), so slight overlap is harmless and
+    # must not delete an entire probe region before vision has inspected it.
     windows.sort()
-    merged = []
-    for w in windows:
-        if merged and w[0] < merged[-1][1] - 0.3:
-            continue
-        merged.append(w)
-    return merged[:int(cfg["max_segments_per_source"])]
+    merged = list(dict.fromkeys(windows))
+    cap = max(1, int(cfg["max_segments_per_source"]))
+    if len(merged) <= cap:
+        return merged
+    if cap == 1:
+        return [merged[len(merged) // 2]]
+    # When more windows exist than we can afford, skip the opening-biased first region and spread
+    # the budget from the next region through the end (for five regions/cap three: 20%, 50%, 90%).
+    indexes = [1 + int(i * (len(merged) - 2) / float(cap - 1)) for i in range(cap)]
+    return [merged[index] for index in dict.fromkeys(indexes)]
 
 
 def discover_segments_v2(source: SourceVideoCandidate, proxy_path, ffmpeg, ffprobe, status_cb=None,
@@ -1840,9 +2107,10 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
         vertical_quality = max(0.0, min(10.0, (ratio - 0.9) * 9.0))
         if max(w, h) < clip_scraper.MIN_LONG_SIDE:
             vertical_quality *= 0.5
-    # sample frames within the segment window (offset ffmpeg -ss handled by sampling around mid)
-    frames = clip_scraper._sample_bgr_frames(src, ffmpeg, 5, seconds=seg.end_time, width=480)
-    # keep only frames roughly inside the window by re-sampling at the exact window
+    # Sample once, at the exact window.  The prior implementation first decoded five generic
+    # frames up to ``end_time`` and immediately threw them away, then invoked ffmpeg five more
+    # times for this window.  On resume this turned twelve already-downloaded proxies into
+    # hundreds of pointless ffmpeg launches before the actual search could even start.
     frames = _sample_window_frames(src, ffmpeg, seg.start_time, seg.end_time, n=5)
     if not frames:
         seg.rejection_reasons = ["no_frames"]
@@ -1866,8 +2134,10 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     # a short: 1 of its 92 frames showed any change, it passed every gate, and the opening
     # two seconds read as a photograph. "Not duplicated" is not "moving".
     seg.motion_score = _motion_score(frames)
-    if seg.motion_score < MOTION_DEAD:
-        reasons.append("no_motion")
+    # Motion is an editorial preference, not proof that the file is unusable.  A slow close-up of
+    # the exact object can be the best explanatory insert in the body; the dedicated hook gate still
+    # rejects it at scene 0.  Keep it in the pool and make it lose to moving footage through quality.
+    motion_penalty = 1.4 if seg.motion_score < MOTION_DEAD else 0.0
     cadence_hitches = pipeline.micro_stutter_events(src, seg.start_time, seg.end_time)
     seg.micro_stutter_count = len(cadence_hitches)
     # A hitch is one frame whose motion drops below a quarter of its neighbours'. ONE of
@@ -1877,8 +2147,7 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     # cadence is broken THROUGHOUT: a re-encode with duplicated frames, or a slideshow.
     # That shows up as a rate, not a single event, so the rule is per second of window.
     _window = max(0.5, float(seg.end_time) - float(seg.start_time))
-    if len(cadence_hitches) / _window >= CADENCE_HITCH_RATE:
-        reasons.append("cadence_stutter")
+    cadence_penalty = (1.0 if len(cadence_hitches) / _window >= CADENCE_HITCH_RATE else 0.0)
 
     fv = clip_scraper.detect_fake_vertical_or_black_bars(src, ffmpeg, seconds=seg.end_time)
     black_bar = float(fv.get("black_bar_score", 0.0))
@@ -1895,7 +2164,9 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
             reasons.append("landscape_too_small_to_crop")
 
     # OCR: text load + AI watermark (hard) using the reusable stats
-    areas, lines, texts = _ocr_window(src, ffmpeg, seg.start_time, seg.end_time)
+    # OCR can use the exact visual samples we already paid to decode.  It does not need to spin
+    # up another four ffmpeg processes for the same 3–8 second window.
+    areas, lines, texts = _ocr_window(src, ffmpeg, seg.start_time, seg.end_time, frames=frames)
     text_heaviness_ocr = clip_scraper._score_from_ocr(areas, lines)
     if any(clip_scraper._AI_WATERMARK_RE.search(t) for t in texts):
         reasons.append("ai_watermark")
@@ -1917,24 +2188,34 @@ def analyze_segment_v2(seg: SegmentCandidate, ffmpeg, ffprobe, status_cb=None):
     # footage cuts about that often, so the rule demanded a continuous take that most
     # uploads simply do not contain. One inherited cut inside a beat reads as pace; two
     # inside four seconds is someone else's edit showing through.
+    rapid_cut_penalty = 0.0
     if stab.get("cuts_unknown"):
         # Not a rejection: throwing away good footage because ffmpeg hiccupped is worse
         # than keeping a clip that might carry two cuts. But it is recorded, so a run whose
         # cut scans were all failing is visible in the report instead of looking clean.
         seg.cut_scan_failed = True
     elif stab["internal_cut_count"] >= 2:
-        reasons.append("rapid_internal_cuts")
+        # The finalizer searches for a clean sub-window before export.  Rejecting the whole upload
+        # here discarded useful footage elsewhere in the same candidate and was one of the largest
+        # losses in real scrape reports.  Rank it down; final cut QA remains authoritative.
+        rapid_cut_penalty = min(2.0, 0.55 * float(stab["internal_cut_count"]))
 
     text_heaviness = max(text_heaviness_ocr, cap_text_heavy)
+    # Keep the two signals separate. A large subtitle can have the same numeric coverage as a
+    # presentation slide, but only the latter should be rejected; subtitles are removed later.
+    seg.ocr_text_heaviness = round(float(text_heaviness_ocr), 2)
+    seg.caption_text_heaviness = round(float(cap_text_heavy), 2)
     text_cleanliness = max(0.0, 10.0 - text_heaviness * 2.0)
-    clean_frame_score = max(0.0, 10.0 - cap_prob * 8.0)
+    # Burned captions are blurred later.  They should make a clean alternative win a tie, not push
+    # otherwise exact footage below the pre-vision quality floor before semantic matching sees it.
+    clean_frame_score = max(0.0, 10.0 - cap_prob * 2.0)
     resolution_score = max(0.0, min(10.0, (max(w, h) - 400) / 160.0))
-    raw_footage_score = max(0.0, min(10.0, 6.0 + (edit_stability - 5.0) * 0.4 - cap_prob * 3.0))
+    raw_footage_score = max(0.0, min(10.0, 6.0 + (edit_stability - 5.0) * 0.4 - cap_prob * 0.6))
     action_visibility = 6.0    # neutral prior; vision stage refines this
 
     quality = (vertical_quality * 0.15 + raw_footage_score * 0.20 + edit_stability * 0.20
                + clean_frame_score * 0.15 + text_cleanliness * 0.10 + resolution_score * 0.10
-               + action_visibility * 0.10)
+               + action_visibility * 0.10 - motion_penalty - cadence_penalty - rapid_cut_penalty)
 
     seg.quality_score = round(quality, 2)
     seg.raw_footage_score = round(raw_footage_score, 2)
@@ -2014,11 +2295,11 @@ def _sample_window_frames(path, ffmpeg, start, end, n=5):
     return frames
 
 
-def _ocr_window(path, ffmpeg, start, end):
+def _ocr_window(path, ffmpeg, start, end, frames=None):
     """OCR frames inside the window; returns (areas, lines, texts) like clip_scraper._ocr_frame_stats."""
     if cv2 is None or np is None:
         return [], [], []
-    frames = _sample_window_frames(path, ffmpeg, start, end, n=4)
+    frames = list(frames or []) or _sample_window_frames(path, ffmpeg, start, end, n=4)
     ocr = clip_scraper._get_ocr()
     if not frames or ocr is None:
         return [], [], []
@@ -2193,6 +2474,9 @@ def describe_segments_v2(segments, project_dir, ffmpeg, reasoning_model=None, st
             title="Each tile = frames across ONE segment (seg_00, seg_01, ...)")
         if not sheet:
             continue
+        search_context = "\n".join(
+            f'seg_{idx:02d}: search context="{str(seg.query or "")[:80]}"'
+            for idx, (seg, _strip) in enumerate(strips))
         prompt = (
             "Describe each numbered segment tile (seg_00, seg_01, ...); each tile is a few "
             "frames sampled across ONE candidate CUT - the exact window that would be used.\n"
@@ -2203,6 +2487,26 @@ def describe_segments_v2(segments, project_dir, ffmpeg, reasoning_model=None, st
             "when text is on screen IN THESE FRAMES. Japanese creators caption their "
             "openings by convention, so judging whole uploads threw away nearly every "
             "usable Japanese result even when the middle of the video was clean.\n"
+            "`usable` means there is recognizable real footage in the sampled window. Burned-in "
+            "captions, subtitles, a username or other removable text NEVER make an otherwise real "
+            "shot unusable; the editor blurs glyphs later. Set usable=false only for slides, screen "
+            "recordings/web pages, severe corruption, an unrecognizable frame, or content with no "
+            "usable live-action/real-world picture.\n"
+            "creator_overlay means a SEPARATE inset window of the person filming reacting to "
+            "the footage - a picture-in-picture head, a circular face bubble, a green-screen "
+            "commentator pasted over the shot. A person simply being in the scene, filming "
+            "themselves, talking to camera or holding the phone is NOT an overlay. This flag "
+            "rejects the clip outright, and left undefined it was set on a quarter of an "
+            "ordinary Japanese pool - every clip that merely had a face in it.\n"
+            "NAME THE SPECIFIC VISIBLE THING. Do not collapse an identifiable cultural object "
+            "into a generic category: a card visibly showing a decorated manhole and/or a sign "
+            "reading マンホールカード is a manhole card, not merely an 'illustrated card'; a "
+            "decorated utility cover embedded in pavement is a decorated manhole cover, not merely "
+            "a 'circular plaque'. The search context below is a CLUE for vocabulary, never proof: "
+            "use the specific name only when the frames themselves support it through shape, "
+            "setting, printed imagery or readable text. If the picture contradicts the query, "
+            "describe the picture and ignore the query.\n\n"
+            "SEARCH CONTEXT BY TILE:\n" + search_context + "\n\n"
             "Return STRICT JSON keyed by index.\n"
             'For each: {"subjects":[".."],"subject_count":int,"action":"..","location":"..",'
             '"camera_style":"..","shot_size":"..","motion":"low|moderate|high","visible_text":"..",'
@@ -2312,8 +2616,13 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         return "missing source query/provenance"
     desc = seg.visual_description or {}
     age = str(desc.get("age_confidence") or "").casefold()
-    if age in {"child", "minor", "teen", "underage"}:
-        return "minor or uncertain-age creator footage"
+    if age in {"child", "minor", "underage"}:
+        return "child footage"
+    if bool(desc.get("sexualized_content")):
+        return "sexualized creator footage"
+    # Non-sexualized school/festival/lifestyle footage is legitimate factual B-roll. The former
+    # blanket teen veto made scripts about Japanese students incapable of using the actual subject
+    # and forced them into generic adults, empty streets or filler.
     _sid = getattr(intent, "scene_id", None) if intent is not None else None
     # Only judge motion on a segment that was actually measured. analyze_segment_v2 fills
     # source_width, so an unset width means nobody looked - a library clip reused without a
@@ -2330,6 +2639,10 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         # A picture-in-picture of the creator reacting cannot be blurred away - it IS the
         # shot.
         return "creator reaction overlay"
+    if desc.get("usable") is False:
+        # Stage-A is explicitly instructed that captions alone remain usable. This catches actual
+        # slides, browser recordings, corrupt/unrecognizable frames and other non-footage.
+        return "vision found no usable real footage"
     if bool(desc.get("burned_captions")):
         # Captions do not reject anything any more (user: "Untertitel sind egal").
         #
@@ -2339,10 +2652,11 @@ def editorial_rejection_reason(seg: SegmentCandidate, intent: Optional[VisualInt
         # someone else's caption in the corner. The blur still runs, so the text is removed
         # wherever the glyph pass can find it; when it cannot, the clip is used as it is.
         _captions_are_removable(seg)
-    if float(seg.text_heaviness or 0) >= 4.5:
-        # Raised from 2.5, and this half of the change survived the audit: text_heaviness is
-        # max(OCR area, CV bright-blob score) and the CV half generates false positives on
-        # ordinary bright detail, so the old bar rejected clean footage.
+    # Only OCR-heavy material that vision did NOT identify as burned captions is slide-like.
+    # The former max(OCR, caption detector) gate contradicted the caption policy above and threw
+    # away precisely the native TikToks the glyph blur is designed to recover.
+    if (float(getattr(seg, "ocr_text_heaviness", seg.text_heaviness) or 0) >= 4.5
+            and not bool(desc.get("burned_captions"))):
         return "text-heavy footage (a slide, not footage)"
     if intent is not None and requires_japanese_context(intent):
         if not seg.japanese_context:
@@ -2385,19 +2699,26 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         seg_lines.append(
             f'seg {i} (id={s.segment_id}): subjects={d.get("subjects")}, action="{d.get("action")}", '
             f'location="{d.get("location")}", camera={d.get("camera_style")}, motion={d.get("motion")}, '
-            f'usable={d.get("usable")}, eligible_scenes={s.scene_ids or "all"}')
+            f'usable={d.get("usable")}, found_for_scene={s.scene_ids or "any"}')
     intent_lines = []
     for it in intents:
         intent_lines.append(
             f'scene {it.scene_id} [{it.visual_type}/{str(getattr(it, "match_category", "") or "vibe")}]: '
+            f'multi_shot_chapter={bool(getattr(it, "allows_partial_coverage", False))}; '
             f'whole-story subject="{it.story_subject}", local claim="{it.local_claim}", '
             f'subject="{it.subject}", action="{it.action}", '
-            f'location="{it.location}", mood="{it.mood}", avoid={it.avoid_elements}; text="{it.scene_text[:80]}"')
+            f'location="{it.location}", mood="{it.mood}", '
+            f'required visible elements={it.required_elements}, avoid={it.avoid_elements}; '
+            f'text="{it.scene_text[:180]}"')
     prompt = (
-        "You match short video SEGMENTS to narration SCENES for a found-footage short. For EACH scene, "
+        "You match short video SEGMENTS to narration SCENES for a found-footage short, and you "
+        "report evidence rather than verdicts: the editor applies its own acceptance thresholds "
+        "to your numbers, so a blanket \"reject by default\" simply leaves beats blank. For EACH "
+        "scene, "
         "pick the best-fitting segments and score the fit. A segment fits when its subject/action/"
-        "location genuinely support the scene's visible intent. A segment with eligible_scenes may ONLY "
-        "be returned for one of those scene numbers. Fragments/abstract scenes accept a "
+        "location genuinely support the scene's visible intent. `found_for_scene` only records which "
+        "search turned the segment up; consider EVERY segment for EVERY scene, because a clip found "
+        "while searching one beat is often the best picture for another. Fragments/abstract scenes accept a "
         "topically coherent segment; for those, a topically related Japanese slice-of-life segment is "
         "a VALID candidate (score it honestly rather than returning nothing). Scenes tagged /shock "
         "want the visual PUNCHLINE: absurd, exaggerated, cringe/awkward/fail or meme-like footage, "
@@ -2415,6 +2736,44 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         "connection caps script_match at 3. Tutorials, product demos, anime/avatar/cartoon "
         "footage, gaming overlays and comedy face-filters cap script_match at 2 unless the "
         "sentence is literally about that thing.\n\n"
+        "IGNORE SHOT DIRECTION IN THE SCENE: a scene's subject/action may contain camera or "
+        "quality words (close-up, macro, cross-section, slow motion, high-end, premium, perfect, "
+        "satisfying). They are how the editor would like to FILM it, never something a clip has "
+        "to prove. Judge only the thing and what it does: for \"Close-up of the fluffy texture "
+        "and perfect cross-section\" of an egg sandwich, the requirement is an egg sandwich on "
+        "screen - any framing. Treating the camera words as required evidence scores correct "
+        "footage at zero.\n"
+        "VISIBLE-EVIDENCE CONTRACT (MANDATORY): use ONLY the supplied subjects/action/location "
+        "description. Never infer an object's purpose, ownership, location or use from its broad "
+        "category. A container is not a restaurant bag basket. A kitchen is not a restaurant. A "
+        "person holding a box is not a customer placing a handbag below a chair. A toilet bowl is "
+        "not a toilet-tank sink or proof of water reuse. A cashier/register is not proof of money "
+        "being placed in a coin tray. Shared words such as container, bag, cash, toilet, Japan or "
+        "restaurant do not establish a match.\n"
+        "For each proposed candidate return `visible_evidence`: short concrete things/actions that "
+        "the description explicitly confirms, `missing_required`: every required scene element not "
+        "explicitly confirmed, and `literal_match`: true only when the central subject AND central "
+        "action are visibly proven. If an indispensable object/action is missing, set literal_match "
+        "false and name it in missing_required - then SCORE THE REST HONESTLY on the full 0-10 "
+        "scale instead of collapsing to a token low number: the right subject in the right place "
+        "doing something adjacent is a 5-6, the right topic with the wrong subject is a 2-3, and "
+        "unrelated footage is a 0-1. Flattening every imperfect clip to 3 destroys the ranking the "
+        "editor needs and leaves beats with no picture at all. If the description is ambiguous, say "
+        "so in missing_required and let the numbers carry the doubt; never invent evidence. "
+        "`covers` may contain only exact scene requirements that "
+        "are directly proven by visible_evidence. For multi_shot_chapter=true, a segment may be a "
+        "literal candidate when it visibly proves ONE named required sub-action/object; list the "
+        "other requirements under missing_required and put the proven sub-action in covers. Missing "
+        "the other shots does not invalidate that segment. Generic setting, clothing, streets, or "
+        "topic atmosphere alone still does not count as partial coverage.\n\n"
+        "CENTRAL ACTION VS DETAIL ATTRIBUTES: a clip can be literal support when it visibly proves "
+        "the central human action even if occupation, relationship, time of day or one wardrobe "
+        "detail cannot be verified from frames. A person lying on a city pavement is valid support "
+        "for narration about a salaryman passed out outside (list 'salaryman/suit' as missing); "
+        "people drinking in an izakaya support an office drinking party (list boss/subordinate as "
+        "missing); a suited commuter walking in the morning supports returning to work (list "
+        "brushing off dust as missing). Score these as useful 5-7 candidates, not unrelated 0-3. "
+        "This never permits a different SUBJECT CLASS: an object cannot stand in for a person.\n\n"
         "MASK SCENES: a visible person wearing a mask, face covering, train mask scene, school mask "
         "scene or masked date is a valid literal/context match for narration about masks becoming "
         "normal, comfort, politeness, or attraction starting above the nose. Do not reject it merely "
@@ -2424,12 +2783,33 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
         "(the actual speaker, customer-service interaction, train announcement setting, or named "
         "cultural practice). Do not accept generic fashion, laughing, walking or unrelated station "
         "clips merely because the narration mentions sound.\n\n"
+        "MULTI-SHOT CHAPTER COVERAGE: a scene may be a complete 6-12 second list item. For every "
+        "candidate, return `covers` containing only the required visible elements or concrete "
+        "sub-actions unmistakably visible in that exact segment. Do not claim that a machine "
+        "exterior covers hands pressing its buttons, or that a finished bowl covers purchasing "
+        "the ticket. The editor uses this to combine overview -> use -> result shots.\n\n"
         "SEGMENTS:\n" + "\n".join(seg_lines) + "\n\nSCENES:\n" + "\n".join(intent_lines) + "\n\n"
         'Return STRICT JSON: {"scenes": {"1": [{"seg": <seg index>, "subject_match":0-10,'
         '"action_match":0-10,"location_match":0-10,"mood_match":0-10,"script_match":0-10,'
-        '"style_match":0-10,"reason":"short"}], "2": [...]}} - keys are the BARE scene numbers '
-        'shown above (digits only, never "scene 1"); list up to 4 candidates per scene, best first.')
-    data = _llm_json([{"role": "system", "content": "You are a precise footage-to-script matcher. JSON only."},
+        '"style_match":0-10,"literal_match":true|false,'
+        '"visible_evidence":["explicitly observed subject/action"],'
+        '"missing_required":["required element not visibly proven"],'
+        '"covers":["exact visible element/action"],"reason":"short factual explanation"}], '
+        '"2": [...]}} - keys are the BARE scene numbers '
+        'shown above (digits only, never "scene 1"); list up to 4 candidates per scene, best first.\n'
+        "COVERAGE (read this last, it overrides any urge to be terse): return your 3 BEST segments "
+        "for EVERY scene, ranked, even when none of them is a good match - a low score is how you "
+        "say \"this is weak\", an omission is not. The editor discards everything under its own "
+        "threshold, so an imperfect candidate costs nothing while a missing one leaves that beat "
+        "with no picture at all. Judged against 29 real segments this instruction was the "
+        "difference between 4 candidates and full coverage. Only return an empty list for a scene "
+        "when not one segment shows anything even loosely related to it.")
+    data = _llm_json([{"role": "system", "content": (
+                          "You are a precise, well-calibrated footage-to-script matcher. Do not treat "
+                          "semantic association, keyword overlap or inferred object purpose as proof - "
+                          "report what is visibly there and what is missing, and use the whole 0-10 "
+                          "range so the editor can rank. The editor, not you, decides what is good "
+                          "enough. JSON only.")},
                       {"role": "user", "content": prompt}],
                      max_tokens=6000, temperature=0.1, reasoning_model=reasoning_model,
                      status_cb=status_cb, label="scene matcher")
@@ -2446,16 +2826,36 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
     intent_by_id = {it.scene_id: it for it in intents}
     out = {}
     near_misses = {}          # scene_id -> best scores seen, matched or not
+    dropped = {}              # why the code threw away an answer the model DID give
+    empty_answers = []        # scenes the model explicitly answered with an empty list
     for sid_str, cands in smap.items():
         try:
             # models routinely answer with "scene 3" / "Scene_3" instead of "3" - a strict
             # int() threw ValueError and silently DISCARDED every candidate of that scene
             sid = int(re.sub(r"[^0-9-]", "", str(sid_str)) or "x")
         except (TypeError, ValueError):
+            # These two paths had NO counter, so an answer keyed by something unexpected
+            # vanished without a trace and the run reported "the matcher judged the segments
+            # off-topic" - the one message that is certainly wrong when the model answered.
+            dropped[f"unreadable scene key {sid_str!r}"] = (
+                dropped.get(f"unreadable scene key {sid_str!r}", 0) + 1)
             continue
         it = intent_by_id.get(sid)
+        if it is None:
+            dropped[f"answer for scene {sid}, which is not in this batch "
+                    f"({sorted(intent_by_id)})"] = 1 + dropped.get(
+                        f"answer for scene {sid}, which is not in this batch "
+                        f"({sorted(intent_by_id)})", 0)
+        elif not isinstance(cands, list):
+            dropped[f"scene {sid} value was {type(cands).__name__}, not a list"] = (
+                dropped.get(f"scene {sid} value was {type(cands).__name__}, not a list", 0) + 1)
         if it is None or not isinstance(cands, list):
             continue
+        if not cands:
+            # An explicit empty array is the model USING the escape hatch, not a parse failure and
+            # not a discard - the last case in this loop that no counter described, so a run where
+            # the model simply declined every scene looked exactly like a broken pipeline.
+            empty_answers.append(sid)
         scored = []
         near_rows = []          # below the floor, used only to stop a beat being empty
         for c in cands:
@@ -2464,10 +2864,26 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
             try:
                 seg = seg_by_id[int(c.get("seg"))]
             except (KeyError, TypeError, ValueError):
+                dropped["unknown segment index"] = dropped.get("unknown segment index", 0) + 1
                 continue
-            if seg.scene_ids and sid not in seg.scene_ids:
-                continue
-            if editorial_rejection_reason(seg, it):
+            # scene_ids is PROVENANCE - the search that happened to surface this clip - and every
+            # query is scene-bound, so every segment carried exactly one scene id. Enforcing it
+            # here meant a perfect vending-machine clip found by beat 2's query could never be
+            # offered to beat 1: the model answered, the code deleted the answer, and the run
+            # then reported "the matcher judged the segments off-topic". Re-use across beats is
+            # already prevented downstream, by the strict one-source-per-scene assigner.
+            _reason = editorial_rejection_reason(seg, it)
+            # Provenance is a SEARCH-time rule and it already ran there: a Japan-specific query
+            # refuses candidates without a Japanese caption before anything is downloaded. Running
+            # it again here vetoed the corrective round by construction - those adaptive queries
+            # are deliberately English, their results are legitimately English-captioned, they get
+            # downloaded and described, and then every one of them is deleted at match time. That
+            # is why a corrective round could report "recovered 0/4" after finding good footage.
+            # Once vision has SEEN the clip, the picture outranks the caption language; keep it,
+            # ranked below an equally good clip with native provenance.
+            _weak_provenance = _reason == "no Japanese source-context signal"
+            if _reason and not _weak_provenance:
+                dropped[_reason] = dropped.get(_reason, 0) + 1
                 continue
             def g(k):
                 try:
@@ -2480,6 +2896,71 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
             overall = semantic_match_score(subj, act, loc, mood, script_m)
             _cat = str(getattr(it, "match_category", "") or "").lower()
             _rel = getattr(it, "script_relevancy", 70)
+            _role = str(getattr(it, "communication_role", "") or "").lower()
+            _strict_evidence = (float(_rel or 0) >= 85 and
+                                (_cat == "literal" or it.visual_type == "concrete"
+                                 or _role in ("proof", "demonstration")))
+            _literal = c.get("literal_match") is True
+            _evidence = [str(value).strip() for value in (c.get("visible_evidence") or [])
+                         if str(value).strip()][:8]
+            _missing = [str(value).strip() for value in (c.get("missing_required") or [])
+                        if str(value).strip()][:8]
+            _covers = [str(value).strip() for value in (c.get("covers") or [])
+                       if str(value).strip()][:8]
+            _allows_partial = bool(getattr(it, "allows_partial_coverage", False))
+            # Gemini's numeric score is not allowed to overrule its own evidence. This catches
+            # exactly the bad run where "man holding a food container in a kitchen" received
+            # 7.6 for "handbag in a basket under a restaurant chair".
+            #
+            # But SILENCE IS NOT EVIDENCE OF FAILURE. Demoting a candidate because the answer
+            # simply did not carry the contract fields made the whole gate a kill switch: the
+            # slider defaults to 90, every concrete beat is therefore "strict", the demotion
+            # capped script_match at 3.0 while the concrete floor at 90 is 6.2, and the
+            # near-miss rescue below was disabled for exactly these beats. That combination
+            # cannot match anything - measured on the coming-of-age run: 83 segments passed
+            # quality, 0 passed the matcher, all 6 beats "uncovered". Only judge the contract
+            # when the model actually answered it.
+            _answered_contract = ("literal_match" in c) or bool(_evidence) or bool(_missing)
+            # `missing_required` is a RANKING signal, not a veto. A beat lists several required
+            # elements ("flags", "names on the flags", "procession"), so real footage almost
+            # always misses one - treating that as failure demoted every candidate of every
+            # scene to just under the floor and turned the whole run into WEAK rescues. What
+            # actually matters is the model's own verdict on the central subject+action, which
+            # is exactly what literal_match reports.
+            # A confirmed subject in the confirmed place is a match even when the action is a
+            # NEIGHBOUR of the one written down. Measured on the konbini pool: the beat "staff
+            # restock the shelves" had 14 fitting segments - including a uniformed shop worker
+            # reaching for a box inside a convenience store - and came back empty at 3.0/4.3,
+            # because that is not literally "arranging products on shelves". No editor would
+            # reject that shot. The original protection ("a handbag under a chair" scoring 7.6)
+            # is unaffected: there the SUBJECT is wrong, and a wrong subject still fails below.
+            # Missing secondary attributes lower the model's scores but are not a veto. The model's
+            # literal_match already answers whether the central visible subject+action are proven.
+            # The previous extra `_missing` veto rejected a person lying on a pavement because a
+            # still frame could not prove his occupation, and rejected an izakaya drinking scene
+            # because it could not prove who was the boss: 61 technical passes, 0 semantic passes.
+            # Vision sometimes marks literal_match=false merely because a secondary attribute
+            # ("salaryman", "boss", exact relationship) is invisible. Preserve a clearly visible
+            # human central action when its own numeric evidence is strong; a wrong object or a
+            # different action still fails these floors and cannot leak in as filler.
+            # A high numeric score alone cannot turn a loosely associated object into proof
+            # (e.g. a food container into a handbag basket). The relaxed branch is only for
+            # visible evidence that directly covers at least one required concrete element.
+            _central_action_is_clear = (bool(_evidence) and bool(_covers)
+                                        and subj >= 5.0 and act >= 6.0)
+            _evidence_fails = _answered_contract and (not _evidence or
+                                                      (not _literal and not _central_action_is_clear))
+            if _strict_evidence and (_evidence_fails or subj < 5.5 or act < 5.0):
+                # Demote, do not annihilate: this candidate may no longer be presented as an
+                # exact match, but it stays inside near-miss range so a beat that would
+                # otherwise be EMPTY can still borrow it instead of replaying a neighbour.
+                _floor_now = match_thresholds_for_relevancy(it.visual_type, _rel)["script_floor"]
+                script_m = min(script_m, max(NEAR_MISS_FLOOR, _floor_now - 0.3))
+                overall = semantic_match_score(subj, act, loc, mood, script_m)
+            if _weak_provenance:
+                # Native-provenance footage still wins a tie; this one only gets used when the
+                # beat has nothing better, which is exactly what the old veto made impossible.
+                overall = max(0.0, overall - 0.6)
             # Remember the best REJECTED pair too. "matched 0/6 after floors" is not
             # diagnosable on its own: a run where the best candidate scored 5.4 against a
             # 5.9 floor and a run where it scored 1.8 need opposite fixes, and the report
@@ -2506,7 +2987,14 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                 # two clips. A 6.4 that shows the thing being narrated beats the same
                 # phone for the eighth time, so the honest comparison is not
                 # "match vs no match" but "weak match vs a repeat".
-                if overall >= NEAR_MISS_FLOOR:
+                # The rescue used to switch itself off at relevancy >= 85, i.e. exactly where
+                # the strict demotion above was active - so the strictest runs were the ones
+                # left with nothing at all. High relevancy should mean "rank a weak clip last",
+                # never "leave the beat blank".
+                # A low numerical score may be a useful last-resort neighbour. An explicit
+                # evidence contradiction (wrong object/action, literal_match=false) is not a
+                # near miss and must never re-enter the timeline through this rescue path.
+                if overall >= NEAR_MISS_FLOOR and not _evidence_fails:
                     near_rows.append({
                         "segment": seg, "subject_match": subj, "action_match": act,
                         "location_match": loc, "mood_match": mood, "script_match": script_m,
@@ -2523,6 +3011,9 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                 "segment": seg, "subject_match": subj, "action_match": act, "location_match": loc,
                 "mood_match": mood, "script_match": script_m, "style_match": style_m,
                 "semantic_match": overall, "overall_match": overall, "striking": striking,
+                "covers": _covers,
+                "visible_evidence": _evidence, "missing_required": _missing,
+                "literal_match": _literal,
                 "match_class": match_class_for(overall, it.visual_type, _rel),
                 "reason": str(c.get("reason", ""))[:160]})
             seg.semantic_score = max(seg.semantic_score, overall)
@@ -2558,6 +3049,79 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
                             "near miss at %.1f rather than repeating another beat's footage."
                  % (sid, scored[0]["overall_match"]))
         out[sid] = scored
+
+    # The vision matcher is intentionally conservative about relationship details: a close-up of
+    # somebody selecting boxed chocolate cannot prove that a girlfriend gives it to *her* partner.
+    # It must not, however, erase an otherwise excellent, scene-bound chocolate/gift insert and
+    # leave the beat blank.  Recover only directly visible supporting objects/actions from the
+    # query that was issued FOR THIS scene.  This is explicitly a context fallback, never an
+    # "exact" relationship claim, and does not allow generic people/talking heads back in.
+    _context_groups = (
+        (("valentine", "chocolate", "white day", "gift", "present", "sweets", "cookie", "confection"),
+         ("chocolate", "cocoa", "confection", "candy", "sweet", "cookie", "boxed", "box", "package", "gift"),
+         ("バレンタイン", "チョコ", "ホワイトデー", "義理チョコ", "お菓子", "ギフト", "お返し")),
+        (("train", "station", "commuter", "platform", "rail"),
+         ("train", "station", "platform", "commuter", "carriage", "rail"),
+         ("電車", "満員電車", "通勤", "駅", "ホーム")),
+        (("christmas", "eve", "lights", "winter"),
+         ("christmas", "light", "decoration", "winter", "tree", "ornament"),
+         ("クリスマス", "イルミネーション", "冬")),
+        (("couple", "dating", "girlfriend", "boyfriend", "romance", "affection"),
+         ("couple", "man and woman", "two people", "holding hands", "date"),
+         ("カップル", "デート", "彼氏", "彼女", "恋人")),
+    )
+    for it in intents:
+        if out.get(it.scene_id):
+            continue
+        intent_text = " ".join(str(getattr(it, key, "") or "") for key in
+                               ("scene_text", "story_subject", "local_claim", "subject", "action")).casefold()
+        hits_needed = [group for group in _context_groups
+                       if any(token in intent_text for token in group[0])]
+        if not hits_needed:
+            continue
+        recovered = []
+        for seg in described:
+            # First prefer the exact scene-bound search, but do not pretend that a good
+            # chocolate/display/train insert becomes unusable merely because it was found for
+            # the adjacent sentence. The global allocator still enforces one source per scene.
+            # This is the path that prevents ten empty beats from borrowing the same four clips.
+            is_scene_bound = it.scene_id in (seg.scene_ids or [])
+            source_text = str(getattr(seg, "query", "") or "").casefold()
+            source_support = any(any(anchor in source_text for anchor in anchors)
+                                 for _intent, _evidence, anchors in hits_needed)
+            if not is_scene_bound and not source_support:
+                continue
+            if editorial_rejection_reason(seg, it):
+                continue
+            desc = seg.visual_description or {}
+            observed = " ".join(str(desc.get(key) or "") for key in
+                                ("subjects", "action", "location")).casefold()
+            strength = max((sum(token in observed for token in evidence)
+                            for _intent, evidence, _anchors in hits_needed), default=0)
+            # One exact concrete object is enough for a supporting insert (e.g. chocolate);
+            # generic room/people footage still has zero strength and remains rejected.
+            if strength < 1:
+                continue
+            score = min(6.0, 4.75 + 0.55 * strength + 0.08 * float(seg.quality_score or 0.0)
+                        - (0.35 if not is_scene_bound else 0.0))
+            recovered.append({
+                "segment": seg, "subject_match": score, "action_match": score,
+                "location_match": 4.5, "mood_match": 5.0, "script_match": score,
+                "style_match": 5.0, "semantic_match": score, "overall_match": score,
+                "striking": float(desc.get("striking") or 0.0),
+                "covers": [], "visible_evidence": [], "missing_required": [],
+                "literal_match": False, "match_class": "C_MATCH",
+                "assignment_type": "context_fallback",
+                "reason": ("scene-bound visible context insert; relationship detail not inferred"
+                           if is_scene_bound else
+                           "adjacent-topic visible context insert; relationship detail not inferred"),
+            })
+        if recovered:
+            recovered.sort(key=lambda row: (row["overall_match"], row["segment"].quality_score), reverse=True)
+            out[it.scene_id] = recovered[:3]
+            _log(status_cb, "Scrape V2: scene %s recovered %d concrete scene-bound context "
+                            "insert(s) after the literal matcher returned none."
+                 % (it.scene_id, len(out[it.scene_id])))
     matched = sum(1 for v in out.values() if v)
     _log(status_cb, f"Scrape V2: matched {matched}/{len(intents)} scene(s) after floors.")
     # Two very different failures look identical in that count, and the near-miss report
@@ -2565,11 +3129,33 @@ def match_segments_to_scenes_v2(intents, segments, reasoning_model=None, status_
     # then failed the floor, versus a scene it declined to offer anything for at all. The
     # first is a threshold to argue about, the second is the model saying the footage is
     # off-topic - opposite fixes, so say which happened.
+    if dropped:
+        # Report discards ALWAYS, not only when a scene ends up completely silent. A beat that
+        # kept one candidate and lost twelve looks healthy in the counters and is not.
+        _log(status_cb, "Scrape V2: the pipeline discarded %d matcher answer(s): %s."
+             % (sum(dropped.values()),
+                ", ".join(f"{count}x {reason}" for reason, count
+                          in sorted(dropped.items(), key=lambda kv: -kv[1])[:6])))
     silent = [it.scene_id for it in intents if it.scene_id not in near_misses]
     if silent:
-        _log(status_cb, "Scrape V2: the matcher offered NO candidate at all for "
-                        f"{len(silent)}/{len(intents)} scene(s): {silent[:12]} - it judged "
-                        "the segments off-topic for them, which no threshold will change.")
+        # Only call it "off-topic" when the model really said nothing. If the code deleted the
+        # answers, say THAT instead - the two need opposite fixes and the old message always
+        # blamed the footage.
+        if dropped:
+            _log(status_cb, "Scrape V2: %d/%d scene(s) ended with no candidate, but the matcher DID "
+                            "answer for them - the pipeline discarded %d candidate(s): %s."
+                 % (len(silent), len(intents), sum(dropped.values()),
+                    ", ".join(f"{count}x {reason}" for reason, count
+                              in sorted(dropped.items(), key=lambda kv: -kv[1])[:5])))
+        elif empty_answers:
+            _log(status_cb, "Scrape V2: the matcher returned an EMPTY list for "
+                            f"{len(empty_answers)}/{len(intents)} scene(s): {empty_answers[:12]} - "
+                            f"it read all {len(described)} segment(s) and judged none of them "
+                            "related. The pool is the problem here, not a threshold.")
+        else:
+            _log(status_cb, "Scrape V2: the matcher offered NO candidate at all for "
+                            f"{len(silent)}/{len(intents)} scene(s): {silent[:12]} - it judged "
+                            "the segments off-topic for them, which no threshold will change.")
     if matched < len(intents) and near_misses:
         # Say HOW FAR the misses were, in the same breath as the count.
         misses = [(sid, n) for sid, n in near_misses.items() if not out.get(sid)]
@@ -2594,12 +3180,21 @@ def assign_segments_globally_v2(intents, scene_candidates, cfg=None, status_cb=N
     cfg = cfg or SCRAPE_V2_CONFIG
     intent_by_id = {it.scene_id: it for it in intents}
     order = sorted(intent_by_id.keys())
+    required_duration = dict(cfg.get("required_duration_by_scene") or {})
+    montage_scene_ids = {int(value) for value in (cfg.get("visual_chapter_scene_ids") or [])}
 
     # edges: (assignment_score, scene_id, cand) best first
     edges = []
     for sid, cands in (scene_candidates or {}).items():
         for c in cands:
             seg = c["segment"]
+            # Never assign a discovery window that is shorter than the final narration chapter.
+            # The old finalizer silently extended it beyond the inspected window and crossed into
+            # the source video's next scene immediately before our cut.
+            need = float(required_duration.get(str(sid), required_duration.get(sid, 0.0)) or 0.0)
+            if (need and sid not in montage_scene_ids
+                    and float(seg.duration or 0.0) + 0.05 < need):
+                continue
             a_score = (c["overall_match"] * 0.55 + seg.quality_score * 0.20
                        + c.get("style_match", 0) * 0.10 + 0.10 * 5.0 + 0.05 * 5.0)
             edges.append((round(a_score, 3), sid, c))
@@ -2887,7 +3482,8 @@ def _hook_presenter_queries_v2(hook_intent=None):
                            ("story_subject", "local_claim", "subject", "action", "location")).casefold()
     relationship_cues = ("couple", "dating", "date", "girlfriend", "boyfriend", "romance",
                          "relationship", "matching", "osoroi", "christmas")
-    if any(cue in intent_text for cue in relationship_cues):
+    if any(re.search(r"(?<![a-z])" + re.escape(cue) + r"(?![a-z])", intent_text)
+           for cue in relationship_cues):
         themed = (("カップルコーデ", "ja"), ("カップル デート vlog", "ja"),
                   ("カップル 写真", "ja"), ("Japanese couple matching outfits", "en"),
                   ("Japanese couple date vlog", "en"))
@@ -2992,17 +3588,16 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
                     sort="RELEVANCE", coverage_pass=False):
     """Run a batch of SearchQueryV2 through the dual backend, dedupe by source_id, relevance-rank.
 
-    ``ALL`` asks the backend to combine relevance, most-liked, most-viewed and recent result
-    orders for the same raw term. The merged pool is then ranked against the scene's visible
-    subject/action instead of trusting one platform order."""
+    ``ALL`` is treated as a controller preference rather than four browser searches: coverage
+    uses relevance, while later recovery uses most-liked. This preserves both signals without
+    spending most of the run repeating the same term four times."""
     ranked_all = []
     plat_counts, creator_counts = {}, {}
     preferred = str(sort or "RELEVANCE").upper()
     if preferred not in ("RELEVANCE", "MOST_LIKED", "MOST_VIEWED", "MOST_RECENT", "ALL"):
         preferred = "MOST_LIKED"
-    # backend_search expands ALL internally and deduplicates the combined pool.
-    #
-    # ...which means ONE query under "ALL" is FOUR browser searches: most-liked, relevance,
+    # backend_search can expand ALL internally, but that means ONE query becomes FOUR searches:
+    # most-liked, relevance,
     # most-viewed, most-recent, run in sequence. That is depth on a single term, and the
     # coverage wave is the one round whose whole job is BREADTH - one search for every beat
     # before any beat gets a second. Spending four searches per term there is why 162
@@ -3011,8 +3606,8 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
     # available to the later rounds, which target beats that are still empty.
     #
     # coverage_pass was already a parameter here and had simply never been read.
-    if coverage_pass and preferred == "ALL":
-        preferred = "RELEVANCE"
+    if preferred == "ALL":
+        preferred = "RELEVANCE" if coverage_pass else "MOST_LIKED"
     sort_passes = [preferred]
     selected_platforms = clip_scraper.normalize_platforms(platforms)
 
@@ -3086,7 +3681,7 @@ def _search_sources(queries, platforms, cancel_check, deadline, seen_source_ids,
             state["broadened_queries"] = state.get("broadened_queries", 0) + 1
             _run_pass(q, broader, sort_passes[0], target_platforms)
     ranked_all.sort(key=lambda s: s.rank_score, reverse=True)
-    return ranked_all
+    return interleave_ranked_sources_by_scene(ranked_all)
 
 
 def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
@@ -3225,15 +3820,61 @@ def _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, d
     return passed
 
 
+def _clean_window_start(source_path, ffmpeg, lo, hi, want, edge=0.22):
+    """Start time of a cut-free `want`-second window for a candidate whose window straddles a cut.
+
+    The final audit rejects an exported clip that contains a source scene change. Throwing the
+    whole candidate away for that was measurably wasteful: on the real pool, 13 of 14 sources
+    hold at least one clean window, so the shot the matcher approved is usually still there - a
+    second or two along. Slide, do not discard.
+
+    The slide may leave the discovery window but never leaves the SHOT: it searches the maximal
+    cut-free interval containing the middle of the inspected window. No cut between the two means
+    it is the same continuous take, so the picture vision described is the picture exported -
+    which is the actual rule the "never extend" comment was protecting.
+    """
+    lo, hi, want = float(lo), float(hi), float(want)
+    duration = float(clip_scraper._probe_duration(
+        source_path, clip_scraper._ffmpeg_tools()[1]) or 0.0)
+    if duration <= 0.0 or duration + 0.05 < want:
+        return None
+    cuts = sorted(float(c) for c in (clip_scraper.hard_cut_times(
+        source_path, ffmpeg, scan_seconds=min(duration + 0.1, 180.0)) or []))
+    if not cuts:
+        return None                      # nothing to avoid: either no cuts or the scan failed
+    # Every shot of the source, then only those the inspected window actually touches - the take
+    # it was cut from and the one immediately after the straddled cut. Anchoring on a single
+    # midpoint was worse than useless: a window straddling a cut anchors into the SHORT side.
+    bounds = [0.0] + cuts + [duration]
+    shots = [(bounds[i] + edge, bounds[i + 1] - edge) for i in range(len(bounds) - 1)]
+    reach_lo, reach_hi = lo - want, hi + want
+    best = None
+    for shot_lo, shot_hi in shots:
+        if shot_hi <= reach_lo or shot_lo >= reach_hi:
+            continue
+        if shot_hi - shot_lo + 0.05 < want:
+            continue                     # this take is shorter than the beat needs
+        # closest legal start inside this shot to the window vision actually looked at
+        candidate = min(max(lo, shot_lo), shot_hi - want)
+        if best is None or abs(candidate - lo) < abs(best - lo):
+            best = candidate
+    return best
+
+
 def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
     """Normalize the chosen segment window into a clean 9:16 1080x1920 clip. Returns the path.
 
-    `min_seconds`: cut AT LEAST this much source (scene length + headroom). The segment window
-    is only the DISCOVERY window (~2.3s); the source proxy is the whole video, so a scene that
-    needs 3.3s can simply take more material from the same start point. Cutting only the window
-    made the renderer FREEZE the last frame for the difference (user: "zahlreiche freezeframes").
+    `min_seconds` is the exact narration chapter length.  The inspected discovery window must
+    already contain that much continuous footage; the finalizer never reaches beyond its end.
+    Otherwise semantic review and cut detection would describe a different picture than the one
+    the renderer receives.
     """
-    want = max(float(seg.duration or 0), float(min_seconds or 0))
+    want = max(0.1, float(min_seconds or seg.duration or 0))
+    # Finalization may trim an inspected clean window, but must never EXTEND beyond it.  Extending
+    # was the exact double-cut bug: semantic review saw one shot, while the render included the
+    # source's next shot for the final few frames.
+    if float(seg.duration or 0.0) + 0.05 < want:
+        return ""
     prev = getattr(seg, "_final_secs", 0.0)
     if seg.final_path and prev >= want - 0.01:
         return seg.final_path
@@ -3243,10 +3884,11 @@ def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
     ffprobe = clip_scraper._ffmpeg_tools()[1]
     source_duration = float(clip_scraper._probe_duration(seg.source_path, ffprobe) or 0.0)
     start = float(seg.start_time or 0.0)
+    if start + want > float(seg.end_time or 0.0) + 0.05:
+        return ""
     if source_duration > 0:
         if source_duration + 0.05 < want:
             return ""
-        start = min(start, max(0.0, source_duration - want - 0.03))
     # Cut from the de-captioned copy when the blur managed to make one, so the accepted
     # clip is the clean version rather than the one with someone else's text on it.
     cut_from = str(getattr(seg, "cleaned_path", "") or seg.source_path)
@@ -3260,8 +3902,227 @@ def _finalize_segment_clip(seg, project_dir, ffmpeg, min_seconds=None):
             Path(final).unlink(missing_ok=True)
             seg.final_path = ""
             return ""
+        # FINAL PICTURE AUDIT: judge the exact exported bytes, not only the proxy window.  A source
+        # scene change within 0.22s of either boundary is effectively the chosen in/out point;
+        # anything deeper inside the usable
+        # picture creates a visible double-cut and invalidates this candidate.
+        final_cuts = clip_scraper.hard_cut_times(
+            final, ffmpeg, scan_seconds=min(final_duration + 0.1, 90.0))
+        inside = ([cut for cut in (final_cuts or [])
+                   if 0.22 < float(cut) < final_duration - 0.22]
+                  if final_cuts is not None else [])
+        if inside:
+            Path(final).unlink(missing_ok=True)
+            seg.final_path = ""
+            # SLIDE BEFORE DISCARDING. This audit used to end the candidate outright, and it did
+            # so silently: the beat then reported "selected segment failed the final editorial
+            # gate" and borrowed a neighbour's picture instead - a semantic match of 5.95 thrown
+            # away over a scene change that a one-second shift avoids entirely (measured on the
+            # konbini run, beat 1).
+            slid = _clean_window_start(cut_from, ffmpeg, start, float(seg.end_time or 0.0), want)
+            if slid is not None and abs(slid - start) > 0.05:
+                final = clip_scraper.normalize_clip(cut_from, dest, ffmpeg, seconds=want,
+                                                    start=slid)
+                if final:
+                    final_duration = float(clip_scraper._probe_duration(final, ffprobe) or 0.0)
+                    recut = clip_scraper.hard_cut_times(
+                        final, ffmpeg, scan_seconds=min(final_duration + 0.1, 90.0))
+                    still_inside = [cut for cut in (recut or [])
+                                    if 0.22 < float(cut) < final_duration - 0.22]
+                    if final_duration + 0.08 >= want and not still_inside:
+                        seg.start_time, seg.end_time = slid, slid + want
+                        seg.final_path = str(final)
+                        seg._final_secs = want
+                        return seg.final_path
+                    Path(final).unlink(missing_ok=True)
+            seg.final_path = ""
+            seg.rejection_reasons = list(seg.rejection_reasons or []) + ["final_internal_cut"]
+            return ""
         seg._final_secs = want
     return seg.final_path
+
+
+def plan_chapter_montage_rows(primary_seg, candidate_rows, scene_need, scene_intent,
+                               source_owner=None, scene_idx=0, max_shots=4):
+    """Pure editorial planner for a multi-shot visual chapter.
+
+    Returns ``[(candidate_row, seconds), ...]``. It maximises coverage of the chapter's concrete
+    visible elements, permits non-overlapping windows from one source inside the same topic, and
+    guarantees that real source duration covers the narration without a frozen tail.
+    """
+    scene_need = float(scene_need or 0.0)
+    if primary_seg is None or scene_need <= 0.0:
+        return []
+    source_owner = dict(source_owner or {})
+    required = [str(value).strip() for value in
+                (getattr(scene_intent, "required_elements", None) or [])
+                if str(value).strip()]
+    rows = list(candidate_rows or [])
+    if not any(row.get("segment") is primary_seg for row in rows):
+        rows.insert(0, {"segment": primary_seg, "overall_match": primary_seg.semantic_score,
+                        "covers": [], "match_class": "A_MATCH"})
+
+    def visible_tokens(row):
+        seg0 = row.get("segment")
+        desc = (seg0.visual_description or {}) if seg0 is not None else {}
+        values = list(row.get("covers") or []) + list(desc.get("subjects") or []) + [
+            desc.get("action") or "", desc.get("location") or ""]
+        return _tokens(" ".join(str(value) for value in values if value))
+
+    wanted_shots = max(1, min(int(max_shots), int(math.ceil(scene_need / 4.0))))
+    # A single continuous source that genuinely covers the complete chapter is already the ideal
+    # result. Multi-shot assembly is a recovery/editorial enhancement, not a reason to reject a
+    # coherent 8-second demonstration just because no second TikTok is needed.
+    single_can_cover = (float(primary_seg.duration or 0.0) + 0.05 >= scene_need
+                        and not editorial_rejection_reason(primary_seg, scene_intent))
+    minimum_shots = 1 if single_can_cover else wanted_shots
+    selected, selected_ids, selected_windows, covered = [], set(), {}, set()
+    while len(selected) < int(max_shots):
+        best = None
+        for row in rows:
+            candidate = row.get("segment")
+            if candidate is None or candidate.segment_id in selected_ids:
+                continue
+            owner = source_owner.get(candidate.source_id)
+            if owner is not None and owner != scene_idx:
+                continue
+            if editorial_rejection_reason(candidate, scene_intent):
+                continue
+            overlaps = any(not (candidate.end_time <= lo + 0.08
+                                or candidate.start_time >= hi - 0.08)
+                           for lo, hi in selected_windows.get(candidate.source_id, []))
+            if overlaps:
+                continue
+            visible = visible_tokens(row)
+            new_visible = len(visible - covered)
+            required_gain = 0
+            for element in required:
+                element_tokens = _tokens(element)
+                if element_tokens and element_tokens & visible and not element_tokens <= covered:
+                    required_gain += 1
+            diversity = 0.4 if candidate.source_id not in selected_windows else 0.0
+            score = (float(row.get("overall_match") or candidate.semantic_score or 0.0)
+                     + required_gain * 1.6 + min(4, new_visible) * 0.18 + diversity)
+            if candidate is primary_seg and not selected:
+                score += 0.8
+            if best is None or score > best[0]:
+                best = (score, row, visible)
+        if best is None:
+            break
+        _score, chosen_row, visible = best
+        chosen = chosen_row["segment"]
+        selected.append(chosen_row)
+        selected_ids.add(chosen.segment_id)
+        selected_windows.setdefault(chosen.source_id, []).append(
+            (float(chosen.start_time), float(chosen.end_time)))
+        covered.update(visible)
+        capacity = sum(float(row["segment"].duration or 0.0) for row in selected)
+        if len(selected) >= wanted_shots and capacity + 0.05 >= scene_need:
+            break
+    if (len(selected) < minimum_shots
+            or sum(float(row["segment"].duration or 0.0) for row in selected) + 0.05 < scene_need):
+        return []
+
+    def story_order(row):
+        visible = visible_tokens(row)
+        first = len(required) + 1
+        for index, element in enumerate(required):
+            if _tokens(element) & visible:
+                first = index
+                break
+        return first, float(row["segment"].start_time or 0.0)
+
+    selected.sort(key=story_order)
+    capacities = [float(row["segment"].duration or 0.0) for row in selected]
+    allocations = [0.0] * len(selected)
+    remaining, active = scene_need, set(range(len(selected)))
+    while active and remaining > 0.001:
+        share = remaining / len(active)
+        saturated = [index for index in active if capacities[index] <= share + 0.001]
+        if not saturated:
+            for index in active:
+                allocations[index] += share
+            remaining = 0.0
+            break
+        for index in saturated:
+            allocations[index] = capacities[index]
+            remaining -= allocations[index]
+            active.remove(index)
+    if remaining > 0.05 or any(value < 1.25 for value in allocations):
+        return []
+    return list(zip(selected, allocations))
+
+
+def render_chapter_montage(plan, scene_idx, scene_need, project_dir, ffmpeg, ffprobe,
+                            status_cb=None):
+    """Render a planned chapter montage from exact, independently audited source windows."""
+    if not plan:
+        return "", []
+    parts = []
+    for index, (row, seconds) in enumerate(plan):
+        source_seg = row["segment"]
+        part_seg = copy.copy(source_seg)
+        part_seg.segment_id = f"{source_seg.segment_id}_chapter_{scene_idx}_{index}"
+        part_seg.final_path = ""
+        if hasattr(part_seg, "_final_secs"):
+            delattr(part_seg, "_final_secs")
+        part = _finalize_segment_clip(part_seg, project_dir, ffmpeg,
+                                      min_seconds=round(float(seconds), 3))
+        if not part:
+            return "", []
+        parts.append((part, source_seg, round(float(seconds), 3)))
+
+    chapter_dir = Path(project_dir) / "seedance 2.0"
+    digest = hashlib.sha1((str(scene_idx) + "|" + "|".join(
+        item[1].segment_id for item in parts)).encode("utf-8", "ignore")).hexdigest()[:10]
+    destination = chapter_dir / f"v2chapter_{scene_idx:02d}_{digest}.mp4"
+    concat_file = chapter_dir / f"_v2chapter_{scene_idx:02d}_{digest}.txt"
+    concat_file.write_text("\n".join(
+        "file '" + Path(path).resolve().as_posix().replace("'", "'\\''") + "'"
+        for path, _source, _seconds in parts), encoding="utf-8")
+    command = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+               "-t", f"{float(scene_need):.3f}", "-an", "-c:v", "libx264",
+               "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30",
+               "-movflags", "+faststart", str(destination)]
+    try:
+        subprocess.run(command, check=True, capture_output=True, timeout=240)
+    except Exception as exc:
+        _log(status_cb, f"Fact Short chapter montage render failed: {exc.__class__.__name__}.")
+        return "", []
+    finally:
+        concat_file.unlink(missing_ok=True)
+    duration = float(clip_scraper._probe_duration(destination, ffprobe) or 0.0)
+    if duration + 0.08 < float(scene_need):
+        destination.unlink(missing_ok=True)
+        return "", []
+    boundaries, cursor = [], 0.0
+    for _path, _source, seconds in parts[:-1]:
+        cursor += float(seconds)
+        boundaries.append(cursor)
+    cuts = [float(value) for value in (clip_scraper.hard_cut_times(
+        destination, ffmpeg, scan_seconds=min(duration + 0.1, 90.0)) or [])]
+    # Every detected picture change must be the edit we intentionally created. Two changes around
+    # one boundary mean the incoming source switches again a few frames later - the exact
+    # "scene changes just before/after our cut" defect the hand audit found.
+    if not chapter_montage_cuts_are_clean(cuts, boundaries, duration):
+        destination.unlink(missing_ok=True)
+        _log(status_cb, "Fact Short chapter montage rejected: hidden source cut beside the "
+                        "editorial boundary.")
+        return "", []
+    return str(destination), parts
+
+
+def chapter_montage_cuts_are_clean(cuts, boundaries, duration, tolerance=0.22):
+    """Accept only the deliberately authored chapter boundaries, one detected cut each."""
+    cuts = [float(value) for value in (cuts or [])]
+    boundaries = [float(value) for value in (boundaries or [])]
+    duration = float(duration or 0.0)
+    unexpected = [cut for cut in cuts
+                  if tolerance < cut < duration - tolerance
+                  and not any(abs(cut - boundary) <= tolerance for boundary in boundaries)]
+    double_cuts = [boundary for boundary in boundaries
+                   if len([cut for cut in cuts if abs(cut - boundary) <= tolerance]) > 1]
+    return not unexpected and not double_cuts
 
 
 # ---------------------------------------------------------------- hook V2
@@ -3340,8 +4201,9 @@ def relationship_recovery_queries_v2(uncovered):
     for it in uncovered or []:
         text = " ".join(str(getattr(it, key, "") or "") for key in
                         ("scene_text", "story_subject", "local_claim", "subject", "action")).casefold()
-        if not any(k in text for k in ("couple", "dating", "date", "girlfriend", "boyfriend",
-                                       "romance", "matching", "osoroi", "christmas", "gift")):
+        if not any(re.search(r"(?<![a-z])" + re.escape(k) + r"(?![a-z])", text)
+                   for k in ("couple", "dating", "date", "girlfriend", "boyfriend",
+                             "romance", "matching", "osoroi", "christmas", "gift")):
             continue
         if any(k in text for k in ("matching", "outfit", "osoroi", "fashion", "sync")):
             terms = [("カップルコーデ", "ja"), ("ペアルック", "ja"),
@@ -3394,16 +4256,21 @@ def retry_unmatched_scenes_v2(weak_intents, platforms, project_dir, ffmpeg, ffpr
             f'"{(it.scene_text or "")[:120]}"' for it in weak_intents[:8])
         data = _llm_json([
             {"role": "system", "content":
-             "You are the Lateral Search Architect. Previous LITERAL searches for these scenes "
-             "returned boring, static or irrelevant footage. Abandon the literal approach: "
-             "translate each scene into the numbers users flex with, the human behavior it "
-             "causes, or native platform slang. OBJECT RULE by the [role] tag: proof/"
+             "You are the Evidence-Gap Search Architect. Previous searches for these scenes "
+             "returned footage that failed visual verification. Do NOT merely loosen relevance "
+             "or abandon the required object/action. Repair the gap with a search ladder: exact "
+             "native object/place name, visible use/action, native uploader wording, and a genuinely "
+             "different shot that visibly proves the same local claim or human consequence. "
+             "OBJECT RULE by the [role] tag: proof/"
              "demonstration beats SHOULD search the factual object itself (hands counting four "
              "sweets, tying a bow); emotion/human_consequence/pattern_interrupt beats must "
-             "avoid lifeless objects and show a person instead. JSON only."},
+             "show the affected person/action. Never replace a missing specific object with a broad "
+             "category, setting or keyword association. JSON only."},
             {"role": "user", "content":
-             f"FAILED SCENES:\n{lines}\n\nFor EACH scene return 3-5 lateral native queries "
-             "(1-2 Japanese words each; latin unit tokens like 40kg allowed).\n"
+             f"FAILED SCENES:\n{lines}\n\nFor EACH scene return 4-6 distinct native queries "
+             "(normally 1-3 Japanese terms; exact product/practice names may be longer). Include "
+             "the indispensable noun, a visible action, native post wording, and one evidence-based "
+             "alternative. Latin unit tokens like 40kg are allowed.\n"
              'Return exactly: {"scenes": {"<scene number>": ["query", ...]}}'}],
             max_tokens=1500, temperature=0.9, reasoning_model=reasoning_model,
             status_cb=status_cb, label="lateral retry")
@@ -3506,6 +4373,9 @@ def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segm
     failed = [{"scene_id": it.scene_id, "line": it.scene_text,
                "wanted_subject": it.subject, "wanted_action": it.action,
                "wanted_location": it.location, "communication_role": it.communication_role,
+               "match_category": it.match_category,
+               "required_visible_elements": list(it.required_elements or []),
+               "avoid_elements": list(it.avoid_elements or []),
                "story_subject": it.story_subject, "local_claim": it.local_claim}
               for it in weak_intents[:8]]
     searched_rows = []
@@ -3516,17 +4386,28 @@ def adapt_queries_from_live_round_v2(weak_intents, searched_queries, recent_segm
             searched_rows.append({"query": str(searched or ""), "platforms": ["all"]})
     prompt = (
         "You are the live Search Controller for a TikTok/Instagram/X footage scraper. A search round just "
-        "finished and the listed scenes STILL have no semantic match. Inspect the searched terms "
-        "and what vision actually saw. Diagnose the failure pattern, then change strategy: choose "
-        "a different observable human action, native synonym, location/context, or literal proof. "
+        "finished and the listed scenes STILL have no verified visual match. Inspect the searched "
+        "terms and what vision actually saw. For each scene explicitly compare the REQUIRED VISIBLE "
+        "ELEMENTS with the observed subjects/actions/locations and identify the missing evidence. "
+        "Then change strategy using a search ladder: exact native object/place name, visible use or "
+        "action, native uploader wording, or a different shot that proves the same local claim. "
+        "Search like an uploader, not a dictionary: combine the cultural anchor with a populated "
+        "UGC action/format term such as 歌ってみた, 女子会, 開封, 使ってみた, やってみた, "
+        "ルーティン, 飯, 寝落ち or あるある when appropriate. If a chapter contains several "
+        "actions, target its central recognisable activity and separate coverage shots; do not "
+        "lock the retry to a rare incidental prop just because it appeared in the narration. A "
+        "failed karaoke search for an internal telephone should pivot to people singing in the "
+        "karaoke room, friends at the karaoke table, or karaoke food—not another telephone synonym. "
         "Use rejection counts: repeated captions/black bars means leave tutorial/news-repost "
         "neighbourhoods for clean UGC actions; repeated semantic mismatch means change the visible "
-        "subject/action, not merely a synonym. "
+        "subject/action, not merely a synonym. Never respond to a failed specific search by widening "
+        "to a broad category such as container, restaurant vlog, toilet, Japan lifestyle or city. "
         "Do not repeat or lightly reword a failed query. Do not add platform names such as TikTok, "
-        "X, Twitter or Instagram. Create platform-specific terms: TikTok uses 1-2 compact words; "
+        "X, Twitter or Instagram. Create platform-specific terms: TikTok uses one compact native "
+        "anchor plus one uploader-action/format phrase; "
         "Instagram uses one keyword phrase or one #hashtag; X uses 2-4 event/proof words and may "
         "retain a disambiguator. Preserve named-entity anchors. Return at most two new terms per "
-        "scene total. JSON only.\n\n"
+        "scene total PER PLATFORM; each term must target a distinct result neighbourhood. JSON only.\n\n"
         f"UNMATCHED SCENES:\n{json.dumps(failed, ensure_ascii=False)}\n\n"
         f"SEARCHED THIS ROUND:\n{json.dumps(searched_rows, ensure_ascii=False)}\n\n"
         f"VISION OBSERVATIONS / LIVE LOG:\n{json.dumps(observations, ensure_ascii=False)}\n\n"
@@ -3652,6 +4533,68 @@ def existing_fact_short_segments_v2(project_dir, script_text, ffmpeg, ffprobe,
     return segments
 
 
+def resume_project_proxy_segments_v2(project_dir, ffmpeg, ffprobe, status_cb=None):
+    """Re-open already downloaded V2 proxies from THIS interrupted project.
+
+    A resume used to search the project library only for *other* projects, then start with an
+    empty source-id set.  It therefore paid to download the same TikToks again while the original
+    proxies were sitting in ``_v2_proxies``.  Re-discovering their windows is also valuable after a
+    quality-analysis upgrade because the good moment may be later than the old inspection window.
+    """
+    root = Path(project_dir) / "seedance 2.0" / "_v2_proxies"
+    if not root.is_dir():
+        return [], set()
+    segments, source_ids = [], set()
+    paths = sorted(root.glob("proxy_*.*"), key=lambda path: path.stat().st_mtime)
+    for path in paths:
+        if path.suffix.casefold() not in {".mp4", ".mov", ".mkv", ".webm"}:
+            continue
+        # proxy_tiktok_123456.mp4 -> platform=tiktok/source_id=123456. Keep the stable
+        # filename identity for non-numeric source IDs too; it still prevents a second fetch.
+        match = re.match(r"^proxy_([^_]+)_(.+)$", path.stem, flags=re.I)
+        if not match:
+            continue
+        platform, source_id = match.group(1).casefold(), match.group(2)
+        if source_id in source_ids:
+            continue
+        source = SourceVideoCandidate(
+            platform=platform, source_id=source_id, creator_id="resumed_source", url="",
+            query="resumed project proxy", query_tier="resume_local",
+            scene_ids=[], japanese_context=True)
+        fresh = discover_segments_v2(source, path, ffmpeg, ffprobe, status_cb=status_cb)
+        # These files already passed proxy download validation in the interrupted run.  A full
+        # segment-quality pass here used to run OCR, cut scans and cadence decoding for every
+        # window of every source before *any* vision matching.  Apart from making Continue take
+        # several minutes, that duplicated the final render QA (which remains authoritative).
+        # Keep representative early/late windows for semantic vision review now; the chosen clip
+        # still receives the exhaustive trim/freeze/cut validation before it can render.
+        if len(fresh) > 2:
+            fresh = [fresh[0], fresh[-1]]
+        dims = clip_scraper._probe_dims(path, ffprobe)
+        for segment in fresh:
+            if not dims:
+                # Let the normal analyser make the rejection decision when probing fails.  This
+                # also keeps the helper usable with an injected/test proxy reader.
+                analyze_segment_v2(segment, ffmpeg, ffprobe, status_cb=status_cb)
+                if segment.rejection_reasons or segment.quality_score < SEGMENT_SOFT_MIN_QUALITY:
+                    continue
+                segments.append(segment)
+                continue
+            if not _is_native_9_16(*dims):
+                continue
+            segment.source_width, segment.source_height = map(int, dims)
+            segment.native_9_16 = True
+            segment.quality_score = SEGMENT_MIN_QUALITY
+            segment.quality_gate = "resume_fast_vision"
+            segments.append(segment)
+        source_ids.add(source_id)
+    if segments:
+        _log(status_cb, "Scrape V2 resume: reopened %d local proxy source(s), kept %d segment(s) "
+                        "for the current search/match pass."
+             % (len(source_ids), len(segments)))
+    return segments, source_ids
+
+
 # ---------------------------------------------------------------- orchestrator
 
 def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_seconds, script_relevancy,
@@ -3681,6 +4624,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         pass
     ffmpeg, ffprobe = clip_scraper._ffmpeg_tools()
     state = {"rejections": {}, "scene_reports": [], "_downloaded_ids": set()}
+    chapter_mode = any(bool(scene.get("visual_chapter")) for scene in (scenes or []))
 
     # The strongest reference edits use native portrait footage. Cropping landscape X clips often
     # made the subject unrecognisable; all Clip Shorts now reject those before vision matching.
@@ -3744,6 +4688,21 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                     if use_influencer_hook else list(intents))
     hook_intent = (next((it for it in intents if it.scene_id == 0), None)
                    if use_influencer_hook else None)
+    cfg = dict(cfg)
+    cfg["required_duration_by_scene"] = {
+        str(index): max(0.0, float(scene.get("end", 0.0) or 0.0)
+                        - float(scene.get("start", 0.0) or 0.0))
+        for index, scene in enumerate(scenes)
+    }
+    cfg["visual_chapter_scene_ids"] = [
+        index for index, scene in enumerate(scenes) if bool(scene.get("visual_chapter"))
+    ]
+    _visual_chapters = set(cfg["visual_chapter_scene_ids"])
+    for _intent in intents:
+        # A long chapter is deliberately edited as overview -> action -> result. Each source
+        # segment must prove its own sub-action, but no single four-second TikTok window has to
+        # prove every sentence in a ten-second chapter by itself.
+        _intent.allows_partial_coverage = _intent.scene_id in _visual_chapters
     # The download cap has to know how many beats it is feeding. A 14-scene fact short with a
     # 36-download pool starves by arithmetic: the first scenes take what they need and the
     # rest get an empty list back from every later call. Guarantee a per-scene share, and
@@ -3774,7 +4733,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
 
     queries_by_scene, search_plan_audit = build_scene_bound_query_plan(
         intents, project_dir, script_text, use_influencer_hook=use_influencer_hook,
-        status_cb=status_cb)
+        status_cb=status_cb, active_platforms=platforms)
     state["search_plan_audit"] = search_plan_audit
     config["search_plan_script_sha256"] = search_plan_audit["script_sha256"]
     _log(status_cb, "Scrape V2 hook mode: " + (
@@ -3783,31 +4742,56 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
 
     scene_candidates = {}
     seen_source_ids = set()
+    _intent_by_scene = {intent.scene_id: intent for intent in body_intents}
+    _chapter_scene_ids = {int(value) for value in cfg.get("visual_chapter_scene_ids", [])}
+
+    def _has_a_match(scene_id):
+        """A chapter is solved only when approved shots cover its complete real duration."""
+        rows = [row for row in (scene_candidates.get(scene_id) or [])
+                if str(row.get("match_class") or "") == "A_MATCH"]
+        if not rows:
+            return False
+        if scene_id not in _chapter_scene_ids:
+            return True
+        need = float((cfg.get("required_duration_by_scene") or {}).get(
+            str(scene_id), (cfg.get("required_duration_by_scene") or {}).get(scene_id, 0.0)) or 0.0)
+        intent = _intent_by_scene.get(scene_id)
+        return bool(plan_chapter_montage_rows(
+            rows[0].get("segment"), rows, need, intent,
+            source_owner={}, scene_idx=scene_id, max_shots=4))
+
+    def _has_editorial_choice(scene_id):
+        """Return true only when a scene has multiple independently sourced usable options."""
+        rows = list(scene_candidates.get(scene_id) or [])
+        eligible = [
+            row for row in rows
+            if row.get("segment") is not None
+            and str(row.get("match_class") or "") in {"A_MATCH", "B_MATCH", "C_MATCH"}
+        ]
+        distinct = {str(row["segment"].source_id) for row in eligible}
+        minimum = max(2, int(cfg.get("min_distinct_matches_per_scene", 3) or 3))
+        if len(distinct) < minimum:
+            return False
+        if scene_id not in _chapter_scene_ids:
+            return True
+        need = float((cfg.get("required_duration_by_scene") or {}).get(str(scene_id), 0.0) or 0.0)
+        intent = _intent_by_scene.get(scene_id)
+        return bool(plan_chapter_montage_rows(
+            eligible[0].get("segment"), eligible, need, intent,
+            source_owner={}, scene_idx=scene_id, max_shots=4))
 
     query_queue = []
     coverage_queries = []
     coverage_by_scene = []
-    # Round zero is deliberately scene-fair: reserve up to two platform-appropriate queries for
-    # every scene. Proof beats prefer X (recorded incidents) then TikTok; human/action beats prefer
-    # TikTok then Instagram. The remaining platform variants stay in the normal queue.
+    # Round zero is deliberately chapter-fair: execute exactly ONE highest-priority relevance
+    # query for every chapter.  Only chapters that fail that pass reach their second/third query.
+    # This prevents a strong result from still triggering two minutes of redundant searches.
     # Previously tier sorting put all sumo variants first, so the 25-minute deadline expired
     # before heels, glasses, Mount Omine or the royal-family searches were even attempted.
     for it in body_intents:
         intent_queries = queries_by_scene.get(it.scene_id, [])
         if intent_queries:
-            order = (["twitter", "tiktok", "instagram"] if it.communication_role == "proof"
-                     else ["tiktok", "instagram", "twitter"])
-            chosen = []
-            for platform in order:
-                candidate = next((q for q in intent_queries
-                                  if platform in {_canonical_platform(p) for p in (q.platforms or [])}
-                                  and q not in chosen), None)
-                if candidate is not None:
-                    chosen.append(candidate)
-                if len(chosen) >= 2:
-                    break
-            if not chosen:
-                chosen = intent_queries[:1]
+            chosen = intent_queries[:1]
             coverage_by_scene.append(chosen)
             query_queue.extend(q for q in intent_queries if q not in chosen)
 
@@ -3825,12 +4809,15 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     # for scenes 9, 10 and 11), while scenes 12-15 were never searched at all. The matcher
     # assigns whatever a text finds to EVERY scene it fits, so searching it once is not a
     # loss of coverage - it is the same pool for a third of the price.
-    _cov_seen, _cov = set(), []
+    _cov_by_key, _cov = {}, []
     for q in coverage_queries:
         key = _query_identity(q)
-        if key in _cov_seen:
+        if key in _cov_by_key:
+            prior = _cov_by_key[key]
+            prior.scene_ids = list(dict.fromkeys(list(prior.scene_ids or [])
+                                                  + list(q.scene_ids or [])))
             continue
-        _cov_seen.add(key)
+        _cov_by_key[key] = q
         _cov.append(q)
     if len(_cov) != len(coverage_queries):
         _log(status_cb, "Scrape V2: coverage wave %d -> %d searches after dropping repeated "
@@ -3841,13 +4828,16 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     # the same broad query (東京 / 日本 学校 ...). Search each text ONCE globally - the vision
     # matcher assigns the found segments to every scene anyway, so per-intent repeats only
     # burn browser time.
-    _seen_qtext = set()
+    _seen_qtext = {}
     _dq = []
     for q in query_queue:
         key = _query_identity(q)
         if key in _seen_qtext:
+            prior = _seen_qtext[key]
+            prior.scene_ids = list(dict.fromkeys(list(prior.scene_ids or [])
+                                                  + list(q.scene_ids or [])))
             continue
-        _seen_qtext.add(key)
+        _seen_qtext[key] = q
         _dq.append(q)
     if len(_dq) != len(query_queue):
         _log(status_cb, "Scrape V2: %d broad queries after global dedupe (was %d)."
@@ -3856,7 +4846,23 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     # Never append a global filler pool. Every body query must remain attributable
     # to an active scene and visual intent from this exact script.
 
-    all_segments = []
+    # Resume the current project's own downloaded proxies before looking at older related projects
+    # or hitting the network.  Seed the attempted-id budget too, so backend results cannot trigger
+    # an accidental second download of a source we already have locally.
+    resumed_segments, resumed_source_ids = resume_project_proxy_segments_v2(
+        project_dir, ffmpeg, ffprobe, status_cb=status_cb)
+    all_segments = list(resumed_segments)
+    if resumed_source_ids:
+        state["_downloaded_ids"].update(resumed_source_ids)
+        state["resumed_proxy_sources"] = len(resumed_source_ids)
+        state["segments_resumed"] = len(resumed_segments)
+        resumed_matches = match_segments_to_scenes_v2(
+            body_intents, resumed_segments, reasoning_model=reasoning_model, status_cb=status_cb)
+        for sid, candidates in resumed_matches.items():
+            scene_candidates.setdefault(sid, []).extend(candidates)
+            scene_candidates[sid].sort(key=lambda row: row["overall_match"], reverse=True)
+            scene_candidates[sid] = scene_candidates[sid][:6]
+        state["segments_semantic_passed"] = sum(len(v) for v in scene_candidates.values())
     # LOCAL LIBRARY FIRST: re-check earlier same-topic clips before spending time on a fresh
     # browser search. The current vision matcher, not the old filename/timing, decides placement.
     library_segments = existing_fact_short_segments_v2(
@@ -3872,7 +4878,7 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             scene_candidates.setdefault(sid, []).extend(candidates)
             scene_candidates[sid].sort(key=lambda row: row["overall_match"], reverse=True)
             scene_candidates[sid] = scene_candidates[sid][:6]
-        covered_from_library = {sid for sid, candidates in scene_candidates.items() if candidates}
+        covered_from_library = {sid for sid in scene_candidates if _has_a_match(sid)}
         # A library clip can only be USED ONCE - the final assignment never puts the same
         # footage on two beats. Coverage, though, was counted per scene independently, so
         # three library clips that each matched nine beats cancelled the search for all
@@ -3885,14 +4891,20 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             taken, truly_covered = set(), set()
             for sid in sorted(covered_from_library,
                               key=lambda s: len(scene_candidates.get(s) or [])):
-                for row in (scene_candidates.get(sid) or []):
-                    seg = row.get("segment")
-                    key = getattr(seg, "segment_id", None) or id(seg)
-                    if key in taken:
-                        continue
-                    taken.add(key)
-                    truly_covered.add(sid)
-                    break
+                rows = [row for row in (scene_candidates.get(sid) or [])
+                        if str(row.get("match_class") or "") == "A_MATCH"]
+                need = float((cfg.get("required_duration_by_scene") or {}).get(str(sid), 0.0) or 0.0)
+                if sid in _chapter_scene_ids:
+                    plan = plan_chapter_montage_rows(
+                        rows[0].get("segment") if rows else None, rows, need,
+                        _intent_by_scene.get(sid), source_owner={}, scene_idx=sid)
+                    needed = {row["segment"].source_id for row, _seconds in plan}
+                else:
+                    needed = ({rows[0]["segment"].source_id} if rows else set())
+                if not needed or needed & taken:
+                    continue
+                taken.update(needed)
+                truly_covered.add(sid)
             starved = len(covered_from_library) - len(truly_covered)
             covered_from_library = truly_covered
             coverage_queries = [query for query in coverage_queries
@@ -3951,9 +4963,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             cov_batch = coverage_queries[cov_start:cov_start + 4]
             before_raw = int(state.get("raw_results", 0) or 0)
             before_quality = int(state.get("segments_quality_passed", 0) or 0)
+            # Relevance always gets first look. Likes/views may rank a later pass, but never choose
+            # the initial neighbourhood; that was the source of polished unrelated viral clips.
             coverage_sources = _search_sources(
                 cov_batch, platforms, cancel_check, deadline, seen_source_ids, state,
-                status_cb, sort=sort_mode, coverage_pass=True)
+                status_cb, sort="RELEVANCE", coverage_pass=True)
             coverage_segments = _download_and_segment(
                 coverage_sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline, state,
                 status_cb, _round_budget(len({sid for q in cov_batch
@@ -3975,31 +4989,42 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                 if q.visual_intent_id in intent_by_key and q.visual_intent_id not in _batch_seen:
                     _batch_seen.add(q.visual_intent_id)
                     batch_intents.append(intent_by_key[q.visual_intent_id])
-            weak_now = [it for it in batch_intents if not scene_candidates.get(it.scene_id)]
+            weak_now = [it for it in batch_intents if not _has_a_match(it.scene_id)]
             raw_delta = int(state.get("raw_results", 0) or 0) - before_raw
             quality_delta = int(state.get("segments_quality_passed", 0) or 0) - before_quality
             _log(status_cb, "Search Controller round: %d raw result(s), %d usable segment(s), "
                             "%d/%d scene concept(s) still unmatched."
                  % (raw_delta, quality_delta, len(weak_now), len(batch_intents)))
-            # Adapt only when the round demonstrably failed, at most three times per run. This reads
-            # vision observations and rejected outcomes live, then inserts corrective searches at
-            # the front of the remaining queue.
+            # Adapt only when the round demonstrably failed. Every unresolved scene gets one
+            # evidence-driven correction of its own; the old global cap of two meant later
+            # chapters never learned from their failed results at all.
+            adapted_scene_ids = {int(value) for value in
+                                 (state.get("live_adapted_scene_ids") or [])}
+            adaptable_now = [it for it in weak_now if it.scene_id not in adapted_scene_ids]
             adaptations = int(state.get("live_adaptation_rounds", 0) or 0)
-            if (config.get("use_llm_search", False) and weak_now and adaptations < 3
+            if (config.get("use_llm_search", False) and adaptable_now
                     and time.monotonic() < deadline):
                 adaptive = adapt_queries_from_live_round_v2(
-                    weak_now, cov_batch, coverage_segments,
-                    reasoning_model=reasoning_model, status_cb=status_cb, limit=8,
+                    adaptable_now, cov_batch, coverage_segments,
+                    reasoning_model=reasoning_model, status_cb=status_cb,
+                    limit=min(12, max(4, len(adaptable_now) * 3)),
                     rejection_summary=state.get("rejections") or {})
                 fresh_adaptive = []
                 for q in adaptive:
                     key = _query_identity(q)
                     if key in _seen_qtext:
                         continue
-                    _seen_qtext.add(key)
+                    # `_seen_qtext` is intentionally a mapping, not a set: earlier query
+                    # deduplication merges scene IDs into the original query object.  Adaptive
+                    # terms must register in that same mapping or the next dedupe path either
+                    # crashes (`dict` has no .add) or loses provenance.
+                    _seen_qtext[key] = q
                     fresh_adaptive.append(q)
                 if fresh_adaptive:
                     state["live_adaptation_rounds"] = adaptations + 1
+                    adapted_scene_ids.update(
+                        sid for query in fresh_adaptive for sid in (query.scene_ids or []))
+                    state["live_adapted_scene_ids"] = sorted(adapted_scene_ids)
                     state["live_adaptive_queries"] = state.get("live_adaptive_queries", 0) + len(fresh_adaptive)
                     _log(status_cb, "Search Controller: executing %d changed-strategy query/queries now."
                          % len(fresh_adaptive))
@@ -4022,14 +5047,27 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                             scene_candidates[sid].sort(
                                 key=lambda r: r["overall_match"], reverse=True)
                             scene_candidates[sid] = scene_candidates[sid][:6]
-                        recovered = sum(1 for it in weak_now
-                                        if scene_candidates.get(it.scene_id))
+                        recovered = sum(1 for it in adaptable_now if _has_a_match(it.scene_id))
                         _log(status_cb, "Search Controller: recovered %d/%d previously unmatched "
                                         "scene concept(s) in the corrective round."
-                             % (recovered, len(weak_now)))
-    BATCH = 8
+                             % (recovered, len(adaptable_now)))
+    BATCH = 4
     while query_queue:
         if (cancel_check and cancel_check()) or time.monotonic() >= deadline:
+            break
+        # Stop searching a chapter only after there are several independent matching uploads.
+        # One A-match is coverage, but it is not editorial choice and cannot survive a later cut-QA
+        # rejection without falling back to filler.
+        before_prune = len(query_queue)
+        query_queue = [query for query in query_queue
+                       if not query.scene_ids or not all(_has_editorial_choice(sid)
+                                                        for sid in query.scene_ids)]
+        if len(query_queue) != before_prune:
+            state["queries_skipped_after_a_match"] = (
+                state.get("queries_skipped_after_a_match", 0) + before_prune - len(query_queue))
+            _log(status_cb, "Search Controller: skipped %d queued search(es); their chapter "
+                            "already has an A-match." % (before_prune - len(query_queue)))
+        if not query_queue:
             break
         matched_scenes = sum(1 for sid, c in scene_candidates.items() if c)
         # STRICT no-reuse: every scene needs its OWN source, so keep searching until the pool
@@ -4037,10 +5075,12 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         # the same TikTok). Only then is it possible to fill the render without reusing a source.
         distinct_sources = len({c["segment"].source_id
                                 for cands in scene_candidates.values() for c in cands})
-        if (matched_scenes >= len(body_intents) and distinct_sources >= len(body_intents)
-                and len(all_segments) >= len(body_intents) * 2):
+        if (all(_has_editorial_choice(it.scene_id) for it in body_intents)
+                and matched_scenes >= len(body_intents)
+                and distinct_sources >= len(body_intents) * 2
+                and len(all_segments) >= len(body_intents) * 3):
             break
-        uncovered_now = [it for it in body_intents if not scene_candidates.get(it.scene_id)]
+        uncovered_now = [it for it in body_intents if not _has_editorial_choice(it.scene_id)]
         # Compare ATTEMPTS against the cap, because attempts are what _round_budget spends.
         # downloaded_sources counts only successful fetches; with any dead links the two
         # diverge permanently, the raise below never fires, and every later round plans zero
@@ -4048,19 +5088,19 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         if len(state.get("_downloaded_ids") or ()) >= cfg["max_downloaded_analysis_videos"]:
             if not uncovered_now:
                 break
-            # Beats with nothing at all outrank the pool cap. The Tokyo run hit this break
-            # with twelve empty beats and stopped searching anyway, then filled them with
-            # stills. A beat that has never had a single candidate gets its reserve.
+            # A chapter with only one surviving option is still under-sourced. Reserve a smaller
+            # corrective allowance for every chapter that lacks editorial choice.
             cfg = dict(cfg)
-            cfg["max_downloaded_analysis_videos"] += per_scene_downloads * len(uncovered_now)
-            _log(status_cb, "Scrape V2: %d beat(s) still have no footage; extending the "
+            cfg["max_downloaded_analysis_videos"] += max(2, per_scene_downloads // 2) * len(uncovered_now)
+            _log(status_cb, "Scrape V2: %d chapter(s) still lack enough independent footage; extending the "
                             "download pool to %d rather than falling back to stills."
                  % (len(uncovered_now), cfg["max_downloaded_analysis_videos"]))
         batch_q = query_queue[:BATCH]
         query_queue = query_queue[BATCH:]
         _log(status_cb, "Scrape V2: searching %s ... (%d queries queued)" % (batch_q[0].tier, len(query_queue)))
+        secondary_sort = "MOST_LIKED" if sort_mode == "RELEVANCE" else sort_mode
         sources = _search_sources(batch_q, platforms, cancel_check, deadline, seen_source_ids, state,
-                                  status_cb, sort=sort_mode)
+                                  status_cb, sort=secondary_sort)
         _log(status_cb, "Scrape V2: ranking %d source video(s) by relevance..." % len(sources))
         segs = _download_and_segment(sources, project_dir, ffmpeg, ffprobe, cancel_check, deadline,
                                      state, status_cb,
@@ -4183,11 +5223,32 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
     def _uncovered_intents():
         # a scene is "covered" only if the strict-source assigner can give it its OWN clip
         asg = assign_segments_globally_v2(body_intents, scene_candidates, cfg)
-        return [it for it in body_intents
-                if not (asg.get(it.scene_id) and asg[it.scene_id].segment_id)]
+        owners = {}
+        for sid, assignment in asg.items():
+            segment = getattr(assignment, "_seg", None)
+            if segment is not None:
+                owners[segment.source_id] = sid
+        uncovered_rows = []
+        for it in body_intents:
+            assignment = asg.get(it.scene_id)
+            primary = getattr(assignment, "_seg", None) if assignment else None
+            if primary is None:
+                uncovered_rows.append(it)
+                continue
+            if it.scene_id in _chapter_scene_ids:
+                need = float((cfg.get("required_duration_by_scene") or {}).get(
+                    str(it.scene_id), 0.0) or 0.0)
+                rows = [row for row in (scene_candidates.get(it.scene_id) or [])
+                        if str(row.get("match_class") or "") == "A_MATCH"]
+                if not plan_chapter_montage_rows(
+                        primary, rows, need, it, source_owner=owners,
+                        scene_idx=it.scene_id, max_shots=4):
+                    uncovered_rows.append(it)
+        return uncovered_rows
 
     uncovered = _uncovered_intents()
-    if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:
+    if (config.get("use_llm_search", False) and uncovered
+            and time.monotonic() < deadline):
         _log(status_cb, "Escalation 1/3 (cross-platform pivot): %d scene(s) still without a "
                         "unique clip - re-sending their terms to X + Instagram..." % len(uncovered))
         _merge_matches(escalate_platform_pivot_v2(
@@ -4196,7 +5257,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             download_budget=_round_budget(len(uncovered))))
         uncovered = _uncovered_intents()
 
-    if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:
+    if (config.get("use_llm_search", False) and uncovered
+            and time.monotonic() < deadline):
         _log(status_cb, "Escalation 2/3 (lateral-agent): %d scene(s) still uncovered - generating "
                         "fresh creative queries (numbers / cringe / trends)..." % len(uncovered))
         _merge_matches(retry_unmatched_scenes_v2(
@@ -4205,7 +5267,8 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             download_budget=_round_budget(len(uncovered))))
         uncovered = _uncovered_intents()
 
-    if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:
+    if (config.get("use_llm_search", False) and uncovered and not chapter_mode
+            and time.monotonic() < deadline):
         # STAGE 3 - global thematic filler pool: match the still-uncovered scenes against the
         # broad on-theme B-roll already gathered (lateral filler + surplus hook clips), relaxed.
         described_pool = sorted((s for s in all_segments if s.visual_description),
@@ -4216,6 +5279,30 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             state["escalation_stage3"] = state.get("escalation_stage3", 0) + 1
             _merge_matches(match_segments_to_scenes_v2(
                 uncovered, described_pool, reasoning_model=reasoning_model, status_cb=status_cb))
+            uncovered = _uncovered_intents()
+    elif uncovered and chapter_mode:
+        _log(status_cb, "Fact Short chapters: skipped the global filler bucket; only scene-bound "
+                        "or concrete recovery searches may fill an uncovered chapter.")
+    # FULL-POOL SECOND LOOK. The matcher is called once per download batch, so it judges 4-19
+    # segments at a time and never sees the pool as a whole - a batch of four can only answer
+    # "none of these fit", which is exactly what a run reports while a fitting clip from an
+    # earlier batch sits unused. Measured on one konbini pool: the same segments and the same
+    # floors gave 1 of 5 beats a match batch-by-batch and 4 of 5 when judged together.
+    #
+    # This is NOT the filler bucket: no relaxation, the same floors decide, and it only looks at
+    # beats that are still empty. That is why it may run in chapter mode too, where the filler
+    # bucket is rightly forbidden.
+    if config.get("use_llm_search", False) and uncovered and time.monotonic() < deadline:
+        whole_pool = [s for s in all_segments if s.visual_description]
+        if len(whole_pool) > 12:
+            _log(status_cb, "Scrape V2 full-pool second look: re-judging %d described segment(s) "
+                            "against %d still-empty beat(s) - the batch matcher never saw them "
+                            "side by side." % (len(whole_pool), len(uncovered)))
+            state["full_pool_second_look"] = state.get("full_pool_second_look", 0) + 1
+            _merge_matches(match_segments_to_scenes_v2(
+                uncovered, whole_pool, reasoning_model=reasoning_model, status_cb=status_cb))
+            recovered_now = len(uncovered) - len(_uncovered_intents())
+            _log(status_cb, "Scrape V2 full-pool second look: recovered %d beat(s)." % recovered_now)
             uncovered = _uncovered_intents()
     # Stage 4 is a deterministic, topic-specific recovery after the LLM's broad queries were
     # exhausted. It matters most for dating scripts: "woman reservation" is a syntactically valid
@@ -4424,6 +5511,38 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
 
     _intent_cat = {it.scene_id: getattr(it, "match_category", "") for it in intents}
 
+    # A visual chapter is one searchable topic but may need several 2-4 second detail shots.
+    # Reserve source videos across chapters (reusing different windows inside the SAME chapter is
+    # useful and mirrors the hand edit; repeating that source in another topic is not).
+    chapter_source_owner = {}
+    for _sid, _assignment in assignments.items():
+        _assigned_seg = getattr(_assignment, "_seg", None)
+        if _assigned_seg is not None:
+            chapter_source_owner[_assigned_seg.source_id] = _sid
+
+    def _chapter_montage(scene_idx, primary_seg, scene_need, scene_intent):
+        """Build overview -> interaction -> result from approved segments of one topic."""
+        if scene_need <= 0.0:
+            return "", []
+        rows = list(scene_candidates.get(scene_idx) or [])
+        planned = plan_chapter_montage_rows(
+            primary_seg, rows, scene_need, scene_intent,
+            source_owner=chapter_source_owner, scene_idx=scene_idx, max_shots=4)
+        if not planned:
+            return "", []
+        destination, parts = render_chapter_montage(
+            planned, scene_idx, scene_need, project_dir, ffmpeg, ffprobe,
+            status_cb=status_cb)
+        if not destination:
+            return "", []
+        for _part, source_seg, _seconds in parts:
+            chapter_source_owner[source_seg.source_id] = scene_idx
+        primary_seg.final_path = str(destination)
+        primary_seg._final_secs = scene_need
+        _log(status_cb, "Fact Short chapter %s: assembled %d relevant detail shot(s) for %.1fs "
+                        "instead of stretching one TikTok." % (scene_idx, len(parts), scene_need))
+        return str(destination), parts
+
     def _write_scene(scene_idx, seg, atype, flevel, sem, mclass, visual_role=None):
         sc0 = scenes[scene_idx]
         scene_intent = (hook_intent if scene_idx == 0 and hook_intent is not None else
@@ -4439,10 +5558,23 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             scene_need = max(0.0, float(sc0.get("end", 0) or 0) - float(sc0.get("start", 0) or 0))
         except (TypeError, ValueError):
             scene_need = 0.0
-        # cut enough source for the scene (+headroom) so the renderer never freeze-frames
-        final = _finalize_segment_clip(seg, project_dir, ffmpeg,
-                                       min_seconds=(scene_need + 0.3) if scene_need else None)
+        # Cut exactly the visual chapter.  Assignment already guarantees the inspected stable
+        # window is long enough, so no unreviewed source frames are appended as "headroom".
+        montage_parts = []
+        if bool(sc0.get("visual_chapter")) and scene_need >= 5.2:
+            final, montage_parts = _chapter_montage(
+                scene_idx, seg, scene_need, scene_intent)
+        else:
+            final = _finalize_segment_clip(seg, project_dir, ffmpeg,
+                                           min_seconds=scene_need if scene_need else None)
         if not final:
+            # Say WHY. This was the only silent failure left in the chain: a beat with an
+            # approved match reported nothing at all, the report said "failed the final
+            # editorial gate", and no line anywhere named the export as the culprit.
+            _log(status_cb, "Scrape V2: scene %s lost its approved clip at export (%s), needed "
+                            "%.1fs from a %.1fs window."
+                 % (scene_idx, ", ".join(seg.rejection_reasons or ["window too short"]),
+                    scene_need, float(seg.duration or 0.0)))
             return False
         sc = scenes[scene_idx]
         name = Path(final).name
@@ -4462,6 +5594,12 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         sc["native_9_16"] = seg.native_9_16
         sc["assignment_type"] = atype
         sc["fallback_level"] = flevel
+        if montage_parts:
+            sc["chapter_montage"] = [{
+                "segment_id": source.segment_id, "source_id": source.source_id,
+                "start": round(float(source.start_time), 3),
+                "duration": seconds, "query": source.query or "",
+            } for _path, source, seconds in montage_parts]
         if visual_role:
             sc["visual_role"] = visual_role
         elif scene_idx == 0:
@@ -4475,7 +5613,9 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
                              or sc.get("script") or "")[:160],
             "assignment_type": atype, "match_class": mclass,
             "script_match_score": round(sem, 1),
-            "why": ("exact semantic match" if atype == "exact" else
+            "why": ("verified literal visual-evidence match" if
+                    atype == "exact" and mclass in ("A_MATCH", "B_MATCH") else
+                    "unverified candidate; not represented as an exact match" if atype == "exact" else
                     "relevance-ranked fallback (no exact match passed the floors for this scene)"
                     if atype in ("context_fallback",) else atype),
             "thumbs": _slog_thumbs(seg, project_dir, ffmpeg, n=1),
@@ -4570,6 +5710,11 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
         rep["assignment_type"] = "uncovered_still"
         rep["uncovered_reason"] = reason
 
+    reserved_sources = {
+        getattr(a._seg, "source_id", "")
+        for sid, a in assignments.items()
+        if getattr(a, "_seg", None) is not None
+    }
     for it in body_intents:
         a = assignments.get(it.scene_id)
         rep = {"scene_id": it.scene_id, "scene_text": it.scene_text,
@@ -4579,13 +5724,36 @@ def scrape_social_plan_v2(config, scenes, project_dir, platforms, per_clip_secon
             seg = a._seg
             ok = _write_scene(it.scene_id, seg, a.assignment_type, a.fallback_level,
                               a.semantic_score, a.match_class)
-            rep.update({"selected_segment": seg.segment_id, "assignment_type": a.assignment_type,
-                        "semantic_score": a.semantic_score, "quality_score": a.quality_score})
-            if a.assignment_type == "exact":
+            chosen_type, chosen_sem, chosen_quality = (a.assignment_type, a.semantic_score,
+                                                        a.quality_score)
+            # The final byte-level cut audit can discover a transition that proxy analysis missed.
+            # Try another semantically approved candidate from a different, unreserved source
+            # before declaring the chapter uncovered and borrowing unrelated neighbour motion.
+            if not ok:
+                for row in scene_candidates.get(it.scene_id, []):
+                    alternative = row.get("segment")
+                    if (alternative is None or alternative.segment_id == seg.segment_id
+                            or alternative.source_id in reserved_sources):
+                        continue
+                    alternative_type = str(row.get("assignment_type") or "retry_exact")
+                    alternative_sem = float(row.get("overall_match") or 0.0)
+                    if _write_scene(it.scene_id, alternative, alternative_type, 0,
+                                    alternative_sem, str(row.get("match_class") or "A_MATCH")):
+                        seg, ok = alternative, True
+                        chosen_type, chosen_sem = alternative_type, alternative_sem
+                        chosen_quality = float(alternative.quality_score or 0.0)
+                        reserved_sources.add(alternative.source_id)
+                        _log(status_cb, "Scrape V2: scene %s used its next approved candidate "
+                                        "after the first failed the exact final-cut audit."
+                             % it.scene_id)
+                        break
+            rep.update({"selected_segment": seg.segment_id, "assignment_type": chosen_type,
+                        "semantic_score": chosen_sem, "quality_score": chosen_quality})
+            if ok and chosen_type == "exact":
                 counters["scenes_exact_matched"] += 1
-            elif a.assignment_type in ("alternative_visual", "retry_exact"):
+            elif ok and chosen_type in ("alternative_visual", "retry_exact"):
                 counters["scenes_alternative_matched"] += 1
-            elif a.assignment_type in ("context_fallback", "emergency_fallback"):
+            elif ok and chosen_type in ("context_fallback", "emergency_fallback"):
                 counters["scenes_context_fallback"] += 1
             if not ok:
                 counters["scenes_unmatched"] += 1

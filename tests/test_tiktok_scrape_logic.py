@@ -63,6 +63,9 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         self.assertFalse(tiktok_login._search_response_matches_query(
             "https://www.tiktok.com/api/challenge/item_list/?challengeID=1",
             "wallet japan", is_tag=False))
+        self.assertFalse(tiktok_login._search_response_matches_query(
+            "https://www.tiktok.com/api/search/general/full/?aid=1988",
+            "wallet japan", is_tag=False))
         self.assertTrue(tiktok_login._search_response_matches_query(
             "https://www.tiktok.com/api/challenge/item_list/?challengeID=1",
             "#踊ってみた", is_tag=True))
@@ -91,6 +94,105 @@ class TikTokScrapeLogicTests(unittest.TestCase):
         strict = scrape_v2.match_thresholds_for_relevancy("concrete", 90)
         self.assertGreater(strict["script_floor"], 5.8)
         self.assertGreater(strict["overall"], 6.5)
+
+    def _matcher_fixture(self, relevancy=90):
+        intent = scrape_v2.VisualIntent(
+            scene_id=0, scene_text="Young adults parade through the street carrying huge flags.",
+            visual_type="concrete", match_category="literal",
+            subject="young adults with flags", action="carrying flags through a street",
+            location="Japanese city street", required_elements=["flags", "names on the flags"])
+        intent.script_relevancy = relevancy
+        seg = scrape_v2.SegmentCandidate(
+            segment_id="s0", source_id="src0", platform="tiktok", source_path="proxy.mp4",
+            start_time=0.0, end_time=6.0, duration=6.0, query="成人式", japanese_context=True,
+            source_width=1080, source_height=1920, native_9_16=True, motion_score=3.0,
+            visual_description={"subjects": ["group carrying flags"],
+                                "action": "marching with flags", "location": "city street",
+                                "age_confidence": "adult"})
+        return intent, seg
+
+    def _run_matcher(self, intent, seg, candidate):
+        answer = {"scenes": {"0": [dict(candidate, seg=0)]}}
+        with mock.patch.object(scrape_v2, "_llm_json", return_value=answer):
+            return scrape_v2.match_segments_to_scenes_v2([intent], [seg])
+
+    def test_strict_relevancy_never_empties_a_scene(self):
+        """At relevancy 90 every concrete beat is "strict". The evidence gate used to cap
+        script_match at 3.0 while the floor is 6.2 AND switch off the near-miss rescue, so the
+        matcher returned literally nothing - 83 quality segments, 0 candidates, six blank beats."""
+        intent, seg = self._matcher_fixture(90)
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 8, "action_match": 7, "location_match": 7, "mood_match": 6,
+            "script_match": 7, "style_match": 6, "literal_match": False,
+            "visible_evidence": ["group carrying flags"],
+            "missing_required": ["names on the flags"], "covers": []})
+        self.assertTrue(out.get(0), "a scene with a plausible clip must never come back empty")
+
+    def test_missing_contract_fields_are_not_treated_as_failed_evidence(self):
+        """A model answer without literal_match/visible_evidence is silence, not proof of a bad
+        match; demoting it made every non-conforming answer unusable."""
+        intent, seg = self._matcher_fixture(90)
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 9, "action_match": 8, "location_match": 8, "mood_match": 7,
+            "script_match": 8, "style_match": 7})
+        best = out[0][0]
+        self.assertGreaterEqual(best["script_match"], 8.0)
+        self.assertIn(best["match_class"], ("A_MATCH", "B_MATCH", "C_MATCH"))
+
+    def test_proven_literal_match_still_clears_the_strict_floor(self):
+        intent, seg = self._matcher_fixture(90)
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 9, "action_match": 9, "location_match": 8, "mood_match": 7,
+            "script_match": 9, "style_match": 7, "literal_match": True,
+            "visible_evidence": ["group carrying flags", "city street"],
+            "missing_required": ["names on the flags"], "covers": ["flags"]})
+        best = out[0][0]
+        self.assertFalse(best.get("below_floor"))
+        self.assertEqual(best["match_class"], "A_MATCH")
+
+    def test_clip_found_by_another_beat_can_still_serve_this_beat(self):
+        """Every query is scene-bound, so every segment carried exactly one scene id. Enforcing
+        that id in the matcher meant a perfect clip found by beat 3's search could never be
+        offered to beat 0 - the model answered and the code deleted the answer, which the run
+        then reported as "the matcher judged the segments off-topic"."""
+        intent, seg = self._matcher_fixture(90)
+        seg.scene_ids = [3]
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 9, "action_match": 9, "location_match": 9, "mood_match": 8,
+            "script_match": 9, "style_match": 8, "literal_match": True,
+            "visible_evidence": ["group carrying flags", "city street"],
+            "missing_required": [], "covers": ["flags"]})
+        self.assertTrue(out.get(0), "provenance must not bar a clip from another beat")
+        self.assertEqual(out[0][0]["match_class"], "A_MATCH")
+
+    def test_english_captioned_clip_survives_match_on_a_japan_topic(self):
+        """The Japanese-provenance rule belongs to SEARCH, where it already runs. Repeating it at
+        match time vetoed the corrective round by construction: its adaptive queries are English
+        on purpose, their results are legitimately English-captioned, and every one of them was
+        deleted after being downloaded and described - "recovered 0/4" on good footage."""
+        intent, seg = self._matcher_fixture(90)
+        intent.scene_text = "Cleaners turn around a Japanese bullet train in seven minutes."
+        intent.location = "Japan train platform"
+        seg.japanese_context = False
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 9, "action_match": 9, "location_match": 8, "mood_match": 7,
+            "script_match": 9, "style_match": 7, "literal_match": True,
+            "visible_evidence": ["cleaning crew", "train"], "missing_required": [],
+            "covers": ["cleaning"]})
+        self.assertTrue(out.get(0), "a clip vision already approved must not be vetoed by caption "
+                                    "language")
+
+    def test_unproven_candidate_is_demoted_not_promoted(self):
+        """The gate still has to work: no evidence + weak numbers may be kept as a last-resort
+        near miss, but it must never present itself as a real match."""
+        intent, seg = self._matcher_fixture(90)
+        out = self._run_matcher(intent, seg, {
+            "subject_match": 4, "action_match": 3, "location_match": 5, "mood_match": 5,
+            "script_match": 8, "style_match": 6, "literal_match": False,
+            "visible_evidence": [], "missing_required": ["flags"], "covers": []})
+        for row in out.get(0, []):
+            self.assertNotEqual(row["match_class"], "A_MATCH")
+            self.assertLess(row["script_match"], 6.2)
 
     def test_v2_validation_accepts_topic_or_optional_influencer_hook(self):
         base = {"voice_speed": 1.10, "scenes": [

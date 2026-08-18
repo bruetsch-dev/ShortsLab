@@ -1,0 +1,7 @@
+{
+  "label": "a low-poly dog",
+  "aliases": ["puppy", "pup", "hound"],
+  "stands_in_for": ["wolf", "coyote"],
+  "height_m": 0.63,
+  "coat_material": "fur"
+}

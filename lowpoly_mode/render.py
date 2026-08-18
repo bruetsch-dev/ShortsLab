@@ -14,6 +14,9 @@ from physics_mode.blender_runner import frames_to_clip, run_scene
 
 KIT = Path(__file__).resolve().parent / "blender_kit"
 SCRIPT = KIT / "render_shot.py"
+# The character models. Passed as a param, never baked into the spec: the spec is written
+# to spec.json and copied verbatim into report.json, and an absolute path in there rots.
+MODELS = Path(__file__).resolve().parent / "models"
 
 
 def render_shot(spec: dict, out_dir, seconds: float, *, res=(540, 960), fps: int = 24,
@@ -24,7 +27,8 @@ def render_shot(spec: dict, out_dir, seconds: float, *, res=(540, 960), fps: int
     (out_dir / "spec.json").write_text(json.dumps(spec, indent=1), encoding="utf-8")
     ok, msg = run_scene(SCRIPT, out_dir,
                         {"res_x": res[0], "res_y": res[1], "fps": fps,
-                         "seconds": float(seconds), "kit_dir": str(KIT), "spec": spec},
+                         "seconds": float(seconds), "kit_dir": str(KIT),
+                         "models_dir": str(MODELS), "spec": spec},
                         blender=blender, status_cb=status_cb, timeout=1800)
     if not ok:
         (status_cb or print)(f"  shot failed: {msg[-300:]}")
@@ -41,7 +45,7 @@ def preview_shot(spec: dict, out_dir, seconds: float = 2.0, frame: int = 6,
     ok, _msg = run_scene(SCRIPT, out_dir,
                          {"res_x": res[0], "res_y": res[1], "fps": 24,
                           "seconds": float(seconds), "preview_frame": int(frame),
-                          "kit_dir": str(KIT), "spec": spec},
+                          "kit_dir": str(KIT), "models_dir": str(MODELS), "spec": spec},
                          blender=blender, status_cb=status_cb, timeout=600)
     shot = out_dir / "preview.png"
     return shot if ok and shot.is_file() else None

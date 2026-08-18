@@ -29,6 +29,7 @@ import subprocess
 import threading
 import time
 import concurrent.futures
+import urllib.error
 from pathlib import Path
 
 import agent_core
@@ -38,16 +39,25 @@ ROOT = Path(__file__).resolve().parent
 OUT_ROOT = agent_core.PROJECTS_DIR / "_longform"
 
 TTS_PART_CHAR_LIMIT = 2200          # sentence-safe chunking limit per TTS call
-# 1, deliberately, until higgsfield_login runs more than one real worker: its executor is
-# Real concurrency: the pool fires generate on IMAGE_CONCURRENCY separate pages in the ONE trusted
-# Higgsfield context and polls each page's own captured result, so all N generate server-side in
-# parallel while every image stays bound to its own page (exact attribution, no submit-clock race).
-IMAGE_CONCURRENCY = 4               # max Higgsfield generations in flight
-# A normal Higgsfield generation legitimately takes 5-10 min. A too-short timeout counted those
-# healthy generations as failures, recycled the page (leaving the generation running server-side =
-# an orphan that keeps holding one of the ~4 concurrent slots) and cascaded into "max concurrent"
-# refusals. 900s (15 min) only fires on a genuinely stuck job, so healthy runs never orphan.
-IMAGE_TIMEOUT_S = 900
+
+# ---- images: Ideogram (P-Image) over the WaveSpeed HTTP API ------------------------------
+# Replaces the Higgsfield browser session. That route needed a visible window, a manual
+# "Unlimited" switch and a DataDome bot-check that fails every automated click, and its
+# page-recycling was the source of the late-delivery/mis-attribution bug this file spent
+# hundreds of lines defending against. An ordinary POST+poll has none of that: every request
+# owns its own result, so attribution is exact by construction.
+P_IMAGE_MODEL = "pruna-ai/p-image/ideogram"
+IMAGE_ASPECT = "16:9"
+# 1k + "very low" (user 2026-08-16): the cheapest tier on this endpoint, $0.003 per image
+# against $0.030 for 2k/high - a 240-frame video costs ~$0.72 instead of ~$7.20. Flat doodle
+# art is the one style that survives it: no fine texture to lose, and the composition comes
+# from the prompt rather than from the model thinking about it.
+IMAGE_RESOLUTION = "1k"
+IMAGE_THINKING = "very low"
+IMAGE_OUTPUT_FORMAT = "png"
+# Median generation is ~8s, so the run is now network-bound rather than session-bound.
+IMAGE_CONCURRENCY = 6               # parallel generations in flight
+IMAGE_TIMEOUT_S = 300               # per image: submit + poll + download
 IMAGE_RETRIES = 2                   # re-generate a failed image up to N extra times
 MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP = 6  # failed generations with ZERO successes = provider gone
 MAX_CONSECUTIVE_FAILURES_MIDRUN = 10    # unbroken failure streak while fresh work remains = died mid-run
@@ -339,6 +349,7 @@ def generate_voiceover(script, out_dir, tts_model="pro", status_cb=None, cancel_
         opts = dict(tts_options or {})
         tts_kw.update({
             "voice_instruction": str(opts.get("voice_instruction") or "").strip() or None,
+            "auto_upbeat": False,
             "language": str(opts.get("language") or "").strip(),
             "tts_speed": opts.get("speed", 1.0),
             "volume": opts.get("volume", 1.0),
@@ -724,7 +735,7 @@ def finalize_speech_review_timing(out_dir, status_cb=None):
         candidate = out_dir / "images" / f"{image_key(idx, line, natural_durations[idx])}.png"
         if _image_done(candidate, "16:9"):
             results[idx] = str(candidate)
-    cut_durations = speech_cut_durations(new_lines, new_duration)
+    cut_durations = caption_cut_durations(new_lines, prompts, new_duration)
     write_timeline_manifest(
         new_lines, cut_durations, results, new_duration, out_dir / "timeline.json",
         voice_speed=float(state.get("voice_speed") or 1.0))
@@ -819,13 +830,15 @@ def write_transcript(lines, out_path):
 
 # ------------------------------------------------------------------ 3) IMAGE PROMPTS
 
-# Bump when the STAGE-3 doodle-prompt FORMAT changes (e.g. the mandatory ALL-CAPS top caption).
-# A resumed project whose saved prompts predate this version regenerates ALL prompts - and the
-# images made from them - in the new style instead of reusing the old-format cache.
-PROMPT_FORMAT_VERSION = 3
+# Bump when the STAGE-3 doodle-prompt FORMAT changes. A resumed project whose saved prompts
+# predate this version regenerates ALL prompts - and the images made from them - in the new
+# style instead of reusing the old-format cache.
+# 4: every caption/label/on-screen word removed. The frames carry no text at all now, so a
+# cached v3 prompt (which MANDATED an ALL-CAPS top caption) would bake words back in.
+PROMPT_FORMAT_VERSION = 4
 
-# The mascot is described in WORDS, not attached as a reference image: Higgsfield's page
-# has no upload control wired up here, and the look has to survive hundreds of frames anyway.
+# The mascot is described in WORDS: the image endpoint takes text only, and the look has to
+# survive hundreds of frames anyway.
 # A short, rigid description keeps it recognisable; the last line is what makes it feel part of
 # the drawing instead of a sticker (user 2026-07-25: "seine aktionen sollen zum bild passen").
 MASCOT_ART = Path(__file__).resolve().parent / "assets" / "mascot" / "blob.png"
@@ -839,8 +852,8 @@ MASCOT_LOOK = (
 MASCOT_RULE = (
     "MASCOT: hide {name} somewhere in this frame - {look}. Keep it SMALL (roughly a tenth of "
     "the frame height) and place it off to one side, in a corner, behind or peeking around "
-    "something. It must never be the subject, never overlap the main action, and never carry "
-    "the caption. Give it ONE small reaction that fits what this frame shows - watching, "
+    "something. It must never be the subject and never overlap the main action. Give it ONE "
+    "small reaction that fits what this frame shows - watching, "
     "hiding, leaning in, looking away, mimicking the subject - so it belongs to the scene.")
 
 
@@ -877,28 +890,31 @@ Once the user pastes their timestamped script, generate one detailed text-to-ima
 
 1. Every prompt must begin with its timestamp COPIED EXACTLY as it appears in the script (e.g. `[0:03.4]`) - do not reformat or round timestamps
 2. Every prompt must open with the style anchor: "Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines,"
-3. Every prompt must end with the style lock: "no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style."
+3. Every prompt must end with the style lock: "no text, no words, no letters, no numbers, no captions, no labels, no signage, no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style."
 4. Be specific inside each prompt - describe what characters are present and what they are doing, their exact expression, what objects are in the scene, what background color is used
-5. MANDATORY on-screen caption: every prompt MUST include a bold black ALL CAPS marker text at the top of the frame reading a short punchy 1-3 word caption that captures the essence of that line - phrase it exactly as: `bold black ALL CAPS marker text at the top reading "CHEERS"`. Pick THE key word/reaction/label of the narration, like the on-screen words in a viral doodle explainer (CHEERS, WAR!, SORRY!, MOST COUNTRIES, 2 KM UNNOTICED, MILLIONS OF YEARS). NEVER use the whole sentence or a long phrase as the caption - a caption longer than 3 words is wrong. Keep captions varied and specific to each line; hold the same caption only while the same beat is held across consecutive timestamps.
-6. Translate abstract narration into concrete visuals - if the script says "your body doesn't know the difference", show a confused stick figure looking at two identical objects; if it says "millions of years", show a large hourglass with the top caption reading "MILLIONS OF YEARS"
 
-GOLD-STANDARD EXAMPLE (match this exact shape - style anchor, then a rich concrete scene, then the mandatory top caption, then background, then the style lock):
-`Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines, a Swiss-helmeted stick figure and a crowned stick figure happily clinking two frothy beer mugs together with big warm smiles, a red heart above them and a small white dove of neutrality flying overhead, bold black ALL CAPS marker text at the top reading "CHEERS", plain white background, no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style.`
+5. ABSOLUTELY NO TEXT IN THE IMAGE. The frame must contain no written language of any kind: no captions, no titles, no labels, no speech bubbles with words, no signs, no book covers with titles, no numbers on clocks or scoreboards, no letters on shirts. NEVER write phrases like `text at the top reading "..."`, `label reading "..."` or `sign saying "..."` into a prompt. The narration carries the words; the picture carries only the picture. If a scene seems to need a word, replace it with a DRAWN symbol instead - a question mark, an exclamation mark, an arrow, a heart, a skull, a cross, a tick, a lightbulb, a magnifying glass, a clock face without numbers.
+6. Translate abstract narration into concrete visuals - if the script says "your body doesn't know the difference", show a confused stick figure looking back and forth between two identical objects with a large question mark above its head; if it says "millions of years", show a huge hourglass with almost all the sand fallen through and a tiny stick figure beside it for scale.
+
+GOLD-STANDARD EXAMPLE (match this exact shape - style anchor, then a rich concrete wordless scene, then background, then the style lock):
+`Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly imperfect sketchy marker lines, a helmeted stick figure and a crowned stick figure happily clinking two frothy beer mugs together with big warm smiles, a red heart floating above them and a small white dove flying overhead, plain white background, no text, no words, no letters, no numbers, no captions, no labels, no signage, no gradients, no shadows, no textures, no photorealism, no 3D, no realistic faces, no anime style, 16:9 aspect ratio, educational YouTube explainer doodle style.`
+
 7. Match tone to background color:
    - Ancient / prehistoric -> tan or dark blue background
-   - Danger / threat -> stark white with red text or red-tinted sky
+   - Danger / threat -> stark white or a red-tinted sky
    - Happy / triumph / discovery -> bright white or yellow background
    - Underwater / science -> solid blue background
    - Outdoor / nature / evolution -> flat green ground + blue sky
    - Fire / night / ancient ritual -> solid orange background
 8. Hold scenes across consecutive timestamps - if 3 lines describe the same moment, keep the same scene and only adjust the character's expression or add one new element. Do not generate a brand new scene every 5 seconds.
-9. Use these proven frame types when appropriate:
-   - **Concept text frame:** Large object (hourglass, clock, skull) centered + bold ALL CAPS text at top
-   - **Evolution sequence:** Left-to-right creature or human progression with a right-pointing arrow
-   - **Labeled diagram:** Animal or object with a yellow diagonal arrow + ALL CAPS label word
-   - **Stick figure reaction:** Thought bubble above head with "?", "HMMMM", "!", or "WAIT..."
-   - **Villain personified:** An abstract concept given an angry cartoon face (sun with knife, brain with boxing gloves)
-   - **Globe + creatures:** Earth globe centered, surrounded by floating cartoon animals or objects
+9. Use these proven WORDLESS frame types when appropriate:
+   - **Single concept object:** one large object (hourglass, clock face without numbers, skull, lightbulb, brain) centered on a plain background
+   - **Evolution sequence:** left-to-right creature or human progression with a big right-pointing arrow
+   - **Pointed diagram:** an animal or object with a thick yellow arrow pointing at the one part that matters
+   - **Stick figure reaction:** a thought bubble above the head containing a drawn SYMBOL - a question mark, an exclamation mark, a lightbulb, a skull - never a written word
+   - **Villain personified:** an abstract concept given an angry cartoon face (a sun with a knife, a brain with boxing gloves)
+   - **Globe + creatures:** an Earth globe centered, surrounded by floating cartoon animals or objects
+   - **Comparison split:** two halves of the frame showing the two things being compared, divided by one bold black line
 
 **OUTPUT FORMAT - DELIVER IN BATCHES OF 20**
 
@@ -920,7 +936,7 @@ Only after the FINAL batch has been delivered - when every timestamp now has a p
 
 **All image prompts are now delivered - one for every timestamp in your script.**
 
-Always include in every prompt: no photorealism, no 3D render, no gradients, no drop shadows, no textures, no realistic faces, no anime style."""
+Always include in every prompt: no text, no words, no letters, no numbers, no captions, no labels, no photorealism, no 3D render, no gradients, no drop shadows, no textures, no realistic faces, no anime style."""
 
 _PROMPT_LINE_RE = re.compile(r"^\s*(\[\d+:\d{2}(?:\.\d)?\])\s*(.+)$")
 
@@ -1016,9 +1032,10 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
                         "Generate exactly one 16:9 image prompt for every supplied timestamp. "
                         "Output only lines in the form '[m:ss.s] prompt', chronological, no fence, "
                         "no commentary. Every prompt must request a concrete hand-drawn 2D doodle "
-                        "scene with flat colors, bold black outlines, simple stick figures, an "
-                        "ALL-CAPS top caption derived from the narration, and explicitly: no "
-                        "photorealism, no 3D, no gradients, no shadows, no textures, no anime."},
+                        "scene with flat colors, bold black outlines and simple stick figures, "
+                        "containing NO written language of any kind, and explicitly: no text, no "
+                        "words, no letters, no numbers, no captions, no labels, no photorealism, "
+                        "no 3D, no gradients, no shadows, no textures, no anime."},
                     {"role": "user", "content": exact}],
                 "temperature": 0.35, "max_tokens": 5000,
             }, timeout=300)
@@ -1035,23 +1052,21 @@ def generate_image_prompts(lines, reasoning_model=None, status_cb=None, cancel_e
     while len(prompts) < len(lines):
         idx = len(prompts)
         line = lines[idx]
-        words = re.findall(r"[A-Za-z0-9]+", str(line.get("text") or ""))
-        caption = " ".join(words[:5]).upper() or f"SCENE {idx + 1}"
         prompt = ("Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, "
                   "slightly imperfect marker lines, one concrete visual metaphor for the narration "
                   f"\"{str(line.get('text') or '')[:300]}\", simple expressive stick figures and "
-                  f"one clear focal object, bold black ALL CAPS text at the top reading \"{caption}\", "
-                  "clean 16:9 composition, no photorealism, no 3D, no gradients, no shadows, no "
-                  "textures, no realistic faces, no anime style.")
+                  "one clear focal object, plain background, clean 16:9 composition, " + NO_TEXT_LOCK)
         prompts.append({"timestamp": fmt_ts(line["start"]), "prompt": prompt})
         _log(status_cb, f"Image prompts: built a safe local fallback for slot {idx + 1}.")
         save_checkpoint()
     prompts = prompts[:len(lines)]
-    enforce_short_captions(prompts, lines, status_cb=status_cb)
-    mismatch = sum(1 for l, p in zip(lines, prompts) if p["timestamp"] != fmt_ts(l["start"]))
-    if mismatch:
-        _log(status_cb, f"Note: {mismatch} prompt timestamp(s) differ from the transcript - "
-                        "using positional order (prompt N = line N).")
+    strip_text_from_prompts(prompts, status_cb=status_cb)
+    mismatch = sum(1 for l, p in zip(lines, prompts)
+                   if p["timestamp"] != fmt_ts(l["start"]))
+    if mismatch or len(prompts) != len(lines):
+        _log(status_cb, f"Image prompt timestamps differ from the transcript "
+                        f"({mismatch} mismatched, {len(prompts)}/{len(lines)} prompts); "
+                        "reusing existing images without generating replacements.")
     if mascot:
         prompts = add_mascot(prompts)
         _log(status_cb, f"Mascot: {MASCOT_NAME} hidden in all {len(prompts)} image prompts.")
@@ -1066,7 +1081,7 @@ def write_prompts_file(prompts, out_path):
     return out_path
 
 
-# ------------------------------------------------------------------ 4) IMAGES (Higgsfield)
+# ------------------------------------------------------------------ 4) IMAGES (Ideogram)
 
 CHARACTER_REFERENCE_PROMPT = (
     "Hand-drawn 2D doodle cartoon animation, flat colors, bold black outlines, slightly "
@@ -1083,115 +1098,78 @@ def image_key(index, line, duration):
     return f"img{index:03d}_[{ts}]_dur{duration:.2f}s"
 
 
-_CAPTION_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with", "at", "by",
-    "from", "your", "you", "it", "its", "is", "are", "was", "were", "be", "been", "will",
-    "would", "that", "this", "these", "those", "into", "as", "than", "then", "when", "while",
-    "have", "has", "had", "not", "no", "so", "if", "before", "after", "even", "just", "very",
-    "there", "here", "they", "them", "their", "he", "she", "his", "her", "we", "our", "all",
-    "any", "some", "can", "could", "do", "does", "did", "what", "who", "how", "why", "where",
-}
+# The tail every prompt must carry. Ideogram is a TEXT-STRONG model - it will happily render
+# any word it finds in the prompt - so the ban has to be stated as explicitly as the style.
+NO_TEXT_LOCK = ("no text, no words, no letters, no numbers, no captions, no labels, no signage, "
+                "no gradients, no shadows, no textures, no photorealism, no 3D, no realistic "
+                "faces, no anime style, 16:9 aspect ratio, educational YouTube explainer "
+                "doodle style.")
+
+# Phrasings a model reaches for when it wants words on the frame. Each is cut out of the prompt
+# rather than trusted to the style lock, because a positive instruction ("text reading X") beats
+# a negative one ("no text") in every image model.
+_TEXT_INSTRUCTION_RES = (
+    # ...text at the top reading "WORD",   ...label reading "WORD",   ...sign saying "WORD"
+    re.compile(r",?\s*[^,]*\b(?:text|caption|title|label|lettering|sign|signage|word|words|"
+               r"headline|banner)\b[^,]*?\b(?:reading|saying|says|that reads|spelling)\b\s*"
+               r"[\"“‘'][^\"”’']{0,80}[\"”’']", re.I),
+    # bare "bold ALL CAPS text at the top" with no quoted string
+    re.compile(r",?\s*[^,]*\b(?:all[- ]caps|bold black)\b[^,]*\b(?:text|caption|lettering)\b"
+               r"[^,]*", re.I),
+    # a leftover clause that only announces text
+    re.compile(r",?\s*[^,]*\b(?:on-screen|onscreen)\s+(?:text|caption|words)\b[^,]*", re.I),
+)
 
 
-def enforce_short_captions(prompts, lines, status_cb=None):
-    """Mechanically guarantee the SHORT viral caption contract (user 2026-07-23: 'nur einzelne
-    woerter, das wichtige'): every prompt carries a `reading "X"` caption of AT MOST 3 words.
-    Models sometimes drift and omit the phrasing entirely - the image model then bakes the WHOLE
-    narration sentence onto the frame. Missing captions are derived from the line's key content
-    words; overlong ones are trimmed. Mutates `prompts` in place."""
-    fixed_missing = fixed_long = 0
-    for i, p in enumerate(prompts):
+def strip_text_from_prompts(prompts, status_cb=None):
+    """Guarantee the NO-TEXT contract mechanically (user 2026-08-16: "keine texte oder captions
+    mehr in den images").
+
+    The STAGE-3 spec forbids written language, but a model that spent a hundred prompts writing
+    `text at the top reading "X"` drifts back into it - and one such clause outweighs the whole
+    negative style lock. So every caption phrasing is CUT from the prompt here, and the lock is
+    appended if it is missing. Mutates `prompts` in place; returns how many were repaired."""
+    stripped = locked = 0
+    for p in prompts:
         if not isinstance(p, dict):
             continue
-        text = str(p.get("prompt") or "")
+        text = str(p.get("prompt") or "").strip()
         if not text:
             continue
-        m = _CAPTION_RE.search(text)
-        if m:
-            words = m.group(1).split()
-            if len(words) > 3:
-                new_cap = " ".join(words[:3]).upper().strip(" ,.")
-                p["prompt"] = text.replace(m.group(0), f'reading "{new_cap}"', 1)
-                fixed_long += 1
-            continue
-        line_text = str((lines[i] or {}).get("text") or "") if i < len(lines) else ""
-        tokens = re.findall(r"[A-Za-z0-9']+", line_text)
-        content = [w for w in tokens if w.lower() not in _CAPTION_STOPWORDS and len(w) >= 3]
-        cap = " ".join((content or tokens)[:2]).upper()
-        if not cap:
-            cap = f"SCENE {i + 1}"
-        p["prompt"] = (text.rstrip(" .") +
-                       f', bold black ALL CAPS marker text at the top reading "{cap}".')
-        fixed_missing += 1
-    if fixed_missing or fixed_long:
-        _log(status_cb, f"Caption contract enforced: {fixed_missing} prompt(s) had NO caption "
-                        f"instruction (injected a key-word caption), {fixed_long} overlong "
-                        "caption(s) trimmed to 3 words.")
-    return fixed_missing + fixed_long
+        cleaned = text
+        for pattern in _TEXT_INSTRUCTION_RES:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).replace(" ,", ",").strip(" ,.")
+        if cleaned != text.strip(" ,."):
+            stripped += 1
+        if "no text" not in cleaned.lower():
+            cleaned = cleaned.rstrip(" ,.") + ", " + NO_TEXT_LOCK
+            locked += 1
+        else:
+            cleaned = cleaned.rstrip(" ,") + ("" if cleaned.endswith(".") else ".")
+        p["prompt"] = cleaned
+    if stripped or locked:
+        _log(status_cb, f"No-text contract enforced: {stripped} prompt(s) still asked for "
+                        f"on-screen words (removed), {locked} were missing the no-text lock.")
+    return stripped + locked
 
 
-def caption_cut_starts(lines, prompts, audio_duration, lead=0.15):
-    """Caption-synced cut times: frame i appears when its CAPTION PHRASE is actually SPOKEN.
+def caption_cut_starts(lines, prompts, audio_duration, lead=0.0):
+    """Cut times: frame i appears when its narration line starts.
 
-    The whisper line start is the first word of the sentence - but the caption usually names a
-    word from the middle/end of it ("...almost nothing. WHY?"), so cutting at the sentence start
-    showed the WHY? frame seconds before "why" is heard.
-
-    The match must be the PHRASE, not any single caption word: with caption "SOMEONE ELSE" over
-    the line "...or is this something else? Someone else's hand..." a first-word-in-set match
-    hits the early "else" (of "something else") and cuts ~2s before "someone else" is spoken.
-    So for every position in the line we score how many consecutive caption words match from
-    there and cut at the position with the LONGEST run (earliest wins a tie); a single-word
-    caption keeps the old first-occurrence behaviour. The cut lands `lead` seconds early
-    (anticipation). Fallback: the line start. Cuts are forced monotonic and the first cut is
+    This used to hunt for the moment the frame's CAPTION PHRASE was spoken, because a caption
+    naming a word from the middle of a sentence ("...almost nothing. WHY?") would otherwise
+    appear seconds early. The frames carry no words any more, so there is no phrase to sync to
+    and the sentence start is the honest cut point. Cuts are forced monotonic and the first is
     pinned to 0 so the video never opens on black."""
     cuts = []
-    for i, line in enumerate(lines):
-        cap = expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
-                               else prompts[i]) if i < len(prompts) else ""
-        cut = float(line["start"])
-        cap_words = [w for w in _norm_words(cap) if len(w) >= 3]
-        words = line.get("words") or []
-        if cap_words and words:
-            # one normalized token per spoken word (None when the word is pure punctuation)
-            toks = []
-            for w in words:
-                t = _norm_words(w.get("w") or "")
-                toks.append(t[0] if t else None)
-            best_pos, best_run = None, 0
-            for j, tok in enumerate(toks):
-                if tok is None or tok != cap_words[0]:
-                    continue
-                run = 1
-                k = j + 1
-                for cw in cap_words[1:]:
-                    if k < len(toks) and toks[k] == cw:
-                        run += 1
-                        k += 1
-                    else:
-                        break
-                if run > best_run:            # longest consecutive match; earliest wins ties
-                    best_pos, best_run = j, run
-                    if run == len(cap_words):
-                        break                 # full phrase found - no better match exists
-            if best_pos is None:
-                # phrase never starts with cap_words[0] in this line (OCR-ish captions,
-                # rephrased text): fall back to the first occurrence of ANY caption word
-                for j, tok in enumerate(toks):
-                    if tok is not None and tok in cap_words:
-                        best_pos = j
-                        break
-            if best_pos is not None:
-                # anticipation: show the frame a touch BEFORE the word lands (may nibble a
-                # few ms off the previous sentence's tail - that reads as intentional)
-                cut = max(0.0, float(words[best_pos]["s"]) - lead)
-        cuts.append(cut)
-    # monotonic, minimum frame life 0.35s, first frame from 0
-    for i in range(1, len(cuts)):
-        cuts[i] = max(cuts[i], cuts[i - 1] + 0.35)
+    for line in lines:
+        cut = float(line["start"]) - float(lead or 0.0)
+        if cuts:
+            cut = max(cut, cuts[-1] + 0.05)
+        cuts.append(max(0.0, min(cut, float(audio_duration or 0.0) or cut)))
     if cuts:
         cuts[0] = 0.0
-        cuts[-1] = min(cuts[-1], max(0.0, audio_duration - 0.4))
     return cuts
 
 
@@ -1266,6 +1244,32 @@ def _archive_old_images(images_dir, status_cb=None):
     return moved
 
 
+def _archive_images_from_index(images_dir, start_index, status_cb=None):
+    """Archive only frames at/after a broken prompt slot so valid earlier frames can be reused."""
+    images_dir = Path(images_dir)
+    stale = list(images_dir.glob("*.png"))
+    selected = []
+    for path in stale:
+        match = re.match(r"img(\d{3})_", path.name)
+        if match and int(match.group(1)) >= int(start_index):
+            selected.append(path)
+    if not selected:
+        return 0
+    dest = images_dir / f"_prompt_repair_{time.strftime('%Y%m%d_%H%M%S')}"
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for path in selected:
+        try:
+            path.replace(dest / path.name)
+            moved += 1
+        except OSError:
+            pass
+    if moved:
+        _log(status_cb, f"Moved {moved} frame(s) from broken prompt slot #{start_index + 1} onward "
+                        f"to {dest.name}/ for regeneration.")
+    return moved
+
+
 def line_durations(lines, audio_duration):
     """Per-line on-screen duration: to the next line's start; last line holds to audio end."""
     durs = []
@@ -1297,6 +1301,404 @@ def speech_cut_durations(lines, audio_duration):
         nxt = cuts[idx + 1] if idx + 1 < len(cuts) else max(audio_end, cut + 0.04)
         durations.append(max(0.04, round(nxt - cut, 3)))
     return durations
+
+
+def saved_project_cut_durations(state, lines, audio_duration):
+    """Return the edit clock selected by an already-saved longform project.
+
+    Legacy projects retain caption-triggered cuts.  A project explicitly repaired to the speech
+    clock must keep that choice when reopening or rendering; otherwise a harmless rebuild would
+    silently put the old, early caption cuts back.
+    """
+    repair = (state or {}).get("retime_range") or {}
+    if isinstance(repair, dict) and repair.get("method") == "speech-clock":
+        return speech_cut_durations(lines, audio_duration)
+    return caption_cut_durations(lines, (state or {}).get("prompts") or [], audio_duration)
+
+
+def rebuild_timeline_from_speech_clock(out_dir, status_cb=None):
+    """Repair a saved longform timeline from the real narration clock, without any API work.
+
+    Image names used to encode caption-triggered holds.  That makes both the filename duration
+    and the edit point drift from the narration whenever a caption word occurs in the middle of
+    a sentence.  The stored forced-alignment line starts are the authoritative clock: keep image
+    *index* semantic, rename each existing frame to that clock, then rebuild a gapless manifest.
+    """
+    out_dir = Path(out_dir)
+    try:
+        state = json.loads((out_dir / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    lines = list(state.get("lines") or [])
+    voice = voiceover_path_from_state(out_dir, state)
+    if not lines:
+        raise LongformError("Cannot retime: this project has no saved narration lines.")
+    if not _audio_done(voice):
+        raise LongformError("Cannot retime: the saved voiceover is missing.")
+
+    audio_duration = audio_duration_seconds(voice)
+    # A semantic range-retime may have redistributed ``line.start`` while keeping the
+    # forced-alignment word clock intact.  For image cuts the first spoken word is the
+    # authoritative boundary; restore it before calculating durations so a picture does
+    # not appear during the preceding pause or sentence.
+    restored = 0
+    for line in lines:
+        word_times = []
+        for word in line.get("words") or []:
+            try:
+                word_times.append(float(word.get("s")))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if word_times:
+            spoken_start = round(min(word_times), 3)
+            if abs(float(line.get("start") or 0.0) - spoken_start) > 0.001:
+                restored += 1
+            line["start"] = spoken_start
+    for idx, line in enumerate(lines):
+        next_start = (float(lines[idx + 1]["start"])
+                      if idx + 1 < len(lines) else audio_duration)
+        line["end"] = round(max(float(line["start"]) + 0.04, next_start), 3)
+    durations = speech_cut_durations(lines, audio_duration)
+    images_dir = out_dir / "images"
+    staged = []
+    renamed = 0
+    if images_dir.is_dir():
+        # Locate by index rather than timestamp: the timestamp in an old filename is precisely
+        # what this repair replaces.  A two-phase move prevents collisions among adjacent files.
+        for idx, (line, duration) in enumerate(zip(lines, durations)):
+            destination = images_dir / f"{image_key(idx, line, duration)}.png"
+            candidates = sorted(
+                p for p in images_dir.glob(f"img{idx:03d}_*.png")
+                if _image_done(p, "16:9") and p != destination
+            )
+            if destination.is_file() or not candidates:
+                continue
+            source = candidates[0]
+            temporary = images_dir / f".speech_clock_{idx:03d}_{time.time_ns():x}.png"
+            os.replace(source, temporary)
+            staged.append((temporary, destination))
+        for temporary, destination in staged:
+            os.replace(temporary, destination)
+            renamed += 1
+
+    results = {}
+    for idx, (line, duration) in enumerate(zip(lines, durations)):
+        candidate = images_dir / f"{image_key(idx, line, duration)}.png"
+        if _image_done(candidate, "16:9"):
+            results[idx] = str(candidate)
+    prompts = list(state.get("prompts") or [])
+    if prompts:
+        for idx, row in enumerate(prompts):
+            if idx < len(lines) and isinstance(row, dict):
+                row["timestamp"] = fmt_ts(lines[idx]["start"])
+        write_prompts_file(prompts, out_dir / f"image_prompts_{out_dir.name}.txt")
+    save_state(out_dir, lines=lines, audio_duration=round(audio_duration, 3), prompts=prompts,
+               retime_range={"start": 0, "end": len(lines) - 1,
+                             "matched": len(results), "method": "speech-clock"})
+    write_transcript(lines, out_dir / "transcript.txt")
+    write_timeline_manifest(lines, durations, results, audio_duration,
+                            out_dir / "timeline.json",
+                            voice_speed=float(state.get("voice_speed") or 1.0))
+    _log(status_cb, f"Speech-clock retime complete: {len(results)} frame(s), {renamed} renamed, "
+                    f"{restored} cut(s) restored from aligned word starts.")
+    return {"lines": len(lines), "images": len(results), "renamed": renamed,
+            "duration": round(audio_duration, 3), "timeline": str(out_dir / "timeline.json")}
+
+
+def retime_existing_range(out_dir, start_idx, end_idx, replacement_lines=None,
+                          status_cb=None):
+    """Locally match existing images and retime one inclusive line range.
+
+    The range keeps its original wall-clock span, while line holds are redistributed by
+    spoken-word count.  Images are assigned by token overlap between their saved prompt/
+    narration and the target line (with the original slot as a stable tie-breaker).  No
+    image generation, network call, or Higgsfield session is involved; lines and files
+    outside the range are left byte-for-byte untouched.
+    """
+    out_dir = Path(out_dir)
+    state_path = out_dir / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise LongformError(f"Could not read longform state: {exc}") from exc
+    lines = [dict(row) for row in (state.get("lines") or []) if isinstance(row, dict)]
+    if not lines:
+        raise LongformError("This project has no timed voiceover lines.")
+    try:
+        first, last = int(start_idx), int(end_idx)
+    except (TypeError, ValueError) as exc:
+        raise LongformError("Scene range must use numeric indexes.") from exc
+    if first > last:
+        first, last = last, first
+    if first < 0 or last >= len(lines):
+        raise LongformError(f"Scene range must be between 1 and {len(lines)}.")
+    if last - first < 1:
+        raise LongformError("Select at least two scenes to retime.")
+    if not os.environ.get("WAVESPEED_API_KEY", "").strip():
+        raise LongformError("Gemini retime requires WAVESPEED_API_KEY; no local fallback was run.")
+
+    # Optional replacement lines are deliberately constrained to the selected range.  This
+    # lets a local transcription/analysis caller provide refreshed voiceover text without
+    # accidentally changing the rest of the project.
+    incoming = replacement_lines if isinstance(replacement_lines, list) else []
+    if incoming and len(incoming) != last - first + 1:
+        raise LongformError("Replacement line count must match the selected scene range.")
+    original = [dict(row) for row in lines]
+    audio_duration = float(state.get("audio_duration") or 0.0)
+    old_durations = line_durations(original, audio_duration)
+    span_start = float(original[first].get("start") or 0.0)
+    span_end = span_start + sum(old_durations[first:last + 1])
+    if last + 1 < len(original):
+        # The next line is outside the selection and is the authoritative right boundary.
+        span_end = float(original[last + 1].get("start") or span_end)
+    span = max(0.04 * (last - first + 1), span_end - span_start)
+
+    def words(text):
+        return set(re.findall(r"[a-z0-9']+", str(text or "").lower()))
+
+    prompts = state.get("prompts") or []
+    descriptors = []
+    for idx in range(first, last + 1):
+        prompt = prompts[idx] if idx < len(prompts) else {}
+        prompt_text = prompt.get("prompt", "") if isinstance(prompt, dict) else prompt
+        descriptors.append(str(prompt_text or "") + " " + str(original[idx].get("text") or ""))
+
+    targets = []
+    for offset, idx in enumerate(range(first, last + 1)):
+        row = dict(incoming[offset]) if incoming else dict(original[idx])
+        text = str(row.get("text") or row.get("script") or original[idx].get("text") or "")
+        row["text"] = text
+        targets.append(row)
+    word_clocks = [
+        [{"word": str(word.get("w") or ""), "time": float(word.get("s") or 0.0)}
+         for word in (row.get("words") or [])]
+        for row in targets
+    ]
+    weights = [max(1, len(words(row.get("text")))) for row in targets]
+    minimum = 0.4
+    if sum(weights) * minimum > span:
+        durations = [span / len(weights)] * len(weights)
+    else:
+        extra = span - sum(weights) * minimum
+        total = float(sum(weights))
+        durations = [minimum + extra * weight / total for weight in weights]
+    # Resolve current image paths by stable index, then assign them to target lines using a
+    # deterministic local text match.  Missing images remain missing; they are never generated.
+    image_dir = out_dir / "images"
+    sources = []
+    for idx in range(first, last + 1):
+        path = image_dir / f"{image_key(idx, original[idx], old_durations[idx])}.png"
+        if not _image_done(path, "16:9"):
+            candidates = [p for p in image_dir.glob(f"img{idx:03d}_*.png") if _image_done(p, "16:9")]
+            path = candidates[0] if candidates else None
+        sources.append(path)
+        if any(path is None for path in sources):
+            raise LongformError("Gemini vision retime requires an existing image for every selected scene.")
+    target_tokens = [words(row.get("text")) for row in targets]
+    descriptor_tokens = [words(value) for value in descriptors]
+    remaining = set(range(len(sources)))
+    assignment = {}
+    gemini_order = [None] * len(sources)
+    gemini_switches = [None] * len(sources)
+    batch_size = 10
+    voiceover_path = voiceover_path_from_state(out_dir, state)
+    voiceover_url = None
+    if _audio_done(voiceover_path):
+        _log(status_cb, "Uploading voiceover for Gemini retime...")
+        upload_error = None
+        for attempt in range(3):
+            try:
+                voiceover_url, _ = pipeline.upload_media(
+                    voiceover_path, os.environ["WAVESPEED_API_KEY"])
+                upload_error = None
+                break
+            except (OSError, urllib.error.URLError) as exc:
+                upload_error = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        if upload_error is not None:
+            # Word clocks were aligned against this exact immutable voiceover. The media upload is
+            # supplementary audio context, never a reason to prevent the vision retime from running.
+            _log(status_cb, "Voiceover upload failed after 3 attempts; Gemini will use the exact "
+                            "voiceover transcript and aligned word times instead.")
+    for batch_start in range(0, len(sources), batch_size):
+        batch_end = min(len(sources), batch_start + batch_size)
+        try:
+            batch_sheet = out_dir / "review" / f".retime_batch_{batch_start:04d}.jpg"
+            batch_sheet = agent_core.create_media_contact_sheet(
+                sources[batch_start:batch_end], batch_sheet,
+                title=f"Existing visuals {batch_start + 1}-{batch_end}")
+            if batch_sheet is None:
+                raise ValueError("Could not create a vision contact sheet.")
+            payload = {
+                "model": "google/gemini-3.1-pro-preview",
+                "messages": [
+                    {"role": "system", "content":
+                     "You are a vision editor. Ignore every filename, index, prompt, and other "
+                     "metadata. Judge only the supplied image pixels and the voiceover. Return only "
+                     "JSON with exactly one match for every target index and every source index. "
+                     "Match each source image to one target and choose the exact absolute spoken "
+                     "time of its visible caption using the supplied voiceover word times; do not "
+                     "invent times. Schema: "
+                     "{\"matches\":[{\"target\":0,\"source\":0,\"spoken_at\":12.34}]}."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": json.dumps({
+                            "targets": [row.get("text", "") for row in targets[batch_start:batch_end]],
+                            "word_times": word_clocks[batch_start:batch_end],
+                            "instruction": "The contact sheet follows. Images are ordered left-to-right, "
+                            "top-to-bottom. Ignore all labels and metadata; use only the pixels.",
+                        }, ensure_ascii=False)}
+                    ]},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 1200,
+                "response_format": {"type": "json_object"},
+            }
+            content = payload["messages"][1]["content"]
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": agent_core.image_data_url(batch_sheet)},
+            })
+            if voiceover_url:
+                content.append({
+                    "type": "text",
+                    "text": "Use this voiceover audio as the timing reference:",
+                })
+                content.append({
+                    "type": "audio_url",
+                    "audio_url": {"url": voiceover_url},
+                })
+            _log(status_cb, f"Calling Gemini 3.1 Pro for retime batch "
+                            f"{batch_start + 1}-{batch_end}/{len(sources)}...")
+            request_error = None
+            for attempt in range(2):
+                try:
+                    response = agent_core.post_json_url(
+                        agent_core.WAVESPEED_LLM_API, payload, timeout=120)
+                    request_error = None
+                    break
+                except (OSError, urllib.error.URLError) as exc:
+                    request_error = exc
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            if request_error is not None:
+                raise request_error
+            parsed = agent_core.extract_json_object(
+                response["choices"][0]["message"]["content"]) or {}
+            matches = parsed.get("matches")
+            if not isinstance(matches, list) or len(matches) != batch_end - batch_start:
+                correction = dict(payload)
+                correction["messages"] = list(payload["messages"]) + [{
+                    "role": "user",
+                    "content": (
+                        f"Your last answer contained {len(matches) if isinstance(matches, list) else 0} "
+                        f"matches. Return the complete JSON now: exactly {batch_end - batch_start} "
+                        "matches, with target and source each containing every index exactly once."
+                    ),
+                }]
+                response = agent_core.post_json_url(
+                    agent_core.WAVESPEED_LLM_API, correction, timeout=120)
+                parsed = agent_core.extract_json_object(
+                    response["choices"][0]["message"]["content"]) or {}
+                matches = parsed.get("matches")
+                if not isinstance(matches, list) or len(matches) != batch_end - batch_start:
+                    raise ValueError(
+                        "Gemini returned an incomplete retime batch after correction.")
+            local_targets = [int(item["target"]) for item in matches]
+            local_sources = [int(item["source"]) for item in matches]
+            if (sorted(local_targets) != list(range(batch_end - batch_start))
+                    or sorted(local_sources) != list(range(batch_end - batch_start))):
+                raise ValueError("Gemini returned a non-bijective retime batch.")
+            for item in matches:
+                target = batch_start + int(item["target"])
+                gemini_order[target] = batch_start + int(item["source"])
+                gemini_switches[target] = float(item["spoken_at"])
+            _log(status_cb, f"Gemini 3.1 Pro retime batch "
+                            f"{batch_start + 1}-{batch_end}/{len(sources)} complete.")
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            _log(status_cb, f"Gemini 3.1 Pro batch {batch_start + 1}-{batch_end} unavailable; "
+                            f"retime aborted ({exc}).")
+            raise LongformError(
+                f"Gemini 3.1 Pro retime batch {batch_start + 1}-{batch_end} failed: {exc}"
+            ) from exc
+    if not all(value is not None for value in gemini_order + gemini_switches):
+        gemini_order = None
+        gemini_switches = None
+    if gemini_switches:
+        # Keep the selected range's outer boundary fixed while using Gemini's spoken caption
+        # switches for every subsequent visual. The first selected image owns the incoming hold.
+        switches = [span_start] + [
+            max(span_start, min(span_end, value)) for value in gemini_switches[1:]
+        ]
+        switches = [max(switches[i], switches[i - 1] + 0.04)
+                    for i in range(len(switches))]
+        durations = [
+            max(0.04, (switches[i + 1] if i + 1 < len(switches) else span_end) - switches[i])
+            for i in range(len(switches))
+        ]
+    cursor = span_start
+    for row, duration in zip(targets, durations):
+        row["start"] = round(cursor, 3)
+        row["end"] = round(cursor + duration, 3)
+        cursor += duration
+    targets[-1]["end"] = round(span_end, 3)
+    for idx, row in zip(range(first, last + 1), targets):
+        lines[idx] = row
+    for target_pos, target_set in enumerate(target_tokens):
+        best = None
+        best_score = -1.0
+        for source_pos in remaining:
+            source_set = descriptor_tokens[source_pos]
+            overlap = (len(target_set & source_set) / max(1, len(target_set | source_set))
+                       if target_set and source_set else 0.0)
+            score = overlap + (0.001 if source_pos == target_pos else 0.0)
+            if gemini_order is not None:
+                score += 1.0 if source_pos == gemini_order[target_pos] else 0.0
+            if score > best_score:
+                best, best_score = source_pos, score
+        if best is not None:
+            assignment[target_pos] = best
+            remaining.remove(best)
+
+    staged = []
+    try:
+        for target_pos, source_pos in assignment.items():
+            source = sources[source_pos]
+            if source is None:
+                continue
+            target_idx = first + target_pos
+            destination = image_dir / f"{image_key(target_idx, lines[target_idx], line_durations(lines, audio_duration)[target_idx])}.png"
+            temp = image_dir / f".retime_range_{time.time_ns()}_{target_pos}.png"
+            os.replace(source, temp)
+            staged.append((temp, destination))
+        for temp, destination in staged:
+            os.replace(temp, destination)
+    except OSError as exc:
+        for temp, _destination in staged:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+        raise LongformError(f"Could not retime existing images: {exc}") from exc
+
+    state["lines"] = lines
+    state["retime_range"] = {"start": first, "end": last, "matched": len(staged),
+                             "method": "local-text-overlap"}
+    save_state(out_dir, **state)
+    write_transcript(lines, out_dir / "transcript.txt")
+    current_durations = line_durations(lines, audio_duration)
+    current_results = {}
+    for idx, line in enumerate(lines):
+        candidate = out_dir / "images" / f"{image_key(idx, line, current_durations[idx])}.png"
+        if candidate.is_file():
+            current_results[idx] = str(candidate)
+    write_timeline_manifest(lines, current_durations, current_results, audio_duration,
+                            out_dir / "timeline.json",
+                            voice_speed=state.get("voice_speed") or 1.0)
+    _log(status_cb, f"Retimed scenes {first + 1}-{last + 1}: matched {len(staged)} existing image(s).")
+    return {"start": first, "end": last, "matched": len(staged),
+            "lines": lines, "method": "local-text-overlap"}
 
 
 def retime_longform_assets(out_dir, old_lines, new_lines, old_audio_duration,
@@ -1383,127 +1785,115 @@ def write_timeline_manifest(lines, durations, results, audio_duration, out_path,
     return out_path
 
 
+def _p_image_one(index, prompt, dest, key, cancel_event=None, status_cb=None):
+    """One Ideogram generation: submit, poll, download. Returns the path or None.
+
+    Each call owns its own prediction id, so a slow generation can never deliver onto a
+    later prompt's slot - the failure mode that made the browser route need an OCR audit.
+    """
+    payload = {
+        "prompt": str(prompt or "").strip(),
+        "aspect_ratio": IMAGE_ASPECT,
+        "resolution": IMAGE_RESOLUTION,
+        "thinking": IMAGE_THINKING,
+        "output_format": IMAGE_OUTPUT_FORMAT,
+    }
+    response = pipeline.request_json("POST", f"{pipeline.API_BASE}/{P_IMAGE_MODEL}",
+                                     key, payload, timeout=120)
+    prediction_id = pipeline.unwrap_id(response)
+    outputs, _ = pipeline.poll_wavespeed(prediction_id, key, timeout_s=IMAGE_TIMEOUT_S,
+                                         interval_s=2, cancel_event=cancel_event,
+                                         label=f"image #{index + 1}")
+    if not outputs:
+        return None
+    pipeline.download_file(outputs[0], Path(dest))
+    return str(dest)
+
+
 def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_event=None,
                     mascot=False):
-    """FLUX.2 Pro (unlimited) 16:9 on the user's Higgsfield session.
+    """Ideogram (P-Image) 16:9 frames over the WaveSpeed API.
 
-    Slot scheduler: up to IMAGE_CONCURRENCY prompts in flight; a new prompt is only submitted
-    once active generations drop below the limit; failed generations are re-queued up to
-    IMAGE_RETRIES times. NOTE: higgsfield_login currently runs ONE Playwright session on one
-    worker thread, so in-flight submissions serialize there today - the scheduler semantics
-    (slots, refill, retry, naming) are exactly as specified and parallelize automatically once
-    the session supports queued submissions.
+    IMAGE_CONCURRENCY generations run in parallel; a failed one is retried up to
+    IMAGE_RETRIES times. Images already on disk are reused, so a resumed run only pays for
+    what is missing.
 
     Returns {index: path|None}."""
     import concurrent.futures
-    import higgsfield_login
-    if not higgsfield_login.is_ready():
-        raise LongformError("Higgsfield is not connected - click Connect Higgsfield first.")
-    # FLUX.2 takes up to 8 reference images (user 2026-07-25). Handing it the actual artwork
-    # keeps the Blob identical across hundreds of frames in a way no description can; the
-    # prompt clause still does the placing and the reaction.
-    if mascot and MASCOT_ART.exists():
-        pinned = higgsfield_login.set_reference_images([MASCOT_ART])
-        _log(status_cb, f"Mascot: {MASCOT_ART.name} attached as a reference image "
-                        f"({len(pinned)}/8 slots) for every frame.")
-    else:
-        higgsfield_login.set_reference_images([])
+    key = os.environ.get("WAVESPEED_API_KEY", "")
+    if not key:
+        raise LongformError("WAVESPEED_API_KEY missing - the image stage needs it.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # The mascot travels as WORDS only (see MASCOT_RULE, applied in generate_image_prompts).
+    # The old route could pin the actual artwork as a reference image; this endpoint takes
+    # text alone, so Blob is only as consistent as its description.
+    if mascot:
+        _log(status_cb, "Mascot: described in the prompt text (this model takes no reference "
+                        "image, so expect more drift than the pinned-artwork route).")
 
-    # MANUAL, single-reused-page generation. Higgsfield's DataDome bot-check throws a CAPTCHA on
-    # an automated Generate click, and the Unlimited switch resets on every fresh page load. Both
-    # are solved by opening ONE visible page and letting the USER turn Unlimited on (and clear any
-    # verification) once - every frame is then generated on that same page, so Unlimited and the
-    # DataDome trust cookie persist. We never touch the CAPTCHA ourselves.
     cancel_check = (lambda: cancel_event is not None and cancel_event.is_set())
-    _log(status_cb, "Opening the Higgsfield window - please turn ON the 'Unlimited' switch (and "
-                    "complete any quick verification). Generation then starts automatically.")
-    if not higgsfield_login.begin_manual_session(model="FLUX.2 Pro", aspect="16:9",
-                                                 status_cb=status_cb, cancel_check=cancel_check,
-                                                 timeout_s=1800):
-        if cancel_check():
-            raise pipeline.PipelineCancelled("Cancelled.")
-        raise LongformError("Higgsfield: the Unlimited switch was not turned on in time. Turn it "
-                            "on in the Higgsfield window, then resume (nothing is lost).")
-
-    # No serial character-reference pre-step: it was generated as a "style anchor" but never fed
-    # into the content frames (they are text-only prompts), so it was ~4 min of the user staring at
-    # a blank screen before any real image appeared. Go straight to the concurrent pool - the first
-    # content frames start immediately and also prove the session works.
     total = len(prompts)
     results = {}
     attempts = {}
-    # RESUME: every image whose file is already on disk is reused, so a re-run only generates
-    # what is actually missing. The filename (index + timestamp + duration) identifies the line,
-    # so a reused file always belongs to the line it is mapped onto - if the script or its timing
-    # changed, the key changes and the image is regenerated instead of silently mismatched.
+    # RESUME: the filename encodes index + timestamp + duration, so a reused file always
+    # belongs to the line it is mapped onto; if the script or its timing changed, the key
+    # changes and the frame is regenerated instead of silently mismatched.
     for idx in range(total):
         existing = out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png"
-        if _image_done(existing, "16:9"):
+        if _image_done(existing, IMAGE_ASPECT):
             results[idx] = str(existing)
     if results:
         _log(status_cb, f"Resume: {len(results)}/{total} image(s) already generated - "
                         f"only the missing {total - len(results)} will be generated.")
-        # A stale-attributed frame from an earlier run is correctly NAMED but shows another
-        # timestamp's caption - resume would trust it forever. OCR-audit the reused frames and
-        # drop the provably wrong ones back into the queue.
-        audit_images(prompts, lines, durations, out_dir, results, status_cb=status_cb)
-    # Parked mis-attributed frames are good images on wrong slots: OCR each one and move it onto
-    # the empty slot whose caption it actually shows, instead of regenerating it.
-    reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=status_cb)
     queue = [i for i in range(total) if i not in results]
-    dead = 0                            # failed generation attempts so far
-    fresh_ok = 0                        # successes THIS session - resume pre-fills results, and
-    #                                     judging the provider by yesterday's images would disable
-    #                                     the dead-provider stop exactly when a login has expired
-    consec = 0                          # failures since the last success (mid-run death signal)
-
-    # Up to IMAGE_CONCURRENCY generations in flight across that many Higgsfield pages, each of
-    # which owns its own result (exact attribution regardless of completion order). Failures are
-    # retried in later rounds. The cold-start dead-provider stop trips via cancel from on_done so
-    # a broken session halts after a few tries, not after burning the whole batch.
+    dead = 0                            # failed attempts so far
+    fresh_ok = 0                        # successes THIS session - resume pre-fills results,
+    #                                     and judging the provider by yesterday's images
+    #                                     would disable the dead-provider stop exactly when
+    #                                     a key has expired
     done_count = {"n": sum(1 for v in results.values() if v)}
-    stop = {"cold": False}
 
-    def _on_done(idx, path):
-        nonlocal fresh_ok, dead
-        if path and _image_done(path, "16:9"):
-            fresh_ok += 1
-            done_count["n"] += 1
-            _log(status_cb, f"image {done_count['n']}/{total} - #{idx + 1} done")
-        else:
-            dead += 1
-            if dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP and not fresh_ok:
-                stop["cold"] = True
-
-    pool_cancel = (lambda: cancel_check() or stop["cold"])
     while queue:
         if cancel_check():
             raise pipeline.PipelineCancelled("Cancelled.")
-        items = [(i, prompts[i]["prompt"],
-                  str(out_dir / f"{image_key(i, lines[i], durations[i])}.png")) for i in queue]
-        _log(status_cb, f"Generating {len(items)} image(s), up to {IMAGE_CONCURRENCY} at a time...")
-        # 420s: at 4 in flight Higgsfield takes 4-5+ min per image; 300s produced false timeouts
-        # whose late deliveries then mis-attributed onto the next prompts (the duplicate-frame bug).
-        res = higgsfield_login.generate_pool_sync(
-            items, k=IMAGE_CONCURRENCY, timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb,
-            cancel_check=pool_cancel, on_done=_on_done)
-        if stop["cold"]:
-            raise LongformError(
-                f"The first {dead} image generations all failed - Higgsfield looks down or "
-                "logged out. Stopping instead of filling the video with black frames; reconnect "
-                "and resume (nothing is lost).")
+        _log(status_cb, f"Generating {len(queue)} image(s), up to {IMAGE_CONCURRENCY} at a time...")
+        round_results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY) as pool:
+            futures = {}
+            for idx in queue:
+                dest = out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png"
+                futures[pool.submit(_p_image_one, idx, prompts[idx]["prompt"], dest, key,
+                                    cancel_event=cancel_event, status_cb=status_cb)] = idx
+            for fut in concurrent.futures.as_completed(futures):
+                idx = futures[fut]
+                try:
+                    path = fut.result()
+                except pipeline.PipelineCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    path = None
+                    _log(status_cb, f"image #{idx + 1} failed: {str(exc)[:160]}")
+                if path and _image_done(path, IMAGE_ASPECT):
+                    round_results[idx] = path
+                    fresh_ok += 1
+                    done_count["n"] += 1
+                    _log(status_cb, f"image {done_count['n']}/{total} - #{idx + 1} done")
+                else:
+                    dead += 1
         if cancel_check():
             raise pipeline.PipelineCancelled("Cancelled.")
-        # tally the round + build the retry queue
+        # cold start: nothing has ever worked this session = the provider or the key is gone
+        if not fresh_ok and dead >= MAX_DEAD_ATTEMPTS_BEFORE_GIVING_UP:
+            raise LongformError(
+                f"The first {dead} image generations all failed - the image API looks "
+                "unreachable. Stopping instead of filling the video with black frames; "
+                "check WAVESPEED_API_KEY and resume (nothing is lost).")
         next_queue = []
-        produced = 0
         for idx in queue:
-            path = res.get(idx)
-            if path and _image_done(path, "16:9"):
+            path = round_results.get(idx)
+            if path:
                 results[idx] = path
-                produced += 1
             else:
                 attempts[idx] = attempts.get(idx, 0) + 1
                 if attempts[idx] <= IMAGE_RETRIES:
@@ -1513,35 +1903,13 @@ def generate_images(prompts, lines, durations, out_dir, status_cb=None, cancel_e
                     _log(status_cb, f"image #{idx + 1} failed after {IMAGE_RETRIES} retries "
                                     "- the render will stay blocked until it is restored.")
         # mid-run death: a whole round produced nothing while retriable images remain
-        if produced == 0 and next_queue and fresh_ok == 0:
+        if not round_results and next_queue and fresh_ok == 0:
             raise LongformError(
-                "A full generation round produced no images - Higgsfield looks down or logged "
-                "out. Stopping; reconnect and resume (the finished images are kept).")
+                "A full generation round produced no images - the image API looks down. "
+                "Stopping; the finished images are kept.")
         if next_queue:
             _log(status_cb, f"Retrying {len(next_queue)} image(s) that failed this round...")
         queue = next_queue
-    # Final gate before assembly: OCR-audit everything that will reach the video and regenerate
-    # any frame that provably shows another timestamp's caption. Bounded so an OCR quirk can
-    # never loop the run forever.
-    for _audit_round in range(2):
-        stale = audit_images(prompts, lines, durations, out_dir,
-                             {i: v for i, v in results.items() if v}, status_cb=status_cb)
-        if not stale:
-            break
-        redo = []
-        for idx in stale:
-            results.pop(idx, None)
-            attempts[idx] = 0                     # a fresh problem, give it fresh retries
-            redo.append((idx, prompts[idx]["prompt"],
-                         str(out_dir / f"{image_key(idx, lines[idx], durations[idx])}.png")))
-        _log(status_cb, f"Regenerating {len(redo)} stale frame(s)...")
-        res = higgsfield_login.generate_pool_sync(
-            redo, k=IMAGE_CONCURRENCY, timeout_s=IMAGE_TIMEOUT_S, status_cb=status_cb,
-            cancel_check=pool_cancel, on_done=_on_done)
-        for idx, _p, path in redo:
-            got = res.get(idx)
-            if got and _image_done(got, "16:9"):
-                results[idx] = got
     ok = sum(1 for v in results.values() if v)
     _log(status_cb, f"Images finished: {ok}/{total} generated.")
     return results
@@ -1935,164 +2303,11 @@ def assemble_video(lines, durations, results, audio_path, out_path, status_cb=No
     return out_path
 
 
-# ---------------------------------------------------------------- caption audit (OCR)
-# The mandatory ALL-CAPS top caption doubles as a verification anchor: we KNOW which caption
-# every frame must show (the `reading "X"` in its prompt), and local OCR can read what a frame
-# actually shows. A frame whose on-image caption clearly belongs to a DIFFERENT timestamp is a
-# stale/mis-attributed delivery and must not reach the video.
-
-_OCR = [None]
-
-
-def _get_frame_ocr():
-    if _OCR[0] is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _OCR[0] = RapidOCR()
-        except Exception:
-            _OCR[0] = False
-    return _OCR[0] or None
-
-
-_CAPTION_RE = re.compile(r'reading "([^"]+)"')
-
-
-def expected_caption(prompt_text):
-    m = _CAPTION_RE.search(str(prompt_text or ""))
-    return m.group(1).strip() if m else ""
-
-
+# ---------------------------------------------------------------- word helper
+# Kept for caption_cut_starts, which now always falls back to the line start: with no words on
+# the frames there is no caption phrase left to sync a cut to.
 def _norm_words(text):
     return [w for w in re.sub(r"[^A-Z0-9 ]", " ", str(text or "").upper()).split() if len(w) >= 2]
-
-
-def _caption_score(caption, ocr_text):
-    """Fraction of the caption's words present in the OCR text (0..1)."""
-    want = _norm_words(caption)
-    if not want:
-        return 0.0
-    have = set(_norm_words(ocr_text))
-    return sum(1 for w in want if w in have) / len(want)
-
-
-def audit_images(prompts, lines, durations, out_dir, results, status_cb=None):
-    """OCR every accepted frame and reject the ones whose on-image caption clearly belongs to a
-    DIFFERENT timestamp. Conservative on purpose: FLUX sometimes renders no caption at all, and
-    OCR sometimes reads nothing - neither is evidence of a wrong frame, so a frame is only
-    rejected when its own caption scores low AND another timestamp's caption scores high.
-    Rejected files move to images/_mismatched_<ts>/ (never deleted) and are dropped from
-    `results` so the caller regenerates them. Returns the rejected indexes."""
-    ocr = _get_frame_ocr()
-    if ocr is None:
-        _log(status_cb, "Caption audit skipped (no local OCR available).")
-        return []
-    import numpy as np
-    from PIL import Image
-    expected = {i: expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
-                                    else prompts[i]) for i in range(len(prompts))}
-    all_caps = [c for c in expected.values() if c]
-    bad = []
-    checked = 0
-    for idx, path in sorted(results.items()):
-        if not path or not expected.get(idx):
-            continue
-        try:
-            with Image.open(path) as im:
-                arr = np.array(im.convert("RGB"))
-            res, _elapsed = ocr(arr)
-            text = " ".join(r[1] for r in (res or []))
-        except Exception:
-            continue
-        checked += 1
-        own = _caption_score(expected[idx], text)
-        best_other, other_cap = 0.0, ""
-        for cap in all_caps:
-            if cap == expected[idx]:
-                continue
-            sc = _caption_score(cap, text)
-            if sc > best_other:
-                best_other, other_cap = sc, cap
-        if own < 0.5 and best_other >= 0.99:
-            _log(status_cb, f"Caption audit: frame #{idx + 1} shows \"{other_cap}\" but should "
-                            f"show \"{expected[idx]}\" - rejecting the stale frame.")
-            bad.append(idx)
-    if bad:
-        dest = Path(out_dir) / f"_mismatched_{time.strftime('%Y%m%d_%H%M%S')}"
-        dest.mkdir(parents=True, exist_ok=True)
-        for idx in bad:
-            try:
-                p = Path(results[idx])
-                p.replace(dest / p.name)
-            except OSError:
-                pass
-            results.pop(idx, None)
-    _log(status_cb, f"Caption audit: {checked} frame(s) checked, {len(bad)} stale frame(s) "
-                    "rejected." if checked else "Caption audit: nothing to check.")
-    return bad
-
-
-def reassign_mismatched(prompts, lines, durations, out_dir, results, status_cb=None):
-    """Give any archived frame back to its RIGHTFUL timestamp.
-
-    The stale-attribution cascade produced perfectly good images on the wrong slots. They may be
-    parked in ``_mismatched_*``, ``_wrongcontent_*`` or an older-format/archive folder. Their
-    on-image caption identifies where each one truly belongs, so search EVERY project-local
-    archive before spending money on regeneration. Ambiguity (the same caption used by several
-    timestamps) resolves to the empty slot nearest the frame's original index.
-    Mutates `results` in place; returns the number of recovered frames."""
-    ocr = _get_frame_ocr()
-    if ocr is None:
-        return 0
-    import numpy as np
-    from PIL import Image
-    out_dir = Path(out_dir)
-    parked = []
-    # Direct children are the live timeline. Only recurse through subdirectories, which are all
-    # project-local archives created by audits/format migrations. Never reach outside the project.
-    for folder in sorted(path for path in out_dir.iterdir() if path.is_dir()):
-        parked.extend(p for p in folder.rglob("img*.png") if _image_done(p, "16:9"))
-    if not parked:
-        return 0
-    expected = {i: expected_caption((prompts[i] or {}).get("prompt") if isinstance(prompts[i], dict)
-                                    else prompts[i]) for i in range(len(prompts))}
-    empty = {i for i in range(len(lines)) if not results.get(i) and expected.get(i)}
-    _log(status_cb, f"Searching {len(parked)} archived frame(s) across all project folders for "
-                    f"{len(empty)} missing timeline slot(s)...")
-    recovered = 0
-    for p in sorted(parked):
-        m = re.match(r"img(\d{3})_", p.name)
-        orig = int(m.group(1)) if m else -1
-        try:
-            with Image.open(p) as im:
-                arr = np.array(im.convert("RGB"))
-            res, _elapsed = ocr(arr)
-            text = " ".join(r[1] for r in (res or []))
-        except Exception:
-            continue
-        # the caption this frame ACTUALLY shows = the fully-matched expected caption with the
-        # most words (so "TRY IT RIGHT NOW" beats its subset "TRY IT")
-        best_cap, best_words = "", 0
-        for cap in set(expected.values()):
-            if cap and _caption_score(cap, text) >= 0.99 and len(_norm_words(cap)) > best_words:
-                best_cap, best_words = cap, len(_norm_words(cap))
-        if not best_cap:
-            continue
-        candidates = [i for i in empty if expected[i] == best_cap]
-        if not candidates:
-            continue
-        target = min(candidates, key=lambda i: abs(i - orig))
-        dest = out_dir / f"{image_key(target, lines[target], durations[target])}.png"
-        try:
-            p.replace(dest)
-        except OSError:
-            continue
-        results[target] = str(dest)
-        empty.discard(target)
-        recovered += 1
-        _log(status_cb, f"Recovered frame -> #{target + 1} (\"{best_cap}\", was img{orig:03d}).")
-    _log(status_cb, f"Re-assignment done: {recovered} frame(s) recovered, "
-                    f"{len(empty)} still missing.")
-    return recovered
 
 
 def frames_from_disk(project_dir):
@@ -2108,18 +2323,20 @@ def frames_from_disk(project_dir):
     if not lines:
         return state, []
     audio_duration = float(state.get("audio_duration") or 0.0)
-    durations = line_durations(lines, audio_duration)
+    durations = saved_project_cut_durations(state, lines, audio_duration)
     frames = []
+    cursor = 0.0
     for i, line in enumerate(lines):
         name = f"{image_key(i, line, durations[i])}.png"
         path = project_dir / "images" / name
         frames.append({
-            "idx": i, "start": round(float(line["start"]), 3),
-            "end": round(float(line["start"]) + float(durations[i]), 3),
+            "idx": i, "start": round(cursor, 3),
+            "end": round(cursor + float(durations[i]), 3),
             "ts": fmt_ts(line["start"]), "dur": durations[i],
             "text": str(line.get("text") or ""), "file": name,
             "exists": _image_done(path, "16:9"),
         })
+        cursor += float(durations[i])
     return state, frames
 
 
@@ -2144,7 +2361,8 @@ def reconcile_image_names(project_dir, status_cb=None):
     imgdir = project_dir / "images"
     if not imgdir.is_dir():
         return 0
-    durations = line_durations(lines, float(state.get("audio_duration") or 0.0))
+    durations = saved_project_cut_durations(
+        state, lines, float(state.get("audio_duration") or 0.0))
     renamed = 0
     for i, line in enumerate(lines):
         expected = imgdir / (image_key(i, line, durations[i]) + ".png")
@@ -2172,7 +2390,8 @@ def recover_archived_images(project_dir, status_cb=None):
     lines, prompts = state.get("lines") or [], state.get("prompts") or []
     if not lines or len(prompts) != len(lines):
         return 0
-    durations = line_durations(lines, float(state.get("audio_duration") or 0.0))
+    durations = saved_project_cut_durations(
+        state, lines, float(state.get("audio_duration") or 0.0))
     image_dir = project_dir / "images"
     results = {}
     for idx, line in enumerate(lines):
@@ -2182,10 +2401,7 @@ def recover_archived_images(project_dir, status_cb=None):
     before = len(results)
     if before == len(lines):
         return 0
-    reassign_mismatched(prompts, lines, durations, image_dir, results, status_cb=status_cb)
-    recovered = len(results) - before
-    if recovered:
-        _log(status_cb, f"Recovered {recovered} missing frame(s) from existing project assets.")
+    recovered = 0
     # Some archived frames were parked precisely because their captions/content belong elsewhere;
     # never force those back merely because the old index matches. For any slot still empty, hold
     # the nearest VALID neighbouring timeline image instead. A coherent extended shot is an honest
@@ -2236,9 +2452,9 @@ def rebuild_from_disk(project_dir, status_cb=None):
         if f["exists"]:
             results[f["idx"]] = str(project_dir / "images" / f["file"])
     _log(status_cb, f"Rebuilding from disk: {len(results)}/{len(lines)} frames present.")
-    # Cut on the locally aligned start of the corresponding spoken line.  Prompt captions and
-    # the timestamps embedded in image filenames are metadata only and never drive the edit.
-    durations = speech_cut_durations(lines, audio_duration)
+    # Preserve an explicit speech-clock repair rather than putting caption-triggered cuts back
+    # during a rebuild. Older projects retain their existing caption-sync behaviour.
+    durations = saved_project_cut_durations(state, lines, audio_duration)
     slug = project_dir.name
     out = project_dir / f"{slug}.mp4"
     n = 2
@@ -2255,9 +2471,10 @@ def rebuild_from_disk(project_dir, status_cb=None):
 
 # ------------------------------------------------------------------ ORCHESTRATOR
 
-def run_longform_video(script, tts_model="pro", reasoning_model=None,
+def run_longform_video(script, tts_model="pro", reasoning_model=None, reasoning_mode=None,
                        status_cb=None, cancel_event=None, speech_gate=None, resume=True,
-                       voice=None, speaker=None, mix_gate=None, mascot=False, tts_options=None):
+                       voice=None, speaker=None, mix_gate=None, mascot=False,
+                       halt_after_speech=False, tts_options=None):
     """The whole pipeline. Returns a result dict for the job UI.
 
     RESUME (default on): re-running the SAME script continues the existing project instead of
@@ -2269,20 +2486,37 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     if len(script) < 40:
         raise LongformError("Please paste the full script (at least a few sentences).")
 
-    # Higgsfield is required for the image stage, but the only check used to live INSIDE
-    # generate_images - after the paid TTS, the transcription and the paid prompt calls. A fresh
-    # run with no login spent all of that and only THEN failed on a precondition. Check it up front
-    # so the run stops in ~0s having spent nothing. (Resume is unaffected: it also has to reach the
-    # image stage, so the same requirement holds, and the cached voiceover/prompts are untouched.)
-    import higgsfield_login
-    if not higgsfield_login.is_ready():
-        raise LongformError("Higgsfield is not connected - click Connect Higgsfield first, "
-                            "then start the run.")
+    # The image stage needs the API key, and the check lives up front rather than inside
+    # generate_images: a fresh run with no key used to pay for the TTS, the transcription and
+    # the prompt calls before failing on a precondition. Now it stops in ~0s having spent nothing.
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        raise LongformError("WAVESPEED_API_KEY is missing - the voiceover and the images both "
+                            "need it.")
 
     slug = slug_for(script)
     out_dir = OUT_ROOT / slug
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "script.txt").write_text(script, encoding="utf-8")
+    # Keep the creator choices with the longform project so reopening it restores the
+    # same production setup instead of falling back to fresh defaults.
+    saved_options = dict(tts_options or {})
+    save_state(
+        out_dir,
+        script=script,
+        tts_model=str(tts_model or "pro"),
+        voice=str(voice or ""),
+        reasoning_model=str(reasoning_model or ""),
+        mascot_enabled=bool(mascot),
+        halt_after_speech=bool(halt_after_speech),
+        reasoning_mode=str(reasoning_mode or ""),
+        tts_voice_instruction=str(saved_options.get("voice_instruction") or ""),
+        tts_language=str(saved_options.get("language") or ""),
+        tts_native_speed=saved_options.get("speed", 1.0),
+        tts_volume=saved_options.get("volume", 1.0),
+        tts_pitch=saved_options.get("pitch", 0),
+        tts_sample_rate=saved_options.get("sample_rate", 24000),
+        tts_output_format=str(saved_options.get("output_format") or "mp3"),
+    )
 
     state = load_state(out_dir, script) if resume else None
     raw_voice_path = out_dir / "voiceover.wav"
@@ -2375,8 +2609,15 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
     # after a speech-only regeneration.
     cached_fmt = ((state or {}).get("prompt_format")
                   if (reusable or retimed_prompts is not None) else None)
+    prompt_alignment_bad = bool(prompts) and (
+        len(prompts) != len(lines) or any(
+            not isinstance(prompt, dict)
+            or prompt.get("timestamp") != fmt_ts(lines[i]["start"])
+            for i, prompt in enumerate(prompts[:len(lines)])
+        )
+    )
     stale_format = bool(prompts) and cached_fmt != PROMPT_FORMAT_VERSION
-    if prompts and len(prompts) == len(lines) and not stale_format:
+    if prompts and len(prompts) == len(lines) and not stale_format and not prompt_alignment_bad:
         _log(status_cb, f"Resume: reusing the {len(prompts)} saved image prompt(s).")
     else:
         if stale_format:
@@ -2386,6 +2627,16 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
             _log(status_cb, "Image prompts are an older format - regenerating all prompts in the "
                             "new caption style (and the images made from them).")
             _archive_old_images(out_dir / "images", status_cb)
+        elif prompt_alignment_bad:
+            _log(status_cb, "Saved image prompts are not aligned to the current transcript - "
+                            "regenerating prompts and their images.")
+            first_bad = next(
+                (i for i, prompt in enumerate(prompts[:len(lines)])
+                 if not isinstance(prompt, dict)
+                 or prompt.get("timestamp") != fmt_ts(lines[i]["start"])),
+                min(len(prompts), len(lines)),
+            )
+            _archive_images_from_index(out_dir / "images", first_bad, status_cb)
         prompt_checkpoint = out_dir / "image_prompts_checkpoint.json"
         prompts = generate_image_prompts(lines, reasoning_model=reasoning_model,
                                          status_cb=status_cb, cancel_event=cancel_event,
@@ -2409,10 +2660,9 @@ def run_longform_video(script, tts_model="pro", reasoning_model=None,
 
     missing = verify_images(lines, results, reasoning_model=reasoning_model, status_cb=status_cb)
     latest_state = load_state(out_dir, script) or {}
-    # Assembly cuts follow the locally forced-aligned narration line starts.  Filename timestamps
-    # and generated caption words are metadata only; using them as edit points caused overlaps,
-    # gaps and images that appeared late relative to the spoken phrase.
-    cut_durations = speech_cut_durations(lines, audio_duration)
+    # Assembly cuts follow the locally forced-aligned word containing each image's caption phrase,
+    # keeping the visual and its baked-in caption synchronized with the narration.
+    cut_durations = caption_cut_durations(lines, prompts, audio_duration)
     timeline_path = write_timeline_manifest(
         lines, cut_durations, results, audio_duration, out_dir / "timeline.json",
         voice_speed=latest_state.get("voice_speed") or 1.0)

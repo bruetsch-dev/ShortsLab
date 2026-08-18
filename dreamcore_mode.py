@@ -1,21 +1,12 @@
-"""Dreamcore shorts: prompts that already contain cuts, then an edit locked to the melody.
+"""Dreamcore prompt writing and music-aware assembly.
 
-The reference this is built from is measured, not described. `between silence and sky`
-(reference/dreamcore/) is 14.61s long, has exactly three cuts - 3.68, 7.32, 11.00 - and all
-three land within 52 ms of a note onset in its music. The music underneath repeats a phrase
-every ~3.85s, and 86% of that grid falls on an onset. So the whole look is one rule:
-
-    a cut happens only on a phrase boundary, and every shot fills exactly one phrase.
-
-That has a consequence for the prompts. A generator asked for "an abandoned mall at night"
-returns one continuous 10-second drift, which is one shot, which is one phrase - three
-generations for a 12-second video. To get the reference's cut density the CUT has to be
-inside the generated clip, so the prompts here explicitly ask for two or three hard cuts at
-named times, and those times come from the same grid the editor will later snap to.
-
-The user generates the clips themselves and drops them back in. This module does the two
-things that are hard: writing prompts that survive contact with a generator, and cutting
-the result to the music without the cuts drifting.
+The reference folder contains several different edit grammars, not one universal cadence:
+the common four-shot reveal at roughly 3.7-second intervals, almost unbroken passages with
+one late reveal (or no cut), and deliberately unstable memory-glitch bursts. Higgsfield can
+only generate ten seconds at a time, so every generated prompt is a self-contained 10s
+chapter that explicitly names one of those grammars. The final editor may still snap an
+internal cut to the selected music, but prompt generation no longer forces every idea into
+the same three-shot template or the same sunny cloud suburb.
 """
 
 from __future__ import annotations
@@ -131,122 +122,61 @@ def music_grid(bed_path, status_cb=None) -> dict:
 # ----------------------------------------------------------------- prompt writing
 
 
-_WORLD_RULES = """Write prompts that work in any modern video generator.
+_REFERENCE_DNA = """You write production-ready prompts for 10-second vertical dreamcore videos.
 
-  * NEVER name a model, a duration, an aspect ratio, a resolution or any generation
-    setting inside the prompt. Those are chosen outside it.
-  * One flowing line per prompt. No line breaks, no bullet points, no headings.
-  * Describe the CAMERA's motion in every shot. A prompt that reads like a photograph
-    produces a photograph that wobbles. (The world itself stays still - see below.)
-  * Keep it concrete. "A slow steady dolly forward down the centre line of the road, the
-    same red clapboard house repeating to the vanishing point" beats "eerie empty street"."""
+REFERENCE DNA (derived from the full local reference folder, never copied shot-for-shot):
+* Begin with something immediately readable and ordinary: civic infrastructure, a transit
+  interior, a domestic object, a shop, a school corridor, a road, a playground, a machine.
+* Break reality with ONE dominant spatial rule: impossible repetition, impossible scale,
+  an interior turned inside-out, architecture suspended in weather, a route with no valid
+  destination, or familiar geometry folding into a physically impossible system.
+* The viewer understands the ordinary anchor first and discovers the impossible rule next.
+  Weird decoration alone is not dreamcore. The contradiction must be visible in the frame.
+* Use clean, deep-focus images with strong perspective and a readable silhouette. Lighting
+  may be hard blue midday, pale overcast, candy-pastel afterglow, sodium night, fluorescent
+  interior or wet neon. The references do NOT all use blue sky, clouds or suburban houses.
+* Emptiness is common, but not an absolute law. If a distant human presence improves scale,
+  keep it anonymous and secondary. Never make a talking character the subject.
+* Motion has intent: slow forward travel, lateral glide, crane reveal, orbit, or a perfectly
+  still observation used as contrast. Do not add generic handheld wobble.
 
-_AESTHETIC = """You write prompts for dreamcore short videos.
+NOVELTY:
+Do not recreate the references' recognizable combinations (colourful houses on a cloud
+cliff, an endless cloud road, a neighbourhood cylinder, a ferris wheel above Earth, a train
+filled with clouds, or a giant slide from orbit). Abstract their visual grammar and invent a
+new ordinary anchor, impossible rule, palette, materials and reveal. Across multiple prompts,
+build a coherent collection rather than repeating the same location.
 
-WHAT THIS ACTUALLY IS - measured from the reference reels, not from the word "dreamcore":
-
-    ONE ORDINARY THING, REPEATED FOREVER, IN AN IMPOSSIBLE PLACE.
-
-  A row of small colourful suburban houses along a road - and the road runs along the edge
-  of a cliff that drops into a sea of clouds, and the houses repeat past the horizon. A
-  two-lane road on a narrow strip of grass floating above the clouds, a yellow warning sign
-  and one abandoned car on it. An entire neighbourhood wrapped around the INSIDE of a
-  mile-wide tube with a disc of blue sky at the far end. A door standing open in a sand
-  dune. A corridor lined with switched-on televisions.
-
-  The OBJECTS are always mundane - houses, kerbs, lawns, road markings, road signs, an old
-  car, lamps, TVs. The GEOMETRY is what is impossible: the scale, the repetition, where the
-  ground stops. Never dress a mundane object up to be strange; put it somewhere it cannot be.
-
-THE CAMERA - the most important rule, and the one most often written wrong:
-  * The camera MOVES IN EVERY SHOT, and it is the ONLY thing that moves.
-  * The move is a slow, steady, CONSTANT-SPEED dolly FORWARD along the perspective line -
-    down the road, down the row, down the tube. No acceleration, no handheld, no shake, no
-    whip pan, no zoom. A camera gliding on rails, or a drone holding a straight line.
-  * The other two moves that belong here: a slow rise (crane up) that reveals more of the
-    impossible shape, and a slow tilt down from level to looking-down. Both at the same
-    unhurried constant speed.
-  * NEVER write "locked off", "static camera" or "the camera holds still". A still frame of
-    a still world is a photograph, and the reference is never that.
-  * Write the move into the prompt for every single shot, in those words.
-
-THE WORLD IS FROZEN:
-  * Nothing in the world moves. No wind, no people, no traffic, no swaying grass, no
-    rippling water, no flickering lights, no dust in a beam.
-  * That stillness against a moving camera IS the uncanny feeling. "A curtain moves in an
-    unfelt draught" is the single most common way to break it.
-  * No people. No animals. Vehicles are parked and empty.
-
-THE LOOK - all four references agree, and every one of these is the opposite of "eerie":
-  * A pristine hyper-real 3D render. Sharp and clean: no grain, no dirt, no wear, no VHS,
-    no chroma bleed, no vignette, no camcorder timestamp.
-  * DEEP FOCUS. Everything from the near kerb to the vanishing point is in focus. No bokeh,
-    no shallow depth of field.
-  * BRIGHT HARD SUNLIGHT from one side, mid-day, with sharp consistent shadows falling the
-    same way in every shot. A deep blue sky with huge white cumulus towers. Never overcast,
-    never grey, never "no sun", never flat and shadowless.
-  * Cheerful saturated colour: primary-coloured clapboard houses, emerald mown grass, white
-    cloud, deep blue sky. Or the candy variant - pink, lilac and cyan pastels. THE CONTRAST
-    between a happy palette and total emptiness is the entire effect. A sad, drained or
-    grey palette kills it dead.
-
-COMPOSITION:
-  * One-point perspective, every time. A road, a row of houses, a kerb, a corridor, a tube
-    - something runs from the bottom of the frame to a vanishing point and the eye follows
-    it. Centre it and make it symmetrical, or run it as a hard diagonal.
-  * The repetition must be visible IN the frame: the same house, the same lamp, the same
-    window, receding until it is too small to count.
-  * Shot in 9:16, so the tall axis carries the sky above and the ground below.
-
-EVERY PROMPT IS THE SAME SCENE. NOT A SHARED "WORLD" - THE SAME PLACE:
-  * All of the prompts together are ONE location, filmed from different positions in it.
-    Not a lamppost scene and then a swimming-pool scene and then a staircase scene. One
-    road, one row of houses, one cliff - and every shot of every clip stands somewhere on
-    that same ground, looking at the same things from a new spot.
-  * The WORLD sentence names the actual place and everything permanent in it. No shot in
-    any prompt may introduce a landmark, building or object that the world sentence did
-    not already name. A new object means a new scene, and the clips stop cutting together.
-  * What changes between prompts is only WHERE THE CAMERA IS and HOW MUCH IT SEES: at the
-    kerb, at the far end of the row, low over the grass, high above the whole thing. The
-    label of a prompt is a vantage ("from the road", "from above the row"), never a new
-    subject.
-  * Cut the finished clips together in any order and it must play as one continuous walk
-    through a single place.
-
-THE SHOTS GO FROM FURTHER AND FURTHER OUT:
-  * Not different places. The SAME place, seen from a new vantage after every cut, each one
-    revealing more of how impossible it is.
-  * A good order: inside it at eye level -> close on one of the repeated objects -> wide
-    down the whole row -> a high aerial, tilted down, that shows the true shape and scale
-    (the strip is a slab in the clouds; the houses go on for ever; the street is inside a
-    cylinder). The last shot is the reveal and it should be the biggest.
-  * Every shot keeps the same sun direction, the same palette, the same materials.
-
+CREATIVE RANGE:
+Possible families include impossible public utilities, recursive service corridors, soft
+technology ruins, indoor weather systems, nostalgia enlarged to civic scale, transit limbo,
+domestic architecture obeying the wrong gravity, and quiet places governed by an absurd
+physical rule. These are starting axes, not subjects to copy verbatim.
 """
 
+_PROMPT_RULES = """PROMPT CONSTRUCTION:
+* Every output text is one copy-ready prompt for EXACTLY 10.0 seconds and vertical 9:16.
+* State the requested edit pattern and every cut time explicitly. A hard cut is not a pan,
+  dissolve, morph or zoom. A continuous pattern contains no hidden cut.
+* For each shot, name the lens/view height, camera path, foreground anchor, perspective,
+  impossible spatial fact, materials, palette, light direction and what new information the
+  shot reveals. Use concrete nouns and geometry, not mood adjectives as substitutes.
+* Preserve anchor identity, materials, palette and lighting across cuts within a chapter.
+  In Memory Glitch only, adjacent micro-shots may jump between related locations while one
+  recurring object and one colour signature keep the sequence legible.
+* End on the strongest spatial reveal or unresolved image. Do not waste the final second on
+  a fade, logo, title, black frame or generic beauty shot.
+* Natural environmental motion is allowed when it proves scale, but architecture and anchor
+  objects must not melt, mutate or randomly change identity.
+* Include: no dialogue, no captions, no logo, no watermark. Avoid long negative lists.
 
-_CUT_RULES = """THE ONE THING THAT MAKES THIS WORK - the cuts are IN the prompt:
-
-  * Each prompt must produce a clip that contains {cuts_per_clip} HARD CUTS inside it.
-    Not a pan, not a dissolve, not a camera move: a hard cut to a new vantage on the same
-    world. Write them explicitly, with times, in the prompt text.
-  * The clip is about {clip_seconds} seconds long, and the hold times are FIXED:
-    {hold_sequence}, in that order. Write exactly those numbers into the prompt. They are
-    musical phrases of the track this gets cut to, plus a small margin - generators never
-    honour a hold to the frame, and half a second too much is trimmed away while half a
-    second too little has to be slowed down.
-  * Do not add a shot beyond that list. Three full phrases do not fit in a ten-second clip,
-    and an extra shot is simply cut off at the end of the generation.
-
-HOLDING THE WORLD TOGETHER:
-  * Write a WORLD sentence first: the ordinary object that repeats, the impossible geometry
-    it sits in, the saturated palette, the sun direction, and the clean-render look. Be
-    specific enough that two separate generations land in the same place under the same sun.
-    It must also name EVERY permanent thing in the scene, because no prompt may add one
-    later - this sentence is the whole inventory of the location.
-  * Begin every prompt with that exact same world sentence, word for word. Do not paraphrase
-    it between prompts.
-
+Return strict JSON:
+{"world":"<one-sentence collection-level visual logic>",
+ "prompts":[{"label":"<specific 3-6 word concept>",
+             "edit_style":"<the assigned style id>",
+             "cut_times":[<seconds>],
+             "shots":["<short concrete shot summary>"],
+             "text":"<complete one-line 10-second generation prompt>"}]}
 """
 
 
@@ -276,30 +206,14 @@ over anything else in the prompt. Never write them:
   nouns beside them: eerie, uncanny, liminal, surreal, dreamlike, unsettling, mysterious,
   ethereal, haunting. Name the object and the geometry instead.
 
-HOW MUCH DETAIL - this is not optional, and short prompts are the usual failure:
-  Write 60-110 words FOR EACH SHOT, not for the whole prompt. A generator fills everything
-  you leave unsaid with the average of its training data, and the average of "empty street"
-  is a stock photograph. Every shot names, concretely:
-    - the camera move, in words, with its direction and its constant slow speed
-    - the camera height and whether it is level, tilted down, or looking up
-    - the vanishing point and what leads the eye into it
-    - the repeated object, how many are visible, and how far back they are still countable
-    - the impossible geometry and where exactly the ordinary ground stops
-    - materials and their colours: clapboard, asphalt, kerbstone, mown turf, roof shingle,
-      painted steel - each with its actual colour named
-    - the sun: its direction, the hardness of the shadows, where they fall
-    - the sky: its blue, the shape and size of the cumulus, how much of the frame it takes
-    - that the air is completely still and nothing in the world moves
-  Do not repeat the world sentence's contents inside each shot - build ON it.
-
-Return JSON:
-  {"world": "<the shared world sentence>",
-   "prompts": [{"label": "<3-5 words naming a VANTAGE, not a new subject>",
-                "shots": ["<shot 1 vantage>", "<shot 2 vantage>"],
-                "text": "<the full one-line prompt, cuts and hold times included>"}]}"""
+HOW MUCH DETAIL:
+  Write enough concrete visual information to control every assigned shot, normally 60-100
+  words per deliberate shot. Micro-shots in Memory Glitch are concise by necessity. Spend
+  detail on camera, geometry, materials, palette, lighting and the visual reveal; do not pad
+  the prompt with synonyms for a mood. Follow the JSON contract above exactly."""
 
 
-PROMPT_SYSTEM = _AESTHETIC + _CUT_RULES + _WORLD_RULES + "\n\n" + _SAFETY_RULES
+PROMPT_SYSTEM = _REFERENCE_DNA + "\n\n" + _PROMPT_RULES + "\n\n" + _SAFETY_RULES
 
 # Wording that gets a perfectly innocent liminal prompt refused. Two kinds: rooms whose name
 # alone reads as surveillance of undressed people, and negations - a generator acts on the
@@ -390,38 +304,95 @@ def shot_plan(clip_seconds: float, phrase: float, max_shots: int = 4) -> list:
     return holds or [round(phrase + HOLD_MARGIN, 1)]
 
 
+EDIT_STYLES = {
+    "classic_reveal": {
+        "name": "Classic reveal",
+        "cuts": [3.7, 7.4],
+        "direction": ("Three deliberate shots of one place. Begin inside the readable "
+                      "ordinary anchor, cut wider at 3.7s, then reveal the full impossible "
+                      "geometry at 7.4s. Every cut must increase spatial understanding."),
+    },
+    "continuous_passage": {
+        "name": "Continuous passage",
+        "cuts": [],
+        "direction": ("One uninterrupted 10-second camera move with no cuts, dissolves or "
+                      "teleports. The impossible rule becomes legible through parallax, "
+                      "occlusion and a controlled change in camera height or direction."),
+    },
+    "late_reveal": {
+        "name": "Late reveal",
+        "cuts": [7.4],
+        "direction": ("Hold one patient exploratory move until 7.4s, then hard-cut once to "
+                      "a radically clearer scale reveal for the final 2.6 seconds."),
+    },
+    "memory_glitch": {
+        "name": "Memory glitch",
+        # Measured from the two rapid-cut references: four ~0.3s fragments followed by a
+        # longer hold, repeated in waves. It is intentionally opt-in because generators
+        # obey the other three patterns more reliably.
+        "cuts": [0.3, 0.6, 0.9, 1.2, 2.4, 2.7, 3.0, 3.3, 4.9, 5.2, 5.5, 5.8, 7.4, 7.7, 8.0, 8.3],
+        "direction": ("A controlled memory-overflow montage: four 0.3-second hard-cut "
+                      "fragments, a longer held image, then two more related bursts. Keep "
+                      "one recurring object and one colour signature so it reads as an "
+                      "intentional memory fracture rather than random stock images."),
+    },
+}
+
+
+def edit_patterns_for(style: str, clip_count: int) -> list[dict]:
+    """Reference-derived edit assignments for fixed 10-second Higgsfield generations."""
+    key = str(style or "auto").strip().lower()
+    if key in EDIT_STYLES:
+        keys = [key] * max(1, int(clip_count))
+    else:
+        # Auto deliberately mixes the reliable reference languages. Memory Glitch remains
+        # explicit: asking a video model for sixteen exact cuts is useful when wanted, but
+        # a bad default for somebody expecting two dependable generations.
+        cycle = ("classic_reveal", "continuous_passage", "late_reveal")
+        keys = [cycle[i % len(cycle)] for i in range(max(1, int(clip_count)))]
+    return [{"id": k, **EDIT_STYLES[k]} for k in keys]
+
+
 def prompts_for(brief: str, clip_count: int = 2, cuts_per_clip: int = 2,
                 phrase: float = 3.85, clip_seconds: float = 10.0,
-                status_cb=None, model: str = PROMPT_MODEL) -> dict:
-    """Copy-ready prompts, each producing one clip that already contains its own cuts."""
-    _log(status_cb, f"Writing {clip_count} prompts, {cuts_per_clip} cuts inside each...")
+                status_cb=None, model: str = PROMPT_MODEL,
+                edit_style: str = "auto") -> dict:
+    """Create independent, copy-ready 10s prompts from the measured reference grammar.
+
+    ``cuts_per_clip`` stays in the signature for old saved projects and callers. New runs
+    use ``edit_style``; leaving the direction blank is a supported creative mode.
+    """
+    clip_seconds = 10.0  # Higgsfield's actual generation unit; do not imply longer clips.
+    patterns = edit_patterns_for(edit_style, clip_count)
+    _log(status_cb, "Writing 10-second Dreamcore prompts: "
+         + ", ".join(p["name"] for p in patterns) + ".")
     agent_core.assert_wavespeed_balance(status_cb=status_cb)
-    # How many shots fit is arithmetic, not a preference: the generator makes clips of a
-    # fixed length, and three full phrases need 11.55s. Asking for more than fits loses the
-    # last shot in every clip.
-    holds = shot_plan(clip_seconds, phrase, max_shots=int(cuts_per_clip) + 1)
-    hold_text = " then ".join(f"{h:.1f}s" for h in holds)
-    system = (PROMPT_SYSTEM
-              .replace("{cuts_per_clip}", str(max(1, len(holds) - 1)))
-              .replace("{hold_sequence}", hold_text)
-              .replace("{clip_seconds}", f"{float(clip_seconds):.0f}")
-              .replace("{hold}", f"{phrase + HOLD_MARGIN:.1f}")
-              .replace("{phrase}", f"{phrase:.1f}"))
-    # The brief is named as SCENERY, not as the subject. Called "the idea" it was treated
-    # as the thing to depict, and a brief about cliffs and grass came back as a landscape
-    # film with a dreamcore label on it.
-    ask = (f"The setting these take place in - scenery only, dreamcore is still the "
-           f"subject: {str(brief or '').strip() or 'empty liminal spaces'}\n"
-           f"Write exactly {int(clip_count)} prompts. Each produces ONE clip of about "
-           f"{float(clip_seconds):.0f} seconds holding {len(holds)} shots with hold times "
-           f"{hold_text}, separated by {max(1, len(holds) - 1)} hard cuts.")
-    # max_tokens has to carry clip_count x (world sentence + 3 shots x ~100 words). At 4000
-    # the last prompt came back truncated mid-shot, and a truncated prompt is a silently
-    # worse video rather than an error.
-    budget = min(24000, 1800 + int(clip_count) * (int(cuts_per_clip) + 1) * 320)
+    direction = str(brief or "").strip()
+    if direction:
+        creative_input = ("Optional user direction follows. Preserve its useful subject or "
+                          "constraints, but transform it through the reference DNA and do not "
+                          f"illustrate it literally:\n{direction}")
+    else:
+        creative_input = ("The user supplied no direction. Be the creative director: invent a "
+                          "fresh, specific collection concept without asking a question. Avoid "
+                          "the recognizable reference combinations listed in NOVELTY and avoid "
+                          "the generic fallback of an empty corridor or cloud suburb.")
+    assignments = []
+    for i, pattern in enumerate(patterns, 1):
+        cut_text = ", ".join(f"{x:.1f}s" for x in pattern["cuts"]) or "none"
+        assignments.append(
+            f"Clip {i}: edit_style={pattern['id']}; hard cut times={cut_text}; "
+            f"{pattern['direction']}")
+    ask = (creative_input + "\n\nCreate exactly " + str(int(clip_count))
+           + " distinct 10.0-second prompts. Follow these per-clip assignments exactly:\n"
+           + "\n".join(assignments)
+           + "\nThe concepts should feel authored as one collection, but each chapter must "
+             "have its own ordinary anchor and impossible spatial rule. Return only JSON.")
+    budget = min(24000, 2200 + int(clip_count) * 1500)
     out = agent_core._post_llm_json(
-        model, [{"role": "system", "content": system}, {"role": "user", "content": ask}],
-        max_tokens=budget, temperature=0.75, timeout=900) or {}
+        model, [{"role": "system", "content": PROMPT_SYSTEM},
+                {"role": "user", "content": ask}],
+        max_tokens=budget, temperature=0.92 if not direction else 0.82, timeout=900) or {}
     if isinstance(out, list):
         out = {"prompts": out}
     prompts = []
@@ -433,7 +404,10 @@ def prompts_for(brief: str, clip_count: int = 2, cuts_per_clip: int = 2,
         else:
             text, label, shots = " ".join(str(item).split()), "", []
         if text:
-            prompts.append({"label": label or f"Clip {i + 1}", "text": text, "shots": shots})
+            assigned = patterns[i]
+            prompts.append({"label": label or f"Clip {i + 1}", "text": text,
+                            "shots": shots, "edit_style": assigned["id"],
+                            "cut_times": assigned["cuts"]})
     if not prompts:
         raise RuntimeError("No prompts came back.")
     flagged = [(p["label"], hits) for p in prompts
@@ -448,11 +422,9 @@ def prompts_for(brief: str, clip_count: int = 2, cuts_per_clip: int = 2,
         _log(status_cb, "Dreamcore: stock-footage wording (this is what makes a clip come "
              "back as a screensaver) - "
              + "; ".join(f"{label}: {', '.join(h)}" for label, h in stock))
-    _log(status_cb, f"{len(prompts)} prompts ready "
-                    f"({len(prompts) * (cuts_per_clip + 1)} shots at {phrase:.2f}s each = "
-                    f"{len(prompts) * (cuts_per_clip + 1) * phrase:.1f}s of video).")
+    _log(status_cb, f"{len(prompts)} independent 10-second prompts ready.")
     return {"world": " ".join(str(out.get("world") or "").split()), "prompts": prompts,
-            "phrase": phrase, "cuts_per_clip": int(cuts_per_clip)}
+            "phrase": phrase, "edit_style": str(edit_style or "auto")}
 
 
 # ----------------------------------------------------------------- reading the uploads
@@ -469,7 +441,8 @@ def _probe_seconds(path) -> float:
         return 0.0
 
 
-def shots_in(clip, threshold: float = SCENE_THRESHOLD) -> list[dict]:
+def shots_in(clip, threshold: float = SCENE_THRESHOLD,
+             min_shot: float = MIN_SHOT) -> list[dict]:
     """Split one uploaded clip at its own hard cuts.
 
     The prompt asked the generator for cuts; whether it obeyed is a fact about the file, so
@@ -496,7 +469,7 @@ def shots_in(clip, threshold: float = SCENE_THRESHOLD) -> list[dict]:
     bounds = [0.0] + sorted(marks) + [round(duration, 3)]
     shots = []
     for a, b in zip(bounds, bounds[1:]):
-        if b - a >= MIN_SHOT:
+        if b - a >= float(min_shot):
             shots.append({"clip": str(clip), "start": round(a, 3), "end": round(b, 3),
                           "seconds": round(b - a, 3)})
     return shots
@@ -564,7 +537,12 @@ def plan_edit(shots: list, grid: dict, target_seconds: float | None = None) -> d
     t = 0.0
     for shot in shots:
         have = float(shot.get("seconds") or 0.0)
-        if have >= phrase * (1.0 - SPEED_SLACK):
+        # Continuous, late-reveal and memory-glitch chapters carry an authored timing
+        # inside the generated 10s file. Re-quantising them to 3.85s phrases would erase
+        # exactly the reference edit language the user selected.
+        if shot.get("preserve_duration"):
+            slot = have
+        elif have >= phrase * (1.0 - SPEED_SLACK):
             slot = phrase
         elif have >= half * (1.0 - SPEED_SLACK):
             slot = half
@@ -574,7 +552,7 @@ def plan_edit(shots: list, grid: dict, target_seconds: float | None = None) -> d
         # Pull the END of this shot onto a real note. Only accept the snap while the shot
         # still has the material to fill it - a longer slot than the clip can cover would
         # be a slow-down beyond SPEED_SLACK, which is visible.
-        snapped = _snap(t + slot)
+        snapped = _snap(t + slot) if not shot.get("preserve_duration") else t + slot
         if abs(snapped - (t + slot)) > 1e-6 and snapped - t >= MIN_SHOT:
             if have >= (snapped - t) * (1.0 - SPEED_SLACK):
                 slot = round(snapped - t, 3)
@@ -592,7 +570,8 @@ def plan_edit(shots: list, grid: dict, target_seconds: float | None = None) -> d
 
 
 def edit_to_music(clips: list, bed_path, out_path, status_cb=None, work_dir=None,
-                  target_seconds: float | None = None) -> dict:
+                  target_seconds: float | None = None,
+                  prompt_meta: list | None = None) -> dict:
     """Uploaded clips + a music bed -> one short whose every cut sits on the melody."""
     ffmpeg = str(pipeline.find_ffmpeg() or "ffmpeg")
     out_path = Path(out_path)
@@ -603,9 +582,23 @@ def edit_to_music(clips: list, bed_path, out_path, status_cb=None, work_dir=None
     grid = music_grid(bed_path, status_cb=status_cb)
     shots = []
     for i, clip in enumerate(clips, 1):
-        found = shots_in(clip)
+        prompt = ((prompt_meta or [])[i - 1]
+                  if i - 1 < len(prompt_meta or []) else {})
+        style = str((prompt or {}).get("edit_style") or "classic_reveal")
+        if style == "continuous_passage":
+            # Force one source shot even if the generator introduces a harmless exposure
+            # jump that scene detection mistakes for an edit.
+            found = shots_in(clip, threshold=1.1, min_shot=0.1)
+        elif style == "memory_glitch":
+            found = shots_in(clip, threshold=0.18, min_shot=0.12)
+        else:
+            found = shots_in(clip)
+        if style in {"continuous_passage", "late_reveal", "memory_glitch"}:
+            for shot in found:
+                shot["preserve_duration"] = True
+                shot["edit_style"] = style
         lengths = ", ".join("%.1fs" % s["seconds"] for s in found) or "unreadable"
-        _log(status_cb, f"Clip {i}: {len(found)} shot(s) ({lengths}).")
+        _log(status_cb, f"Clip {i}: {style}, {len(found)} shot(s) ({lengths}).")
         shots.extend(found)
     if not shots:
         raise RuntimeError("None of the uploaded clips could be read.")

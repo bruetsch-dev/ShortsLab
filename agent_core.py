@@ -561,6 +561,30 @@ def clean_text(text):
     )
 
 
+def _clean_generated_script_layout(text):
+    """Normalize punctuation without destroying semantic paragraph boundaries."""
+    value = clean_text(text or "")
+    paragraphs = []
+    for paragraph in re.split(r"\n\s*\n+", value):
+        paragraph = re.sub(r"[ \t\r\f\v]+", " ", paragraph)
+        paragraph = re.sub(r"\s*\n\s*", " ", paragraph).strip()
+        if paragraph:
+            paragraphs.append(paragraph)
+    return "\n\n".join(paragraphs)
+
+
+def _generated_fact_script_with_blocks(data):
+    """Return hook + three explicit visual paragraphs when the model supplied blocks."""
+    if not isinstance(data, dict):
+        return ""
+    hook = _clean_generated_script_layout(data.get("hook") or "")
+    blocks = [_clean_generated_script_layout(value) for value in
+              (data.get("visual_blocks") or []) if str(value or "").strip()]
+    if hook and len(blocks) == 3:
+        return "\n\n".join([hook] + blocks)
+    return _clean_generated_script_layout(data.get("script") or "")
+
+
 def seconds_from_stamp(minutes, seconds):
     return int(minutes) * 60 + int(seconds)
 
@@ -2002,17 +2026,33 @@ def estimate_script_tokens(text):
 
 def _trim_script_to_token_limit(text, limit):
     """Keep complete sentences whenever possible and guarantee the configured hard ceiling."""
-    text = clean_text(text or "").strip()
+    text = _clean_generated_script_layout(text or "")
     if not limit or estimate_script_tokens(text) <= limit:
         return text
     kept = []
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        candidate = " ".join(kept + [sentence]).strip()
+    # Keep the paragraph marker attached to its following sentence. A token trim must not turn
+    # four machine-readable search chapters back into one flat narration string.
+    units = re.split(r"(?<=[.!?])([ \t]+|\n\n+)", text)
+    sentences = []
+    separator = ""
+    for index in range(0, len(units), 2):
+        sentence = units[index].strip()
+        if sentence:
+            sentences.append((separator, sentence))
+        separator = units[index + 1] if index + 1 < len(units) else ""
+    for separator, sentence in sentences:
+        glue = "\n\n" if "\n" in separator else (" " if kept else "")
+        candidate = (kept[-1] + glue + sentence if kept else sentence)
+        prior = "".join(kept[:-1]) if kept else ""
+        candidate = prior + candidate
         if estimate_script_tokens(candidate) > limit:
             break
-        kept.append(sentence)
+        if kept:
+            kept.append(glue + sentence)
+        else:
+            kept.append(sentence)
     if kept:
-        return " ".join(kept).strip()
+        return "".join(kept).strip()
     raw_tokens = re.findall(r"[\w]+|[^\s\w]", text, flags=re.UNICODE)
     # Reserve one slot for terminal punctuation when the truncated prefix has none.
     reserve = 1 if raw_tokens and raw_tokens[min(len(raw_tokens), limit) - 1] not in ".!?" else 0
@@ -2023,7 +2063,7 @@ def _trim_script_to_token_limit(text, limit):
 
 
 def generate_viral_script(topic="", status_cb=None, instructions="", format_mode="standard",
-                          token_limit=None):
+                          token_limit=None, reasoning_model=None):
     """Write a reference-style viral short script from a topic (empty topic = the model picks
     its own high-potential topic in the same style). Returns {"topic","script","hook_keywords"}.
 
@@ -2169,6 +2209,9 @@ the active length limit, narration-only requirement, or strict JSON output.
   that hook beat; the later blocks remain about women and their other visible restrictions.
 - STRUCTURE: hook plus exactly 3 concrete, escalating visual blocks. Each block contains one
   physical action or situation a phone camera can clearly show. The final block is the strongest.
+- SEARCH CHAPTERS: keep the hook and each visual block as its own paragraph. These four paragraph
+  boundaries are machine-readable edit instructions: never merge them and never put a blank line
+  inside one block.
 - VISUAL VARIETY: every block needs a different setting, action or prop. Do not repeat the hook
   location as generic filler and do not restate the same fact with synonyms.
 - RETENTION: use a clean curiosity gap, an immediate concrete reveal, then escalation and payoff.
@@ -2207,7 +2250,10 @@ Write ONE narration script following ALL of these rules:
 
 Return STRICT JSON:
 {{"topic": "<short topic label>",
- "script": "<the narration text>",
+ "hook": "<the hook sentence; empty only for mini story format>",
+ "visual_blocks": ["<visual block 1>", "<visual block 2>", "<visual block 3>"],
+ "script": "<the complete narration text; for standard format use hook, blank line, block 1,
+ blank line, block 2, blank line, block 3>",
  "hook_keywords": ["8-14 words: the strong VERBS, toxic/extreme ADJECTIVES and shock NOUNS/
 numbers from the script, spelled EXACTLY as written in the script"]}}"""
     log(status_cb, "Script creator: writing a reference-style script"
@@ -2227,13 +2273,14 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
                 f"Retry nonce: {secrets.token_hex(8)}."
             )
         model_output_tokens = max(280, token_limit * 2)
-        data = _post_llm_json(SCRIPT_CREATOR_MODEL,
+        data = _post_llm_json(reasoning_model or SCRIPT_CREATOR_MODEL,
                               [{"role": "system", "content": system},
                                {"role": "user", "content": attempt_prompt}], model_output_tokens,
                               min(1.15, temperature + attempt * 0.08))
         if not isinstance(data, dict) or not str(data.get("script") or "").strip():
             continue
-        candidate = clean_text(str(data.get("script") or "")).strip()
+        candidate = (_clean_generated_script_layout(data.get("script") or "") if mini_story
+                     else _generated_fact_script_with_blocks(data))
         duplicate_score = max((_script_text_similarity(candidate, old) for old in prior_scripts), default=0.0)
         candidate_hook = candidate.split(".", 1)[0].strip().casefold()
         repeated_hook = any(candidate_hook and candidate_hook == old.split(".", 1)[0].strip().casefold()
@@ -2266,7 +2313,8 @@ numbers from the script, spelled EXACTLY as written in the script"]}}"""
         pass
     return {"topic": out_topic, "script": script, "hook_keywords": kws[:14],
             "format_mode": format_mode, "estimated_tokens": estimate_script_tokens(script),
-            "token_limit": token_limit}
+            "token_limit": token_limit,
+            "reasoning_model": reasoning_model or SCRIPT_CREATOR_MODEL}
 
 
 def regenerate_script_from_reference(original_script, instructions="", status_cb=None):
@@ -2364,7 +2412,7 @@ def _post_llm_json(model, messages, max_tokens, temperature, timeout=180):
     # for (2026-07-26). Same models that get the raised token ceiling get the raised wait.
     _m = str(model or "").lower()
     if any(t in _m for t in ("gemini", "glm", "qwen", "deepseek", "thinking",
-                             "kimi", "moonshot")):
+                             "kimi", "moonshot", "gpt-5.6")):
         timeout = max(timeout, 420)
     data = post_json_url(WAVESPEED_LLM_API, payload, timeout=timeout)
     return extract_json_object(data["choices"][0]["message"]["content"])
@@ -3221,11 +3269,15 @@ def post_json_url(url, payload, timeout=75):
         # EMPTY with finish_reason=length. Every Kimi run died at the script step with
         # "returned NoneType" (2026-07-25) while the model itself was working fine.
         if any(token in model for token in ("gemini", "glm", "qwen", "deepseek", "thinking",
-                                            "kimi", "moonshot")):
+                                            "kimi", "moonshot", "gpt-5.6")):
+            # DeepSeek V4 thinks far longer than the rest: measured on one logic prompt,
+            # V4 Pro at effort "max" spent 7.3k output tokens purely on reasoning before it
+            # answered at all, so the 8000 ceiling left almost nothing for the JSON.
+            floor = 20000 if "deepseek" in model else 8000
             try:
-                if int(payload["max_tokens"]) < 8000:
+                if int(payload["max_tokens"]) < floor:
                     payload = dict(payload)
-                    payload["max_tokens"] = 8000
+                    payload["max_tokens"] = floor
             except (TypeError, ValueError):
                 pass
     data = json.dumps(payload).encode("utf-8")
@@ -4409,7 +4461,8 @@ def llm_speaker_clip_plan(title, script, visual_script, speaker_image_path, reas
         f"Optional visual direction:\n{visual_script or '(none provided)'}"
     )
     payload = {
-        "model": reasoning_model or GPT55_MODEL,
+        # The speaker photo is the whole point of this call, so it must go to a model that sees.
+        "model": reasoning_modes.vision_model_for(reasoning_model or GPT55_MODEL),
         "messages": [
             {"role": "system", "content": "You are a precise image-to-video prompt writer for realistic short-form creator clips."},
             {
@@ -5756,6 +5809,127 @@ def coalesce_short_scrape_scenes(scenes, min_s=1.45, max_s=3.2):
     return ordered
 
 
+_SCRAPE_CHAPTER_CUE_RE = re.compile(
+    r"^\s*(?:and\s+)?(?:second|third|fourth|fifth|next|finally|last(?:ly)?|but\s+the\s+"
+    r"(?:best|worst|strangest|craziest)|the\s+(?:second|third|fourth|fifth))\b",
+    flags=re.I,
+)
+
+
+def coalesce_scrape_visual_chapters(scenes, min_s=3.2, target_s=4.8, max_s=6.2,
+                                     preserve_hook=False, semantic_blocks=None):
+    """Turn narration micro-beats into a small number of searchable visual chapters.
+
+    Scrape footage is strongest when one concrete object/action can cover a complete thought.
+    Searching every two-word timing fragment produced dozens of vague queries and forced a new
+    TikTok at every phrase.  This groups adjacent voice beats into 3-8 second chapters, while
+    listicle cues such as ``Second`` and ``And third`` remain hard topic boundaries.  ``First``
+    intentionally stays with the opening hook: successful hand edits introduce the list and its
+    first proof object in one visual chapter.
+    """
+    ordered = sorted((dict(scene) for scene in (scenes or [])),
+                     key=lambda scene: float(scene.get("start", 0.0)))
+    if len(ordered) < 2:
+        return ordered
+
+    def _duration(rows):
+        return max(0.0, float(rows[-1].get("end", 0.0)) - float(rows[0].get("start", 0.0)))
+
+    def _text(scene):
+        return clean_text(str(scene.get("exact_voice_text") or scene.get("voice_line")
+                              or scene.get("script") or ""))
+
+    def _merge(rows, chapter_index):
+        merged = dict(rows[0])
+        merged["start"] = round(float(rows[0].get("start", 0.0)), 3)
+        merged["end"] = round(float(rows[-1].get("end", merged["start"])), 3)
+        voice = clean_text(" ".join(_text(row) for row in rows if _text(row)))
+        if voice:
+            merged["script"] = voice
+            merged["exact_voice_text"] = voice
+            merged["voice_line"] = voice
+            merged["beat_purpose"] = f"Show one concrete visual chapter for: {voice}"
+            merged["scene_objective"] = f"Keep one relevant object/action on screen for: {voice}"
+            merged["required_visual_information"] = voice
+            merged["must_show"] = important_terms(voice, 7, SEARCH_NOISE)
+        merged["visual_chapter"] = True
+        merged["chapter_id"] = f"chapter_{chapter_index + 1}"
+        merged["chapter_member_ids"] = [str(row.get("id", i)) for i, row in enumerate(rows)]
+        merged["micro_beat"] = False
+        merged.pop("beat_group", None)
+        merged.pop("shots", None)
+        return merged
+
+    # Listicles and paragraphs still provide useful semantic boundaries, but they must not turn
+    # into 10–12 second *single* scrape chapters. A social-source window is deliberately limited
+    # to ~2–8 seconds so it can be inspected and cut cleanly. The old structured-mode exception
+    # grouped a whole Romance Rulebook paragraph into one chapter, then demanded an impossible
+    # 11.7 seconds from a 2.5-second verified TikTok window and discarded the match at export.
+    # Keep the semantic boundary preference while respecting the same maximum duration as every
+    # other chapter; adjacent chapters can still be assembled as a coherent story in the timeline.
+    listicle_mode = any(_SCRAPE_CHAPTER_CUE_RE.search(_text(scene)) for scene in ordered)
+    blocks = [clean_text(str(value)) for value in (semantic_blocks or []) if clean_text(str(value))]
+    block_terms = [words(value) for value in blocks]
+    paragraph_mode = 1 < len(block_terms) <= 8
+    mapped_blocks = []
+    previous_block = 0
+    for scene in ordered:
+        scene_terms = words(_text(scene))
+        scores = [len(scene_terms & terms) / max(1.0, min(len(scene_terms), len(terms)))
+                  for terms in block_terms]
+        best = max(range(len(scores)), key=lambda index: scores[index]) if scores else 0
+        # Spoken content is sequential; generic words may weakly resemble an earlier paragraph,
+        # but a later scene must never jump backward into it.
+        previous_block = max(previous_block, best)
+        mapped_blocks.append(previous_block)
+    structured_mode = listicle_mode or paragraph_mode
+    effective_max = float(max_s)
+    chapters, current = [], []
+    current_block = None
+    for index, scene in enumerate(ordered):
+        text = _text(scene)
+        scene_block = mapped_blocks[index] if paragraph_mode else None
+        hard_boundary = bool(current and (_SCRAPE_CHAPTER_CUE_RE.search(text)
+                                          or (paragraph_mode and scene_block != current_block)))
+        if preserve_hook and index == 1 and current:
+            hard_boundary = True
+        proposed = current + [scene]
+        # `min_s` is a preferred pacing threshold, never permission to exceed the maximum
+        # usable social-footage window.  A short first micro-beat may stand alone; the renderer
+        # can play a 1.5s relevant shot, but cannot safely invent the rest of a long chapter.
+        if current and (hard_boundary or _duration(proposed) > effective_max):
+            chapters.append(_merge(current, len(chapters)))
+            current = [scene]
+            current_block = scene_block
+        else:
+            current = proposed
+            if len(current) == 1:
+                current_block = scene_block
+
+        # A completed sentence near the target is a natural optional boundary.  Do not split on
+        # every full stop: wait until the chapter already carries enough visual information.
+        if (current and _duration(current) >= float(target_s)
+                and _text(current[-1]).rstrip().endswith((".", "!", "?"))):
+            chapters.append(_merge(current, len(chapters)))
+            current = []
+            current_block = None
+    if current:
+        chapters.append(_merge(current, len(chapters)))
+
+    # Avoid a tiny tail chapter: attach it to the previous thought when the combined duration is
+    # still reasonable.  A longer relevant hold is preferable to a final filler clip.
+    if len(chapters) > 1:
+        tail = chapters[-1]
+        tail_dur = float(tail.get("end", 0.0)) - float(tail.get("start", 0.0))
+        prev = chapters[-2]
+        combined = float(tail.get("end", 0.0)) - float(prev.get("start", 0.0))
+        # Never turn a short tail into another overlong source demand. A separate short
+        # cut is preferable to accepting a matching TikTok and deleting it at export.
+        if tail_dur < float(min_s) and combined <= effective_max:
+            chapters[-2:] = [_merge([prev, tail], len(chapters) - 2)]
+    return chapters
+
+
 # The 12 canonical short-SFX types of the TikTok-documentary style (synthesized in
 # soundeffects/shorts_ready/editor_pack by scripts/make_editor_sfx.py). Each maps to a clean
 # library-token fallback in case the pack folder is missing. Approx clip length per type is used
@@ -6911,7 +7085,10 @@ def plan_visual_fx(config, project_dir, reasoning_model=None, status_cb=None, co
                     plan = collaborate_json(messages, max_tokens=4000, temperature=0.2, status_cb=status_cb, label="visual fx") or {}
                 else:
                     data = post_json_url(WAVESPEED_LLM_API, {
-                        "model": reasoning_model or GPT55_MODEL, "messages": messages,
+                        # Contact sheet in the payload: a text-only pick would invent the
+                        # bounding boxes instead of seeing them, so vision gets its own model.
+                        "model": reasoning_modes.vision_model_for(reasoning_model or GPT55_MODEL),
+                        "messages": messages,
                         "temperature": 0.2, "max_tokens": 4000, "response_format": {"type": "json_object"}}, timeout=180)
                     plan = extract_json_object(data["choices"][0]["message"]["content"]) or {}
                 smap = plan.get("scenes") if isinstance(plan.get("scenes"), dict) else {}
@@ -8825,11 +9002,16 @@ def apply_timeline_edits_to_config(config, edits, slug, prepare_media=True):
             _adur = float(probe_audio_duration(str(config["audio_path"])) or 0.0)
         except Exception:  # noqa: BLE001
             _adur = 0.0
-        if _adur > t + 0.05:
-            new_scenes[-1]["end"] = round(_adur, 3)
-            config["duration"] = round(_adur, 3)
-            log(None, f"Timeline render: clips ended {(_adur - t):.2f}s before the voiceover - "
-                      "extended the last scene so no speech is cut.")
+        # AAC encoders and social platforms need a little room after the final phoneme. Ending
+        # the container on the exact final word timestamp still clips its release even though the
+        # numeric audio/video durations appear equal. Keep a short visual/audio tail by default.
+        _tail = max(0.20, min(1.0, float(config.get("voice_tail_padding", 0.45) or 0.45)))
+        _voice_end = _adur + _tail
+        if _voice_end > t + 0.05:
+            new_scenes[-1]["end"] = round(_voice_end, 3)
+            config["duration"] = round(_voice_end, 3)
+            log(None, f"Timeline render: extended the last scene to voiceover + {_tail:.2f}s "
+                      "tail so the final word is not cut.")
     if "overlays" in edits:
         config["smart_overlays"] = any(scene.get("overlays") for scene in new_scenes)
         config["timeline_overlays_managed"] = True
@@ -10441,7 +10623,12 @@ def run_project(form, status_cb=None):
         # resolving together signals "you can scroll now". Boundaries inside +-0.4s of a
         # sentence-end are moved onto the onset of the SECOND word of the next sentence
         # (a cut mid-thought), keeping scenes contiguous and >=1.2s.
-        if canonical_words and str(form.get("pipeline_version") or "v0.2") != "v0.1":
+        _semantic_blocks = [block for block in re.split(r"\n\s*\n+", script or "")
+                            if clean_text(block)]
+        _structured_fact_script = (len(_semantic_blocks) > 1
+                                   or bool(_SCRAPE_CHAPTER_CUE_RE.search(script or "")))
+        if (canonical_words and not _structured_fact_script
+                and str(form.get("pipeline_version") or "v0.2") != "v0.1"):
             _sent_ends = [w["end"] for w in canonical_words if str(w["word"]).rstrip()[-1:] in ".!?"]
             _onsets = [w["start"] for w in canonical_words]
             _moved = 0
@@ -10462,7 +10649,26 @@ def run_project(form, status_cb=None):
             if _moved:
                 log(status_cb, f"v0.2 pacing: moved {_moved} cut(s) off sentence ends into "
                                "mid-sentence (asynchronous cut rule).")
-    log(status_cb, f"Using {len(scenes_override)} micro-beat(s) as the edit map.")
+        # SEARCH/CUT CHAPTERS: the scraper should solve tangible visual ideas, not two-word voice
+        # fragments.  One strong phone-video action may cover the whole thought.  This is the
+        # behaviour that made the successful hand cuts both faster to source and easier to follow.
+        _before_chapters = len(scenes_override)
+        # Social segments are inspected as short cut-free phone-video windows. Do not ask the
+        # assignment stage to fill 5–6 seconds from a verified 2–4 second window: it can only
+        # reject the clip later or append unreviewed footage past a source scene change.
+        scenes_override = coalesce_scrape_visual_chapters(
+            scenes_override, min_s=2.0,
+            target_s=(3.0 if mini_story_mode else 2.8),
+            max_s=(3.4 if mini_story_mode else 3.2),
+            preserve_hook=form_flag(form, "influencer_hook", False),
+            semantic_blocks=_semantic_blocks,
+        )
+        if canonical_words:
+            scenes_override = sync_scenes_to_voice_timeline(
+                scenes_override, canonical_words, target_duration=target_duration)
+        log(status_cb, f"Fact Short visual chapters: {_before_chapters} narration beat(s) -> "
+                       f"{len(scenes_override)} searchable object/action chapter(s).")
+    log(status_cb, f"Using {len(scenes_override)} visual scene(s) as the edit map.")
     if visual_script:
         log(status_cb, "Visual Ablauf prompt applied to scene planning, image prompts, Seedance prompts, and review.")
     web_images_per_scene = 2
@@ -11096,7 +11302,11 @@ def run_project(form, status_cb=None):
                 # Keep searching TikTok for any BODY scene still unmatched (targeted retry rounds).
                 # Scene 0 is the hook and is never re-searched here.
                 _first_body_scene = 1 if use_influencer_hook else 0
-                for rnd in range(1, MAX_SCRAPE_ROUNDS):
+                # Scrape V2 owns its search, adaptive recovery and evidence matching end-to-end.
+                # Running the legacy retry after V2 is what replaced honest UNMATCHED scenes with
+                # clips V2 had explicitly rejected (Tokyo Sleeps in Suits: 0 semantic passes became
+                # four unrelated rendered clips). Never cross that boundary again.
+                for rnd in ([] if _v2 else range(1, MAX_SCRAPE_ROUNDS)):
                     if _cancel():
                         break
                     unmatched = [i for i, c in enumerate(scene_clips)
@@ -11180,15 +11390,17 @@ def run_project(form, status_cb=None):
                 # lower number has consistently returned the same D_REJECTED decisions and added
                 # 10-20 minutes. In that case go directly to the controlled same-bucket clean-footage
                 # fallback below.
-                remaining_body = [i for i, c in enumerate(scene_clips) if i > 0 and c is None]
-                _any_matched = any(c is not None for i, c in enumerate(scene_clips) if i > 0)
+                remaining_body = [i for i, c in enumerate(scene_clips)
+                                  if i >= _first_body_scene and c is None]
+                _any_matched = any(c is not None for i, c in enumerate(scene_clips)
+                                   if i >= _first_body_scene)
                 _large_zero_match_pool = (not _any_matched and len(body_pool) >= scene_total)
                 _floor_threshold = adaptive_script_match_threshold(
                     script_relevancy, MAX_SCRAPE_ROUNDS)
                 _can_relax_further = _floor_threshold < current_match_threshold - 0.01
-                _run_final_rescore = should_run_final_semantic_rescore(
+                _run_final_rescore = (not _v2 and should_run_final_semantic_rescore(
                     current_match_threshold, _floor_threshold, len(remaining_body),
-                    len(body_pool), _any_matched, scene_total)
+                    len(body_pool), _any_matched, scene_total))
                 if _run_final_rescore:
                     log(status_cb, f"Final semantic fallback: re-scoring {len(remaining_body)} unmatched "
                                    f"scene(s) at {_floor_threshold:.1f}/10 (floor).")
@@ -11529,25 +11741,41 @@ def run_project(form, status_cb=None):
                 return _cap_cache[_k]
 
             _CAP_MAX = 1.5   # strict: anything above incidental text is not renderable
+            def _source_key(_clip):
+                _meta = clip_meta.get(str(_clip), {}) or {}
+                _source_id = str(_meta.get("clip_id") or "").strip()
+                _platform = str(_meta.get("platform") or "").strip().lower()
+                if _source_id:
+                    return f"{_platform}:{_source_id}"
+                # Different trims/copies of the same download may have different filenames.
+                # Content hashing makes the final no-repeat rule survive those copies too.
+                try:
+                    _hash = hashlib.sha256()
+                    with Path(_clip).open("rb") as _fh:
+                        for _chunk in iter(lambda: _fh.read(1024 * 1024), b""):
+                            _hash.update(_chunk)
+                    return "sha256:" + _hash.hexdigest()
+                except Exception:
+                    return "path:" + str(Path(_clip).resolve())
+
             _used_keys = set()
-            _prev_key = None
             _swaps = 0
             _cap_swaps = 0
             _caption_drops = 0
+            _duplicate_drops = 0
             for _idx in range(len(scene_clips)):
                 _clip = scene_clips[_idx]
                 if _clip is None:
-                    _prev_key = None
                     continue
-                _key = str(Path(_clip).resolve())
-                _is_dup = _key in _used_keys and _key != _prev_key
+                _key = _source_key(_clip)
+                _is_dup = _key in _used_keys
                 # V2 segments already passed the segment-level caption gates
                 # (_segment_caption_signals + burned-caption rejects); re-OCRing them here at
                 # the strict 1.5 bar dropped 13/17 good Japanese clips (signs/stickers score
                 # 2-5) and the continuity fill then rendered ONE clip for the whole video.
                 _is_capt = (not _v2) and _cap_score(_clip) > _CAP_MAX
                 if _is_dup or _is_capt:
-                    _cand = [p for p in fallback_pool if str(Path(p).resolve()) not in _used_keys]
+                    _cand = [p for p in fallback_pool if _source_key(p) not in _used_keys]
                     _clean = [p for p in _cand if _cap_score(p) <= _CAP_MAX]
                     # A captioned clip may only be replaced by a clean clip. For a pure duplicate,
                     # any unused candidate helps, but never use that looser branch for captions.
@@ -11561,23 +11789,26 @@ def run_project(form, status_cb=None):
                             _cap_swaps += 1
                         elif _is_dup:
                             _swaps += 1
-                        _key = str(Path(_repl).resolve())
+                        _key = _source_key(_repl)
                         if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
                             clip_decision_log[_idx]["cleanup_swapped"] = True
-                    elif _is_capt:
+                    elif _is_capt or _is_dup:
                         # Never blur captions. If no clean replacement exists, leave the scene
                         # unassigned so the normal clean fallback/continuity path handles it.
                         scene_clips[_idx] = None
-                        _caption_drops += 1
+                        if _is_capt:
+                            _caption_drops += 1
+                        else:
+                            _duplicate_drops += 1
                         if _idx < len(clip_decision_log) and isinstance(clip_decision_log[_idx], dict):
-                            clip_decision_log[_idx]["captioned_clip_dropped"] = True
-                        _prev_key = None
+                            clip_decision_log[_idx]["captioned_clip_dropped" if _is_capt
+                                                    else "duplicate_source_dropped"] = True
                         continue
                 _used_keys.add(_key)
-                _prev_key = _key
-            if _swaps or _cap_swaps or _caption_drops:
+            if _swaps or _cap_swaps or _caption_drops or _duplicate_drops:
                 log(status_cb, f"Final clean-up: swapped {_cap_swaps} captioned + {_swaps} duplicate "
-                               f"clip(s); dropped {_caption_drops} captioned clip(s) with no clean replacement.")
+                               f"clip(s); dropped {_caption_drops} captioned + {_duplicate_drops} duplicate "
+                               "clip(s) with no clean replacement.")
 
             # Place only clips that passed semantic matching for this exact scene.  The previous
             # reuse cycle filled rejected scenes with an unrelated clip accepted for a different
@@ -11636,6 +11867,9 @@ def run_project(form, status_cb=None):
                         sc.pop("clip", None)
                 else:
                     sc.pop("clip", None)
+                    sc["assignment_type"] = "uncovered_still"
+                    sc["match_class"] = "UNMATCHED"
+                    sc.pop("script_match_score", None)
             # mark candidate statuses: assigned clips are accepted + shown; the rest stay hidden
             for c in candidate_statuses:
                 if c.get("status") == "downloaded_pending_review":

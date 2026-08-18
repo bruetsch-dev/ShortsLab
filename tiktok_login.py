@@ -100,8 +100,9 @@ def _search_response_matches_query(url, query, is_tag=False):
 
     TikTok can keep firing responses after navigation.  Previously every `/full` response was
     absorbed, so a Japanese query could receive the same unrelated For You/search feed dozens of
-    times.  Responses without an exposed keyword are still allowed and are checked by item text
-    below; responses which *do* expose a keyword must belong to this search.
+    times. Responses without an exposed keyword are not search evidence: TikTok now fires a
+    global recommendation `/full` request beside the real keyword request, and accepting it made
+    every Japanese term receive the same unrelated feed.
     """
     low = str(url or "").casefold()
     if is_tag:
@@ -116,7 +117,7 @@ def _search_response_matches_query(url, query, is_tag=False):
     for key in ("keyword", "query", "q", "search_keyword"):
         values.extend(params.get(key, []))
     if not values:
-        return True
+        return False
     wanted = _normalise_search_text(query).lstrip("#")
     return any(_normalise_search_text(value).lstrip("#") == wanted for value in values)
 

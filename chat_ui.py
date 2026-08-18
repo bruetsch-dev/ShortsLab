@@ -352,6 +352,8 @@ MASTER_MANIFESTS = {
                "check": ["add_characters"]},
     "captions": {"action": "/captions-run", "file": "video_file",
                  "fields": ["caption_max_words", "caption_center_y"]},
+    "asmr": {"action": "/asmr-run", "file": "video_file",
+             "fields": ["asmr_profile"]},
     "longform": {"action": "/longform-run", "text": ["script"],
                  "fields": ["tts_model", "reasoning_model"],
                  "check": ["halt_after_speech"]},
@@ -472,6 +474,8 @@ def _project_kind(slug, title):
     t = (title or "").lower()
     if s.startswith("sfxmaster") or "_sfx_enhanced" in s or t.startswith("sfx master"):
         return "sfx"
+    if s.startswith("asmr_") or t.startswith("asmr sound"):
+        return "asmr"
     if (s.startswith("visualmaster") or "_visual_enhanced" in s
             or t.startswith("visual master") or t.startswith("vfx master")):
         return "vfx"

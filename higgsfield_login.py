@@ -42,6 +42,7 @@ import re
 import json
 import time
 import threading
+import subprocess
 from pathlib import Path
 
 try:
@@ -70,17 +71,77 @@ _LOCALE = os.environ.get("HIGGSFIELD_LOCALE", "en-US").strip() or "en-US"
 
 # --- calibration points (override via env; locked against the live UI after Connect) ----------
 LOGIN_URL = os.environ.get("HIGGSFIELD_LOGIN_URL") or "https://higgsfield.ai/"
+HOMEPAGE_URL = os.environ.get("HIGGSFIELD_HOMEPAGE_URL") or "https://higgsfield.ai/"
 CREATE_URL = os.environ.get("HIGGSFIELD_CREATE_URL") or "https://higgsfield.ai/ai/image?model=flux_2"
 DEFAULT_MODEL = os.environ.get("HIGGSFIELD_MODEL") or "FLUX.2 Pro"
 DEFAULT_ASPECT = os.environ.get("HIGGSFIELD_ASPECT") or "16:9"
+# Kept separately from CREATE_URL so the established FLUX longform workflow is untouched.
+VIDEO_CREATE_URL = os.environ.get("HIGGSFIELD_VIDEO_CREATE_URL") or "https://higgsfield.ai/ai/video?model=seedance_2_5"
+SEEDANCE_25_MODEL = os.environ.get("HIGGSFIELD_SEEDANCE_25_MODEL") or "Seedance 2.5"
 # an image URL "looks generated" when it points at Higgsfield's own media/CDN storage. Kept broad
 # on purpose - the newest large image that appears AFTER we click generate is the one we keep.
 _GEN_URL_RE = re.compile(
     r"(higgsfield|hgsfld|cloudfront|storage\.googleapis|r2\.cloudflarestorage|amazonaws|"
     r"supabase|blob\.core\.windows)", re.I)
 _IMG_EXT_RE = re.compile(r"\.(png|jpe?g|webp)(\?|$)", re.I)
+_VIDEO_EXT_RE = re.compile(r"\.(mp4|webm|mov|m4v)(\?|$)", re.I)
 
 _HEADLESS = (os.environ.get("HIGGSFIELD_HEADLESS", "0").strip().lower() in ("1", "true", "yes"))
+
+
+def _installed_chrome_channel():
+    """Use the normal stable Chrome build for the guarded Seedance page when available.
+
+    This is not an attempt to solve or evade a CAPTCHA.  Higgsfield's video endpoint is more
+    sensitive to Playwright's bundled Chromium fingerprint than the image endpoint.  Launching
+    the user's installed Chrome with the same dedicated Higgsfield profile gives the user a
+    normal, visible browser for the manual verification phase.  Automation still stops whenever
+    a verification is visible.
+    """
+    requested = os.environ.get("HIGGSFIELD_VIDEO_BROWSER", "chrome").strip().lower()
+    if requested in {"", "chromium", "playwright", "bundled"}:
+        return None
+    if requested == "chrome":
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES", r"C:\\Program Files")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        ]
+        return "chrome" if any(path.is_file() for path in candidates) else None
+    return requested
+
+
+def _normal_chrome_executable():
+    """Find the user-facing Chrome executable, never Playwright's bundled Chromium."""
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\\Program Files")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def open_manual_seedance_browser(status_cb=None):
+    """Open a real Chrome window for the user-owned Unlimited workflow.
+
+    No Playwright process, debugging pipe or browser control is involved. The app merely opens
+    Higgsfield's homepage; the user navigates, completes any verification and submits chapters.
+    Finished files are imported back through the normal Shortslab UI.
+    """
+    chrome = _normal_chrome_executable()
+    if chrome is None:
+        _status(status_cb, "Google Chrome was not found; open Higgsfield manually in Chrome, then import the chapter downloads.")
+        return False
+    try:
+        # Drop any stale controlled profile lock before normal Chrome opens its persistent session.
+        close_session()
+        subprocess.Popen([str(chrome), f"--user-data-dir={PROFILE_DIR}", "--new-window", HOMEPAGE_URL],
+                         cwd=str(ROOT), creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        _status(status_cb, "Opened normal Google Chrome at Higgsfield. The app will not control this browser.")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _status(status_cb, f"Could not open normal Google Chrome ({exc.__class__.__name__}: {exc}).")
+        return False
 
 _LOCK = threading.Lock()
 _SESSION = [None]                       # the shared Session; ONLY touched on the worker thread
@@ -297,11 +358,12 @@ class Session:
     Runs HEADED but parked FAR off-screen (like the scrape sessions) so nothing shows in the
     taskbar; set HIGGSFIELD_WINDOW_VISIBLE=1 to watch it while calibrating."""
 
-    def __init__(self, headless=None, status_cb=None):
+    def __init__(self, headless=None, status_cb=None, browser_channel=None):
         self._p = None
         self._ctx = None
         self._status_cb = status_cb
         self.headless = _HEADLESS if headless is None else bool(headless)
+        self._browser_channel = browser_channel
         self._pids = set()
         self._hide_stop = threading.Event()
         self._watcher = None
@@ -309,6 +371,12 @@ class Session:
         self._captured = []                 # generated-image URLs seen on the reused page
         self._gen_model = None              # desired model/aspect, re-applied before EVERY generate
         self._gen_aspect = None             # (a DataDome captcha reload resets the aspect to 3:4)
+        self._video_page = None
+        self._video_captured = []
+        self._video_consumed = set()       # URLs already downloaded as a completed chapter
+        self._video_model = None
+        self._video_aspect = None
+        self._video_unlimited_required = True
         self._open()
 
     def _open(self):
@@ -326,9 +394,19 @@ class Session:
                          "--disable-renderer-backgrounding",
                          "--disable-background-timer-throttling",
                          "--disable-features=CalculateNativeWinOcclusion"]
-            self._ctx = self._p.chromium.launch_persistent_context(
-                str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
-                viewport={"width": 1360, "height": 900}, args=args)
+            launch = {
+                "headless": self.headless,
+                "locale": _LOCALE,
+                "viewport": {"width": 1360, "height": 900},
+                "args": args,
+            }
+            # Do not spoof an old Chromium UA in the normal Chrome channel. The browser reports
+            # its actual version, which keeps the manual Higgsfield video verification coherent.
+            if self._browser_channel:
+                launch["channel"] = self._browser_channel
+            else:
+                launch["user_agent"] = _UA
+            self._ctx = self._p.chromium.launch_persistent_context(str(PROFILE_DIR), **launch)
         except Exception:
             if self._p is not None:
                 try:
@@ -536,6 +614,24 @@ class Session:
         if not aspect:
             return True
         wanted = str(aspect).strip()
+        # Current Higgsfield markup exposes the ratio as aria-label=Ratio. Prefer it, then keep
+        # the older listbox path for existing pages.
+        direct = self._elements(page, "button[aria-label='Ratio']")
+        for trigger in direct:
+            try:
+                if not trigger.is_visible():
+                    continue
+                if self._text(trigger).strip() == wanted:
+                    return True
+                trigger.click(timeout=1500)
+                page.wait_for_timeout(250)
+                for option in self._elements(page, "button,[role='option']"):
+                    if option.is_visible() and self._text(option).strip() == wanted:
+                        option.click(timeout=1500)
+                        page.wait_for_timeout(300)
+                        return True
+            except Exception:
+                continue
         # Already selected: do not click it again (clicking a selected control merely opens its
         # popup and leaves an overlay over the prompt).
         for el in self._elements(page, "button[aria-haspopup='listbox']"):
@@ -570,12 +666,49 @@ class Session:
         if not model:
             return True
         wanted = re.sub(r"\s+", " ", str(model)).strip().lower()
-        # Critical: when FLUX.2 Pro is already selected, never click its button. The old code did,
-        # opening the model popup; the following prompt click was then blocked by that popup.
-        for el in self._elements(page, "main button"):
+        # The live video composer uses an aria-label=Model button.  The legacy implementation only
+        # *looked* for the selected label, meaning Seedance 2.5 was never actually chosen when the
+        # page defaulted to Seedance 2.0.
+        # Query separately: lightweight test/probe pages may only expose the generic selector.
+        for el in (self._elements(page, "button[aria-label='Model']") + self._elements(page, "main button")):
             try:
-                if el.is_visible() and self._text(el).lower() == wanted:
+                if el.is_visible() and wanted in re.sub(r"\s+", " ", self._text(el)).lower():
                     return True
+            except Exception:
+                continue
+        for trigger in self._elements(page, "button[aria-label='Model']"):
+            try:
+                if not trigger.is_visible():
+                    continue
+                trigger.click(timeout=1500)
+                page.wait_for_timeout(350)
+                for option in self._elements(page, "button,[role='option']"):
+                    text = re.sub(r"\s+", " ", self._text(option)).strip().lower()
+                    if option.is_visible() and text.startswith(wanted):
+                        option.click(timeout=1500)
+                        page.wait_for_timeout(450)
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _set_video_duration(self, page, seconds=10):
+        """Select Higgsfield's native Seedance duration; never rely on its 8s default."""
+        wanted = f"{int(seconds)}s"
+        for trigger in self._elements(page, "button[aria-label='Duration']"):
+            try:
+                if not trigger.is_visible():
+                    continue
+                if self._text(trigger).strip().lower() == wanted:
+                    return True
+                trigger.click(timeout=1500)
+                page.wait_for_timeout(250)
+                for option in self._elements(page, "button,[role='option']"):
+                    text = re.sub(r"\s+", " ", self._text(option)).strip().lower()
+                    if option.is_visible() and text in {wanted, f"{int(seconds)} seconds", f"{int(seconds)} second"}:
+                        option.click(timeout=1500)
+                        page.wait_for_timeout(350)
+                        return True
             except Exception:
                 continue
         return False
@@ -603,6 +736,14 @@ class Session:
                 return bool(el.is_checked())
         except Exception:
             pass
+        try:
+            classes = str(el.get_attribute("class") or "").lower()
+            if re.search(r"(?:^|\s)(?:is-|state-)?(?:on|active|enabled|checked)(?:\s|$)", classes):
+                return True
+            if re.search(r"(?:^|\s)(?:is-|state-)?(?:off|inactive|disabled|unchecked)(?:\s|$)", classes):
+                return False
+        except Exception:
+            pass
         return None
 
     def _wait_for_generator_bar(self, page, timeout_ms=25000):
@@ -622,9 +763,14 @@ class Session:
                         .some(b => /generate/i.test(b.innerText || ''));
                       // The word 'Unlimited' is not a leaf - it labels a role=switch a few DOM
                       // levels up. Ready = a real switch exists whose surrounding text says so.
-                      const unl = [...document.querySelectorAll('[role=\"switch\"]')].some(sw => {
+                      const unl = [...document.querySelectorAll(
+                        '[role=\"switch\"],[role=\"checkbox\"],input[type=\"checkbox\"],'
+                        + 'button,[aria-label*=\"Unlimited\" i],[title*=\"Unlimited\" i]')].some(sw => {
                         let n = sw, txt = '';
-                        for (let i = 0; i < 4 && n; i++) { txt += ' ' + (n.innerText || ''); n = n.parentElement; }
+                        for (let i = 0; i < 5 && n; i++) {
+                          txt += ' ' + (n.innerText || '') + ' ' + (n.getAttribute('aria-label') || '');
+                          n = n.parentElement;
+                        }
                         return /unlimited/i.test(txt);
                       });
                       return gen && unl;
@@ -648,14 +794,25 @@ class Session:
         match on the text of up to a few ancestors, and only accept an element that exposes a
         real on/off state (aria-checked / data-state on|off) so we never grab a popover trigger.
         """
-        for el in self._elements(page, "[role='switch']"):
+        candidates = self._elements(
+            page,
+            "[role='switch'],[role='checkbox'],input[type='checkbox'],button,"
+            "[aria-label*='Unlimited' i],[title*='Unlimited' i]")
+        # Keep the direct selector fallback: the live page has the broader control
+        # shape above, while lightweight/probe DOMs may expose only role=switch.
+        if not candidates:
+            candidates = self._elements(page, "[role='switch']")
+        for el in candidates:
             try:
                 if not el.is_visible():
                     continue
                 ctx = el.evaluate(
                     """node => {
                       let n = node, txt = (node.getAttribute('aria-label') || '');
-                      for (let i = 0; i < 4 && n; i++) { txt += ' ' + (n.innerText || ''); n = n.parentElement; }
+                      for (let i = 0; i < 5 && n; i++) {
+                        txt += ' ' + (n.innerText || '') + ' ' + (n.getAttribute('aria-label') || '');
+                        n = n.parentElement;
+                      }
                       return txt;
                     }""")
             except Exception:
@@ -769,19 +926,125 @@ class Session:
 
         page.on("response", _on_resp)
 
+    def _attach_video_capture(self, page):
+        """Capture a finished Higgsfield video from the network, not from brittle cards."""
+        def _maybe_add(url):
+            # Video deliveries may be served through the same signed/API endpoint for every
+            # Seedance submission. De-duplicating by URL caused chapter 2+ of AI Motion to be
+            # invisible even though Higgsfield had completed them. `generate_video_reuse`
+            # records a cut immediately before each Generate click, so an event after that cut
+            # belongs to the new submission.
+            if url and _VIDEO_EXT_RE.search(url) and _GEN_URL_RE.search(url):
+                self._video_captured.append(url)
+
+        def _scan(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    _scan(item)
+            elif isinstance(value, list):
+                for item in value:
+                    _scan(item)
+            elif isinstance(value, str):
+                _maybe_add(value)
+
+        def _on_resp(resp):
+            try:
+                url = resp.url
+                ctype = str((resp.headers or {}).get("content-type", "")).lower()
+                if "video" in ctype or _VIDEO_EXT_RE.search(url):
+                    _maybe_add(url)
+                elif "json" in ctype:
+                    try:
+                        _scan(resp.json())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+
+    def _discover_video_results(self, page, captured_after=0):
+        """Return newly visible generated-video URLs as a network-capture fallback.
+
+        Higgsfield does not consistently fetch a completed result through the page response
+        stream.  In some layouts the video is already rendered in a result card (or behind a
+        download link) before Playwright observes a media response.  Treat that visible result
+        as a completion too; otherwise a perfectly finished chapter is reported as missing.
+        This is deliberately read-only and never presses Generate or touches verification UI.
+        """
+        known = set(self._video_captured)
+        try:
+            urls = page.evaluate(
+                """() => {
+                  const values = new Set();
+                  const add = value => {
+                    if (typeof value !== 'string' || !value) return;
+                    const clean = value.trim();
+                    if (/\\.(mp4|webm|mov|m4v)(?:[?#]|$)/i.test(clean)) values.add(clean);
+                  };
+                  document.querySelectorAll('video[src],video source[src],a[href],button[data-url],button[data-download-url],img[data-video-url]')
+                    .forEach(node => {
+                      add(node.currentSrc); add(node.src); add(node.href);
+                      add(node.getAttribute('data-url')); add(node.getAttribute('data-download-url'));
+                      add(node.getAttribute('data-video-url'));
+                    });
+                  document.querySelectorAll('[data-state="complete"],[data-status="completed"],[data-status="complete"]')
+                    .forEach(node => {
+                      for (const attr of node.getAttributeNames()) add(node.getAttribute(attr));
+                    });
+                  return [...values];
+                }""") or []
+        except Exception:
+            urls = []
+        for url in urls:
+            if _VIDEO_EXT_RE.search(str(url)) and _GEN_URL_RE.search(str(url)) and url not in known:
+                self._video_captured.append(str(url))
+                known.add(str(url))
+        return self._video_captured[captured_after:]
+
     def _has_captcha(self, page):
-        """True while a DataDome / captcha-delivery verification is mounted over the page."""
+        """True while any human verification is mounted over the page.
+
+        Higgsfield has used DataDome, Cloudflare Turnstile and plain ``Verify you are human``
+        overlays. Treating only the old DataDome iframe as a CAPTCHA let AI Motion falsely claim
+        that preflight was complete while the visible challenge still blocked Generate.
+        """
         try:
             return bool(page.evaluate(
-                """() => [...document.querySelectorAll('iframe')]
-                     .some(f => /captcha-delivery|datadome/i.test(f.src || ''))
-                   || !!document.querySelector('[id*=datadome i],[class*=datadome i]')"""))
+                """() => {
+                  const visible = node => {
+                    const style = getComputedStyle(node);
+                    const box = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                      && style.opacity !== '0' && box.width > 4 && box.height > 4;
+                  };
+                  const frameChallenge = [...document.querySelectorAll('iframe')]
+                    .some(f => visible(f) && /captcha-delivery|datadome|turnstile|challenges\.cloudflare|recaptcha|hcaptcha|arkoselabs|geetest/i.test(f.src || ''));
+                  const challengeNode = [...document.querySelectorAll(
+                    '[id*=datadome i],[class*=datadome i],[id*=captcha i],[class*=captcha i],'
+                    + '[id*=turnstile i],[class*=turnstile i],[id*=recaptcha i],[class*=recaptcha i],'
+                    + '[id*=hcaptcha i],[class*=hcaptcha i],[id*=challenge i],[class*=challenge i]')]
+                    .some(node => {
+                      if (!visible(node)) return false;
+                      const context = ((node.innerText || '') + ' ' + node.id + ' ' + node.className
+                        + ' ' + (node.getAttribute('aria-label') || '')).toLowerCase();
+                      return /captcha|datadome|turnstile|recaptcha|hcaptcha|verify|human|security|challenge/.test(context);
+                    });
+                  const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').toLowerCase();
+                  const challengeText = /verify (that )?you(?:'|’)re? human|verify you are human|security check|complete the verification|checking your browser/.test(text);
+                  return frameChallenge || challengeNode || challengeText;
+                }"""))
         except Exception:
             return False
 
     def open_generator(self, model=None, aspect=None, status_cb=None):
-        """Open (once) the single reused generator page and set model + aspect. The Unlimited
-        switch is deliberately NOT touched here - the user sets it. Returns True on success."""
+        """Open the reusable generator, set model/aspect, and enable Unlimited by default.
+
+        Unlimited can reset whenever Higgsfield re-renders or navigates.  Always attempting the
+        verified toggle here prevents a generation from silently falling back to credit usage;
+        callers still retain the visible manual wait as a safe fallback for a CAPTCHA or a UI
+        change that makes the switch unavailable.
+        """
         cb = status_cb or self._status_cb
         model = model or DEFAULT_MODEL
         aspect = aspect or DEFAULT_ASPECT
@@ -801,20 +1064,24 @@ class Session:
         self._dismiss_overlays(page)
         self._set_model(page, model)
         self._set_aspect(page, aspect)
+        if self._set_unlimited(page):
+            _status(cb, "Higgsfield Unlimited is ON.")
+        else:
+            _status(cb, "Higgsfield Unlimited could not be verified yet; waiting for it before generation.")
         return True
 
-    def unlimited_is_on(self):
-        page = self._gen_page
+    def unlimited_is_on(self, page=None):
+        page = page or self._gen_page
         if page is None:
             return False
         sw = self._find_unlimited_switch(page)
         return sw is not None and self._control_state(sw) is True
 
-    def wait_for_user_unlimited(self, status_cb=None, cancel_check=None, timeout_s=1200):
+    def wait_for_user_unlimited(self, status_cb=None, cancel_check=None, timeout_s=1200, page=None):
         """Bring the window forward and WAIT until the USER turns Unlimited ON (and clears any
         DataDome verification). Returns True once Unlimited reads on with no CAPTCHA showing."""
         cb = status_cb or self._status_cb
-        page = self._gen_page
+        page = page or self._gen_page
         if page is None:
             return False
         deadline = time.time() + timeout_s
@@ -822,7 +1089,7 @@ class Session:
         while time.time() < deadline:
             if cancel_check and cancel_check():
                 return False
-            if self.unlimited_is_on() and not self._has_captcha(page):
+            if self.unlimited_is_on(page) and not self._has_captcha(page):
                 _status(cb, "Unlimited is ON - starting image generation.")
                 return True
             now = time.time()
@@ -887,6 +1154,175 @@ class Session:
         if self._download(page, chosen, out_path):
             return str(out_path)
         _status(cb, f"Higgsfield: failed to download the finished image ({chosen}).")
+        return None
+
+    # ---- Seedance 2.5 video, same verified-Unlimited session -------------------------------
+
+    def open_video_generator(self, model=SEEDANCE_25_MODEL, aspect="9:16", unlimited_required=True, status_cb=None):
+        """Open only the Higgsfield homepage for user-controlled AI Motion preflight.
+
+        The user, not the app, navigates from this homepage to the video composer and sets
+        Seedance/ratio/duration/Unlimited.  In particular, do not navigate the page again after
+        it opens: the provider's CAPTCHA often appears only after an action and a forced route
+        change destroys a legitimate manual preflight.
+        """
+        cb = status_cb or self._status_cb
+        self._video_model, self._video_aspect = model, aspect
+        self._video_unlimited_required = bool(unlimited_required)
+        if self._video_page is None:
+            self._video_page = self._ctx.new_page()
+            self._attach_video_capture(self._video_page)
+        page = self._video_page
+        try:
+            page.goto(HOMEPAGE_URL, timeout=60000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            self._dismiss_overlays(page)
+            _status(cb, "AI Motion preflight: Higgsfield homepage opened. Navigate to Seedance and set everything yourself, then press Ready in ShortsLab.")
+            return True
+        except Exception as exc:
+            _status(cb, f"Higgsfield video composer failed to open ({exc.__class__.__name__}: {exc}).")
+            return False
+
+    def _video_preflight_issues(self, page):
+        """Read only the state the app can safely verify without taking over the video UI.
+
+        The human owns model, duration and ratio during preflight; automation never changes
+        those controls itself.  They still have to be visibly present in their required state
+        before the app can take over.  This prevents the previous false-ready path where the
+        page had finished loading but the user was still configuring Seedance.
+        """
+        issues = []
+        issues.extend(self._video_setting_issues(page))
+        if self._video_unlimited_required and not self.unlimited_is_on(page):
+            issues.append("Unlimited")
+        if self._video_rights_confirmation_needed(page):
+            issues.append("I own the rights of this content")
+        return issues
+
+    def _video_setting_issues(self, page):
+        """Return visible required video settings that cannot yet be confirmed.
+
+        This intentionally reads rendered text instead of opening any dropdown.  Higgsfield
+        regularly changes the controls' markup, whereas the selected values remain visible in
+        the composer.  A closed composer with no visible Seedance/10-second/9:16 values is not
+        ready for an automated prompt submission.
+        """
+        try:
+            state = page.evaluate(
+                """() => {
+                  const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').toLowerCase();
+                  return {
+                    model: /seedance\\s*(?:2[ .]?5|2\\.5)/i.test(text),
+                    duration: /(?:^|\\D)10\\s*(?:seconds?|secs?|sec|s)(?:\\D|$)/i.test(text),
+                    aspect: /9\\s*(?::|x|×)\\s*16/i.test(text),
+                  };
+                }""") or {}
+        except Exception:
+            # Treat a temporarily unreadable/transitioning page as not ready rather than
+            # guessing and submitting a prompt underneath a loading or verification overlay.
+            state = {}
+        issues = []
+        if not state.get("model"):
+            issues.append("Seedance 2.5")
+        if not state.get("duration"):
+            issues.append("10 seconds")
+        if not state.get("aspect"):
+            issues.append("9:16")
+        return issues
+
+    def wait_for_video_preflight(self, status_cb=None, cancel_check=None, timeout_s=None):
+        """Wait for a human to prepare the visible Seedance page; never change controls here.
+
+        ``None`` means wait until the user either completes the real preflight or cancels the
+        project.  A CAPTCHA is a user-facing state, not a generation failure, so AI Motion must
+        not turn it into a timed-out failed run while the browser is still open.
+        """
+        cb = status_cb or self._status_cb
+        page = self._video_page
+        if page is None:
+            return False
+        deadline = (time.time() + float(timeout_s)) if timeout_s is not None else None
+        last_note = ""
+        while deadline is None or time.time() < deadline:
+            if cancel_check and cancel_check():
+                return False
+            if self._has_captcha(page):
+                note = "Complete Higgsfield's human verification in the visible window."
+            elif not self._wait_for_generator_bar(page, timeout_ms=300):
+                note = "Waiting for Higgsfield's video controls to finish loading."
+            else:
+                issues = self._video_preflight_issues(page)
+                if not issues:
+                    _status(cb, "AI Motion preflight complete — using your selected Seedance video settings. AI is taking over.")
+                    return True
+                note = "Complete: " + ", ".join(issues) + ". AI Motion will not submit anything until every item is visible and ready."
+            if note != last_note:
+                _status(cb, "AI Motion preflight: " + note)
+                last_note = note
+            page.wait_for_timeout(1200)
+        return False
+
+    def generate_video_reuse(self, prompt, out_path, first_frame=None, timeout_s=900, status_cb=None):
+        """Generate one Seedance chapter, optionally seeded by an exact prior last frame."""
+        cb = status_cb or self._status_cb
+        page = self._video_page
+        if page is None:
+            return "UNLIMITED_OFF"
+        # Do not touch any toggle, prompt field, upload or Generate control while a human
+        # verification is visible. Repeated automated clicks during this state make a legitimate
+        # verification harder and can keep the account in the challenge loop.
+        if self._has_captcha(page):
+            _status(cb, "Higgsfield human verification is visible; AI Motion is paused without further automated clicks.")
+            return "CAPTCHA"
+        issues = self._video_preflight_issues(page)
+        if issues:
+            _status(cb, "AI Motion preflight changed during the run; waiting for: " + ", ".join(issues) + ".")
+            return "PREFLIGHT_REQUIRED"
+        self._dismiss_overlays(page)
+        if first_frame:
+            frame = Path(first_frame)
+            if not frame.exists() or not self.apply_reference_images(page, [frame]):
+                _status(cb, "Higgsfield could not attach the previous chapter's final frame.")
+                return None
+        else:
+            self._clear_reference_images(page)
+        if not self._type_prompt(page, prompt):
+            _status(cb, "Higgsfield could not enter the Seedance prompt.")
+            return None
+        if self._video_rights_confirmation_needed(page):
+            _status(cb, "AI Motion is paused: tick Higgsfield's 'I own the rights of this content' confirmation yourself.")
+            return "PREFLIGHT_REQUIRED"
+        # Snapshot all result cards *before* Generate. Higgsfield keeps the previous chapter on
+        # screen; without this baseline chapter 2 could download chapter 1 again and falsely
+        # look successful.
+        self._discover_video_results(page, 0)
+        cut = len(self._video_captured)
+        if not self._click_generate(page):
+            _status(cb, "Higgsfield video Generate button was not found.")
+            return None
+        _status(cb, f"Higgsfield: generating {Path(out_path).name} with Unlimited...")
+        deadline = time.time() + max(90, int(timeout_s))
+        while time.time() < deadline:
+            if self._has_captcha(page):
+                return "CAPTCHA"
+            fresh = self._video_captured[cut:] or self._discover_video_results(page, cut)
+            fresh = [url for url in fresh if url not in self._video_consumed]
+            if fresh:
+                page.wait_for_timeout(1800)
+                # The DOM card can mount slightly before its signed URL is usable. Recheck it
+                # once after the settle delay and always download the result from this chapter.
+                fresh = self._video_captured[cut:] or self._discover_video_results(page, cut)
+                fresh = [url for url in fresh if url not in self._video_consumed]
+                chosen = fresh[-1] if fresh else None
+                if not chosen:
+                    continue
+                if self._download(page, chosen, out_path):
+                    self._video_consumed.add(chosen)
+                    return str(out_path)
+                _status(cb, "Higgsfield video finished but its file could not be downloaded.")
+                return None
+            page.wait_for_timeout(1200)
+        _status(cb, f"Higgsfield timed out waiting for {Path(out_path).name}.")
         return None
 
     # ---- concurrent generation: K pages, each owns its own result -----------------------------
@@ -1186,6 +1622,30 @@ class Session:
         except Exception:
             return False
 
+    def _video_rights_confirmation_needed(self, page):
+        """Whether Higgsfield visibly asks the human to confirm content ownership.
+
+        This is intentionally read-only: the manual AI Motion preflight must never submit a
+        rights declaration on the user's behalf.
+        """
+        phrases = ("i own the rights", "i have the rights", "rights to this content", "own this content")
+        for el in self._elements(page, "label,[role='checkbox'],input[type='checkbox'],button"):
+            try:
+                if not el.is_visible():
+                    continue
+                context = str(el.evaluate("node => { let n=node, t=''; for(let i=0;i<3&&n;i++,n=n.parentElement) t+=' '+(n.innerText||'')+' '+(n.getAttribute('aria-label')||''); return t; }") or "").lower()
+                if not any(phrase in context for phrase in phrases):
+                    continue
+                if str(el.get_attribute("type") or "").lower() == "checkbox":
+                    return not el.is_checked()
+                # A label/button does not itself expose a checked state. Look for the actual
+                # checkbox within its nearest card before deciding it still needs user action.
+                checked = el.evaluate("node => { const box = node.closest('label,div')?.querySelector(\"input[type=checkbox],[role=checkbox]\"); return box ? (box.checked || box.getAttribute('aria-checked') === 'true') : false; }")
+                return not bool(checked)
+            except Exception:
+                continue
+        return False
+
     def _download(self, page, url, out_path):
         """Fetch the result image WITH the session's auth (page.request reuses context cookies)."""
         try:
@@ -1364,13 +1824,26 @@ def _executor():
         return _EXECUTOR
 
 
-def _session_on_worker(status_cb=None):
+def _session_on_worker(status_cb=None, browser_channel=None):
     if _SESSION[0] is None:
         try:
-            _SESSION[0] = Session(status_cb=status_cb)
+            _SESSION[0] = Session(status_cb=status_cb, browser_channel=browser_channel)
+            if browser_channel:
+                _status(status_cb, f"Higgsfield AI Motion is using installed {browser_channel.title()} for manual preflight.")
         except Exception as exc:            # noqa: BLE001
-            _status(status_cb, f"Higgsfield session failed to open ({exc.__class__.__name__}: {exc}).")
-            _SESSION[0] = None
+            # A system Chrome install can be unavailable or blocked by enterprise policy. The
+            # image workflow still has its bundled Chromium fallback; make that fallback explicit
+            # rather than silently reporting a bogus CAPTCHA state.
+            if browser_channel:
+                _status(status_cb, f"Installed {browser_channel.title()} could not open ({exc.__class__.__name__}); falling back to Chromium.")
+                try:
+                    _SESSION[0] = Session(status_cb=status_cb)
+                except Exception as fallback_exc:            # noqa: BLE001
+                    _status(status_cb, f"Higgsfield session failed to open ({fallback_exc.__class__.__name__}: {fallback_exc}).")
+                    _SESSION[0] = None
+            else:
+                _status(status_cb, f"Higgsfield session failed to open ({exc.__class__.__name__}: {exc}).")
+                _SESSION[0] = None
     # The marker only says that this profile was logged in once. Session cookies can expire
     # months later; treating the marker as live authentication made the UI say Connected while
     # Higgsfield showed Login, then the longform scheduler burned ten generation attempts.
@@ -1489,7 +1962,7 @@ def _open_visible_on_worker(status_cb=None):
             pass
         _SESSION[0] = None
     os.environ["HIGGSFIELD_WINDOW_VISIBLE"] = "1"
-    return _session_on_worker(status_cb)
+    return _session_on_worker(status_cb, browser_channel=_installed_chrome_channel())
 
 
 def _begin_manual_on_worker(model, aspect, status_cb, cancel_check, timeout_s):
@@ -1517,6 +1990,37 @@ def begin_manual_session(model=None, aspect=None, status_cb=None, cancel_check=N
         return False
 
 
+def _begin_seedance_25_video_on_worker(status_cb, cancel_check, timeout_s, unlimited_required, ready_gate):
+    sess = _open_visible_on_worker(status_cb)
+    if sess is None or not sess.open_video_generator(status_cb=status_cb, unlimited_required=unlimited_required):
+        return False
+    # The homepage is intentionally all the app opens. This gate belongs to ShortsLab's UI and
+    # is released only after the user has navigated/configured Higgsfield by hand.
+    if ready_gate is not None and not ready_gate():
+        return False
+    return sess.wait_for_video_preflight(status_cb=status_cb, cancel_check=cancel_check,
+                                         timeout_s=timeout_s)
+
+
+def begin_seedance_25_video_session(status_cb=None, cancel_check=None, timeout_s=1200,
+                                    unlimited_required=True, ready_gate=None):
+    """Open a visible Seedance 2.5 video session and verify all manual preflight items.
+
+    ``timeout_s=None`` intentionally keeps the job alive until user cancellation; this is used
+    for AI Motion because a provider-owned human verification must never become a false failure.
+    """
+    if not is_ready():
+        _status(status_cb, "Higgsfield is not connected - click Connect Higgsfield first.")
+        return False
+    try:
+        future = _executor().submit(_begin_seedance_25_video_on_worker, status_cb,
+                                    cancel_check, timeout_s, bool(unlimited_required), ready_gate)
+        return bool(future.result(timeout=(float(timeout_s) + 60) if timeout_s is not None else None))
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield Seedance 2.5 session failed ({exc.__class__.__name__}: {exc}).")
+        return False
+
+
 def _generate_shared_on_worker(prompt, out_path, timeout_s, status_cb):
     sess = _SESSION[0]
     if sess is None:
@@ -1541,6 +2045,41 @@ def generate_shared_sync(prompt, out_path, timeout_s=300, status_cb=None):
     except Exception as exc:                # noqa: BLE001
         _status(status_cb, f"Higgsfield generate failed ({exc.__class__.__name__}: {exc}).")
         return None
+
+
+def _generate_seedance_25_video_on_worker(prompt, out_path, first_frame, timeout_s, status_cb):
+    sess = _SESSION[0]
+    if sess is None:
+        return None
+    return sess.generate_video_reuse(prompt, out_path, first_frame=first_frame,
+                                     timeout_s=timeout_s, status_cb=status_cb)
+
+
+def generate_seedance_25_video_sync(prompt, out_path, first_frame=None, timeout_s=900, status_cb=None):
+    """Generate a Seedance 2.5 chapter from the active, Unlimited Higgsfield session."""
+    try:
+        return _executor().submit(_generate_seedance_25_video_on_worker, prompt, str(out_path),
+                                  str(first_frame) if first_frame else None, timeout_s, status_cb).result(
+                                      timeout=max(180.0, float(timeout_s) + 120.0))
+    except concurrent.futures.TimeoutError:
+        _status(status_cb, f"Higgsfield Seedance 2.5 timed out for {out_path}.")
+        return None
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"Higgsfield Seedance 2.5 generation failed ({exc.__class__.__name__}: {exc}).")
+        return None
+
+
+def wait_for_seedance_25_unlimited_sync(status_cb=None, cancel_check=None, timeout_s=None):
+    """Backward-compatible name: wait for the complete manual Seedance preflight."""
+    try:
+        future = _executor().submit(
+            lambda: (_SESSION[0].wait_for_video_preflight(
+                status_cb=status_cb, cancel_check=cancel_check, timeout_s=timeout_s)
+                if _SESSION[0] is not None and _SESSION[0]._video_page is not None else False)
+        )
+        return bool(future.result(timeout=(float(timeout_s) + 60) if timeout_s is not None else None))
+    except Exception:
+        return False
 
 
 def _generate_pool_on_worker(items, k, timeout_s, status_cb, cancel_check, on_done):

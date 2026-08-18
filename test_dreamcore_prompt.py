@@ -1,15 +1,4 @@
-"""The dreamcore prompt rules, checked against what the references actually do.
-
-No API calls: everything here is the system prompt's own text and the pure planning
-functions. The point is that a future edit cannot quietly put back the aesthetic this
-mode was written with first - a dim VHS corridor with a locked-off camera - which is a
-different genre from the four reels in reference/dreamcore/ and produced unusable prompts.
-
-Measured from those reels (see the module docstring): a pristine hyper-real render, hard
-mid-day sun, a camera that moves in every shot and is the only thing that moves, one-point
-perspective, mundane objects repeated to the horizon in an impossible geometry, and shots
-that step further out until an aerial reveals the true scale.
-"""
+"""Offline checks for the reference-derived Dreamcore prompt planner."""
 
 import dreamcore_mode as D
 
@@ -19,90 +8,92 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-def test_system_prompt_states_the_measured_grammar():
+def test_system_uses_full_reference_range():
     s = D.PROMPT_SYSTEM
     required = [
-        ("the subject is the aesthetic", "ONE ORDINARY THING"),
-        ("camera always moves", "The camera MOVES IN EVERY SHOT"),
-        ("the move is a forward dolly", "dolly FORWARD"),
-        ("the world is frozen", "Nothing in the world moves"),
-        ("clean render, not VHS", "hyper-real 3D render"),
-        ("hard sun with sharp shadows", "BRIGHT HARD SUNLIGHT"),
-        ("one-point perspective", "One-point perspective"),
-        ("the shots step further out", "FURTHER AND FURTHER OUT"),
-        ("cuts live inside the clip", "HARD CUTS inside it"),
-        ("the output contract survives", "Return JSON"),
+        ("ordinary anchor", "immediately readable and ordinary"),
+        ("impossible spatial rule", "ONE dominant spatial rule"),
+        ("lighting range", "sodium night"),
+        ("not cloud-suburb locked", "do NOT all use blue sky"),
+        ("reference combinations cannot be copied", "NOVELTY"),
+        ("fixed Higgsfield length", "EXACTLY 10.0 seconds"),
+        ("strict output contract", "cut_times"),
     ]
-    ok = True
-    for label, needle in required:
-        ok &= check(f"system prompt: {label}", needle in s, f"missing {needle!r}")
+    return all(check(f"system: {label}", needle in s, needle) for label, needle in required)
+
+
+def test_reference_cut_languages():
+    auto = D.edit_patterns_for("auto", 4)
+    ok = check("auto varies its grammar", len({p["id"] for p in auto}) >= 3, str(auto))
+    ok &= check("classic matches measured 3.7s cadence",
+                D.EDIT_STYLES["classic_reveal"]["cuts"] == [3.7, 7.4])
+    ok &= check("continuous has no hidden cut",
+                D.EDIT_STYLES["continuous_passage"]["cuts"] == [])
+    glitch = D.EDIT_STYLES["memory_glitch"]["cuts"]
+    ok &= check("memory glitch contains micro-cut bursts",
+                len(glitch) >= 12 and min(b-a for a, b in zip(glitch, glitch[1:])) <= .3,
+                str(glitch))
     return ok
 
 
-def test_system_prompt_forbids_the_old_aesthetic():
-    """The old rules are not merely absent - they are named and forbidden.
+def test_blank_direction_is_a_supported_creative_mode():
+    captured = {}
+    old_post = D.agent_core._post_llm_json
+    old_balance = D.agent_core.assert_wavespeed_balance
+    try:
+        D.agent_core.assert_wavespeed_balance = lambda **kwargs: None
 
-    Both of these were positive instructions once, and both are exactly wrong for these
-    references: the reels have no still camera and no grain.
-    """
-    s = D.PROMPT_SYSTEM
-    ok = True
-    ok &= check("locked-off camera is forbidden by name",
-                'NEVER write "locked off"' in s)
-    ok &= check("grain and VHS are forbidden by name",
-                "no grain" in s and "no VHS" in s)
-    ok &= check("the frozen world is spelled out against the old rule",
-                "unfelt draught" in s)
+        def fake_post(model, messages, max_tokens, temperature, timeout):
+            captured["ask"] = messages[-1]["content"]
+            captured["temperature"] = temperature
+            return {"world": "A fresh collection", "prompts": [
+                {"label": "Recursive post office", "shots": ["counter reveal"],
+                 "text": "A complete original vertical 10-second prompt"},
+                {"label": "Gravity laundromat", "shots": ["continuous orbit"],
+                 "text": "A second complete original vertical 10-second prompt"},
+            ]}
+
+        D.agent_core._post_llm_json = fake_post
+        out = D.prompts_for("", clip_count=2, edit_style="auto")
+        ok = check("blank asks the agent to invent", "no direction" in captured["ask"])
+        ok &= check("blank mode is more exploratory", captured["temperature"] >= .9)
+        ok &= check("patterns survive model output",
+                    [p["edit_style"] for p in out["prompts"]]
+                    == ["classic_reveal", "continuous_passage"], str(out))
+        ok &= check("cut metadata survives", out["prompts"][0]["cut_times"] == [3.7, 7.4])
+        return ok
+    finally:
+        D.agent_core._post_llm_json = old_post
+        D.agent_core.assert_wavespeed_balance = old_balance
+
+
+def test_reviews_still_protect_generation_quality():
+    hits = D.stock_review("Cinematic golden hour over rolling hills with lens flare")
+    ok = check("stock wording is flagged", {"golden hour", "ad language", "postcard"} <= set(hits))
+    ok &= check("unsafe negation is flagged",
+                "negation" in D.safety_review("an empty hall with no people"))
     return ok
 
 
-def test_placeholders_survive_assembly():
-    """The prompt is assembled from four blocks; the hold-time substitution runs on the
-    result. A block joined in the wrong order silently drops the cut times."""
-    s = D.PROMPT_SYSTEM
-    ok = True
-    for token in ("{cuts_per_clip}", "{hold_sequence}", "{clip_seconds}"):
-        ok &= check(f"placeholder {token} present", token in s)
-    return ok
-
-
-def test_stock_review_catches_the_words_that_broke_it():
-    """The exact vocabulary Gemini blamed for the stock-footage clip."""
-    hits = D.stock_review("Cinematic golden hour over rolling hills, a serene surreal "
-                          "dreamlike vista, drone shot with lens flare")
-    ok = check("stock wording is flagged", {"golden hour", "ad language", "postcard",
-                                            "drone shot", "surreal"} <= set(hits), str(hits))
-    ok &= check("reference wording is not flagged",
-                D.stock_review("high mid-day sun from the left, hard sharp shadows, a slow "
-                               "steady dolly forward to the vanishing point") == [],
-                str(D.stock_review("high mid-day sun from the left, hard sharp shadows")))
-    return ok
-
-
-def test_safety_review_still_works():
-    ok = check("negation is flagged", "negation" in D.safety_review("an empty hall, no people"))
-    ok &= check("clean prompt passes", D.safety_review("an empty hall, the street unoccupied") == [])
-    return ok
-
-
-def test_shot_plan_fits_the_clip():
-    """Three full phrases do not fit in ten seconds; the third shot must be a half phrase."""
-    holds = D.shot_plan(10.0, 3.85, 3)
-    ok = check("three shots in a 10s clip", len(holds) == 3, str(holds))
-    ok &= check("the last one is a half phrase", holds[-1] < holds[0], str(holds))
-    ok &= check("a 4s clip carries one shot", len(D.shot_plan(4.0, 3.85, 3)) == 1)
+def test_authored_timings_survive_the_final_edit():
+    grid = {"phrase": 3.85, "duration": 30.0, "offset": 0.0, "onsets": []}
+    plan = D.plan_edit([
+        {"clip": "continuous.mp4", "start": 0.0, "end": 10.0, "seconds": 10.0,
+         "preserve_duration": True},
+        {"clip": "glitch.mp4", "start": 0.0, "end": 0.3, "seconds": 0.3,
+         "preserve_duration": True},
+    ], grid)
+    ok = check("continuous chapter is not cut back to one phrase",
+               plan["parts"][0]["slot"] == 10.0, str(plan))
+    ok &= check("reference micro-shot is not discarded",
+                len(plan["parts"]) == 2 and plan["parts"][1]["slot"] == 0.3, str(plan))
     return ok
 
 
 if __name__ == "__main__":
-    results = [
-        test_system_prompt_states_the_measured_grammar(),
-        test_system_prompt_forbids_the_old_aesthetic(),
-        test_placeholders_survive_assembly(),
-        test_stock_review_catches_the_words_that_broke_it(),
-        test_safety_review_still_works(),
-        test_shot_plan_fits_the_clip(),
-    ]
-    print()
-    print(f"{sum(1 for r in results if r)}/{len(results)} groups passed")
+    results = [test_system_uses_full_reference_range(), test_reference_cut_languages(),
+               test_blank_direction_is_a_supported_creative_mode(),
+               test_reviews_still_protect_generation_quality(),
+               test_authored_timings_survive_the_final_edit()]
+    print(f"\n{sum(bool(r) for r in results)}/{len(results)} groups passed")
     raise SystemExit(0 if all(results) else 1)

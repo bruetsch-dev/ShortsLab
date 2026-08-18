@@ -3977,12 +3977,15 @@ def render_video(config, basename=None):
             final_loudness = max(-20.0, min(-14.0, float(config.get("final_loudness_lufs", -15.0))))
             master_ln = f"loudnorm=I={final_loudness:.1f}:TP=-1.0:LRA=11"
             if len(mix_inputs) == 1:
-                filters.append(f"[{mix_inputs[0]}]volume={master_gain:.3f},{master_ln},alimiter=limit=0.97,atrim=0:{duration:.3f}[aout]")
+                filters.append(f"[{mix_inputs[0]}]volume={master_gain:.3f},{master_ln},"
+                               f"alimiter=limit=0.97,apad=whole_dur={duration:.3f},"
+                               f"atrim=0:{duration:.3f}[aout]")
             else:
                 filters.append(
                     "".join(f"[{label}]" for label in mix_inputs)
                     + f"amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0:normalize=0,"
-                    + f"volume={master_gain:.3f},{master_ln},alimiter=limit=0.96,atrim=0:{duration:.3f}[aout]"
+                    + f"volume={master_gain:.3f},{master_ln},alimiter=limit=0.96,"
+                      f"apad=whole_dur={duration:.3f},atrim=0:{duration:.3f}[aout]"
                 )
             cmd += [
                 "-filter_complex",

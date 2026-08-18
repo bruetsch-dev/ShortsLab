@@ -79,6 +79,7 @@ import pipeline
 import sfx_agent
 import caption_agent
 import visual_agent
+import asmr_audio
 import viral_transformation
 import reasoning_modes
 import scrape_browser_preview
@@ -3436,6 +3437,8 @@ def form_page(clear=False, open_load=False, load_slug=""):
               <option value="openai/gpt-5.6-terra"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-terra" else ""}>GPT-5.6 Terra</option>
               <option value="openai/gpt-5.6-luna"{' selected' if state.get("reasoning_model") == "openai/gpt-5.6-luna" else ""}>GPT-5.6 Luna</option>
               <option value="moonshotai/kimi-k3"{' selected' if state.get("reasoning_model") == "moonshotai/kimi-k3" else ""}>Kimi K3</option>
+              <option value="deepseek/deepseek-v4-pro"{' selected' if state.get("reasoning_model") == "deepseek/deepseek-v4-pro" else ""}>DeepSeek V4 Pro (text only)</option>
+              <option value="deepseek/deepseek-v4-flash-0731"{' selected' if state.get("reasoning_model") == "deepseek/deepseek-v4-flash-0731" else ""}>DeepSeek V4 Flash (text only, cheapest)</option>
               <option value="google/gemini-3.5-flash"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash" else ""}>Gemini 3.5 Flash (fastest, cheapest)</option>
               <option value="google/gemini-3.1-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.1-flash-lite" else ""}>Gemini 3.1 Flash Lite</option>
               <option value="google/gemini-3.5-flash-lite"{' selected' if state.get("reasoning_model") == "google/gemini-3.5-flash-lite" else ""}>Gemini 3.5 Flash Lite</option>
@@ -3753,6 +3756,8 @@ def sfx_page():
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="moonshotai/kimi-k3">Kimi K3</option>
+            <option value="deepseek/deepseek-v4-pro">DeepSeek V4 Pro (text only)</option>
+            <option value="deepseek/deepseek-v4-flash-0731">DeepSeek V4 Flash (text only, cheapest)</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
@@ -3810,6 +3815,8 @@ def visual_page():
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="moonshotai/kimi-k3">Kimi K3</option>
+            <option value="deepseek/deepseek-v4-pro">DeepSeek V4 Pro (text only)</option>
+            <option value="deepseek/deepseek-v4-flash-0731">DeepSeek V4 Flash (text only, cheapest)</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash (fastest)</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
@@ -4002,6 +4009,8 @@ def longform_page():
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="moonshotai/kimi-k3">Kimi K3</option>
+            <option value="deepseek/deepseek-v4-pro">DeepSeek V4 Pro (text only)</option>
+            <option value="deepseek/deepseek-v4-flash-0731">DeepSeek V4 Flash (text only, cheapest)</option>
             <option value="google/gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
@@ -4503,6 +4512,62 @@ def start_sfx_job(fields, files):
     return job_id
 
 
+def start_asmr_job(fields, files):
+    """Master an uploaded video's existing ambience locally; no model/API calls."""
+    job_id = str(int(time.time() * 1000))
+    fields = dict(fields)
+    video_path = save_upload(files.get("video_file"), job_id)
+    profile = str(fields.get("asmr_profile") or "close").strip().lower()
+    if profile not in asmr_audio.PROFILES:
+        profile = "close"
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "status": "running", "logs": ["Queued."], "log_times": [time.time()],
+            "result": None, "error": None, "cancel_event": cancel_event,
+            "project_dir": None, "created_at": time.time(), "job_kind": "asmr",
+        }
+    if not video_path:
+        with JOB_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "No video uploaded."
+            JOBS[job_id]["logs"].append("Error: no video uploaded.")
+        return job_id
+
+    def status_cb(message):
+        with JOB_LOCK:
+            job = JOBS.get(job_id)
+            if not job or cancel_event.is_set():
+                raise RunCancelled("Run cancelled by user.")
+            job["logs"].append(message)
+            job.setdefault("log_times", []).append(time.time())
+
+    def worker():
+        try:
+            status_cb("Started local ASMR sound master.")
+            result = asmr_audio.enhance_video(video_path, profile=profile, status_cb=status_cb)
+            with JOB_LOCK:
+                if cancel_event.is_set():
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "done"
+                    JOBS[job_id]["result"] = result
+                    JOBS[job_id]["project_dir"] = result.get("project_dir")
+        except Exception as exc:
+            with JOB_LOCK:
+                if cancel_event.is_set() or isinstance(exc, RunCancelled):
+                    JOBS[job_id]["status"] = "cancelled"
+                    JOBS[job_id]["logs"].append("Cancelled.")
+                else:
+                    JOBS[job_id]["status"] = "error"
+                    JOBS[job_id]["error"] = f"{exc}\n\n{traceback.format_exc()}"
+                    JOBS[job_id]["logs"].append(f"Error: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
 def start_redo_sfx_job(slug, reasoning_model=None, reasoning_mode=None, sfx_amount="medium", mode="redo", regen_captions=False):
     """Timeline "Redo SFX": run a NORMAL SFX-Master pass over the project's LATEST render
     (no upload). Same engine as /sfx-run - the multimodal Audio Director watches the render.
@@ -4804,8 +4869,8 @@ def start_longform_job(fields, files):
             it["key"] = f"{key}_{seen[key]}"
         else:
             seen[key] = 1
-    if not higgsfield_login.is_ready():
-        return fail("Higgsfield is not connected. Open the Longform page and click Connect Higgsfield first.")
+    if not os.environ.get("WAVESPEED_API_KEY"):
+        return fail("WAVESPEED_API_KEY is missing - the image generator needs it.")
 
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(txt_path).stem).strip("_") or "longform"
     out_dir = agent_core.PROJECTS_DIR / "_longform" / stem
@@ -4820,35 +4885,37 @@ def start_longform_job(fields, files):
 
     def worker():
         try:
+            import concurrent.futures
             status_cb(f"Parsed {len(items)} prompt(s). Output -> {out_dir}")
-            status_cb("Opening the Higgsfield window - turn ON Unlimited once; generation "
-                      "starts automatically and never spends credits.")
-            if not higgsfield_login.begin_manual_session(
-                    model=model, aspect=aspect, status_cb=status_cb,
-                    cancel_check=cancel_event.is_set, timeout_s=1800):
-                if cancel_event.is_set():
-                    raise RunCancelled("Run cancelled by user.")
-                raise RuntimeError("Higgsfield Unlimited was not enabled in time.")
-
-            pool_items = []
-            for i, item in enumerate(items):
-                pool_items.append((
-                    i,
-                    item["prompt"],
-                    str(out_dir / f"{item['key']}.png"),
-                ))
-
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Same generator as the Sketch Explainer flow: an ordinary POST+poll per image, so
+            # there is no browser window, no Unlimited switch and no bot-check to clear.
+            key = os.environ.get("WAVESPEED_API_KEY", "")
+            # The prompts are the user's own; only the no-text lock is enforced, because this
+            # tool feeds the same wordless doodle style.
+            rows = [{"prompt": item["prompt"]} for item in items]
+            longform_video.strip_text_from_prompts(rows, status_cb=status_cb)
             completed = {"n": 0}
-
-            def on_done(idx, path):
-                completed["n"] += 1
-                item = items[int(idx)]
-                state = "saved" if path else "failed"
-                status_cb(f"[{completed['n']}/{len(items)}] {item['timestamp']} {state}")
-
-            pool_results = higgsfield_login.generate_pool_sync(
-                pool_items, k=concurrency, timeout_s=300, status_cb=status_cb,
-                cancel_check=cancel_event.is_set, on_done=on_done)
+            pool_results = {}
+            workers = max(1, min(int(concurrency or longform_video.IMAGE_CONCURRENCY),
+                                 longform_video.IMAGE_CONCURRENCY))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for i, item in enumerate(items):
+                    dest = out_dir / f"{item['key']}.png"
+                    futures[pool.submit(longform_video._p_image_one, i, rows[i]["prompt"],
+                                        dest, key, cancel_event=cancel_event)] = i
+                for fut in concurrent.futures.as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        path = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        path = None
+                        status_cb(f"image #{i + 1} failed: {str(exc)[:160]}")
+                    pool_results[i] = path
+                    completed["n"] += 1
+                    status_cb(f"[{completed['n']}/{len(items)}] {items[i]['timestamp']} "
+                              + ("saved" if path else "failed"))
             ok = [path for path in pool_results.values() if path]
             with JOB_LOCK:
                 if cancel_event.is_set():
@@ -5789,6 +5856,13 @@ SFX_STEPS = [
     ("Finish", ("SFX enhancement complete",)),
 ]
 
+ASMR_STEPS = [
+    ("Analyse sound", ("Started local ASMR", "Analysed ")),
+    ("Shape ambience", ("Applying ",)),
+    ("Create timeline", ("ASMR sound master complete", "Editable timeline")),
+    ("Finish", ("Editable timeline project created",)),
+]
+
 LOWPOLY_STEPS = [
     ("Write story", ("Writing the story",)),
     ("Voiceover", ("Recording the voiceover", "Voiceover:")),
@@ -5887,6 +5961,7 @@ def compute_step_view(status, logs, log_times=None, job_kind=None, clip_source=N
     # wrongly showed early. Trust the job's clip_source when we have it.
     is_scrape = (str(clip_source or "").lower() == "scrape") or _is_scrape_run(logs)
     steps = (SFX_STEPS if job_kind == "sfx"
+             else ASMR_STEPS if job_kind == "asmr"
              else PHYSICS_STEPS if job_kind == "physics"
              else LOWPOLY_STEPS if job_kind == "lowpoly"
              else AICORE_STEPS if job_kind == "aicore"
@@ -6579,11 +6654,13 @@ def project_edited_mtime(project_dir):
 
 
 def project_preview_kind(project_dir, report):
-    """Badge to overlay on the preview: 'sfx' / 'vfx' for master-tool projects, else ''."""
+    """Badge to overlay on previews for projects made by an enhancement master."""
     slug = project_dir.name.lower()
     kind = str(report.get("job_kind") or report.get("mode") or "").lower()
     if slug.startswith("sfxmaster") or "sfx" in kind:
         return "sfx"
+    if slug.startswith("asmr_") or "asmr" in kind:
+        return "asmr"
     if slug.startswith("visualmaster") or slug.endswith("_visual_enhanced") or "visual" in kind or "vfx" in kind:
         return "vfx"
     return ""
@@ -6979,6 +7056,8 @@ TIMELINE_SKELETON = """
             <option value="openai/gpt-5.6-terra">GPT-5.6 Terra</option>
             <option value="openai/gpt-5.6-luna">GPT-5.6 Luna</option>
             <option value="moonshotai/kimi-k3">Kimi K3</option>
+            <option value="deepseek/deepseek-v4-pro">DeepSeek V4 Pro (text only)</option>
+            <option value="deepseek/deepseek-v4-flash-0731">DeepSeek V4 Flash (text only, cheapest)</option>
             <option value="google/gemini-3.5-flash">Gemini 3.5 Flash</option>
             <option value="google/gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
             <option value="google/gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option>
@@ -13508,7 +13587,8 @@ def start_dreamcore_job(clip_paths, title="", bed="", meta=None, slug=""):
             report = dreamcore_mode.edit_to_music(
                 clip_paths, bed, final, status_cb=status_cb, work_dir=work_dir,
                 target_seconds=(float(meta.get("target_seconds"))
-                                if str(meta.get("target_seconds") or "").strip() else None))
+                                if str(meta.get("target_seconds") or "").strip() else None),
+                prompt_meta=list(meta.get("prompts") or []))
             # The claim of this whole mode is "the cuts are on the melody". Measure it on
             # the rendered file and keep the number in the report, so a drifting edit is
             # visible instead of merely intended.
@@ -14041,6 +14121,114 @@ def update_timeline_project_media(slug, fields, files):
     }
 
 
+def timeline_edit_state(slug, project_dir):
+    """What this project actually has, for the not-ready screen.
+
+    The old screen said "run the agent (Create Short) first" no matter what, so a run that HAD
+    executed - downloaded 60 clips, made the voiceover, written six scenes - and only failed to
+    assign media told the user to do the thing they had just done, with no way out of the page."""
+    config = read_json_file(project_dir / "config" / "project.json") or {}
+    scenes = [s for s in (config.get("scenes") or []) if isinstance(s, dict)]
+    assigned = 0
+    for scene in scenes:
+        if scene.get("clip") and _resolve_scene_clip(project_dir, scene["clip"]):
+            assigned += 1
+            continue
+        if any(scene.get(key) and _find_scene_image(project_dir, scene[key])
+               for key in ("asset", "image")):
+            assigned += 1
+    clip_dir = project_dir / "seedance 2.0"
+    pool = 0
+    for folder in (clip_dir, clip_dir / "_v2_proxies", project_dir / "local media"):
+        try:
+            pool += sum(1 for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".webm"})
+        except OSError:
+            pass
+    # The scrape report already knows WHY nothing landed on the timeline (this project: 83
+    # segments passed quality, 0 passed the semantic match), so say it instead of guessing.
+    report = read_json_file(project_dir / "review" / "scrape_v2_report.json") or {}
+    return {
+        "title": str(config.get("title") or slug.replace("_", " ")),
+        "scenes": len(scenes), "assigned": assigned, "pool": pool,
+        "voice": (project_dir / "input" / "voiceover.wav").exists(),
+        "quality_passed": report.get("segments_quality_passed"),
+        "semantic_passed": report.get("segments_semantic_passed"),
+        "unmatched": report.get("scenes_unmatched"),
+    }
+
+
+def timeline_not_ready_page(slug, project_dir):
+    """Shown when /timeline is opened for a project with no editable edit yet.
+
+    Reports the real state instead of a fixed sentence, and always offers a way onward: the
+    project itself, its media, or the standalone editor. A dead end with one wrong instruction
+    was the whole complaint."""
+    state = timeline_edit_state(slug, project_dir)
+    rows = [
+        ("Voiceover", "ready" if state["voice"] else "missing", state["voice"]),
+        ("Scenes in the edit", str(state["scenes"]), state["scenes"] > 0),
+        ("Clips assigned to scenes", f'{state["assigned"]} of {state["scenes"]}'
+         if state["scenes"] else "0", state["assigned"] > 0),
+        ("Downloaded clips in the library", str(state["pool"]), state["pool"] > 0),
+    ]
+    if state["pool"] and not state["assigned"]:
+        reason = ("The run downloaded footage but never assigned any of it to the scenes, so there "
+                  "is no cut to open. The clips are not lost &mdash; they are in this project's "
+                  "library and any new run reuses them instead of paying for them again.")
+        if state["semantic_passed"] == 0 and state["quality_passed"]:
+            reason += (f' The scrape report says why: {int(state["quality_passed"])} segments passed '
+                       "the quality check and <b>0</b> passed the relevancy match, so all "
+                       f'{int(state["unmatched"] or state["scenes"])} scenes stayed empty. Re-run it '
+                       "with the relevancy slider lower, or drop clips in by hand in the editor.")
+    elif not state["scenes"]:
+        reason = ("This project has no scenes yet. Run <b>Create Short</b> on it and the editor "
+                  "opens on the finished edit.")
+    else:
+        reason = ("The scenes exist but their media is not on disk, so the editor would open on a "
+                  "track of empty tiles. Re-run the project to rebuild the edit.")
+    status_html = "".join(
+        f'<div class="tlnr-row"><span class="tlnr-dot{"" if ok else " bad"}"></span>'
+        f'<span class="tlnr-k">{esc(label)}</span><span class="tlnr-v">{esc(value)}</span></div>'
+        for label, value, ok in rows)
+    body = brand_header(back=False) + f"""
+<section class="panel tl-blank-wrap">
+  <div class="tl-blank-card tlnr-card">
+    <div class="tl-blank-badge">&#9202;</div>
+    <h1>No edit to open yet</h1>
+    <p class="hint tlnr-name">{esc(state["title"])}</p>
+    <div class="tlnr-status">{status_html}</div>
+    <p class="hint tlnr-why">{reason}</p>
+    <div class="tl-blank-actions">
+      <a class="button primary" href="/?project={esc(slug)}">&#9654; Open the project</a>
+      <a class="button secondary" href="/assets?q={esc(slug)}">&#9638; See its clips</a>
+      <a class="button secondary" href="/timeline">&#127902; Editor without a project</a>
+    </div>
+  </div>
+</section>
+<style>
+  .tl-blank-wrap {{ display:flex; justify-content:center; padding:40px 16px; }}
+  .tl-blank-card {{ max-width:560px; width:100%; text-align:center; }}
+  .tl-blank-badge {{ font-size:44px; line-height:1; margin-bottom:10px; }}
+  .tl-blank-card h1 {{ font-size:30px; margin:0 0 6px; letter-spacing:-.02em; }}
+  .tlnr-name {{ margin:0 0 20px; opacity:.85; }}
+  .tlnr-status {{ display:grid; gap:2px; text-align:left; margin:0 auto 20px; max-width:420px;
+                 border:1px solid var(--line); border-radius:12px; overflow:hidden; }}
+  .tlnr-row {{ display:flex; align-items:center; gap:10px; padding:10px 14px; background:var(--bg-input); }}
+  .tlnr-row + .tlnr-row {{ border-top:1px solid var(--line); }}
+  .tlnr-dot {{ width:8px; height:8px; border-radius:50%; background:#4ade80; flex:0 0 auto; }}
+  .tlnr-dot.bad {{ background:#ff8f88; }}
+  .tlnr-k {{ flex:1 1 auto; font-size:13px; }}
+  .tlnr-v {{ font-size:13px; opacity:.9; font-variant-numeric:tabular-nums; }}
+  .tlnr-why {{ margin:0 auto 22px; max-width:470px; line-height:1.55; }}
+  .tl-blank-actions {{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }}
+  .tl-blank-actions .button {{ width:auto; min-width:170px; text-decoration:none;
+                              display:inline-flex; align-items:center; justify-content:center; }}
+</style>
+"""
+    return page("Timeline Editor", body, body_class="page-timeline-blank")
+
+
 def timeline_blank_page():
     """The timeline editor opened with no project: a launchpad to open an existing timeline or to
     upload your own .mp4 and start editing it. #156."""
@@ -14125,10 +14313,7 @@ def timeline_page(slug):
     # so requiring a finished render here locked the user out of the screen the run just sent them
     # to. A render OR a scenes-in-config edit is enough.
     if not project_has_timeline_edit(slug):
-        msg = ('<section class="panel"><h2>Timeline not ready yet</h2>'
-               '<div class="hint">The timeline editor opens once this project has an edit to work on. '
-               'Run the agent (Create Short) first &mdash; then come back here to fine-tune and render.</div></section>')
-        return page("Shortslab", brand_header(back=False) + msg)
+        return timeline_not_ready_page(slug, project_dir)
     try:
         model = timeline_model(slug)
     except Exception as exc:
@@ -15369,7 +15554,13 @@ class Handler(BaseHTTPRequestHandler):
             if legacy:
                 self.send_bytes(assets_page(show_hidden=show_hidden))
             else:
-                self.send_bytes(chat_ui.chat_shell_page({"view": "assets"}))
+                # ?q= prefills the library search, so a link can open the library ON one project
+                # (the not-ready timeline screen sends the user here to find its downloaded clips).
+                initial_assets = {"view": "assets"}
+                query = (q_all.get("q", [""])[0] or "").strip()
+                if query:
+                    initial_assets["q"] = query
+                self.send_bytes(chat_ui.chat_shell_page(initial_assets))
         elif parsed.path == "/sfx":
             self.send_bytes(sfx_page() if legacy else chat_ui.chat_shell_page({"flow": "sfx"}))
         elif parsed.path == "/visual":
@@ -15734,8 +15925,12 @@ class Handler(BaseHTTPRequestHandler):
                     clip_count=max(1, min(12, int(body.get("clips") or 2))),
                     cuts_per_clip=max(1, min(4, int(body.get("cuts") or 2))),
                     phrase=float(grid.get("phrase") or 3.85),
-                    clip_seconds=max(3.0, min(30.0, float(body.get("clip_seconds") or 10))),
-                    model=str(body.get("model") or "") or dreamcore_mode.PROMPT_MODEL)
+                    # Higgsfield Dreamcore generations are a fixed 10 seconds. Accepting a
+                    # longer UI value produced prompt timelines the generator could never
+                    # deliver and truncated the intended reveal.
+                    clip_seconds=10.0,
+                    model=str(body.get("model") or "") or dreamcore_mode.PROMPT_MODEL,
+                    edit_style=str(body.get("edit_style") or "auto"))
                 out["bed"] = str(bed)
                 out["grid"] = {k: grid[k] for k in ("phrase", "offset", "duration")}
                 # The project exists from HERE, not from the upload. Everything between the
@@ -15907,19 +16102,21 @@ class Handler(BaseHTTPRequestHandler):
             instructions = ""
             format_mode = "standard"
             token_limit = None
+            reasoning_model = ""
             try:
                 request_data = json.loads(body) or {}
                 topic = str(request_data.get("topic") or "")
                 instructions = str(request_data.get("instructions") or "")
                 format_mode = str(request_data.get("format_mode") or "standard")
                 token_limit = request_data.get("token_limit")
+                reasoning_model = str(request_data.get("reasoning_model") or "")
             except Exception:
                 topic = urllib.parse.parse_qs(body).get("topic", [""])[0]
                 instructions = urllib.parse.parse_qs(body).get("instructions", [""])[0]
             try:
                 result = agent_core.generate_viral_script(
                     topic, instructions=instructions, format_mode=format_mode,
-                    token_limit=token_limit)
+                    token_limit=token_limit, reasoning_model=reasoning_model or None)
                 self.send_bytes(json.dumps({"ok": True, **result}).encode("utf-8"),
                                 "application/json; charset=utf-8")
             except Exception as exc:  # noqa: BLE001
@@ -16691,6 +16888,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "anthropic/claude-opus-4.8", "openai/gpt-5.5",
                                        "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
                                        "moonshotai/kimi-k3",
+                                       "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash-0731",
                                        "google/gemini-3.5-flash", "google/gemini-3.1-flash-lite",
                                        "google/gemini-3.5-flash-lite",
                                        "google/gemini-3.1-pro-preview"}:
@@ -16815,6 +17013,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fields, files = {}, {}
             job_id = start_visual_job(fields, files)
+            self.send_response(303)
+            self.send_header("Location", f"/job?id={job_id}")
+            self.end_headers()
+            return
+        if parsed.path == "/asmr-run":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                fields, files = parse_multipart(content_type, body)
+            else:
+                fields, files = {}, {}
+            job_id = start_asmr_job(fields, files)
             self.send_response(303)
             self.send_header("Location", f"/job?id={job_id}")
             self.end_headers()

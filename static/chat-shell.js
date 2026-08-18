@@ -94,7 +94,7 @@ async function jget(url) { const r = await fetch(url); return r.json(); }
 // What a project's `kind` is CALLED on screen. The raw key doubles as a CSS class, so it stays
 // lowercase; only the badge text lives here. An ordinary generated/scraped project has no kind
 // and so no badge.
-const KIND_LABEL = { sfx: "SFX", vfx: "VFX", longform: "Sketch", motion_loop: "Loop",
+const KIND_LABEL = { sfx: "SFX", asmr: "ASMR", vfx: "VFX", longform: "Sketch", motion_loop: "Loop",
                      dreamcore: "Dreamcore" };
 function kindLabel(kind) { return KIND_LABEL[kind] || ""; }
 // STATE is separate from KIND: a failed Sketch used to show only "failed" and lose its
@@ -212,6 +212,7 @@ const FLOW_STEPS = {
   sfx: ["upload", "settings"],
   visual: ["upload", "settings"],
   captions: ["upload", "settings"],
+  asmr: ["upload", "settings"],
   enhance: ["choose"],
   aishort: ["choose"],
   aicore: ["brief", "pick", "clips"],
@@ -329,6 +330,7 @@ function renderAll() {
      physics: renderPhysicsFlow, lowpoly: renderLowpolyFlow,
      longform: renderLongformFlow, sfx: () => renderMasterFlow("sfx"),
      visual: () => renderMasterFlow("visual"), captions: () => renderMasterFlow("captions"),
+     asmr: () => renderMasterFlow("asmr"),
      enhance: renderEnhanceFlow,
      aishort: renderAIShortPicker,
      aicore: renderAICoreFlow,
@@ -591,7 +593,7 @@ function renderModeMenu() {
     c.appendChild(el("div", "card-cap", esc(cap)));
     const grid = el("div", "mode-grid");
     const visibleModes = MODES.filter(m => m.grp === g && !["sfx", "visual", "captions"].includes(m.id));
-    if (g === 1) visibleModes.unshift({ id:"enhance", ico:"✦", t:"Enhance video", d:"Choose SFX Master, Visual Master or Caption Master after opening." });
+    if (g === 1) visibleModes.unshift({ id:"enhance", ico:"✦", t:"Enhance video", d:"Polish sound, visuals, captions or original ambience in an existing video." });
     visibleModes.forEach(m => {
       const b = el("button", "mode-card");
       b.innerHTML = `<span class="mh"><span class="mi">${m.ico}</span>${esc(m.t)}</span><span class="md">${esc(m.d)}</span>`;
@@ -1073,6 +1075,7 @@ function renderScriptFlow() {
               instructions: instructionInput.value.trim(),
               format_mode: "standard",
               token_limit: null,
+              reasoning_model: S.values.reasoning_model || "openai/gpt-5.6-luna",
             }) });
           const d = await r.json();
           if (!d.ok) throw new Error(d.error || "no script");
@@ -1146,7 +1149,17 @@ function renderScriptFlow() {
       // choice visible. Default: japan for the culture-facts preset, general otherwise.
       // Discovery is Asia-locked -> region chips are noise there (languages row stays).
       {
-        if (!S.values.region) S.values.region = isCultureFacts() ? "japan" : "general";
+        // STICKY across chats. The app always opens a fresh chat, so S.values is empty every
+        // time and the region silently fell back to "general" on every single run - a
+        // Japan-only channel then lost its Japan hook terms and proof terms unless the user
+        // re-picked the chip or typed <japan> into the script. Last pick wins, japan is the
+        // fallback because that is what this channel makes.
+        if (!S.values.region) {
+          let remembered = "";
+          try { remembered = localStorage.getItem("sl-region") || ""; } catch (e) {}
+          S.values.region = remembered
+            || (isCultureFacts() ? "japan" : (remembered || "japan"));
+        }
         if (!isDiscovery()) {
           const rrow = el("div", "script-region");
           rrow.appendChild(el("span", "sn-lbl", "Region"));
@@ -1155,6 +1168,7 @@ function renderScriptFlow() {
           REGIONS.forEach(([val, label]) => {
             const b = btn(label, () => {
               S.values.region = val; persist();
+              try { localStorage.setItem("sl-region", val); } catch (e) {}
               rrow.querySelectorAll("button").forEach(x => x.classList.toggle(
                 "region-on", x.dataset.region === val));
             }, "ghost small");
@@ -2003,7 +2017,7 @@ let DREAMCORE_FILES = [];
 function dreamcoreState() {
   if (!S.dreamcore) {
     S.dreamcore = { brief: "", world: "", prompts: [], bed: "", grid: null,
-                    clips: 2, cuts: 2, slug: "" };
+                    clips: 2, editStyle: "auto", slug: "" };
   }
   return S.dreamcore;
 }
@@ -2013,16 +2027,16 @@ function renderDreamcoreFlow() {
   msgU("Dreamcore");
   if (S.jobId) return;
 
-  /* ---- step 1: the place, the music, how many cuts ---- */
+  /* ---- step 1: optional direction, music and reference-derived edit language ---- */
   if (S.step === "brief") {
-    msgA("Name the kind of place. No people, no story — just where we are.");
+    msgA("Add a direction if you have one, or leave it blank and let the director invent a new dreamcore world.");
     const c = card("dreamcore-brief");
     const label = el("label", "aicore-label");
-    label.innerHTML = `<span>The world</span><small>One or two lines. "Empty indoor swimming pools at 3am", "a hotel corridor that never ends". Every clip stays inside this one place.</small>`;
+    label.innerHTML = `<span>Creative direction <em class="optional-mark">Optional</em></span><small>A setting, object, memory, reference note or visual instruction. Blank is fully supported: the agent creates an original concept from the reference style.</small>`;
     const ta = document.createElement("textarea");
     ta.rows = 4;
     ta.id = "dreamcore-brief-input";
-    ta.placeholder = "e.g. drained public swimming baths, sodium light, nobody there";
+    ta.placeholder = "Leave blank for a fully original concept, or add a loose direction…";
     ta.value = D.brief || "";
     ta.addEventListener("input", () => { D.brief = ta.value; persist(); });
     label.appendChild(ta);
@@ -2059,21 +2073,35 @@ function renderDreamcoreFlow() {
       w.appendChild(inp);
       return w;
     };
-    row.append(bedWrap, num("clips", "Clips", "How many you will generate", 1, 12),
-               num("cuts", "Cuts inside each", "2 gives three shots per clip", 1, 4));
+    const styleWrap = el("label", "aicore-label dc-style");
+    styleWrap.innerHTML = `<span>Cut language</span><small>Every Higgsfield generation is exactly 10 seconds.</small>`;
+    const styleSel = document.createElement("select");
+    [
+      ["auto", "Auto mix — varied reference patterns"],
+      ["classic_reveal", "Classic reveal — cuts at 3.7s + 7.4s"],
+      ["continuous_passage", "Continuous passage — no cuts"],
+      ["late_reveal", "Late reveal — one cut at 7.4s"],
+      ["memory_glitch", "Memory glitch — rapid cut bursts"],
+    ].forEach(([value, text]) => {
+      const o = document.createElement("option"); o.value = value; o.textContent = text;
+      o.selected = (D.editStyle || "auto") === value; styleSel.appendChild(o);
+    });
+    styleSel.addEventListener("change", () => { D.editStyle = styleSel.value; persist(); });
+    styleWrap.appendChild(styleSel);
+    row.append(bedWrap, num("clips", "10s chapters", "How many prompts to create", 1, 12), styleWrap);
     c.appendChild(row);
 
     const foot = el("div", "card-foot");
     foot.appendChild(btn("All modes", resetToMode, "ghost"));
     const go = btn("Write the prompts", async () => {
       const brief = (D.brief || "").trim();
-      if (!brief) { errorCard(T.err_generic, "Name the place first."); return; }
       go.disabled = true; go.textContent = "Writing…";
       const wait = card("dreamcore-wait");
       wait.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
       try {
         const d = await jpost("/dreamcore-prompts", {
-          brief, bed: D.bed || "", clips: D.clips, cuts: D.cuts });
+          brief, bed: D.bed || "", clips: D.clips,
+          edit_style: D.editStyle || "auto", clip_seconds: 10 });
         if (d.error) throw new Error(d.error);
         D.prompts = d.prompts || []; D.world = d.world || "";
         D.grid = d.grid || null;
@@ -2104,7 +2132,7 @@ function renderDreamcoreFlow() {
     const c = card("dreamcore-prompts");
     if (D.world) {
       const w = el("div", "aicore-world");
-      w.innerHTML = `<span class="aw-k">Shared world · already at the start of every prompt</span>`;
+      w.innerHTML = `<span class="aw-k">Collection logic</span>`;
       w.appendChild(el("p", "aw-v", esc(D.world)));
       c.appendChild(w);
     }
@@ -2147,6 +2175,12 @@ function renderDreamcoreFlow() {
           .map((s, n) => `<span class="dc-shot"><i>${n + 1}</i>${esc(s)}</span>`).join("");
         row.appendChild(shots);
       }
+      const grammar = el("div", "dc-grammar");
+      const cuts = (p.cut_times || []).length
+        ? (p.cut_times || []).map(v => Number(v).toFixed(1) + "s").join(" · ")
+        : "no internal cuts";
+      grammar.textContent = `${String(p.edit_style || "10s chapter").replaceAll("_", " ")} · ${cuts}`;
+      row.appendChild(grammar);
       row.appendChild(el("pre", "ap-text", esc(p.text || "")));
 
       const drop = el("div", "aicore-drop");
@@ -2212,6 +2246,7 @@ function renderEnhanceFlow() {
     ["sfx", protoIcon("sound"), "SFX Master", "Add transition, reaction and word-triggered sound effects."],
     ["visual", protoIcon("visual"), "Visual Master", "Add arrows, focus cues and motion-aware visual effects."],
     ["captions", protoIcon("captions"), "Caption Master", "Generate or restyle captions for an existing video."],
+    ["asmr", protoIcon("sound"), "ASMR Sound", "Make original ambience feel closer, clearer and more immersive."],
   ].forEach(([id, icon, title, desc]) => {
     const b = el("button", "mode-card");
     b.innerHTML = `<span class="mh"><span class="mi">${icon}</span>${esc(title)}</span><span class="md">${esc(desc)}</span>`;
@@ -2311,8 +2346,10 @@ async function submitRun() {
 
 /* ------------------------------------------------------------------ FLOW: masters (sfx/visual/captions) */
 function renderMasterFlow(kind) {
-  const titles = { sfx: T.mode_sfx_t, visual: T.mode_vfx_t, captions: T.mode_captions_t };
-  const uploadQ = { sfx: T.sfx_upload_q, visual: T.vfx_upload_q, captions: T.cap_upload_q };
+  const titles = { sfx: T.mode_sfx_t, visual: T.mode_vfx_t, captions: T.mode_captions_t,
+    asmr: "ASMR Sound" };
+  const uploadQ = { sfx: T.sfx_upload_q, visual: T.vfx_upload_q, captions: T.cap_upload_q,
+    asmr: "Upload a video with original ambience. Its picture stays untouched while the sound is mastered." };
   msgU(esc(titles[kind]));
   msgA(esc(uploadQ[kind]));
   const f = FILES.master_video;
@@ -2362,13 +2399,21 @@ function renderMasterFlow(kind) {
         v => S.master.add_characters = v));
       c.appendChild(toggleField("Add meme reactions", S.master.add_memes !== false,
         v => S.master.add_memes = v));
-    } else {
+    } else if (kind === "captions") {
       c.appendChild(selectField(T.cap_max_words, OPT.caption_max_words, S.master.caption_max_words,
         v => S.master.caption_max_words = v));
       c.appendChild(selectField(T.cap_center_y, OPT.caption_center_y, S.master.caption_center_y,
         v => S.master.caption_center_y = v));
+    } else {
+      c.appendChild(selectField("Sound character", [
+        { value: "close", label: "Close-up ASMR - vivid texture and movement" },
+        { value: "natural", label: "Natural detail - clear but realistic" },
+        { value: "soft", label: "Soft & calm - gentle mechanical ambience" },
+      ], S.master.asmr_profile || "close", v => S.master.asmr_profile = v));
+      c.appendChild(el("div", "card-note", "Uses only the video's original sound. No AI generation, music or unrelated effects are added."));
     }
-    const labels = { sfx: "🔊 " + T.add_sfx, visual: "➜ " + T.add_arrows, captions: "💬 " + T.add_captions };
+    const labels = { sfx: "🔊 " + T.add_sfx, visual: "➜ " + T.add_arrows,
+      captions: "💬 " + T.add_captions, asmr: "Master ASMR sound" };
     const foot = el("div", "card-foot");
     foot.appendChild(btn(T.back, () => editStep("upload"), "ghost"));
     foot.appendChild(el("span", "spacer"));
@@ -2393,9 +2438,11 @@ async function submitMaster(kind) {
     fd.append("vfx_amount", S.master.vfx_amount || "medium");
     if (S.master.add_characters !== false) fd.append("add_characters", "on");
     if (S.master.add_memes !== false) fd.append("add_memes", "on");
-  } else {
+  } else if (kind === "captions") {
     fd.append("caption_max_words", S.master.caption_max_words || firstVal(OPT.caption_max_words) || "4");
     fd.append("caption_center_y", S.master.caption_center_y || firstVal(OPT.caption_center_y) || "0.62");
+  } else {
+    fd.append("asmr_profile", S.master.asmr_profile || "close");
   }
   const c = card(); c.appendChild(el("div", "dots", "<i></i><i></i><i></i>"));
   try {
@@ -2464,6 +2511,8 @@ const PHYS_BRIEF_MODELS = [
   { id: "google/gemini-3.5-flash-lite", t: "Gemini 3.5 Flash Lite (fast)" },
   { id: "google/gemini-3.1-flash-lite", t: "Gemini 3.1 Flash Lite" },
   { id: "google/gemini-3.5-flash", t: "Gemini 3.5 Flash" },
+  { id: "deepseek/deepseek-v4-flash-0731", t: "DeepSeek V4 Flash (cheapest)" },
+  { id: "deepseek/deepseek-v4-pro", t: "DeepSeek V4 Pro" },
   { id: "anthropic/claude-opus-4.8", t: "Claude Opus 4.8 (most detailed)" },
 ];
 /* The scene library, read from the scene FILES at /physics-scenes. Nothing about the
@@ -3182,7 +3231,7 @@ function startJob(jobId, jobKind) {
   S.jobId = jobId; S.jobStatus = "running"; S.draft = false;
   if (jobKind) {
     S.jobKind = String(jobKind);
-    const flowForKind = { longform:"longform", sfx:"sfx", visual:"visual",
+    const flowForKind = { longform:"longform", sfx:"sfx", visual:"visual", asmr:"asmr",
       caption:"captions", viraltrans:"viraltrans", reddit:"reddit", physics:"physics", lowpoly:"lowpoly", aicore:"aicore" };
     S.flow = flowForKind[S.jobKind] || "script";
   }
@@ -4497,6 +4546,9 @@ function showAssets(showHidden) {
   S.view = "assets"; S.showHidden = !!showHidden; renderAll(); persist();
 }
 let assetsProjects = [];
+// One-shot search prefill from /assets?q=... - deliberately NOT in S, so it does not persist
+// into the next visit to the library.
+let assetsInitialQuery = "";
 async function renderAssetsView() {
   const head = el("div", "assets-head");
   head.appendChild(el("h2", "", esc(T.nav_assets)));
@@ -4531,6 +4583,7 @@ async function renderAssetsView() {
     visibleCount = prototypeMode ? 24 : Number.POSITIVE_INFINITY;
     paint();
   });
+  if (assetsInitialQuery) { search.value = assetsInitialQuery; assetsInitialQuery = ""; }
   paint();
   if (S.showHidden) footer.appendChild(btn("← " + T.hide_hidden, () => showAssets(false), "ghost"));
   else if (d.hidden_count) footer.appendChild(btn(`👁 ${T.show_hidden} (${d.hidden_count})`, () => showAssets(true), "ghost"));
@@ -5220,7 +5273,7 @@ async function boot() {
   // auto-restored on load - a stale "Your Short is ready" or half-finished setup must not
   // reappear. Only explicit deep links (/job?id=, /?project=, /sfx, /assets) set a state.
   if (init.new) resetToMode();
-  if (init.view === "assets") { S.view = "assets"; }
+  if (init.view === "assets") { S.view = "assets"; assetsInitialQuery = init.q || ""; }
   if (init.flow) { S.flow = init.flow; S.step = stepsFor(init.flow)[0]; S.completed = []; S.view = "chat"; S.jobId = null; }
   if (init.job) { S.jobId = init.job; S.jobStatus = "running"; S.view = "chat"; if (!S.flow) S.flow = "script"; S.step = "review"; S.completed = stepsFor("script").slice(0, -1); }
   if (init.project) { await loadProject(init.project); return; }
