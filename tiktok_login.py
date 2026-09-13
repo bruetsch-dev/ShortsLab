@@ -1,0 +1,1389 @@
+"""TikTok login-based clip discovery - the primary backend alongside Instagram Reels.
+
+No API keys. The user logs in to TikTok ONCE inside a Chromium window we control
+(a dedicated, persistent browser profile), and from then on we drive that logged-in
+session to run real keyword searches and collect native TikTok item objects. Those
+objects are the exact schema `clip_scraper._item_meta` already understands, so the
+whole existing quality pipeline (metadata pre-filter -> download -> black-bar / text /
+stability gates -> vision matcher) is reused unchanged.
+
+Why a dedicated profile and not the user's everyday Chrome: modern Chrome/Edge encrypt
+their cookie store with App-Bound Encryption, so yt-dlp's --cookies-from-browser fails
+with "Failed to decrypt with DPAPI". Owning the browser profile sidesteps that entirely -
+we read cookies straight from the Playwright context and hand them to yt-dlp as a plain
+Netscape cookies.txt for the actual (watermark-free) download.
+
+Public surface used by clip_scraper:
+    available()                      -> is Playwright importable
+    is_ready()                       -> have we logged in at least once
+    status()                         -> dict for the UI
+    login(status_cb, timeout_s)      -> headed one-time login, returns bool
+    logout()                         -> wipe the saved session
+    ensure_session(status_cb)        -> open/reuse the session on the worker thread (bool)
+    search_sync(query, ...)          -> run a search on the worker thread, block for items
+    export_cookies_txt(path)         -> write cookies.txt for yt-dlp
+    close_session()                  -> tear the shared session down (on the worker thread)
+"""
+
+import concurrent.futures
+import os
+import json
+import re
+import subprocess
+import time
+import threading
+import scrape_browser_preview
+from pathlib import Path
+from urllib.parse import parse_qs, unquote_plus, urlparse
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:                       # playwright not installed
+    sync_playwright = None
+
+ROOT = Path(__file__).resolve().parent
+PROFILE_DIR = Path(os.environ.get("TIKTOK_PROFILE_DIR") or (ROOT / "tiktok-profile"))
+# cookies.txt + login marker live under generated_assets/ (already gitignored).
+_STATE_DIR = ROOT / "generated_assets" / "tiktok"
+COOKIES_TXT = _STATE_DIR / "tiktok_cookies.txt"
+_MARKER = _STATE_DIR / "logged_in.json"
+
+# cookies that only exist for a logged-in TikTok web session
+SESSION_COOKIE_NAMES = ("sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt")
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+# TikTok aggressively blocks HEADLESS browsers - even a logged-in session returns 0 search
+# results in headless mode (empty feed / login-wall). So search runs HEADED by default (a small
+# Chromium window opens during scraping), matching the working headed login. Set TIKTOK_HEADLESS=1
+# to force headless (faster, no window, but usually returns nothing).
+_HEADLESS_SEARCH = (os.environ.get("TIKTOK_HEADLESS", "0").strip().lower()
+                    in ("1", "true", "yes"))
+_LOCALE = os.environ.get("TIKTOK_LOCALE", "en-US").strip() or "en-US"
+
+
+def _browser_executable():
+    """Use the system browser when Playwright's optional Chromium bundle is absent.
+
+    Native app installs do not necessarily run ``playwright install chromium``.  In that
+    case Playwright imports successfully but every scrape session dies at launch with
+    "Executable doesn't exist ... ms-playwright".  Prefer an explicit override, otherwise
+    reuse Chrome/Edge already installed on Windows; returning None keeps Playwright's normal
+    bundled-browser behaviour on development machines and other platforms.
+    """
+    override = os.environ.get("SHORTSLAB_BROWSER_EXECUTABLE", "").strip()
+    candidates = [override] if override else []
+    if os.name == "nt":
+        candidates.extend([
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ])
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _launch_browser_kwargs():
+    executable = _browser_executable()
+    return {"executable_path": executable} if executable else {}
+
+_LOCK = threading.Lock()
+_SESSION = [None]                       # the shared Session; ONLY touched on the worker thread
+# Playwright's SYNC api is thread-affine, and a half-closed driver POISONS the calling thread:
+# every later sync_playwright().start() there dies with "Sync API inside the asyncio loop".
+# Cure: ALL Playwright work is funneled through ONE dedicated worker
+# thread that outlives job runs - the session is created, searched, cookie-read and closed only
+# there, and survives across runs (no per-run reopen churn, no cross-thread closes).
+_EXECUTOR = None
+_EXEC_LOCK = threading.Lock()
+# per-run search health: lets the caller fail FAST when the backend returns nothing at all
+# (expired login / headless block / captcha) instead of grinding through every bucket.
+_SEARCH_STATS = {"searches": 0, "items": 0, "login_wall": 0, "daily_limit": 0}
+
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "at", "for", "from", "in", "of", "on", "the", "to", "with",
+    "japan", "japanese", "video", "viral", "tiktok", "instagram", "reels", "shorts",
+}
+
+
+def _normalise_search_text(value):
+    return re.sub(r"\s+", " ", unquote_plus(str(value or "")).casefold()).strip()
+
+
+def _sanitize_tiktok_query(value):
+    """Strip redundant platform words even for callers that bypass clip_scraper."""
+    query = str(value or "").strip()
+    prefix = "#" if query.startswith("#") else ""
+    query = query.lstrip("#").strip()
+    query = re.sub(r"(?i)(?<![#\w])(?:tiktok|instagram|youtube\s+shorts?|reels?)(?!\w)",
+                   " ", query)
+    query = re.sub(r"(?i)(?<![#\w])(?:on\s+)?(?:twitter|x\.com)(?!\w)", " ", query)
+    query = re.sub(r"\s+", " ", query).strip(" ,;:-")
+    return (prefix + query) if query else ""
+
+
+def _search_response_matches_query(url, query, is_tag=False):
+    """Accept the keyword feed for the current, isolated search page.
+
+    TikTok's current web build no longer includes the keyword in every ``/full`` request.  The
+    scraper creates a brand-new page for each query and closes it afterwards, so an unlabelled
+    search response on that page cannot belong to the previous query.  Rejecting it made every
+    valid search report zero items.  When TikTok does expose a keyword we still verify it.
+    """
+    low = str(url or "").casefold()
+    if is_tag:
+        return "/api/challenge/item_list" in low
+    if "/api/search/" not in low or "/full" not in low:
+        return False
+    try:
+        params = parse_qs(urlparse(url).query)
+    except Exception:
+        return True
+    values = []
+    for key in ("keyword", "query", "q", "search_keyword"):
+        values.extend(params.get(key, []))
+    if not values:
+        return True
+    wanted = _normalise_search_text(query).lstrip("#")
+    return any(_normalise_search_text(value).lstrip("#") == wanted for value in values)
+
+
+def _query_relevance(item, query):
+    """Cheap metadata evidence used before expensive download/vision analysis (0..1)."""
+    author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    hay = _normalise_search_text(" ".join(str(v or "") for v in (
+        item.get("desc"), item.get("title"), item.get("text"),
+        author.get("uniqueId"), author.get("nickname"),
+    )))
+    wanted = _normalise_search_text(query).lstrip("#")
+    if not hay or not wanted:
+        return 0.0
+    if wanted in hay:
+        return 1.0
+    latin = [t for t in re.findall(r"[a-z0-9]+", wanted)
+             if len(t) > 1 and t not in _QUERY_STOPWORDS]
+    chunks = [t for t in re.split(r"\s+", wanted) if re.search(r"[^\x00-\x7f]", t)]
+    evidence = []
+    evidence.extend(1.0 if token in hay else 0.0 for token in latin)
+    for chunk in chunks:
+        compact = re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff]", "", chunk)
+        if not compact:
+            continue
+        if compact in hay:
+            evidence.append(1.0)
+            continue
+        # Native captions often conjugate words or concatenate hashtags.  A three-character
+        # fragment is enough evidence, but one shared kanji is not.
+        grams = {compact[i:i + 3] for i in range(max(1, len(compact) - 2))
+                 if len(compact[i:i + 3]) == 3}
+        evidence.append(max((1.0 for gram in grams if gram in hay), default=0.0))
+    if not evidence:
+        return 0.0
+    return sum(evidence) / len(evidence)
+
+
+def _filter_search_results(items, query):
+    scored = [(item, _query_relevance(item, query)) for item in items]
+    relevant = [(item, score) for item, score in scored if score > 0.0]
+    # A completely evidence-free response is almost certainly TikTok's stale/global feed.  If
+    # at least one result proves the query, keep only evidenced results; downstream vision still
+    # performs the semantic decision.
+    if not relevant:
+        return []
+    for item, score in relevant:
+        item["_query_relevance"] = round(score, 4)
+    return [item for item, _score in relevant]
+
+
+def search_stats():
+    """Cumulative search health for this run: {searches, items, login_wall}."""
+    return dict(_SEARCH_STATS)
+
+
+def reset_search_stats():
+    _SEARCH_STATS.update(searches=0, items=0, login_wall=0, daily_limit=0)
+
+
+def _status(cb, msg):
+    if cb:
+        try:
+            cb(msg)
+        except Exception:
+            pass
+    else:
+        # A headless worker has no UI callback. On Windows its inherited console can still be a
+        # legacy charmap (cp1252); printing a Japanese query then raised UnicodeEncodeError *inside
+        # the search* and the caller mistook that logging failure for zero TikTok results.
+        import sys
+        text = str(msg)
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+
+
+def available():
+    return sync_playwright is not None
+
+
+def _has_session_cookie(cookies):
+    names = {str(c.get("name") or "").lower() for c in (cookies or [])
+             if "tiktok" in str(c.get("domain") or "").lower()}
+    return any(n in names for n in SESSION_COOKIE_NAMES)
+
+
+def _cookies_from_netscape(text):
+    """Parse a Netscape cookies.txt back into Playwright cookie dicts."""
+    out = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, _include_sub, path, secure, expires, name, value = parts
+        try:
+            expiry = int(float(expires))
+        except (TypeError, ValueError):
+            expiry = 0
+        cookie = {"name": name, "value": value, "domain": domain, "path": path or "/",
+                  "secure": secure.upper() == "TRUE"}
+        if expiry > 0:
+            cookie["expires"] = expiry
+        out.append(cookie)
+    return out
+
+
+def is_ready():
+    """True if Playwright is available and a TikTok login has been saved at least once.
+
+    Deliberately cheap: it does not open a browser. That means it can be optimistic - the profile
+    can lose its session cookies while the marker file still sits on disk. `Session._open` checks
+    the real cookies and clears the marker when the login is gone, so this stops lying as soon as
+    anything actually tries to use the session.
+    """
+    return bool(available() and _MARKER.exists() and PROFILE_DIR.exists())
+
+
+def status():
+    info = {"available": available(), "ready": is_ready(),
+            "profile": str(PROFILE_DIR), "logged_in_at": None}
+    try:
+        if _MARKER.exists():
+            info["logged_in_at"] = json.loads(_MARKER.read_text("utf-8")).get("at")
+    except Exception:
+        pass
+    return info
+
+
+def _write_marker():
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _MARKER.write_text(json.dumps({"at": time.strftime("%Y-%m-%d %H:%M:%S")}), "utf-8")
+
+
+def _cookies_to_netscape(cookies):
+    """Serialize Playwright cookies into a Netscape cookies.txt that yt-dlp accepts."""
+    lines = ["# Netscape HTTP Cookie File", "# Written by tiktok_login.py", ""]
+    for c in cookies or []:
+        domain = str(c.get("domain") or "")
+        if "tiktok" not in domain.lower():
+            continue
+        if not domain.startswith("."):
+            domain = "." + domain.lstrip(".")
+        include_sub = "TRUE"
+        path = str(c.get("path") or "/")
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        expires = c.get("expires")
+        try:
+            expires = str(int(expires)) if expires and float(expires) > 0 else "0"
+        except (TypeError, ValueError):
+            expires = "0"
+        name = str(c.get("name") or "")
+        value = str(c.get("value") or "")
+        lines.append("\t".join([domain, include_sub, path, secure, expires, name, value]))
+    return "\n".join(lines) + "\n"
+
+
+def export_cookies_txt(path=None, cookies=None):
+    """Write the current session cookies to a Netscape cookies.txt for yt-dlp.
+    Uses the shared session if `cookies` is not supplied. Returns the path or None."""
+    path = Path(path or COOKIES_TXT)
+    if cookies is None:
+        cookies = _session_cookies_threadsafe()
+        if cookies is None:
+            return None
+    if not _has_session_cookie(cookies):
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_cookies_to_netscape(cookies), "utf-8")
+    return str(path)
+
+
+# --------------------------------------------------------------------------- login
+
+def login(status_cb=None, timeout_s=300):
+    """Open a real Chromium window, let the user sign in to TikTok, and persist the
+    session into PROFILE_DIR. Blocks until a session cookie appears or timeout. Headed."""
+    if not available():
+        _status(status_cb, "TikTok login: Playwright is not installed (pip install playwright "
+                           "&& playwright install chromium).")
+        return False
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # CRITICAL: if a zombie Chromium still holds this profile (leftover off-screen scrape
+    # window), the new browser DELEGATES to it - and the "new" login window then opens in
+    # THAT process, inheriting its off-screen -2400,-2400 position. To the user, clicking
+    # Connect/Reconnect does exactly NOTHING. Kill the leftovers first.
+    _kill_stale_profile_processes()
+    _status(status_cb, "Opening a Chromium window - log in to your TikTok account in it. "
+                       "This window stays connected; you only do this once.")
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                  "--no-default-browser-check", "--window-position=120,60"],
+            **_launch_browser_kwargs())
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _place_window_visible(ctx, 120, 60)   # force ON-SCREEN even if a scrape saved it off-screen
+            try:
+                page.goto("https://www.tiktok.com/login", timeout=60000)
+            except Exception:
+                try:
+                    page.goto("https://www.tiktok.com/", timeout=60000)
+                except Exception:
+                    pass
+            deadline = time.time() + max(30, int(timeout_s))
+            ok = False
+            while time.time() < deadline:
+                try:
+                    if _has_session_cookie(ctx.cookies()):
+                        ok = True
+                        break
+                except Exception:
+                    pass
+                if not ctx.pages:           # user closed the window
+                    break
+                time.sleep(2.0)
+            if ok:
+                export_cookies_txt(cookies=ctx.cookies())
+                _write_marker()
+                _status(status_cb, "TikTok login captured - the session is saved. You can close "
+                                   "the window; future scrapes reuse it automatically.")
+            else:
+                _status(status_cb, "TikTok login timed out / window closed before sign-in completed.")
+            return ok
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def open_manual_browser(status_cb=None, timeout_s=3600):
+    """Open ONE headed Chromium on the TikTok persistent profile with a TikTok tab AND an Instagram
+    tab, so the user can browse both (already logged in to TikTok; Instagram is remembered in the
+    same profile after signing in once) and copy the links of clips they want. Downloading those
+    links is handled by the app's 'Add to manual' action (yt-dlp + the saved login cookies).
+    Blocks on its own thread until the user closes the window. #159."""
+    if not available():
+        _status(status_cb, "Manual browser: Playwright is not installed (pip install playwright "
+                           "&& playwright install chromium).")
+        return False
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # Same profile the scrape uses - kill any zombie holder first so this window actually opens
+    # on-screen instead of delegating to an off-screen scrape process.
+    _kill_stale_profile_processes()
+    _status(status_cb, "Opening TikTok + Instagram in a logged-in window - find clips, copy their "
+                       "links, then paste them into 'Add to manual' back in the editor.")
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=False, user_agent=_UA, locale=_LOCALE,
+            viewport={"width": 1320, "height": 900},
+            args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                  "--no-default-browser-check", "--window-position=120,60"],
+            **_launch_browser_kwargs())
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _place_window_visible(ctx, 120, 60)      # force ON-SCREEN even if a scrape saved it off-screen
+            try:
+                page.goto("https://www.tiktok.com/", timeout=60000)
+            except Exception:
+                pass
+            try:
+                ig = ctx.new_page()
+                ig.goto("https://www.instagram.com/", timeout=60000)
+            except Exception:
+                pass
+            deadline = time.time() + max(60, int(timeout_s))
+            while time.time() < deadline:
+                try:
+                    if not ctx.pages:               # user closed every tab -> done
+                        break
+                except Exception:
+                    break
+                time.sleep(1.2)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    _status(status_cb, "Manual browser closed.")
+    return True
+
+
+def logout():
+    """Forget the saved session (delete profile + cookies)."""
+    import shutil
+    close_session()
+    for target in (PROFILE_DIR, _MARKER, COOKIES_TXT):
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists():
+                target.unlink()
+        except Exception:
+            pass
+    return True
+
+
+# --------------------------------------------------------------------------- search
+
+def _extract_items_from_payload(payload):
+    """Pull TikTok item objects out of a /api/search/* OR /api/challenge/item_list JSON response."""
+    items = []
+    if not isinstance(payload, dict):
+        return items
+    # video-search tab: {"item_list":[ item, ... ]}; hashtag/challenge page: {"itemList":[ item, ... ]}
+    for key in ("item_list", "itemList", "ItemList"):
+        for it in (payload.get(key) or []):
+            if isinstance(it, dict) and (it.get("id") or it.get("video")):
+                items.append(it)
+    # general-search tab: {"data":[ {"type":1,"item":{...}}, ... ]}
+    for row in (payload.get("data") or []):
+        if isinstance(row, dict):
+            it = row.get("item") or row.get("aweme_info")
+            if isinstance(it, dict) and (it.get("id") or it.get("video")):
+                items.append(it)
+    return items
+
+
+def _hide_offscreen_from_taskbar():
+    """Windows only: strip the TASKBAR BUTTON from our off-screen scrape window so nothing shows
+    or blinks in the taskbar. Only windows parked DEEP off-screen (left AND top <= -2000, i.e. the
+    -2400,-2400 position we launch at - no real monitor sits there) get the WS_EX_TOOLWINDOW style
+    (hide -> restyle -> show-without-activate is the required Win32 dance). Returns True if at
+    least one window was found."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    SW_HIDE, SW_SHOWNA = 0, 8
+    found = [False]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _lp):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            # CRITICAL: minimized windows report sentinel positions like -32000/-25600, which a
+            # naive "deep negative" check matches - that restyled EVERY minimized window on the
+            # system. Skip iconic windows and match ONLY our exact -2400,-2400 parking band.
+            if user32.IsIconic(hwnd):
+                return True
+            rect = ctypes.wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            if -2600 <= rect.left <= -2200 and -2600 <= rect.top <= -2200:
+                found[0] = True
+                style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if not (style & WS_EX_TOOLWINDOW):
+                    user32.ShowWindow(hwnd, SW_HIDE)
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                          (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+                    user32.ShowWindow(hwnd, SW_SHOWNA)
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        return False
+    return found[0]
+
+
+def _profile_pids(profile_dir):
+    """PIDs of the chrome.exe process(es) holding `profile_dir` open. The BROWSER process (the one
+    launched with --user-data-dir=<profile>) owns the top-level window, so matching windows by these
+    PIDs reliably identifies OUR scrape window regardless of where it currently sits on screen."""
+    if os.name != "nt":
+        return set()
+    try:
+        marker = str(profile_dir).replace("'", "''")
+        cmd = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" -ErrorAction Stop | "
+               f"Where-Object {{ $_.CommandLine -and $_.CommandLine -like '*{marker}*' }} | "
+               "Select-Object -ExpandProperty ProcessId")
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return {int(x) for x in (out.stdout or "").split() if x.strip().isdigit()}
+    except Exception:
+        return set()
+
+
+def _enforce_offscreen_hidden(pids):
+    """CDP-INDEPENDENT hide: for every top-level window owned by one of `pids`, force it far
+    off-screen (SetWindowPos) AND strip its taskbar button (WS_EX_TOOLWINDOW). This is the fix for
+    the case where the CDP `Browser.setWindowBounds` park silently failed - then the window stays at
+    the profile's restored ON-screen position, the -2400 band never matches, and the window shows in
+    the taskbar. Matching by PID (our profile's browser) means we only ever touch OUR window, never
+    the user's real Chrome. Idempotent: once parked + restyled, every later call is a no-op."""
+    if os.name != "nt" or not pids:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    SW_HIDE, SW_SHOWNA = 0, 8
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
+    GW_OWNER = 4
+    acted = [False]
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _lp):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in pids:
+                return True
+            if user32.GetWindow(hwnd, GW_OWNER):    # owned popup/dialog, not the main window
+                return True
+            # Safety against (rare) PID recycling: only ever touch a real Chromium top-level window
+            # (class "Chrome_WidgetWin_1"), never some unrelated app that inherited a freed PID.
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, buf, 64)
+            if "Chrome_WidgetWin" not in buf.value:
+                return True
+            acted[0] = True
+            if not user32.IsIconic(hwnd):
+                rect = ctypes.wintypes.RECT()
+                # Park at -3200 (not -2400): on a >100% display Windows virtualizes the coordinate
+                # DOWN (e.g. 125% scaling turns -2400 into -1920), which could leave part of the
+                # window on a monitor. -3200 stays fully off-screen even after that scaling. The
+                # "already parked" guard uses a loose -1500 so the watcher never re-moves it (no
+                # flicker) once it has landed off-screen.
+                if (user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                        and not (rect.left <= -1500 and rect.top <= -1500)):
+                    user32.SetWindowPos(hwnd, 0, -3200, -3200, 0, 0,
+                                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if not (style & WS_EX_TOOLWINDOW):
+                user32.ShowWindow(hwnd, SW_HIDE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                      (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+                user32.ShowWindow(hwnd, SW_SHOWNA)
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        return False
+    return acted[0]
+
+
+def _spawn_taskbar_watcher(pids, stop_event, interval=0.7):
+    """Keep OUR off-screen scrape window(s) off-screen AND out of the taskbar for the whole session.
+    Defends against the persistent profile restoring an on-screen position or the site re-showing the
+    window after the initial hide (the reason the one-shot hide kept 'coming back'). Cheap: after the
+    first pass every call is a no-op until something re-shows the window. Daemon; stops on stop_event."""
+    def _loop():
+        while not stop_event.is_set():
+            try:
+                _enforce_offscreen_hidden(pids)
+            except Exception:
+                pass
+            stop_event.wait(interval)
+    t = threading.Thread(target=_loop, name="taskbar-hide", daemon=True)
+    t.start()
+    return t
+
+
+def _park_window_offscreen(ctx, env_visible="TIKTOK_WINDOW_VISIBLE"):
+    """Force the persistent context's OS window FAR off-screen via CDP. `--window-position` is only
+    a hint for a fresh profile - a persistent profile RESTORES the last saved window bounds, so after
+    an interactive login (which showed the window on-screen) the scrape window reappears on-screen
+    and blinks in the taskbar. CDP `Browser.setWindowBounds` overrides that regardless of the saved
+    bounds; then `_hide_offscreen_from_taskbar()` (which keys on the -2400,-2400 band) can strip the
+    taskbar button. Best-effort + silent."""
+    if os.environ.get(env_visible, "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        cdp = ctx.new_cdp_session(page)
+        info = cdp.send("Browser.getWindowForTarget") or {}
+        wid = info.get("windowId")
+        if wid is not None:
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {
+                "left": -2400, "top": -2400, "width": 1280, "height": 900, "windowState": "normal"}})
+    except Exception:
+        pass
+
+
+def _place_window_visible(ctx, left=120, top=60, width=1280, height=900):
+    """Force the persistent context's window ON-SCREEN + focused via CDP, overriding any off-screen
+    bounds the profile saved from a previous BACKGROUND scrape - otherwise an interactive login could
+    open invisibly at -2400,-2400 and the user could never sign in. Best-effort + silent."""
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        cdp = ctx.new_cdp_session(page)
+        info = cdp.send("Browser.getWindowForTarget") or {}
+        wid = info.get("windowId")
+        if wid is not None:
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {
+                "left": left, "top": top, "width": width, "height": height, "windowState": "normal"}})
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# --- MEMORY (user 2026-08-19: "wie kann man den scrape weniger vram/ram fressen lassen") ---
+# A scrape runs THREE headed Chromium instances at once (TikTok + X + Instagram), each a browser
+# process plus a GPU process plus one renderer per tab, all parked off-screen where nobody looks
+# at them. Two things dominate what they hold:
+#   * autoplaying feed VIDEO - hardware decode surfaces live in VRAM and the media cache in RAM,
+#     and the search only ever reads XHR JSON, so not one frame of that video is used;
+#   * the page/disk cache and the background services a logged-in profile starts by default.
+# The live preview screenshots the page, so IMAGES must keep loading - covers are what make that
+# preview readable. Video, audio and webfonts are pure waste here.
+LEAN_BROWSER_ARGS = [
+    "--mute-audio",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-component-update",
+    "--disable-breakpad",
+    "--disable-domain-reliability",
+    "--disk-cache-size=33554432",          # 32 MB instead of Chromium's default few hundred
+    "--media-cache-size=16777216",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=384",
+]
+
+
+def gpu_saving_args():
+    """VRAM-saving flags, OFF by default and opt-in through SCRAPE_DISABLE_GPU=1.
+
+    Turning the GPU off moves compositing onto SwiftShader: VRAM use drops to roughly nothing and
+    RAM/CPU rise a little. It is NOT enabled by default because it also changes the WebGL vendor
+    and renderer strings the page can read, and these are precious logged-in sessions - a
+    fingerprint change is exactly the kind of thing an anti-bot stack scores. Try it, and if the
+    searches keep returning results, keep it.
+    """
+    if os.environ.get("SCRAPE_DISABLE_GPU", "").strip().lower() not in ("1", "true", "yes"):
+        return []
+    return ["--disable-gpu", "--disable-gpu-compositing", "--disable-software-rasterizer",
+            "--disable-accelerated-video-decode", "--disable-accelerated-2d-canvas"]
+
+
+_LEAN_BLOCKED_TYPES = {"media", "font"}
+
+
+def install_lean_routing(context, status_cb=None):
+    """Drop video, audio and webfont bytes before they are ever decoded.
+
+    Results come from intercepted XHR JSON, never from the rendered video, so this changes
+    nothing the scrape reads - and it makes each search faster as well as smaller. Images are
+    deliberately left alone: the live preview is a screenshot of this page.
+    """
+    try:
+        context.route("**/*", lambda route, request: (
+            route.abort() if request.resource_type in _LEAN_BLOCKED_TYPES else route.continue_()))
+        return True
+    except Exception as exc:                      # noqa: BLE001
+        if status_cb:
+            status_cb(f"Lean routing unavailable ({exc.__class__.__name__}); continuing.")
+        return False
+
+
+def _kill_stale_profile_processes():
+    """Windows only: force-kill any Chromium process still holding PROFILE_DIR open. Needed
+    because a crashed run / cross-thread-poisoned session / killed process can leave the browser
+    alive without Playwright knowing about it - the NEXT launch_persistent_context() against the
+    same profile then silently delegates the URL to that zombie and exits instantly, which
+    Playwright surfaces as a confusing TargetClosedError."""
+    if os.name != "nt":
+        return
+    try:
+        marker = str(PROFILE_DIR).replace("'", "''")
+        cmd = (
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" -ErrorAction Stop | "
+            f"Where-Object {{ $_.CommandLine -and $_.CommandLine -like '*{marker}*' }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                       capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+class Session:
+    """A reusable logged-in TikTok browser session. One persistent context for a whole run."""
+
+    def __init__(self, headless=None, status_cb=None):
+        self._p = None
+        self._ctx = None
+        self._status_cb = status_cb
+        self.headless = _HEADLESS_SEARCH if headless is None else bool(headless)
+        self._pids = set()
+        self._hide_stop = threading.Event()
+        self._watcher = None
+        self._recent_search_fingerprints = []
+        self._daily_search_limit = False
+        self._daily_limit_reported = False
+        self._open()
+
+    def _open(self):
+        # A crashed run, a cross-thread-poisoned session, or a killed process can leave the
+        # PREVIOUS Chromium instance still holding PROFILE_DIR open. A new launch against the
+        # same profile then silently DELEGATES to that zombie and exits immediately, which
+        # Playwright reports as TargetClosedError - kill any such leftover first.
+        _kill_stale_profile_processes()
+        try:
+            self._p = sync_playwright().start()
+            args = ["--disable-blink-features=AutomationControlled", "--no-first-run",
+                    "--no-default-browser-check"] + LEAN_BROWSER_ARGS + gpu_saving_args()
+            if not self.headless:
+                # TikTok blocks HEADLESS, so we must run a real (headed) browser - but the user does NOT
+                # want to see a window. Push it FAR off-screen: it still renders normally (off-screen is
+                # not headless and not minimized), so TikTok serves results, but nothing is visible.
+                # Disable occlusion/background throttling so the off-screen window isn't slowed down.
+                # Set TIKTOK_WINDOW_VISIBLE=1 to watch it (debugging).
+                if os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() not in ("1", "true", "yes"):
+                    args += ["--window-position=-2400,-2400", "--window-size=1280,900",
+                             "--disable-backgrounding-occluded-windows",
+                             "--disable-renderer-backgrounding",
+                             "--disable-background-timer-throttling",
+                             "--disable-features=CalculateNativeWinOcclusion"]
+            self._ctx = self._p.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=self.headless, user_agent=_UA, locale=_LOCALE,
+                viewport={"width": 1280, "height": 900}, args=args,
+                **_launch_browser_kwargs())
+            install_lean_routing(self._ctx)
+        except Exception:
+            # Don't leak a started-but-unused Playwright driver connection on a failed launch -
+            # its dispatcher thread lingering has been observed to poison the NEXT sync_playwright()
+            # call in this same thread ("Sync API inside the asyncio loop").
+            if self._p is not None:
+                try:
+                    self._p.stop()
+                except Exception:
+                    pass
+                self._p = None
+            raise
+        visible = os.environ.get("TIKTOK_WINDOW_VISIBLE", "").strip().lower() in ("1", "true", "yes")
+        if not self.headless and not visible:
+            # CDP-force the window off-screen first (a persistent profile can restore an on-screen
+            # position from a prior interactive login), THEN strip its blinking taskbar button.
+            _park_window_offscreen(self._ctx, "TIKTOK_WINDOW_VISIBLE")
+            for _wait in (0.4, 1.2, 2.0):
+                time.sleep(_wait)
+                if _hide_offscreen_from_taskbar():
+                    break
+            # ROBUST enforcement (CDP-independent): identify our window by the profile's browser PID
+            # and force it off-screen + out of the taskbar, then keep enforcing for the whole session.
+            # This catches the failure the band-based hide above cannot: a CDP park that silently
+            # failed leaves the window ON-screen (and in the taskbar), where the -2400 band never
+            # matches. THIS is why the windows kept showing.
+            for _ in range(6):
+                self._pids = _profile_pids(PROFILE_DIR)
+                if self._pids:
+                    break
+                time.sleep(0.5)
+            if self._pids:
+                _enforce_offscreen_hidden(self._pids)
+                self._watcher = _spawn_taskbar_watcher(self._pids, self._hide_stop)
+        self._restore_or_report_login()
+
+    def _restore_or_report_login(self):
+        """Make sure this context is actually signed in, and say so plainly when it is not.
+
+        MEASURED on the pufferfish run 2026-09-03: 49 of 116 sources were rejected as
+        "could not be downloaded", and 12 of 14 re-checked by hand still delivered no media body.
+        The pages were fine - they were rendering LOGGED OUT. `sessionid` was gone from the
+        browser profile while `is_ready()` still reported a connected account, because it only
+        looks for a marker file. A logged-out session cannot fetch most posts, so the run simply
+        lost 42% of its footage without anyone being told why.
+
+        The profile can lose its cookies while the export written at login still holds them, so
+        put those back before giving up. They are the user's own saved session on their own
+        machine; nothing is fetched or asked for. If that does not restore the login, the marker
+        is cleared so the app stops claiming a connection that does not exist.
+        """
+        try:
+            if _has_session_cookie(self.cookies()):
+                return
+            restored = False
+            if COOKIES_TXT.exists():
+                try:
+                    saved = _cookies_from_netscape(COOKIES_TXT.read_text("utf-8"))
+                    if _has_session_cookie(saved):
+                        self._ctx.add_cookies(saved)
+                        restored = _has_session_cookie(self.cookies())
+                except Exception:                                       # noqa: BLE001
+                    restored = False
+            if restored:
+                _status(self._status_cb, "TikTok session: the browser profile had lost its login; "
+                                         "restored it from the saved cookies.")
+                _write_marker()
+                return
+            _status(self._status_cb,
+                    "TikTok session is NOT signed in. Most posts will not deliver their media to "
+                    "a logged-out session, so downloads will largely fail - reconnect TikTok.")
+            try:
+                _MARKER.unlink(missing_ok=True)
+            except OSError:
+                pass
+        except Exception:                                               # noqa: BLE001
+            pass
+
+    def cookies(self):
+        try:
+            return self._ctx.cookies()
+        except Exception:
+            return []
+
+    def logged_in(self):
+        return _has_session_cookie(self.cookies())
+
+    def search(self, query, want=12, status_cb=None, sort="MOST_LIKED", max_scrolls=14,
+               timeout_s=None):
+        """Run a logged-in keyword search and return up to ~want native TikTok item dicts."""
+        cb = status_cb or self._status_cb
+        if self._daily_search_limit:
+            if not self._daily_limit_reported:
+                _status(cb, "TikTok's account search limit is reached for today; continuing with "
+                            "Instagram and X instead of retrying dead TikTok searches.")
+                self._daily_limit_reported = True
+            return []
+        original_query = str(query or "").strip()
+        query = _sanitize_tiktok_query(original_query)
+        if not query:
+            return []
+        if query != original_query:
+            _status(cb, f"TikTok search: cleaned platform boilerplate: {original_query!r} -> {query!r}.")
+        # A "#hashtag" query is routed to TikTok's DEDICATED hashtag/challenge page
+        # (/tag/<tag>), which indexes that tag's videos far better than typing "#tag" into
+        # general search. Its item feed arrives via /api/challenge/item_list instead of
+        # /api/search/.../full, so both the interceptor and the hydration fallback below branch on it.
+        is_tag = query.startswith("#")
+        tag = query.lstrip("#").strip() if is_tag else ""
+        deadline = (time.monotonic() + max(0.1, float(timeout_s))
+                    if timeout_s is not None else None)
+        if not self.headless:
+            _hide_offscreen_from_taskbar()      # windows can be re-created between searches
+        collected = []
+        seen = set()
+        response_urls = []
+        response_shapes = []
+
+        def _absorb(payload):
+            for it in _extract_items_from_payload(payload):
+                vid = str(it.get("id") or "")
+                if not vid or vid in seen:
+                    continue
+                seen.add(vid)
+                it["_source"] = "tiktok_login"   # tells clip_scraper.backend_download to use yt-dlp
+                # synthesize the webpage url so yt-dlp can fetch the (clean) mp4
+                if not it.get("webVideoUrl"):
+                    author = it.get("author") if isinstance(it.get("author"), dict) else {}
+                    uid = author.get("uniqueId") or author.get("unique_id") or ""
+                    if uid:
+                        it["webVideoUrl"] = f"https://www.tiktok.com/@{uid}/video/{vid}"
+                collected.append(it)
+
+        page = self._ctx.new_page()
+
+        def _on_response(resp):
+            try:
+                url = resp.url
+                if "/api/" in str(url) and ("search" in str(url) or "challenge" in str(url)):
+                    response_urls.append(str(url))
+                if _search_response_matches_query(url, query, is_tag=is_tag):
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        if int(payload.get("status_code") or 0) == 2484:
+                            self._daily_search_limit = True
+                            _SEARCH_STATS["daily_limit"] = 1
+                        data = payload.get("data")
+                        response_shapes.append({
+                            "keys": list(payload.keys())[:20],
+                            "status_code": payload.get("status_code"),
+                            "status_msg": str(payload.get("status_msg") or "")[:300],
+                            "data_type": type(data).__name__,
+                            "data_len": len(data) if isinstance(data, list) else None,
+                            "first_data_keys": (list(data[0].keys())[:20]
+                                                if isinstance(data, list) and data
+                                                and isinstance(data[0], dict) else []),
+                        })
+                    _absorb(payload)
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+        try:
+            if is_tag and tag:
+                url = "https://www.tiktok.com/tag/" + _quote(tag)
+            else:
+                url = "https://www.tiktok.com/search/video?q=" + _quote(query)
+            try:
+                nav_ms = 45000 if deadline is None else max(
+                    1000, min(45000, int((deadline - time.monotonic()) * 1000)))
+                page.goto(url, timeout=nav_ms, wait_until="domcontentloaded")
+                scrape_browser_preview.capture(page, "TikTok", query, sort)
+            except Exception as exc:
+                _status(cb, f"TikTok search: navigation failed for {query!r} ({exc.__class__.__name__}).")
+            # let the first XHR settle, then scroll ADAPTIVELY: a dead query fails FAST (settle +
+            # one probe scroll ~4s instead of a fixed 8-scroll ~14s), and a productive query stops
+            # as soon as two consecutive scrolls add nothing new (results stagnated).
+            page.wait_for_timeout(1800)
+            scrape_browser_preview.capture(page, "TikTok", query, sort, force=True)
+            self._maybe_dismiss_overlays(page)
+            scrolls = 0
+            stagnant = 0
+            last_n = len(collected)
+            while (len(collected) < want and scrolls < max_scrolls and stagnant < 4
+                   and (deadline is None or time.monotonic() < deadline)):
+                page.mouse.wheel(0, 2600)
+                page.wait_for_timeout(1100)
+                scrape_browser_preview.capture(page, "TikTok", query, sort, force=True)
+                scrolls += 1
+                if len(collected) <= last_n:
+                    stagnant += 1
+                    if not collected:
+                        break                     # nothing at all after settle + probe -> dead query
+                else:
+                    stagnant = 0
+                last_n = len(collected)
+            # last-resort: parse the embedded hydration JSON if XHRs were blocked
+            if not collected:
+                _absorb(self._hydration_items(page, is_tag=is_tag))
+            # If we got nothing, is TikTok showing a login wall / captcha (session dead or
+            # headless blocked)? Record it so the caller can fail fast with a clear message.
+            if not collected:
+                try:
+                    low = (page.content() or "").lower()
+                    if ("log in to tiktok" in low or "login-modal" in low
+                            or "verify to continue" in low or "/captcha" in low
+                            or "secsdk-captcha" in low):
+                        _SEARCH_STATS["login_wall"] += 1
+                except Exception:
+                    pass
+                try:
+                    video_links = page.locator("a[href*='/video/']").count()
+                    _status(cb, "TikTok empty-feed diagnostic: "
+                            f"page={page.url!r}, title={page.title()!r}, "
+                            f"search_responses={len(response_urls)}, video_links={video_links}.")
+                    if response_urls:
+                        _status(cb, f"TikTok latest search response: {response_urls[-1][:500]}")
+                    if response_shapes:
+                        _status(cb, f"TikTok response shape: {response_shapes[-1]}")
+                except Exception:
+                    pass
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+        raw_count = len(collected)
+        collected = _filter_search_results(collected, query)
+        fingerprint = frozenset(str(item.get("id") or "") for item in collected if item.get("id"))
+        stale_repeat = False
+        mean_relevance = (sum(float(item.get("_query_relevance") or 0) for item in collected)
+                          / len(collected)) if collected else 0.0
+        if fingerprint:
+            for old_query, old_ids in self._recent_search_fingerprints[-4:]:
+                union = len(fingerprint | old_ids)
+                overlap = (len(fingerprint & old_ids) / float(union)) if union else 0.0
+                if (old_query != _normalise_search_text(query) and overlap >= 0.80
+                        and mean_relevance < 0.34):
+                    stale_repeat = True
+                    break
+        self._recent_search_fingerprints.append((_normalise_search_text(query), fingerprint))
+        self._recent_search_fingerprints = self._recent_search_fingerprints[-6:]
+        if stale_repeat:
+            _status(cb, f"TikTok search {query!r}: discarded a repeated stale result feed.")
+            collected = []
+        elif raw_count and not collected:
+            _status(cb, f"TikTok search {query!r}: discarded {raw_count} unrelated/stale result(s).")
+        _SEARCH_STATS["searches"] += 1
+        _SEARCH_STATS["items"] += len(collected)
+        if collected:
+            self._refresh_cookies_quietly()
+        sort_mode = str(sort or "MOST_LIKED").upper()
+        def _metric(item, names):
+            stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else (
+                item.get("stats") if isinstance(item.get("stats"), dict) else {})
+            for name in names:
+                try:
+                    value = item.get(name) or stats.get(name)
+                    if value is not None:
+                        return int(float(value))
+                except (TypeError, ValueError):
+                    pass
+            return 0
+        if sort_mode == "MOST_LIKED":
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("diggCount", "digg_count", "likeCount"))), reverse=True)
+        elif sort_mode == "MOST_VIEWED":
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("playCount", "play_count", "viewCount"))), reverse=True)
+        elif sort_mode == "MOST_RECENT":
+            collected.sort(key=lambda item: (float(item.get("_query_relevance") or 0),
+                              _metric(item, ("createTime", "create_time"))), reverse=True)
+        else:
+            collected.sort(key=lambda item: float(item.get("_query_relevance") or 0), reverse=True)
+        _status(cb, f"TikTok search {query!r}: collected {len(collected)} candidate item(s).")
+        return collected[:max(0, int(want))]
+
+    def _maybe_dismiss_overlays(self, page):
+        # best-effort close of cookie / login nags that can cover the feed
+        for sel in ("button:has-text('Accept all')", "button:has-text('Allow all')",
+                    "div[aria-label='Close'] button", "button[aria-label='Close']"):
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.click(timeout=1500)
+            except Exception:
+                pass
+
+    def download_video(self, url, dest, status_cb=None, timeout_s=90):
+        """Fetch ONE video through this logged-in browser context. Returns the path or None.
+
+        yt-dlp cannot do this any more: it answers "Unexpected response from webpage request" in
+        about a second, and the signed CDN link out of the API answers 403 to every header
+        combination tried (browser UA, Referer, Origin, Range). Both fail because the media is
+        bound to a real session. This context already IS one, so the page is opened here and the
+        media is fetched with the context's own request API, which carries its cookies.
+        """
+        from pathlib import Path as _Path
+        dest = _Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        page = self._ctx.new_page()
+        chunks = []
+        media_urls = []
+
+        def _on_response(resp):
+            try:
+                target = str(resp.url)
+                if not (".mp4" in target or "/video/tos/" in target
+                        or "mime_type=video_mp4" in target):
+                    return
+                if "video" in str(resp.headers.get("content-type") or "") and target not in media_urls:
+                    media_urls.append(target)
+                # Opportunistic: when Chrome still has the body, take it and skip a second fetch.
+                body = resp.body()
+                if body and len(body) > 40000:
+                    chunks.append(body)
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+        try:
+            page.goto(str(url), wait_until="domcontentloaded",
+                      timeout=int(max(15, timeout_s) * 1000))
+            self._maybe_dismiss_overlays(page)
+            # FAIL FAST. Measured on eight real posts 2026-09-03: every download that worked
+            # finished in 2.9-4.8 seconds, and every one that failed burned 26-53 seconds waiting
+            # for a media body that never came. A run inspecting 285 candidates spent 112 of them
+            # on failures - about two hours of the wall clock on posts this session simply cannot
+            # fetch. The long waits protect nothing: nothing has ever succeeded slowly.
+            try:
+                page.wait_for_selector("video", timeout=6000)
+                # The player usually waits for a play intent before pulling the media.
+                page.evaluate("() => { const v = document.querySelector('video');"
+                              " if (v) { v.muted = true; v.play().catch(() => {}); } }")
+            except Exception:
+                pass
+            deadline = time.monotonic() + max(8.0, float(timeout_s) * 0.12)
+            while time.monotonic() < deadline and not (chunks or media_urls):
+                page.wait_for_timeout(250)
+            if chunks:
+                # A ranged player hands back several partial bodies; give the rest a moment.
+                page.wait_for_timeout(1500)
+                body = max(chunks, key=len)
+                if len(body) > 40000:
+                    dest.write_bytes(body)
+                    return dest
+            # ASK FOR THE FILE AGAIN, through this context. Harvesting bytes out of the browser's
+            # own response was the only method for a long time, on the belief that re-requesting a
+            # signed URL always answers 403. That is true of an OUTSIDE request; a request made
+            # through this context carries its cookies and is served normally.
+            #
+            # And the harvest is not merely imperfect, it is unreliable by design: Chrome evicts
+            # large media bodies from its network cache, so `Response.body()` answers "Protocol
+            # error (Network.getResponseBody): No data found". Measured on the pufferfish run
+            # 2026-09-03 - 49 of 116 sources were rejected as undeliverable, and on four of them
+            # re-checked by hand EVERY media response failed that way while the same URLs fetched
+            # complete files of 4.9 to 70 MB through the context.
+            if not media_urls:
+                _status(status_cb, "TikTok download: the page requested no media at all.")
+                return None
+            for target in media_urls[:3]:
+                try:
+                    answer = self._ctx.request.get(
+                        target, headers={"referer": "https://www.tiktok.com/"}, timeout=90000)
+                    if answer.status != 200:
+                        continue
+                    body = answer.body()
+                except Exception:                                       # noqa: BLE001
+                    continue
+                if body and len(body) > 40000 and b"ftyp" in body[:4096]:
+                    dest.write_bytes(body)
+                    _status(status_cb, "TikTok download: fetched the media through the session.")
+                    return dest
+            _status(status_cb, "TikTok download: the media URL would not serve this session.")
+            return None
+        except Exception as exc:                # noqa: BLE001
+            _status(status_cb, f"TikTok download failed ({exc.__class__.__name__}).")
+            return None
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def _hydration_items(self, page, is_tag=False):
+        try:
+            raw = page.evaluate(
+                "() => { const e = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');"
+                " return e ? e.textContent : null; }")
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            default = ((data or {}).get("__DEFAULT_SCOPE__") or {})
+            if is_tag:
+                # hashtag/challenge page embeds its feed under webapp.challenge-detail
+                scope = default.get("webapp.challenge-detail") or {}
+                rows = (scope.get("itemList") or scope.get("item_list")
+                        or scope.get("ItemList") or [])
+                return {"itemList": rows}
+            scope = default.get("webapp.search-detail") or {}
+            rows = scope.get("data") or scope.get("item_list") or []
+            return {"data": rows} if rows and isinstance(rows[0], dict) and "item" in rows[0] \
+                else {"item_list": rows}
+        except Exception:
+            return {}
+
+    def _refresh_cookies_quietly(self):
+        try:
+            export_cookies_txt(cookies=self.cookies())
+            _write_marker()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._hide_stop.set()           # stop the taskbar-hide watcher
+        except Exception:
+            pass
+        try:
+            if self._ctx:
+                self._ctx.close()
+        except Exception:
+            pass
+        try:
+            if self._p:
+                self._p.stop()
+        except Exception:
+            pass
+        self._ctx = self._p = None
+
+
+def _quote(s):
+    import urllib.parse
+    return urllib.parse.quote(str(s), safe="")
+
+
+# ------------------------------------------------------------- worker-thread plumbing
+# ALL Playwright work runs on this ONE dedicated thread (see note at _EXECUTOR). Job
+# threads only ever talk to it through futures, so a session can never be created in
+# one thread and closed from another - the exact pattern that poisoned job threads
+# with "Sync API inside the asyncio loop" and made every later reopen fail.
+
+
+
+def _executor():
+    global _EXECUTOR
+    with _EXEC_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="tiktok-scrape")
+        return _EXECUTOR
+
+
+def _on_worker_thread():
+    return threading.current_thread().name.startswith("tiktok-scrape")
+
+
+def _session_on_worker(status_cb=None):
+    if _SESSION[0] is None:
+        try:
+            _SESSION[0] = Session(status_cb=status_cb)
+        except Exception as exc:            # noqa: BLE001
+            _status(status_cb, f"TikTok session failed to open ({exc.__class__.__name__}: {exc}).")
+            _SESSION[0] = None
+    return _SESSION[0]
+
+
+def _download_on_worker(url, dest, status_cb, timeout_s):
+    sess = _session_on_worker(status_cb)
+    if sess is None:
+        return None
+    try:
+        return sess.download_video(url, dest, status_cb=status_cb, timeout_s=timeout_s)
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok download failed ({exc.__class__.__name__}).")
+        return None
+
+
+def _search_on_worker(query, want, status_cb, sort, timeout_s=None):
+    sess = _session_on_worker(status_cb)
+    if sess is None:
+        return []
+    try:
+        return sess.search(query, want=want, status_cb=status_cb, sort=sort,
+                           timeout_s=timeout_s) or []
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
+        # a dead browser poisons every later search on this session - drop it so the
+        # next call rebuilds a fresh one (still on this same worker thread)
+        try:
+            _SESSION[0].close()
+        except Exception:
+            pass
+        _SESSION[0] = None
+        return []
+
+
+def _session_cookies_threadsafe():
+    """Current session cookies, fetched on the worker thread (None when no session)."""
+    if _on_worker_thread():                 # already there - a future would deadlock
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    def _get():
+        return _SESSION[0].cookies() if _SESSION[0] is not None else None
+    try:
+        return _executor().submit(_get).result(timeout=30)
+    except Exception:
+        return None
+
+
+def ensure_session(status_cb=None, timeout_s=120.0):
+    """Open (or reuse) the logged-in session on the worker thread. True when ready."""
+    if not is_ready():
+        return False
+    try:
+        return (_executor().submit(_session_on_worker, status_cb)
+                .result(timeout=timeout_s) is not None)
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok session failed to open ({exc.__class__.__name__}: {exc}).")
+        return False
+
+
+def search_sync(query, want=12, status_cb=None, sort="MOST_LIKED", timeout_s=None):
+    """Run a logged-in keyword search on the worker thread and block for the result."""
+    if not is_ready():
+        return []
+    wait = 150.0 if timeout_s is None else max(10.0, float(timeout_s) + 30.0)
+    try:
+        return (_executor().submit(_search_on_worker, query, int(want), status_cb, sort,
+                                   timeout_s).result(timeout=wait)) or []
+    except concurrent.futures.TimeoutError:
+        _status(status_cb, f"TikTok search timed out for {query!r}; moving on.")
+        return []
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok search failed ({exc.__class__.__name__}: {exc}).")
+        return []
+
+
+def download_sync(url, dest, status_cb=None, timeout_s=90):
+    """Download one TikTok through the logged-in session. Returns a path or None."""
+    if not is_ready():
+        return None
+    wait = max(30.0, float(timeout_s) + 40.0)
+    try:
+        return _executor().submit(_download_on_worker, url, dest, status_cb,
+                                  timeout_s).result(timeout=wait)
+    except concurrent.futures.TimeoutError:
+        _status(status_cb, "TikTok download timed out; moving on.")
+        return None
+    except Exception as exc:                # noqa: BLE001
+        _status(status_cb, f"TikTok download failed ({exc.__class__.__name__}).")
+        return None
+
+
+def close_session():
+    global _EXECUTOR
+    with _EXEC_LOCK:
+        ex = _EXECUTOR
+    if ex is None:
+        return
+
+    def _close():
+        if _SESSION[0] is not None:
+            try:
+                _SESSION[0].close()
+            except Exception:
+                pass
+            _SESSION[0] = None
+    try:
+        ex.submit(_close).result(timeout=30)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- CLI
+
+if __name__ == "__main__":
+    import sys
+    cmd = (sys.argv[1] if len(sys.argv) > 1 else "login").strip().lower()
+    if cmd == "login":
+        ok = login()
+        print("LOGGED IN" if ok else "NOT LOGGED IN")
+        sys.exit(0 if ok else 1)
+    elif cmd == "status":
+        print(json.dumps(status(), indent=2))
+    elif cmd == "logout":
+        logout()
+        print("logged out")
+    elif cmd == "search":
+        q = sys.argv[2] if len(sys.argv) > 2 else "tokyo street"
+        if not ensure_session(status_cb=print):
+            print("not logged in - run: python tiktok_login.py login")
+            sys.exit(1)
+        items = search_sync(q, want=10, status_cb=print)
+        for it in items[:10]:
+            a = (it.get("author") or {})
+            print("-", it.get("id"), "@" + str(a.get("uniqueId")), "|",
+                  str(it.get("desc"))[:50])
+        close_session()
+    else:
+        print("usage: python tiktok_login.py [login|status|search <q>|logout]")

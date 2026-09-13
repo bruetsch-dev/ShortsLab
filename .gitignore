@@ -1,0 +1,203 @@
+# --- Secrets ---
+.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Generated output & user data (large, not source) ---
+projects/
+uploads/
+renders/
+outputs/
+# every finished render, copied here by renders.py whatever mode produced it
+.renders/
+
+# --- Reddit Story Mode: approved parkour clips (large binaries); keep the folder + README ---
+/assets/parkour_pool/*
+!/assets/parkour_pool/README.txt
+
+# --- Runtime / asset folders (large binaries, keep on disk only) ---
+browser-profile/
+browser-profile-*/
+background music/
+soundeffects/
+speaker/
+
+# --- TikTok login session (Playwright persistent Chromium profile; holds the account
+#     session - this is how scraping works without an API key. Never commit it.) ---
+tiktok-profile/
+tiktok-profile-*/
+
+# --- Runtime-generated working assets (trimmed SFX + caches, regenerated on demand) ---
+generated_assets/
+
+# --- Scratch run dumps + ad-hoc analysis output ---
+_runresult_*.json
+analysis/
+
+# --- Logs ---
+*.log
+launch_app.log
+manual_app.log
+app_server.log
+app_server_error.log
+server.out.log
+server.err.log
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp
+
+# --- Merged-out duplicate project folders (archived media, not source) ---
+_archive_merged/
+
+# --- Speaker face gallery: keep the folder + readme, not the user's photos ---
+/speaker images/*
+!/speaker images/README.txt
+
+# --- Local one-off dev/test scripts ---
+scripts/_*.py
+/_*.py
+twitter-profile/
+higgsfield-profile/
+higgsfield-profile-*/
+
+# App crash + server logs
+logs/
+projects/*/last_job_error.txt
+projects/*/config/project_before_rescript.json
+
+# scrape trainer / benchmark artifacts (downloaded TikTok proxies + SQLite runs - large, per-machine)
+/scrape_training/
+/benchmark_runs/
+
+# icon backups
+static/*.bak
+
+# stray one-off scripts in the repo root
+/script_*.txt
+
+# third-party skill pack (reinstall via: npx ui-ux-pro-max-cli init --ai claude)
+.claude/skills/
+
+# per-session chat UI state
+chat_session.json
+soundeffects_backup_original/
+instagram-profile/
+
+# local push helper (not source)
+push_to_github.bat
+
+# NOTE: static/previews/*.mp4 are intentionally TRACKED - the new-creation mode
+# menu buttons play them as previews, so a fresh clone/pull needs them (without
+# them the buttons only show the static poster JPGs).
+
+# generated: progressively time-stretched hook risers (regenerable cache)
+_stretched_risers/
+
+# --- Local media archives (never delete; too large for the repo) ---
+/wavespeed assets/
+/assets/broll/
+/reference.mp4
+/candidate library/
+
+# Generated Blender scenes and probe frames: every prompt writes a new one, they are run
+# artefacts and not source. The hand-written scenes and the kit ARE tracked.
+physics_mode/scenes/generated/
+lowpoly_mode/generated/
+lowpoly_mode/**/probe/
+
+# downloaded reference footage (media, not code) - SOURCES.md keeps the links
+reference/**/*.mp4
+reference/**/*.wav
+
+# ProPainter (S-Lab License 1.0, non-commercial): a 300MB third-party checkout with 191MB
+# of model weights. Cloned locally by tools/setup_propainter, never committed.
+third_party/
+
+# Intermediate frames for the Blender motion proof; keep the editable scene.
+/static/showroom3d/motion-preview-frames/
+
+# ---- working debris that keeps landing in `git status` ------------------------------------
+# Screenshots, contact sheets and one-off probe media written while measuring the app. They are
+# evidence for a conversation, not source; the numbers taken from them live in the commit
+# messages and in tests.
+tmp_ui_*.png
+scratch_*
+review_*.jpg
+manual_*.jpg
+manual_*.ffscript
+/_v3_preview*.html
+
+# Local review logs and generated run output.
+/v4_vision_requests.jsonl
+/v4_vision_results.jsonl
+/output/
+*.bak_*
+/backups/
+/reference_contact_sheets/
+/references/
+/review/
+/docs/shell-v3-shots/
+/docs/shell-v4-shots/
+/docs/manual_runs/
+/hf_*.mp4
+/step_history.json
+# Blender sources and render proofs for the 3D showroom: the .glb the browser loads is tracked,
+# the editable scene and its proof frames are not.
+/static/showroom3d/*.blend
+/static/showroom3d/*.blend1
+/static/showroom3d/cinematic-proof-*.png
+/static/showroom3d/shortslab-motion-preview.mp4
+/static/showroom3d/shortslab-retro.glb
+# Stills of the stations, superseded by the photographed machine and the 3D set.
+/static/stage/
+# Downloaded runtimes and model checkouts used by the tools, never source.
+/tools/runtime/
+# Chrome profiles and manual working copies made while testing.
+/tmp_chrome_qa/
+/tmp_manual/
+
+# The Blender reference photo for the 3D showroom - a source image, not something the app serves.
+/static/showroom3d/reference.png
+
+# --- Cleanup 2026-09-07: run output and stray files, never source ---
+finished videos/
+finished_videos/
+tmp/
+tmp_*/
+review/
+_debug/
+_ref_loop/
+*.bak*
+*.log
+/*.mp4
+/_v3_preview*.html
+
+# Local temporary review images
+/tmp*.jpg
+/tmp*.jpeg
+/tmp/**/*.jpg
+/tmp/**/*.jpeg
+/tmp_*/**/*.jpg
+/tmp_*/**/*.jpeg
+
+/tools/build_nostril_thumbnail_ab.py
+/doodle_script_projects/
+/reference/
+/assets/hook_intros/
+/assets/meme_stickers/
+/remake_data.json
+/review_tail_transcript.txt
+/shortslab_ui_reference.html
+/scratch_*
+/manual_*.jpg
+/review_*.jpg
+/*.ffscript

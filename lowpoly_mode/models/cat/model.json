@@ -1,0 +1,8 @@
+{
+  "label": "a low-poly house cat",
+  "aliases": ["kitten", "housecat", "kitty"],
+  "stands_in_for": ["dog", "puppy", "fox", "mouse", "rat", "rabbit", "bear", "tiger",
+                    "lion", "raccoon", "squirrel", "wolf", "goat", "sheep", "pig"],
+  "height_m": 0.65,
+  "coat_material": "fur"
+}

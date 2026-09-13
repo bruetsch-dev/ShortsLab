@@ -1,0 +1,21 @@
+# Core render pipeline
+opencv-python
+numpy
+Pillow
+
+# Frame-accurate word-level voice alignment (captions/cuts/SFX timing)
+# Runs on GPU (CUDA) when available, else CPU. Downloads a Whisper model on first use.
+faster-whisper
+
+# Robust JSON parsing for LLM agent outputs (Opus/GPT can emit malformed JSON)
+json-repair
+
+# TikTok clip scraping via your own logged-in session (no API key). yt-dlp downloads the
+# clean mp4; Playwright drives a persistent, logged-in Chromium for the keyword search.
+# After install run once: python -m playwright install chromium
+yt-dlp
+playwright
+rapidocr-onnxruntime
+
+# Native desktop window (WebView2) - launcher prefers this over a browser
+pywebview

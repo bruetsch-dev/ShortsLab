@@ -1,0 +1,581 @@
+/* Shortslab - the window sheet.
+
+   The showroom and the run pages are drawn by static/shell-v3.css. Every OTHER window the app can
+   show - the Timeline editor, its blank and not-ready pages, the file viewer, the scrape log, the
+   developer tools, the stand-alone progress view, and the ?ui=chat escape hatch - is a document of
+   its own with its own stylesheet, and this file makes each of them the same machine: the deep
+   blue field, cream phosphor type, one console face, square corners, ruled boxes with the title
+   cut into the top rule, bracketed commands that invert when pointed at, [x] switches.
+
+   Two parts, and the split is deliberate:
+
+   1. The PALETTE, unlayered. The other sheets state their tokens on :root / .design-v2 /
+      html.theme-dark; an unlayered normal declaration that comes later wins, so the tokens are
+      simply restated here for every selector those sheets use.
+   2. The GRAMMAR, inside a cascade layer. chat-shell.css and the timeline's inline sheet state
+      surfaces with !important on long selectors; for important declarations the cascade reverses
+      layer order and treats unlayered as weakest, so an important rule INSIDE a layer beats them
+      regardless of specificity. Paint and the chrome's own geometry live here; the editor's
+      tracks, drags and measurements are never touched.
+
+   Contrast, measured on #171b24: cream #f1f1f4 13.0:1, secondary #c3c8d4 8.0:1, the caption
+   floor #9aa2b4 5.2:1. Nothing under 12px. */
+
+:root, :root[data-theme="light"], :root[data-theme="dark"] {
+  --app-bg: #111313;
+  --sidebar-bg: #151915;
+  --sidebar-raised: #20242e;
+  --canvas-bg: #111313;
+  --surface: rgba(23, 27, 36, .86);
+  --surface-raised: rgba(32, 38, 50, .94);
+  --surface-hover: rgba(44, 52, 68, .96);
+
+  --border: rgba(160, 176, 220, .24);
+  --border-hover: rgba(160, 176, 220, .42);
+  --border-active: rgba(142, 166, 255, .75);
+
+  --text-primary: #f1f1f4;
+  --text-secondary: #c3c8d4;
+  --text-muted: #9aa2b4;
+  --text-disabled: #79819a;
+
+  /* The column the app starts in. It is the showroom's own --start-gutter, repeated here
+     because a server-rendered window is the same application: the wordmark has to land in
+     the same place when you walk from the Start screen into the Timeline editor. It used
+     to land 40px further left, and the jump is the first thing you see on arrival. */
+  --win-gutter: clamp(20px, 4vw, 56px);
+
+  /* The editor never loaded shell-v3.css, so the accent I moved to #4358d6 last round
+     never reached it: measured on the live page, --studio-accent-solid resolved to ""
+     and the Render button was still #22307f at 1.70:1 against its own ground. The solid
+     value lives here too now, with the same name the shell uses. */
+  --accent: #8ea6ff;
+  --studio-accent-solid: #4358d6;
+  --accent-hover: #b6c6ff;
+  --accent-soft: rgba(142, 166, 255, .16);
+  --accent-medium: rgba(142, 166, 255, .3);
+  --accent-ink: #171b24;
+
+  --success: #8ff0a4;
+  --warning: #8ea6ff;
+  --danger: #ff8a7a;
+
+  --r-lg: 0px; --r-md: 0px; --r-sm: 0px;
+  --sans: "Segoe UI", Arial, sans-serif;
+  --mono: "Segoe UI", Arial, sans-serif;
+  --tr: 180ms ease-out;
+
+  /* the machine's own names for the same colours, so a rule can say what it means */
+  --w-field: #171b24;
+  --w-deep: #101319;
+  --w-well: #141a24;
+  --w-phos: #f1f1f4;
+  --w-phos-2: #c3c8d4;
+  --w-phos-3: #9aa2b4;
+  --w-line: rgba(160, 176, 220, .5);
+  --w-line-2: rgba(160, 176, 220, .24);
+  --w-live: #8ff0a4;
+  --w-warn: #8ea6ff;
+  --w-fail: #ff8a7a;
+  --w-font: "Segoe UI", Arial, sans-serif;
+}
+
+/* design-v2 paints from its own token set (.design-v2 beats :root) */
+.design-v2, .design-v2.prototype-ui {
+  color-scheme: dark;
+  --v2-bg: #111313;
+  --v2-bg-deep: #10120f;
+  --v2-sidebar: #151915;
+  --v2-panel: #1b2117;
+  --v2-panel-2: #20242e;
+  --v2-panel-3: #2b3242;
+  --v2-glass: rgba(35, 43, 32, .86);
+  --v2-text: #f1f1f4;
+  --v2-text-2: #c3c8d4;
+  --v2-text-3: #9aa2b4;
+  --v2-line: rgba(172, 190, 157, .22);
+  --v2-line-strong: rgba(172, 190, 157, .44);
+  --v2-accent: #8ea6ff;
+  --v2-accent-2: #a8b4d0;
+  --v2-accent-3: #c3c8d4;
+  --v2-accent-ink: #171b24;
+  --v2-danger: #ff8a7a;
+  --v2-warning: #8ea6ff;
+  --v2-success: #8ff0a4;
+  --v2-r-xs: 0px; --v2-r-sm: 0px; --v2-r-md: 0px; --v2-r-lg: 0px; --v2-r-xl: 0px;
+  --v2-shadow-1: none;
+  --v2-shadow-2: none;
+}
+
+/* the server-rendered pages (app_style) and the timeline (timeline-theme.css) state theirs on
+   :root and again on html.theme-dark / html.chat-light */
+:root, html.theme-dark, html.chat-light, html.chat-light.theme-dark {
+  color-scheme: dark;
+  --ink: rgba(160, 176, 220, .5);
+  --bg-base: #111313;
+  --bg-raised: #1a1f2b;      /* was an olive; the shell's raised surface is blue-grey */
+  --bg-overlay: #171b24;
+  --bg-input: #151821;       /* the background of 42 <option>s - opening any dropdown in
+                                the editor produced an olive-green list */
+  --text: #f1f1f4;
+  --muted: #c3c8d4;
+  --faint: #9aa2b4;
+  --line: rgba(160, 176, 220, .24);
+  --line-strong: rgba(160, 176, 220, .5);
+  --studio-accent-solid: #4358d6;   /* the shell's primary, by the shell's name */
+  --accent: #8ea6ff;
+  --accent-hover: #b6c6ff;
+  --accent-active: #aebcf5;
+  --accent-subtle: rgba(67, 88, 214, .18);
+  --accent-fg: #171b24;
+  --accent-ink: #171b24;
+  --accent-2: #a8b4d0;
+  --success: #8ff0a4;
+  --warning: #8ea6ff;
+  --danger: #ff8a7a;
+  --display: "Segoe UI", Arial, sans-serif;
+  --pixel: "Segoe UI", Arial, sans-serif;
+  --mono: "Segoe UI", Arial, sans-serif;
+  --r-sm: 0px; --r-md: 0px; --r-lg: 0px; --r-full: 0px;
+  --radius: 0px; --radius-sm: 0px;
+  --sh-1: none;
+  --sh-2: none;
+  --sh-3: none;
+  --blur: none;
+  --dur: 120ms;
+  --ease: ease-out;
+}
+
+html, body {
+  font-family: var(--w-font);
+  letter-spacing: .01em;
+}
+body {
+  background: linear-gradient(180deg, #10120f 0%, #111313 240px) fixed;
+  color: var(--w-phos);
+}
+/* the pixel-art lab wallpaper of the old pages is not part of this machine */
+body::before { display: none !important; }
+body.page-timeline, body.page-timeline-blank {
+  background: linear-gradient(180deg, #10120f 0%, #111313 280px) fixed !important;
+}
+
+/* the raster: the whole window is behind glass, exactly like the run page. Felt, not seen. */
+body::after {
+  content: ""; position: fixed; inset: 0; z-index: 9999; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(0, 0, 0, .055) 0 1px, transparent 1px 3px),
+    radial-gradient(130% 100% at 50% 0%, rgba(160, 180, 255, .05) 0%, rgba(0, 0, 0, 0) 62%);
+}
+
+::selection { background: var(--w-phos); color: var(--w-field); }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: var(--w-well); }
+::-webkit-scrollbar-thumb { background: rgba(172, 190, 157, .38); border: 3px solid var(--w-well); }
+::-webkit-scrollbar-thumb:hover { background: rgba(172, 190, 157, .6); }
+
+/* ================================================================== the grammar */
+@layer shortslab-window {
+
+  /* ---- nothing from that era had a rounded corner or a drop shadow ---------------------- */
+  button, .button, input, select, textarea, .menu, .dropdown {
+    border-radius: 6px !important;
+  }
+  .panel, .button, button, .card, .chat-card, .tl-pop, .tl-script-box, .tl-clip, .tl-lib-item,
+  .asset-card2, .modal, .sheet, .menu, .dropdown, .dev-run, .tlb-proj, [class*="card"] {
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+  button:hover, .button:hover, a.button:hover { transform: none !important; }
+
+  /* ---- focus is a cream ring, always visible ------------------------------------------- */
+  /* the same ring the shell draws - see shell-v3.css. It keeps its !important because this
+     sheet dresses pages that carry stylesheets of their own. */
+  :focus-visible {
+    outline: 2px solid var(--w-accent, #8ea6ff) !important;
+    outline-offset: 2px;
+  }
+
+  /* ---- the title bar: the same bar the run page draws inside the tube ------------------ */
+  .win-titlebar, .top.win-titlebar, body.page-timeline .top.win-titlebar {
+    display: flex !important; flex-direction: row !important; align-items: center !important; gap: 18px !important;
+    min-height: 44px; padding: 0 var(--win-gutter) 6px !important; margin: 0 0 14px !important;
+    border-bottom: 1px solid var(--w-line) !important;
+    position: static !important; z-index: 3; pointer-events: auto !important; flex: none;
+  }
+  body.page-timeline .top.win-titlebar { margin: 0 0 10px !important; }
+  /* The editor is the one window whose <main> carries a gutter of its own (12px - it is a
+     dense working surface and the tracks want the width). The bar subtracts it so the mark
+     still lands on the shared column while the timeline below keeps its own tighter one. */
+  body.page-timeline .top.win-titlebar { padding-inline: calc(var(--win-gutter) - 12px) !important; }
+  .win-titlebar .top-left { display: flex; align-items: center; gap: 18px; min-width: 0; }
+  .win-titlebar .win-brand {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: var(--w-phos);
+    padding: 4px 6px 4px 0; border: 0; background: transparent;
+  }
+  .win-titlebar .win-brand:hover h1 { color: #fff; }
+  .win-titlebar .win-brand .stripes { width: 22px; height: 14px; display: block; }
+  .win-titlebar .win-brand h1 {
+    margin: 0 !important; font: 13px/1 var(--w-font) !important; letter-spacing: .12em !important;
+    text-transform: uppercase; color: var(--w-phos) !important; font-weight: 400 !important;
+    -webkit-text-stroke: 0; text-shadow: none;
+  }
+  .win-titlebar .machine-name {
+    display: inline-flex; align-items: baseline; gap: 10px; color: var(--w-phos); font-size: 13px; letter-spacing: .06em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .win-titlebar .machine-name small { color: var(--w-phos-3); font-size: 12px; letter-spacing: .02em; }
+  .win-titlebar .machine-name b { font-weight: 400; }
+  .win-titlebar .back-arrow {
+    width: 26px !important; height: 26px !important; min-width: 0; padding: 0 !important; margin: 0;
+    display: grid; place-items: center; border: 1px solid var(--w-line) !important; background: transparent !important;
+    color: var(--w-phos) !important;
+  }
+  .win-titlebar .back-arrow:hover { background: var(--w-phos) !important; color: var(--w-field) !important; }
+  .win-titlebar .back-arrow svg { width: 14px; height: 14px; }
+  .win-titlebar .nav-actions { display: flex; gap: 4px; align-items: center; margin-left: auto; }
+  .win-titlebar .nav-sep { display: none; }
+  .win-titlebar .win-cmd, .win-titlebar a.win-cmd {
+    display: inline-flex !important; align-items: center; gap: 4px; height: 26px !important; width: auto !important;
+    padding: 0 10px !important; margin: 0 !important; border: 1px solid var(--w-line) !important; background: transparent !important;
+    color: var(--w-phos-2) !important; font: 12.5px/1 var(--w-font) !important; letter-spacing: .04em; text-decoration: none !important;
+    text-transform: none !important; transition: background 160ms ease-out, color 160ms ease-out;
+  }
+  .win-titlebar .win-cmd:hover { background: var(--w-phos) !important; color: var(--w-field) !important; }
+  .win-titlebar .win-cmd .ico { display: none; }
+  .win-titlebar .win-back::before { font-size: 12px; color: var(--w-phos-3); }
+  .win-titlebar .win-back:hover::before { color: var(--w-field); }
+
+  /* ---- a command is bracketed and inverts when you point at it --------------------------- */
+  .button, a.button, button.button, .btn, button.btn, a.btn, .pg-btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    height: 26px !important; min-height: 0 !important; padding: 0 10px !important; width: auto;
+    border: 1px solid var(--w-line) !important;
+    background: transparent !important;
+    color: var(--w-phos) !important;
+    font-family: var(--w-font) !important;
+    font-size: 12.5px !important;
+    font-weight: 400 !important;
+    letter-spacing: .04em !important;
+    text-transform: none !important;
+    text-decoration: none !important;
+    line-height: 1 !important;
+    transition: background 160ms ease-out, color 160ms ease-out;
+  }
+  .button::before, .btn::before { content: none; }
+  .button::after, .btn::after { content: none; }
+  .button:hover, a.button:hover, button.button:hover, .btn:hover, button.btn:hover, a.btn:hover {
+    background: var(--w-phos) !important;
+    color: var(--w-field) !important;
+  }
+  .button:hover::before, .button:hover::after, .btn:hover::before, .btn:hover::after { color: var(--w-field); }
+  .button.primary::before, .button.primary::after, .btn.primary::before, .btn.primary::after,
+  .back-arrow::before, .back-arrow::after, .win-cmd::after { content: none; }
+  .win-cmd::before { content: "["; } .win-cmd::after { content: "]"; }
+  .win-back::before { content: "Esc\00a0\00a0" !important; }
+  /* the legacy forms set every button full-width; a command is as wide as its word */
+  form .button, form button { width: auto; }
+  .button.primary, a.button.primary, button.primary, .btn.primary, .btn.go, .tl-render-btn, #tl-render-open, #tl-render {
+    background: var(--w-phos) !important;
+    color: var(--w-field) !important;
+    border-color: var(--w-phos) !important;
+    letter-spacing: .1em !important; text-transform: uppercase !important;
+  }
+  .button.primary:hover, a.button.primary:hover, button.primary:hover, .btn.primary:hover, .tl-render-btn:hover { background: #fff !important; }
+  .button.danger, button.danger, .btn.danger, .tl-media-remove {
+    color: var(--w-fail) !important; border-color: rgba(255, 138, 122, .6) !important;
+  }
+  .button.danger:hover, button.danger:hover, .btn.danger:hover, .tl-media-remove:hover { background: var(--w-fail) !important; color: var(--w-deep) !important; }
+  .button:disabled, button:disabled, .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .button .ico, .btn .ico { opacity: 1; }
+  /* the pressed / current state of a command is inverse video */
+  .button.on, button.on, .btn.on, .tl-save-btn.tl-unsaved {
+    background: var(--w-phos) !important; color: var(--w-field) !important; border-color: var(--w-phos) !important;
+  }
+  .tl-save-btn.tl-unsaved { background: var(--w-warn) !important; border-color: var(--w-warn) !important; }
+
+  /* ---- a state is a ruled tag, never a coloured pill ------------------------------------ */
+  .apill, .pill, .tag, .chip, .badge, [class*="pill"], [class*="badge"], .pv-tag, .st, .tlb-proj small {
+    border: 1px solid var(--w-line-2) !important;
+    background: transparent !important;
+    color: var(--w-phos-2) !important;
+    font-family: var(--w-font) !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+    letter-spacing: .06em;
+    padding: 1px 7px !important;
+  }
+  .badge.candidate, .st.ok { color: var(--w-live) !important; border-color: currentColor !important; }
+  .badge.rejected, .st.fail, .fail, [class*="tag-failed"] { color: var(--w-fail) !important; border-color: currentColor !important; background: transparent !important; }
+  .badge.assignment, .st.wait, .pv-tag-editing { color: var(--w-warn) !important; border-color: currentColor !important; }
+  .pv-tag-longform, .pv-tag-sketch { color: #a8b4d0 !important; }
+
+  /* ---- a panel is a rule with its title cut into it, never a floating card --------------- */
+  .panel, .card, .chat-card, .asset-card2, .dev-run, .tlb-proj, .tl-blank-card, .tlnr-card {
+    position: relative;
+    border: 1px solid var(--w-line-2) !important;
+    background: transparent !important;
+  }
+  .panel:hover, .card:hover, .asset-card2:hover { border-color: var(--w-line) !important; }
+  .panel > h2:first-child, .panel > h3:first-child, .card > h2:first-child, .chat-card > h3:first-child,
+  .tl-inspector > h2, .tl-mixer > h2, .tl-audio-panel > h2 {
+    position: absolute; top: -9px; left: 10px; margin: 0 !important; padding: 0 6px;
+    background: var(--bg-base); font: 12.5px/18px var(--w-font) !important; font-weight: 400 !important;
+    letter-spacing: .1em !important; text-transform: uppercase !important; color: var(--w-phos) !important;
+  }
+  .panel { padding-top: 16px; }
+  .card-cap, .tl-rw-title, .tl-ov-sec-h, .tl-insp-sec > h3, .tl-insp-sec > b, .tl-project-media-title, .tl-version-title,
+  .tl-lib-cap, .sb-cap, .subcap, .tl-tm-title {
+    font: 12px/1.4 var(--w-font) !important; font-weight: 400 !important; letter-spacing: .1em !important; text-transform: uppercase !important;
+    color: var(--w-phos-3) !important; margin: 10px 0 6px; padding-top: 8px; border-top: 1px dashed var(--w-line-2);
+  }
+  .tl-rw-group:first-child .tl-rw-title, .tl-insp-sec:first-child > h3, .card-cap:first-child, .tl-version-title, .tl-project-media-title:first-child {
+    margin-top: 0; padding-top: 0; border-top: 0;
+  }
+
+  /* ---- headings the way that machine set them ------------------------------------------- */
+  h1, h2, h3, h4, .title, [class*="title"], [class*="heading"] {
+    font-family: var(--w-font) !important;
+    font-weight: 400 !important;
+    letter-spacing: .06em;
+    -webkit-text-stroke: 0 !important;
+    text-shadow: none !important;
+  }
+  main > section h1, .media-page h1, .job-head h1, .tl-blank-card h1, .tlnr-card h1, .assets-head > h1, .chat > h1, .chat > h2,
+  .proto-assets h1, .proto-assets h2, .page-title, .scrape-log-page h1, .dev-top h1 {
+    font-size: 15px !important; letter-spacing: .1em !important; text-transform: uppercase !important; margin: 0 0 8px !important;
+  }
+
+  /* ---- a caption is spaced-out small type in the dim phosphor --------------------------- */
+  .hint, .card-note, .tl-lib-hint, .tl-rw-note, .pp-note, .sb-cap, .cap, .small, .meta, [class*="caption"], .tlsb-note, .tl-density-hint,
+  .tl-blank-status, .tlnr-name {
+    font-family: var(--w-font) !important; font-size: 12px !important; font-weight: 400 !important;
+    letter-spacing: .03em; color: var(--w-phos-3) !important; line-height: 1.45;
+  }
+  .tl-blank-status.error { color: var(--w-fail) !important; }
+
+  /* ---- fields are wells cut into the field ----------------------------------------------- */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]), select, textarea {
+    background: var(--w-deep) !important;
+    color: var(--w-phos) !important;
+    border: 1px solid var(--w-line-2) !important;
+    font-family: var(--w-font) !important;
+    font-size: 13px;
+    caret-color: var(--w-phos);
+  }
+  input::placeholder, textarea::placeholder { color: var(--w-phos-3) !important; opacity: 1; }
+  input:focus, select:focus, textarea:focus { outline: none !important; border-color: var(--w-phos) !important; }
+  /* the ring comes back for the keyboard: the rule above beats the global :focus-visible,
+     so a tabbing user had only a 1px border tint to go on. */
+  input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid var(--w-accent, #8ea6ff) !important; outline-offset: 2px !important; }
+  select {
+    appearance: none; -webkit-appearance: none; padding-right: 26px !important; cursor: pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='%23f3ecd8'><path d='M4 8h16l-8 9z'/></svg>") !important;
+    background-repeat: no-repeat !important; background-position: right 8px center !important;
+  }
+  select option { background: var(--w-deep); color: var(--w-phos); }
+
+  /* A REAL BOX, NOT TWO BRACKETS AND AN X. The ASCII form ("[x]", "[ ]") was unreadable at a
+     glance: the state lives in a single character, the two states are the same width and the
+     same colour, and nothing about it looks pressable. This is a 16px square that fills with
+     the accent and shows a drawn tick when it is on - the same object at every size, with the
+     label still the hit area. */
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]) {
+    -webkit-appearance: none !important; appearance: none !important;
+    width: 16px !important; height: 16px !important; min-width: 16px !important; flex: none !important;
+    margin: 0 !important; padding: 0 !important; box-shadow: none !important;
+    border: 1px solid var(--w-line-2, rgba(160,176,220,.55)) !important; border-radius: 0 !important;
+    background: transparent !important; position: relative !important; display: inline-block;
+    vertical-align: -3px; cursor: pointer;
+    transition: background 140ms ease-out, border-color 140ms ease-out !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"])::before {
+    /* the tick: two strokes, drawn, so it reads the same on any background */
+    content: "" !important; position: absolute !important; left: 4px; top: 1px;
+    width: 5px !important; height: 9px !important; border: solid transparent !important;
+    border-width: 0 2px 2px 0 !important; border-radius: 0 !important;
+    transform: rotate(42deg) !important; background: transparent !important; box-shadow: none !important;
+    transition: border-color 140ms ease-out !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"])::after { display: none !important; content: none !important; }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]):hover {
+    border-color: var(--w-accent, #8ea6ff) !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]):checked {
+    background: var(--w-accent, #8ea6ff) !important; border-color: var(--w-accent, #8ea6ff) !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]):checked::before {
+    border-color: #101319 !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]):focus-visible {
+    outline: 2px solid var(--w-accent, #8ea6ff) !important; outline-offset: 2px !important;
+  }
+  input[type="checkbox"]:not(.tl-clip-check):not([role="switch"]):disabled { opacity: .4; cursor: default; }
+  .tl-chk, .tl-cap-toggle, label.tl-chk, label.tl-cap-toggle {
+    font: 12.5px/1.4 var(--w-font) !important; font-weight: 400 !important; color: var(--w-phos) !important; gap: 8px !important;
+  }
+
+  /* a fader is a ruled rail with a block cursor for the thumb */
+  input[type="range"] { -webkit-appearance: none !important; appearance: none !important; height: 22px; margin: 0; background: transparent !important; border: 0 !important; cursor: pointer; }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 6px; border: 1px solid var(--w-line); border-radius: 0;
+    background: repeating-linear-gradient(90deg, var(--w-line-2) 0 1px, transparent 1px 10%);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 10px; height: 16px; margin-top: -6px;
+    background: var(--w-phos); border: 0; border-radius: 0; box-shadow: none;
+  }
+  input[type="range"]:hover::-webkit-slider-thumb, input[type="range"]:active::-webkit-slider-thumb { background: #fff; }
+  input[type="range"]:focus-visible { outline: none !important; }
+  input[type="range"]:focus-visible::-webkit-slider-thumb { outline: 2px solid var(--w-accent, #8ea6ff); outline-offset: 2px; }
+
+  /* ---- menus and tabs: the chosen item in inverse video -------------------------------- */
+  .tl-lib-tabs, .tl-sublib-tabs, .tl-density-seg, .seg { display: inline-flex; border: 1px solid var(--w-line) !important; background: transparent !important; gap: 0 !important; padding: 0 !important; }
+  .tl-lib-tab, .tl-sublib-tab, .tl-density-seg button, .seg button, .tl-lib-tabs button {
+    border: 0 !important; background: transparent !important; color: var(--w-phos-2) !important;
+    font: 12.5px/1 var(--w-font) !important; font-weight: 400 !important; letter-spacing: .04em; text-transform: none !important;
+    height: 24px; min-height: 0 !important; padding: 0 10px !important; margin: 0 !important; box-shadow: none !important;
+    transition: background 160ms ease-out, color 160ms ease-out;
+  }
+  .tl-lib-tab + .tl-lib-tab, .tl-sublib-tab + .tl-sublib-tab, .tl-density-seg button + button, .seg button + button { border-left: 1px solid var(--w-line-2) !important; }
+  .tl-lib-tab:hover, .tl-sublib-tab:hover, .tl-density-seg button:hover { color: var(--w-phos) !important; }
+  .tl-lib-tab.active, .tl-lib-tab.on, .tl-sublib-tab.on, .tl-sublib-tab.active, .tl-density-seg button.on, .seg button.on {
+    background: var(--w-phos) !important; color: var(--w-field) !important;
+  }
+
+  /* ---- popups and modals: double-ruled boxes on the field --------------------------------- */
+  .tl-pop, .tl-trans-menu, .tl-script-box, .modal, .sheet, .menu, .dropdown, .tl-ctx-menu, .tl-lib-pop, .tl-fetch-toast, .tl-toast {
+    border: 3px double var(--w-line) !important;
+    background: var(--w-field) !important;
+    color: var(--w-phos) !important;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .6) !important;
+    backdrop-filter: none !important;
+  }
+  .tl-script-overlay, .scrim, .tl-lib-scrim { background: rgba(6, 6, 20, .72) !important; backdrop-filter: none !important; }
+  .tl-pop-field, .tl-script-voicebar label, .tl-script-densitybar label, .tl-script-regen > label, .tl-script-regen > label span {
+    font: 12.5px/1.4 var(--w-font) !important; font-weight: 400 !important; letter-spacing: .04em !important; text-transform: none !important; color: var(--w-phos-2) !important;
+  }
+
+  /* (the editor's own chrome - toolbar, library, tracks, inspector, popups - lives in timeline-theme.css) */
+
+  /* the blank editor and the not-ready page: a ruled box, the program's name cut into it */
+  .tl-blank-wrap { display: flex; justify-content: center; padding: 40px 16px !important; border: 0 !important; }
+  .tl-blank-card, .tlnr-card { max-width: 620px !important; padding: 26px 22px 22px !important; text-align: left !important; }
+  .tl-blank-badge { display: none !important; }
+  .tl-blank-card h1, .tlnr-card h1 {
+    position: absolute; top: -9px; left: 10px; margin: 0 !important; padding: 0 6px !important; background: var(--bg-base);
+    font-size: 12.5px !important; letter-spacing: .1em !important; text-transform: uppercase !important;
+  }
+  .tl-blank-card .hint, .tlnr-card .hint { max-width: none !important; margin: 0 0 16px !important; text-align: left !important; }
+  .tl-blank-actions { justify-content: flex-start !important; gap: 4px !important; }
+  .tl-blank-actions .button { min-width: 0 !important; }
+  .tl-blank-list { text-align: left; gap: 1px !important; margin-top: 14px !important; border: 1px solid var(--w-line-2); }
+  .tl-blank-list .tlb-proj { border: 0 !important; border-bottom: 1px solid var(--w-line-2) !important; padding: 7px 10px !important; font: 12.5px/1.4 var(--w-font) !important; }
+  .tl-blank-list .tlb-proj:last-child { border-bottom: 0 !important; }
+  .tl-blank-list .tlb-proj:hover { background: var(--w-phos) !important; color: var(--w-field) !important; }
+  .tl-blank-list .tlb-proj:hover small { color: var(--w-field) !important; border-color: var(--w-field) !important; }
+  .tlnr-status { display: grid; gap: 2px; margin: 0 0 14px; border: 1px solid var(--w-line-2); padding: 8px 10px; }
+  .tlnr-row { display: grid; grid-template-columns: 12px 1fr auto; gap: 10px; align-items: center; font: 12.5px/1.6 var(--w-font); }
+  .tlnr-dot { width: 8px; height: 8px; background: var(--w-live); border-radius: 6px !important; }
+  .tlnr-dot.bad { background: var(--w-fail); }
+  .tlnr-k { color: var(--w-phos-2); } .tlnr-v { color: var(--w-phos); font-variant-numeric: tabular-nums; }
+
+  /* the file viewer and the legacy job pages */
+  .media-page .job-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+  .media-page .job-actions { display: flex; gap: 4px; }
+  .media-page .panel img, .media-page .panel video { max-width: 100%; border: 1px solid var(--w-line-2); background: #000; }
+  .media-page .panel pre { font: 12px/1.5 var(--w-font); color: var(--w-phos-2); white-space: pre-wrap; margin: 0; }
+  .file-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+  .file-list li a { display: block; padding: 5px 8px; color: var(--w-phos); text-decoration: none; border-bottom: 1px solid var(--w-line-2); font-size: 12.5px; }
+  .file-list li a:hover { background: var(--w-phos); color: var(--w-field); }
+
+  /* the scrape log */
+  body.scrape-log-page, body.scrape-log-page * { font-family: var(--w-font) !important; }
+  body.scrape-log-page { background: linear-gradient(180deg, #10120f 0%, #111313 240px) fixed !important; color: var(--w-phos) !important; padding: 18px 24px !important; }
+  body.scrape-log-page h1 { font-size: 15px !important; letter-spacing: .1em; text-transform: uppercase; padding-bottom: 8px; border-bottom: 1px solid var(--w-line); }
+  body.scrape-log-page .card { padding: 10px 12px !important; margin: 0 0 6px !important; }
+  body.scrape-log-page .card.rejected { border-color: rgba(255, 138, 122, .5) !important; }
+  body.scrape-log-page .card.assignment { border-color: rgba(143, 240, 164, .5) !important; }
+  body.scrape-log-page .k { color: var(--w-phos-3) !important; letter-spacing: .1em; font-size: 12px !important; }
+  body.scrape-log-page .v, body.scrape-log-page .why { color: var(--w-phos-2) !important; }
+  body.scrape-log-page .scene { color: var(--w-phos-3) !important; font-size: 12px !important; }
+  body.scrape-log-page .thumbs img { border: 1px solid var(--w-line-2); }
+
+  /* the developer tools */
+  .dev-wrap { max-width: 900px !important; }
+  .dev-top { border-bottom: 1px solid var(--w-line); padding-bottom: 8px; }
+  .dev-top .dev-brand img { display: none; }
+  .dev-top h1 { font-size: 13px !important; letter-spacing: .12em !important; text-transform: uppercase; }
+  .dev-top h1::before { content: "SHORTSLAB \00b7 "; color: var(--w-phos-3); }
+  #dev-theme { display: none !important; }
+  .dev-run { padding: 7px 10px !important; }
+  .dev-code { font-family: var(--w-font) !important; color: var(--w-phos-2) !important; font-size: 12.5px !important; }
+
+  /* ---- the chat shell (?ui=chat only): the same idioms on its own layout ------------------ */
+  .sb-proj-row, .sb-proj { border-left: 2px solid transparent; }
+  .sb-proj-row:hover, .sb-proj:hover { background: rgba(172, 190, 157, .10) !important; border-left-color: var(--w-warn); }
+  .sb-proj-row.on, .sb-proj.on, .sb-proj-row[aria-current="true"] { background: var(--w-phos) !important; color: var(--w-field) !important; }
+  .chat-card, .chat-card.input-card, .proto-step-surface, .proto-active-card,
+  .prototype-ui .app.proto-flow .chat-card,
+  .prototype-ui .app.proto-assets .chat-card,
+  .prototype-ui .app.proto-flow .proto-step-surface,
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface {
+    border: 1px solid var(--w-line-2) !important;
+    background: var(--surface) !important;
+    box-shadow: none !important;
+  }
+  .chat-card.input-card, .proto-active-card,
+  .prototype-ui .app.proto-flow .proto-active-card,
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface:not(.proto-step-script) {
+    background: var(--surface-raised) !important;
+    border-color: var(--w-line) !important;
+  }
+  .proto-config-title, .card-head, [class*="config-title"] { font-family: var(--w-font); letter-spacing: .06em; }
+  .aicore-drop, .dropzone, [class*="drop-zone"], [class*="-drop"] {
+    background: rgba(172, 190, 157, .05) !important;
+    border: 1px dashed var(--w-line) !important;
+  }
+  .aicore-drop:hover, .dropzone:hover { background: rgba(172, 190, 157, .1) !important; }
+  .asset-card2 { overflow: hidden; }
+  .asset-card2 .abody { border-top: 1px solid var(--w-line-2) !important; padding-top: 10px !important; }
+  .asset-card2 .ath { border: 0 !important; }
+  .asset-card2 .aact { border-top: 1px solid var(--w-line-2) !important; padding-top: 10px !important; }
+  /* the chat shell's sidebar is not part of this machine: one screen, one program, the way back
+     is in the title bar. The layout is a grid with a --sidebar-w column, so the column is
+     collapsed rather than the panel merely hidden. */
+  .app > .sidebar, .app > aside, .sidebar { display: none !important; }
+  .app { --sidebar-w: 0px !important; grid-template-columns: 0 1fr !important; }
+  .app > .canvas, .app > main, .canvas { grid-column: 1 / -1 !important; }
+
+  /* ---- motion: honoured, not assumed ------------------------------------------------------ */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+    .media-loading .ml-bar > i { animation: none !important; width: 35%; }
+    .media-loading .ml-text::after { animation: none !important; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body::after { background: none; }
+}
+/* Studio finishing surfaces. Keep timeline track measurements untouched. */
+body::after {display:none;}
+@layer shortslab-window {
+ /* This asked for a 36px gutter and never got one. It sits in the same layer as the rule
+    above, which declares its padding !important - so nothing about ORDER could save this
+    one, and the bar kept the 4px. The gutter now lives up there, where it can win. */
+ .win-titlebar,.top.win-titlebar,body.page-timeline .top.win-titlebar {min-height:54px;}
+ .win-brand svg rect {fill:#8ea6ff;}
+ .win-titlebar button::before,.win-titlebar button::after,.win-titlebar a::before,.win-titlebar a::after {content:none!important;}
+ .panel, .modal,.sheet {border-radius:10px!important;}
+ button,.button {min-height:34px;}
+ .win-brand {font-weight:650!important;letter-spacing:-.02em!important;}
+}
+.studio-icon {width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;vertical-align:middle;flex:none;}
+@layer shortslab-window {
+ /* the shell's wordmark, to the pixel: 19px / 750 / -0.8px. It was set three different ways
+    on three families of screen, and a wordmark that changes size is not a wordmark. */
+ .win-titlebar .win-brand h1 {font-size:19px!important;font-weight:750!important;letter-spacing:-.042em!important;}
+ .win-titlebar .win-cmd,.win-titlebar a.win-cmd {height:36px!important;letter-spacing:0;}
+}

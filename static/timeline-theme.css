@@ -1,0 +1,414 @@
+/* The editor was set in Lucida Console throughout - 823 elements against 315 in the shell's
+   own face. That single difference is most of why this page reads as a different product
+   wearing the same dark background. Labels, tabs, buttons and prose take the shell's stack;
+   monospace stays only where digits have to line up (durations, timecodes, counters). */
+/* The Timeline editor's own chrome, in the machine's grammar.
+
+   Loaded ONLY on /timeline, after the editor's inline sheet and before shell-window.css. The
+   palette (the blue field, the cream phosphor, one console face, no radii) comes from
+   shell-window.css and is NOT restated here; this file is the part of the grammar that only the
+   editor has - its toolbar, its library and tabs, its tracks and rails, its inspector, its
+   popups and its empty states.
+
+   Everything sits in the same cascade layer as the window sheet, and nearly every declaration
+   carries !important: the editor's inline sheet states its chrome with !important on
+   `body.page-timeline #timeline-root ...` selectors, and for important declarations the cascade
+   reverses layer order, so a layered !important wins regardless of specificity. Paint and the
+   chrome's own geometry only - the tracks' measurements, the drag maths and the player's
+   double-buffer are never touched. */
+
+@layer shortslab-window {
+
+  /* ---- the frame: the title bar is in the flow, the four panels are ruled boxes ------------ */
+  body.page-timeline main { padding: 8px 12px 10px !important; }
+  body.page-timeline .top.win-titlebar { position: static !important; pointer-events: auto !important; margin: 0 0 10px !important; }
+  body.page-timeline .brand, body.page-timeline .nav-actions { display: inline-flex !important; }
+  body.page-timeline .panel, body.page-timeline #timeline-root .panel {
+    border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; box-shadow: none !important;
+    padding: 10px 12px !important;
+  }
+  body.page-timeline #timeline-root .tl-toolbar { padding: 8px 10px !important; }
+  body.page-timeline #timeline-root .tl-player { padding: 6px !important; }
+
+  /* ---- commands: bracketed, they invert when pointed at; the pressed one stays inverted ----- */
+  body.page-timeline #timeline-root .button, body.page-timeline #timeline-root button.button,
+  body.page-timeline #timeline-root .tl-save-btn, body.page-timeline #timeline-root .tl-rework-btn,
+  body.page-timeline #timeline-root .tl-rw-action, body.page-timeline #timeline-root .tl-manual-toggle,
+  body.page-timeline #timeline-root .tl-manual-add, body.page-timeline #timeline-root .tl-manual-open,
+  body.page-timeline #timeline-root .tl-insp-actions button, body.page-timeline #timeline-root .tl-media-actions button {
+    height: 26px !important; min-height: 0 !important; padding: 0 10px !important; width: auto !important;
+    border: 1px solid rgba(160, 176, 220, .5) !important; background: transparent !important; color: #f1f1f4 !important;
+    font: 12.5px/1 "Segoe UI", Arial, sans-serif !important; letter-spacing: .04em !important;
+    text-transform: none !important; box-shadow: none !important; transform: none !important;
+    transition: background 160ms ease-out, color 160ms ease-out !important;
+  }
+  body.page-timeline #timeline-root .button::before, body.page-timeline #timeline-root .tl-rw-action::before,
+  body.page-timeline #timeline-root .tl-manual-add::before, body.page-timeline #timeline-root .tl-manual-open::before { content: none; }
+  body.page-timeline #timeline-root .button::after, body.page-timeline #timeline-root .tl-rw-action::after,
+  body.page-timeline #timeline-root .tl-manual-add::after, body.page-timeline #timeline-root .tl-manual-open::after { content: none; }
+  body.page-timeline #timeline-root .button:hover, body.page-timeline #timeline-root .tl-rw-action:hover,
+  body.page-timeline #timeline-root .tl-manual-toggle:hover, body.page-timeline #timeline-root .tl-manual-add:hover, body.page-timeline #timeline-root .tl-manual-open:hover {
+    background: var(--studio-accent-solid, #4358d6) !important; color: #f1f1f4 !important; border-color: #f1f1f4 !important;
+  }
+  body.page-timeline #timeline-root .button:hover::before, body.page-timeline #timeline-root .button:hover::after { color: #171b24; }
+  /* the one primary command on the bar: Render, in inverse video, the run page's START */
+  body.page-timeline #timeline-root .tl-render-btn, body.page-timeline #timeline-root .button.primary, body.page-timeline #timeline-root button.primary {
+    /* the picker's selected shelf was a white slab - the loudest object in the editor,
+       spent on saying which tab you are already looking at */
+    background: #232838 !important; color: #f1f1f4 !important;
+    box-shadow: inset 0 -2px 0 0 #4358d6 !important; border-color: #f1f1f4 !important;
+    /* 600, not 400. RENDER and FETCH sit in the same viewport wearing the same blue, and
+       the one that spends money and produces the deliverable was two pixels shorter and
+       two hundred weight units lighter than the one that searches for stock clips. */
+    letter-spacing: .1em !important; text-transform: uppercase !important; font-weight: 600 !important; padding: 0 16px !important;
+    min-height: 36px !important;
+  }
+  body.page-timeline #timeline-root .tl-render-btn::before, body.page-timeline #timeline-root .tl-render-btn::after,
+  body.page-timeline #timeline-root .button.primary::before, body.page-timeline #timeline-root .button.primary::after { content: none; }
+  body.page-timeline #timeline-root .tl-render-btn:hover, body.page-timeline #timeline-root .button.primary:hover { background: #fff !important; }
+  body.page-timeline #timeline-root .tl-save-btn.tl-unsaved { background: var(--studio-accent-solid, #4358d6) !important; color: #f1f1f4 !important; border-color: var(--studio-accent-solid, #4358d6) !important; }
+  body.page-timeline #timeline-root .tl-media-remove { color: #ff8a7a !important; border-color: rgba(255, 138, 122, .6) !important; }
+  body.page-timeline #timeline-root .tl-media-remove:hover { background: #ff8a7a !important; color: #101319 !important; }
+  /* the icon-only commands: the exit arrow, the transport, undo/redo/zoom */
+  body.page-timeline #timeline-root .tl-icon-btn, body.page-timeline #timeline-root .tl-editor-exit {
+    width: 26px !important; height: 26px !important; padding: 0 !important; display: inline-flex !important; align-items: center; justify-content: center;
+    color: #f1f1f4 !important; border: 1px solid rgba(160, 176, 220, .5) !important; background: transparent !important; transform: none !important;
+  }
+  body.page-timeline #timeline-root .tl-icon-btn::before, body.page-timeline #timeline-root .tl-icon-btn::after { content: none; }
+  body.page-timeline #timeline-root .tl-editor-exit:hover { background: #f1f1f4 !important; color: #171b24 !important; border-color: #f1f1f4 !important; transform: none !important; }
+  body.page-timeline #timeline-root .tl-ctrl, body.page-timeline #timeline-root .tl-player-bar .tl-ctrl, body.page-timeline #timeline-root .tl-mini,
+  body.page-timeline #timeline-root .tl-meta .tl-histzoom .tl-ctrl.tl-mini {
+    width: 30px !important; height: 26px !important; min-width: 0 !important; padding: 0 !important;
+    border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; color: #f1f1f4 !important; box-shadow: none !important;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important;
+  }
+  body.page-timeline #timeline-root .tl-player-bar .tl-ctrl-main { width: 38px !important; border-color: rgba(160, 176, 220, .5) !important; }
+  body.page-timeline #timeline-root .tl-ctrl:hover, body.page-timeline #timeline-root .tl-mini:hover { background: #f1f1f4 !important; color: #171b24 !important; }
+  body.page-timeline #timeline-root .tl-ctrl.on, body.page-timeline #timeline-root .tl-ctrl[aria-pressed="true"], body.page-timeline #timeline-root .tl-mini.on { background: #f1f1f4 !important; color: #171b24 !important; }
+  body.page-timeline #timeline-root .tl-ctrl:disabled, body.page-timeline #timeline-root .tl-mini:disabled { opacity: .4; }
+  body.page-timeline #timeline-root .tl-playtime, body.page-timeline #timeline-root .tl-total {
+    font-family: "Lucida Console", Consolas, monospace !important; font-weight: 400 !important; font-variant-numeric: tabular-nums; color: #c3c8d4 !important; font-size: 12.5px !important;
+  }
+  body.page-timeline #timeline-root .tl-sep { background: rgba(160, 176, 220, .24) !important; }
+
+  /* ---- the library: tabs as menu items, the fetch well, the sub-tabs, the tiles ------------ */
+  body.page-timeline #timeline-root .tl-lib-head { border-bottom: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; padding-bottom: 8px !important; }
+  body.page-timeline #timeline-root .tl-lib-tabs, body.page-timeline #timeline-root .tl-sublib-tabs {
+    display: inline-flex !important; gap: 0 !important; border: 1px solid rgba(160, 176, 220, .5) !important; background: transparent !important; padding: 0 !important; overflow: visible !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-tabs .tl-lib-tab, body.page-timeline #timeline-root .tl-sublib-tabs .tl-sublib-tab, body.page-timeline #timeline-root .tl-sublib-tab {
+    /* 32, not 24: Media / SFX / VFX and the four shelves under them are how you get
+       anywhere in the picker, and they were the smallest targets on the screen. */
+    height: 32px !important; min-height: 0 !important; padding: 0 12px !important; margin: 0 !important; width: auto !important;
+    border: 0 !important; background: transparent !important; color: #c3c8d4 !important; box-shadow: none !important;
+    font: 12.5px/1 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .04em !important; text-transform: none !important; font-weight: 400 !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-tab + .tl-lib-tab, body.page-timeline #timeline-root .tl-sublib-tab + .tl-sublib-tab { border-left: 1px solid rgba(160, 176, 220, .24) !important; }
+  body.page-timeline #timeline-root .tl-lib-tab:hover, body.page-timeline #timeline-root .tl-sublib-tab:hover { color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-lib-tab.active, body.page-timeline #timeline-root .tl-lib-tab.on,
+  body.page-timeline #timeline-root .tl-sublib-tab.on, body.page-timeline #timeline-root .tl-sublib-tab.active {
+    background: #f1f1f4 !important; color: #171b24 !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-hint { font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; color: #9aa2b4 !important; letter-spacing: .04em; }
+  body.page-timeline #timeline-root .tl-agent-fetch, body.page-timeline #timeline-root .tl-agent-bar, body.page-timeline #timeline-root .tl-manual-panel, body.page-timeline #timeline-root .tl-fetch-float {
+    border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-agent-fetch textarea, body.page-timeline #timeline-root .tl-agent-fetch input[type="text"] {
+    background: #101319 !important; border: 1px solid rgba(160, 176, 220, .24) !important; color: #f1f1f4 !important;
+    font: 13px/1.5 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+  }
+  body.page-timeline #timeline-root .ta-amt-lbl, body.page-timeline #timeline-root .tl-agent-amount label, body.page-timeline #timeline-root .tl-mt-lbl, body.page-timeline #timeline-root .tl-agent-status {
+    font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .08em !important; text-transform: uppercase; color: #9aa2b4 !important; font-weight: 400 !important;
+  }
+  body.page-timeline #timeline-root .tl-agent-fetch .button.primary, body.page-timeline #timeline-root .tl-agent-fetch button.primary { height: 26px !important; }
+  body.page-timeline #timeline-root .tl-manual-toggle { flex-direction: column !important; height: auto !important; padding: 4px 6px !important; border-color: rgba(160, 176, 220, .24) !important; }
+  body.page-timeline #timeline-root .tl-manual-toggle .tl-mt-ico { font-size: 14px; filter: grayscale(1) brightness(1.4); }
+  body.page-timeline #timeline-root .tl-sublib-toolrow { gap: 8px !important; }
+  body.page-timeline #timeline-root .tl-sublib-search, body.page-timeline #timeline-root .tl-sfx-search {
+    background: #101319 !important; border: 1px solid rgba(160, 176, 220, .24) !important; color: #f1f1f4 !important; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+  }
+  body.page-timeline #timeline-root .tl-sublib-sortwrap, body.page-timeline #timeline-root .tl-msearch-sortwrap {
+    border: 1px solid rgba(160, 176, 220, .5) !important; background: transparent !important; color: #f1f1f4 !important; box-shadow: none !important;
+    font: 12.5px/1 'Segoe UI', system-ui, -apple-system, sans-serif !important; height: 32px !important; padding: 0 8px !important; display: inline-flex !important; align-items: center; gap: 6px;
+  }
+  body.page-timeline #timeline-root .tl-sublib-sort, body.page-timeline #timeline-root select.tl-sublib-sort {
+    background: transparent !important; border: 0 !important; color: #f1f1f4 !important; font: 12.5px 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important;
+    /* measured 87x12 inside a 26px pill: only the middle half of the control could be clicked */
+    height: 100% !important; min-height: 30px !important; cursor: pointer !important;
+  }
+  body.page-timeline #timeline-root .tl-sortico { color: #9aa2b4 !important; }
+  body.page-timeline #timeline-root .tl-lib-item {
+    border: 1px solid rgba(160, 176, 220, .24) !important; background: #101319 !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-item:hover { border-color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-lib-item.on, body.page-timeline #timeline-root .tl-lib-item.selected { outline: 2px solid #f1f1f4 !important; outline-offset: -2px; }
+  body.page-timeline #timeline-root .tl-lib-name {
+    font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #f1f1f4 !important; background: transparent !important; letter-spacing: .02em;
+    border-top: 1px solid rgba(160, 176, 220, .24) !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-dur {
+    font: 12px/1 "Lucida Console", Consolas, monospace !important; font-weight: 400 !important; font-variant-numeric: tabular-nums;
+    background: rgba(8, 10, 20, .82) !important; color: #f1f1f4 !important; border: 1px solid rgba(160, 176, 220, .24) !important; padding: 2px 5px !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-play, body.page-timeline #timeline-root .tl-lib-del, body.page-timeline #timeline-root .tl-snd-play {
+    background: rgba(8, 10, 20, .82) !important; color: #f1f1f4 !important; border: 1px solid rgba(160, 176, 220, .5) !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-lib-play:hover, body.page-timeline #timeline-root .tl-lib-del:hover, body.page-timeline #timeline-root .tl-snd-play:hover { background: #f1f1f4 !important; color: #171b24 !important; }
+  body.page-timeline #timeline-root .tl-lib-sound, body.page-timeline #timeline-root .tl-sfx-cat {
+    border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; box-shadow: none !important;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #f1f1f4 !important;
+  }
+  body.page-timeline #timeline-root .tl-sfx-cat:hover, body.page-timeline #timeline-root .tl-lib-sound:hover { border-color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-sfx-cat.on, body.page-timeline #timeline-root .tl-sfx-cat.open { background: rgba(160, 176, 220, .1) !important; }
+  body.page-timeline #timeline-root .tl-snd-cat, body.page-timeline #timeline-root .tl-snd-info small {
+    font: 12px/1.3 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .06em; color: #9aa2b4 !important; border: 0 !important; background: transparent !important;
+  }
+  body.page-timeline #timeline-root .tl-msearch-results .tl-msearch-row { border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; }
+  body.page-timeline #timeline-root .tl-msearch-row:hover { border-color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root details.tl-manual-adv summary { font: 12px 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .08em; text-transform: uppercase; color: #9aa2b4 !important; }
+
+  /* ---- the tracks: rules on the field, the label rail in spaced caps, the ruler in figures ---- */
+  body.page-timeline #timeline-root .tl-stage { padding: 8px 10px 6px !important; }
+  body.page-timeline #timeline-root .tl-row-labels { background: transparent !important; }
+  body.page-timeline #timeline-root .tl-rlabel {
+    font: 12px/1.3 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; letter-spacing: .12em !important; text-transform: uppercase !important;
+    color: #9aa2b4 !important; background: transparent !important; border: 1px solid rgba(160, 176, 220, .24) !important; border-right: 0 !important;
+    justify-content: center !important;
+  }
+  body.page-timeline #timeline-root .tl-rlabel.tl-rl-ruler { border-color: transparent !important; }
+  body.page-timeline #timeline-root .tl-rlabel .tl-mini { border: 0 !important; }
+  body.page-timeline #timeline-root .tl-ruler {
+    font: 12px/1 "Lucida Console", Consolas, monospace !important; color: #9aa2b4 !important; font-variant-numeric: tabular-nums;
+    background: transparent !important; border-bottom: 1px solid rgba(160, 176, 220, .24) !important;
+  }
+  body.page-timeline #timeline-root .tl-ruler span, body.page-timeline #timeline-root .tl-ruler i { color: #9aa2b4 !important; border-color: rgba(160, 176, 220, .24) !important; }
+  body.page-timeline #timeline-root .tl-scroll { background: transparent !important; }
+  body.page-timeline #timeline-root .tl-track {
+    background: #101319 !important; border: 1px solid rgba(160, 176, 220, .24) !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-clip {
+    border: 1px solid rgba(160, 176, 220, .5) !important; background-color: #141a24 !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-clip:hover { border-color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-clip.selected, body.page-timeline #timeline-root .tl-clip.sel, body.page-timeline #timeline-root .tl-clip.on {
+    border-color: #f1f1f4 !important; outline: 2px solid #f1f1f4 !important; outline-offset: -3px;
+  }
+  body.page-timeline #timeline-root .tl-clip b, body.page-timeline #timeline-root .tl-clip small, body.page-timeline #timeline-root .tl-clip span,
+  body.page-timeline #timeline-root .tl-clip-name, body.page-timeline #timeline-root .tl-clip-dur, body.page-timeline #timeline-root .tl-replace-tag {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; letter-spacing: .02em;
+  }
+  body.page-timeline #timeline-root .tl-clip-dur, body.page-timeline #timeline-root .tl-clip .tl-dur {
+    background: rgba(8, 10, 20, .82) !important; color: #f1f1f4 !important; border: 1px solid rgba(160, 176, 220, .24) !important;
+  }
+  body.page-timeline #timeline-root .tl-replace-tag { background: #ff8a7a !important; color: #101319 !important; border: 0 !important; }
+  /* Both labels sit directly on a video frame, so their legibility depended on whatever the
+     clip happened to show: the name was pure white with no shadow at all, the duration had a
+     1px shadow and no plate. A scrim behind each one settles it for every frame. */
+  body.page-timeline #timeline-root .tl-clip-label, body.page-timeline #timeline-root .tl-badge {
+    background: rgba(8, 10, 20, .72) !important; border-radius: 6px; padding: 1px 5px !important;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .9) !important; backdrop-filter: blur(2px);
+  }
+  body.page-timeline #timeline-root .tl-clip-label { color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-badge { color: #c3c8d4 !important; }
+  /* THE PLAYHEAD WAS THE ERROR COLOUR. #ff8a7a is exactly --fail, the salmon on the
+     Library's FAILED badge - so the most-tracked element in the editor, the thing that
+     says where you are, was painted in the colour the product uses for a broken run. A
+     position marker is not a semantic state: it takes the one value no state uses. */
+  body.page-timeline #timeline-root .tl-playhead, body.page-timeline #timeline-root .tl-ph, body.page-timeline #timeline-root .tl-cursor { background: #f1f1f4 !important; box-shadow: none !important; }
+  body.page-timeline #timeline-root .tl-playhead::before { border-top-color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-cutline, body.page-timeline #timeline-root .tl-cut-line, body.page-timeline #timeline-root .tl-beat, body.page-timeline #timeline-root .tl-beatline { background: rgba(160, 176, 220, .24) !important; }
+  body.page-timeline #timeline-root .tl-ov, body.page-timeline #timeline-root .tl-ovclip, body.page-timeline #timeline-root .tl-sfx-clip, body.page-timeline #timeline-root .tl-sfxclip, body.page-timeline #timeline-root .tl-fx {
+    border: 1px solid rgba(160, 176, 220, .5) !important; background: #141a24 !important; color: #f1f1f4 !important; box-shadow: none !important;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important;
+  }
+  body.page-timeline #timeline-root .tl-voice-wave, body.page-timeline #timeline-root .tl-wave { filter: none !important; }
+  body.page-timeline #timeline-root .tl-word, body.page-timeline #timeline-root .tl-voice-word {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #c3c8d4 !important; border-color: rgba(160, 176, 220, .24) !important;
+  }
+  body.page-timeline #timeline-root .tl-word.on, body.page-timeline #timeline-root .tl-word.hook { background: #f1f1f4 !important; color: #171b24 !important; }
+
+  /* ---- the mixer strip and the music command --------------------------------------------- */
+  body.page-timeline #timeline-root .tl-mixer-wrap { padding: 8px 10px !important; }
+  body.page-timeline #timeline-root #tl-music-open, body.page-timeline #timeline-root .tl-music-btn, body.page-timeline #timeline-root [id^="tl-music"] .button {
+    font: 12.5px/1 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .1em !important; text-transform: uppercase !important;
+  }
+
+  /* ---- the inspector: a floating double-ruled box on the field (it opens over the library, so it
+     must be opaque), sections with a dashed rule and a spaced heading ----------------------- */
+  body.page-timeline #timeline-root .tl-inspector, body.page-timeline #timeline-root .tl-inspector.open {
+    background: #171b24 !important; border: 3px double rgba(160, 176, 220, .5) !important; box-shadow: 0 20px 60px rgba(0, 0, 0, .6) !important;
+    padding: 14px 12px 12px !important;
+  }
+  body.page-timeline #timeline-root .tl-inspector > h2 { position: absolute; top: -9px; left: 10px; margin: 0 !important; padding: 0 6px; background: #171b24; }
+  body.page-timeline #timeline-root .tl-insp-name { font: 12.5px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #f1f1f4 !important; word-break: break-word; }
+  body.page-timeline #timeline-root .tl-insp-sec, body.page-timeline #timeline-root .tl-ov-sec-h {
+    font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; letter-spacing: .1em !important; text-transform: uppercase !important;
+    color: #9aa2b4 !important; margin: 12px 0 6px !important; padding-top: 8px !important; border-top: 1px dashed rgba(160, 176, 220, .24) !important; background: transparent !important;
+  }
+  body.page-timeline #timeline-root .tl-insp-pane, body.page-timeline #timeline-root .tl-ov-sec, body.page-timeline #timeline-root .tl-clip-transform-controls {
+    background: transparent !important; border-color: rgba(160, 176, 220, .24) !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root .tl-insp-pane label, body.page-timeline #timeline-root .tl-ov-row label, body.page-timeline #timeline-root .tl-slider label {
+    font: 12.5px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #c3c8d4 !important; letter-spacing: .02em !important; text-transform: none !important;
+  }
+  body.page-timeline #timeline-root .tl-insp-pane label span, body.page-timeline #timeline-root .tl-ov-row label span, body.page-timeline #timeline-root .tl-slider output {
+    color: #f1f1f4 !important; font-variant-numeric: tabular-nums; font-family: "Lucida Console", Consolas, monospace !important;
+  }
+  /* faders: the ruled rail and the block cursor, over the editor's own round amber thumb */
+  body.page-timeline input[type="range"] { -webkit-appearance: none !important; appearance: none !important; background: transparent !important; border: 0 !important; height: 26px !important; }
+  body.page-timeline input[type="range"]::-webkit-slider-runnable-track {
+    height: 6px !important; border: 1px solid rgba(160, 176, 220, .5) !important; border-radius: 6px !important; box-shadow: none !important;
+    background: repeating-linear-gradient(90deg, rgba(160, 176, 220, .24) 0 1px, transparent 1px 10%) !important;
+  }
+  body.page-timeline input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none !important; appearance: none !important; width: 10px !important; height: 16px !important; margin-top: -6px !important;
+    background: #f1f1f4 !important; border: 0 !important; border-radius: 6px !important; box-shadow: none !important;
+  }
+  body.page-timeline input[type="range"]:hover::-webkit-slider-thumb, body.page-timeline input[type="range"]:active::-webkit-slider-thumb { background: #fff !important; }
+  body.page-timeline #timeline-root .tl-range2-track { background: transparent !important; border: 1px solid rgba(160, 176, 220, .5) !important; height: 8px !important; }
+  body.page-timeline #timeline-root .tl-range2-fill { background: repeating-linear-gradient(90deg, #c3c8d4 0 4px, transparent 4px 7px) !important; }
+  body.page-timeline #timeline-root .tl-range2-th { background: #f1f1f4 !important; border: 0 !important; box-shadow: none !important; width: 10px !important; }
+  body.page-timeline #timeline-root .tl-insp-close { width: 26px !important; height: 26px !important; padding: 0 !important; }
+
+  /* ---- popups and the script modal: double-ruled boxes on the field ---------------------- */
+  body.page-timeline #timeline-root .tl-pop, body.page-timeline #timeline-root .tl-audio-pop, body.page-timeline #timeline-root .tl-trans-menu, body.page-timeline .tl-script-box, body.page-timeline .tl-lib-pop, body.page-timeline .tl-ctx-menu {
+    border: 3px double rgba(160, 176, 220, .5) !important; background: #171b24 !important; color: #f1f1f4 !important;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .6) !important; backdrop-filter: none !important;
+  }
+  body.page-timeline #timeline-root .tl-rw-title, body.page-timeline #timeline-root .tl-version-title, body.page-timeline #timeline-root .tl-project-media-title, body.page-timeline #timeline-root .tl-tm-title {
+    font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; letter-spacing: .1em !important; text-transform: uppercase !important; color: #9aa2b4 !important;
+  }
+  body.page-timeline #timeline-root .tl-rw-group + .tl-rw-group { border-top: 1px dashed rgba(160, 176, 220, .24) !important; padding-top: 10px !important; margin-top: 10px !important; }
+  body.page-timeline #timeline-root .tl-chk, body.page-timeline #timeline-root .tl-cap-toggle, body.page-timeline #timeline-root .tl-fx-enable, body.page-timeline #timeline-root .tl-thumb-arrow, body.page-timeline #timeline-root .tl-msearch-jp {
+    font: 12.5px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #f1f1f4 !important; gap: 8px !important; text-transform: none !important; letter-spacing: .02em !important;
+  }
+  body.page-timeline #timeline-root .tl-rw-note, body.page-timeline #timeline-root .tl-thumb-maker small, body.page-timeline #timeline-root .tl-project-media-copy small, body.page-timeline #timeline-root .tl-media-status {
+    font: 12px/1.45 'Segoe UI', system-ui, -apple-system, sans-serif !important; color: #9aa2b4 !important; letter-spacing: .02em;
+  }
+  body.page-timeline #timeline-root .tl-project-media-copy strong { font: 12.5px 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; color: #f1f1f4 !important; }
+  body.page-timeline #timeline-root .tl-thumb-preview { border: 1px solid rgba(160, 176, 220, .24) !important; background: #101319 !important; color: #9aa2b4 !important; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; }
+  body.page-timeline #timeline-root .tl-version-item { border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; font: 12px/1.4 'Segoe UI', system-ui, -apple-system, sans-serif !important; }
+  body.page-timeline #timeline-root .tl-version-item:hover { background: #f1f1f4 !important; color: #171b24 !important; }
+  body.page-timeline .tl-script-box h2 { font-size: 13px !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
+  body.page-timeline .tl-script-regen { border: 1px solid rgba(160, 176, 220, .24) !important; background: transparent !important; }
+  body.page-timeline .tl-script-box textarea { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; }
+  body.page-timeline .tl-density-seg { border: 1px solid rgba(160, 176, 220, .5) !important; }
+  body.page-timeline .tl-density-seg button { background: transparent !important; color: #c3c8d4 !important; font: 12.5px 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; border: 0 !important; height: 24px !important; padding: 0 12px !important; }
+  body.page-timeline .tl-density-seg button + button { border-left: 1px solid rgba(160, 176, 220, .24) !important; }
+  body.page-timeline .tl-density-seg button.on { background: #f1f1f4 !important; color: #171b24 !important; }
+  body.page-timeline .tl-script-hookstatus { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; font-weight: 400 !important; }
+
+  /* ---- the player: the stage is the one black thing on the screen -------------------------- */
+  body.page-timeline #timeline-root .tl-stage-view { border: 1px solid rgba(160, 176, 220, .5) !important; }
+  body.page-timeline #timeline-root .tl-stage-empty {
+    font: 12.5px/1.5 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .08em; text-transform: uppercase; color: #9aa2b4 !important;
+  }
+  body.page-timeline #timeline-root .tl-player-bar { background: transparent !important; border-top: 1px solid rgba(160, 176, 220, .24) !important; backdrop-filter: none !important; }
+  body.page-timeline #timeline-root .tl-clip-transform-box { border: 1px dashed #f1f1f4 !important; box-shadow: none !important; }
+  body.page-timeline #timeline-root .tl-clip-transform-tag { background: #101319 !important; color: #f1f1f4 !important; font: 12px 'Segoe UI', system-ui, -apple-system, sans-serif !important; letter-spacing: .08em; }
+  body.page-timeline #timeline-root .tl-clip-scale-handle, body.page-timeline #timeline-root .tl-ov-scale-handle { background: #f1f1f4 !important; border: 2px solid #171b24 !important; box-shadow: none !important; }
+  body.page-timeline #timeline-root .tl-preview-overlay.selected { outline: 2px solid #f1f1f4 !important; }
+
+  /* ---- loaders and toasts ---------------------------------------------------------------- */
+  body.page-timeline .tl-toast, body.page-timeline .tl-fetch-toast, body.page-timeline #tl-toast {
+    border: 1px solid #2a2016 !important; background: #efe6cf !important; color: #2a2016 !important;
+    font: 13px Georgia, "Times New Roman", serif !important; box-shadow: 4px 4px 0 rgba(0, 0, 0, .45) !important;
+  }
+  body.page-timeline #nav-loading { background: rgba(6, 6, 20, .82) !important; backdrop-filter: none !important; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    body.page-timeline * { transition-duration: .001ms !important; animation-duration: .001ms !important; }
+  }
+}
+@layer shortslab-window {
+ body.page-timeline #timeline-root .button,body.page-timeline #timeline-root button.button {height:34px!important;font:500 13px/1 'Segoe UI',Arial,sans-serif!important;letter-spacing:0!important;}
+ body.page-timeline #timeline-root .button::before,body.page-timeline #timeline-root .button::after {content:none!important;}
+ body.page-timeline #timeline-root .panel {background:#151a24!important;border:1px solid #2e3546!important;border-radius:10px!important;}
+ body.page-timeline #timeline-root .tl-render-btn {font-weight:650!important;}
+}
+@layer shortslab-window {
+ body.page-timeline #timeline-root .tl-render-btn,body.page-timeline #timeline-root .button.primary,body.page-timeline #timeline-root button.primary {background:var(--studio-accent-solid, #4358d6)!important;color:#f1f1f4!important;border-color:var(--studio-accent-solid, #4358d6)!important;}
+}
+
+  /* FETCH was a lavender gradient with a sparkle - the only gradient anywhere in the app.
+     It is the one primary action in this panel, so it takes the shell's primary treatment. */
+  body.page-timeline #timeline-root #tl-agent-go {
+    background: var(--studio-accent-solid, #4358d6) !important; color: #f1f1f4 !important;
+    border: 1px solid var(--studio-accent-solid, #4358d6) !important; border-radius: 6px !important;
+    letter-spacing: .08em !important; text-transform: uppercase !important;
+    font-weight: 600 !important; box-shadow: none !important;
+  }
+  body.page-timeline #timeline-root #tl-agent-go:hover { background: #2c3ca0 !important; }
+
+  /* ONE RADIUS SCALE, ENFORCED. Measured on the live editor: 6px on 88 elements and 10px on
+     35 - the studio scale - but also 5px on 31 chips, 9px on 15 rail labels and clips, 50%
+     on 11 transition buttons, plus one-offs at 3, 8, 12, 14 and a 99px pill on the sort
+     control. Nine radii in one view is why the shapes read as unrelated. Controls take 6,
+     surfaces take 10, and nothing is a pill. */
+  body.page-timeline #timeline-root .tl-lib-dur,
+  body.page-timeline #timeline-root .tl-rlabel,
+  body.page-timeline #timeline-root .tl-clip,
+  body.page-timeline #timeline-root .tl-ovitem,
+  body.page-timeline #timeline-root .tl-voice-end-lbl,
+  body.page-timeline #timeline-root .tl-trans-add,
+  body.page-timeline #timeline-root .tl-sublib-sortwrap,
+  body.page-timeline #timeline-root .tl-sublib-sortwrap select,
+  body.page-timeline #timeline-root .tl-sublib-tab,
+  body.page-timeline #timeline-root .tl-lib-tab,
+  body.page-timeline #timeline-root .tl-fx,
+  body.page-timeline #timeline-root .tl-ov { border-radius: 6px !important; }
+  body.page-timeline #timeline-root .tl-stage-view,
+  body.page-timeline #timeline-root .tl-fetch-float { border-radius: 10px !important; }
+
+  /* the tabs were pills sitting on a pill-shaped rail; a segmented control is squarer and
+     reads as one object with parts, which is what it is */
+  body.page-timeline #timeline-root .tl-sublib-tabs,
+  body.page-timeline #timeline-root .tl-lib-tabs { gap: 4px !important; }
+
+  /* The bar is the one element that should be identical on every route, and it was
+     identical on none: 76px in the shell, 71 here, 61 on the wait screen, on three
+     different grounds. Measured, then matched. */
+  body.page-timeline main > header.win-titlebar,
+  body.page-timeline header.win-titlebar.top {
+    height: 76px !important; min-height: 76px !important; max-height: 76px !important;
+    box-sizing: border-box !important;
+    margin: 0 !important; padding: 0 36px !important;
+    background: #111313 !important;
+    border-bottom: 1px solid #2b3242 !important;
+    border-radius: 0 !important;
+    display: flex !important; align-items: center !important;
+  }
+
+  /* and flush to the top edge, like every other screen - the editor sat 8px down because its
+     main carries a margin the shell does not have */
+  body.page-timeline main { margin-top: 0 !important; padding-top: 0 !important; }
+
+  /* shell-window.css loads after this file and carries its own !important on the bar, so the
+     hairline and the gutter need one more level of specificity to land */
+  html body.page-timeline main > header.win-titlebar.top {
+    border-bottom: 1px solid #2b3242 !important;
+    padding: 0 36px !important;
+  }
+
+  /* the editor's native range inputs painted themselves with the light accent */
+  body.page-timeline input[type='range'] { accent-color: var(--studio-accent-solid, #4358d6) !important; }
+  body.page-timeline input[type='range']::-webkit-slider-thumb { background: var(--studio-accent-solid, #4358d6) !important; }
+  body.page-timeline input[type='range']::-moz-range-thumb { background: var(--studio-accent-solid, #4358d6) !important; }
+
+  /* the checkboxes painted their checked state with the LIGHT accent, so a ticked box read
+     brighter than the render button - the fill is the primary value everywhere else */
+  body.page-timeline input[type='checkbox'] { accent-color: var(--studio-accent-solid, #4358d6) !important; }
+  body.page-timeline input[type='checkbox']:checked { background: var(--studio-accent-solid, #4358d6) !important;
+    border-color: var(--studio-accent-solid, #4358d6) !important; }
+
+@layer shortslab-window {
+  /* A SOUND MARKER WAS 14 x 19px. Placing and nudging SFX is the core editing loop of this
+     screen and it was the smallest target on it. The marker stays narrow - it marks a POINT in
+     time and 32px of ink would overlap its neighbours - so the ink grows to fill its lane and
+     an invisible pad carries the hit area out to 32 x 32 around it. */
+  body.page-timeline #timeline-root .tl-fx { height: 24px !important; min-width: 18px !important; }
+  /* The pad used to be written here as ::after and never applied: `#tl-sfx .tl-fx::after` is
+     the marker's pointed tip, an id selector that outranks anything in a layer, and its whole
+     job is to be 0x0 with borders. It is a real child element now - see .tl-fx-pad in app.py. */
+  body.page-timeline #timeline-root .tl-ovitem { min-height: 26px !important; }
+}

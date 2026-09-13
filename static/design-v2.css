@@ -1,0 +1,1124 @@
+/* ============================================================================
+   SHORTSLAB — DESIGN V2
+   A presentation-only system layered over the existing application. The V1 UI
+   remains available with ?design=v1. No production or pipeline selectors live here.
+   ============================================================================ */
+
+.design-v2 {
+  color-scheme: dark;
+  --v2-bg: #070a10;
+  --v2-bg-deep: #04060b;
+  --v2-sidebar: #0a0e16;
+  --v2-panel: #10151f;
+  --v2-panel-2: #151b27;
+  --v2-panel-3: #1b2330;
+  --v2-glass: rgba(16, 21, 31, .82);
+  --v2-text: #f1f4f8;
+  --v2-text-2: #aab4c2;
+  --v2-text-3: #6f7a8a;
+  --v2-line: rgba(236, 242, 255, .09);
+  --v2-line-strong: rgba(236, 242, 255, .17);
+  --v2-accent: #3d92ff;
+  --v2-accent-2: #56c8ff;
+  --v2-accent-3: #a993ff;
+  --v2-accent-ink: #04122b;
+  --v2-danger: #ff746d;
+  --v2-warning: #ffc75b;
+  --v2-success: #62e889;
+  --v2-r-xs: 8px;
+  --v2-r-sm: 11px;
+  --v2-r-md: 16px;
+  --v2-r-lg: 22px;
+  --v2-r-xl: 30px;
+  --v2-shadow-1: 0 1px 1px rgba(0, 0, 0, .28), 0 10px 28px rgba(0, 0, 0, .16);
+  --v2-shadow-2: 0 26px 80px rgba(0, 0, 0, .30);
+  --v2-ease: cubic-bezier(.16, 1, .3, 1);
+  --v2-fast: 180ms;
+  --v2-normal: 280ms;
+  --v2-sidebar-w: 326px;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.design-v2[data-theme="light"], .design-v2.chat-light {
+  color-scheme: light;
+  --v2-bg: #eceff4;
+  --v2-bg-deep: #e6eaf1;
+  --v2-sidebar: #e2e7ef;
+  --v2-panel: #f7f9fc;
+  --v2-panel-2: #ffffff;
+  --v2-panel-3: #eaeef5;
+  --v2-glass: rgba(247, 249, 252, .84);
+  --v2-text: #111620;
+  --v2-text-2: #505a6a;
+  --v2-text-3: #7b8492;
+  --v2-line: rgba(20, 28, 45, .10);
+  --v2-line-strong: rgba(20, 28, 45, .18);
+  --v2-accent: #1668d6;
+  --v2-accent-2: #0b6ea8;
+  --v2-accent-3: #6f58cc;
+  --v2-accent-ink: #ffffff;
+  --v2-shadow-1: 0 1px 1px rgba(26, 40, 30, .05), 0 10px 26px rgba(26, 40, 30, .07);
+  --v2-shadow-2: 0 24px 70px rgba(26, 40, 30, .12);
+}
+
+.design-v2 * { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--v2-text-3) 28%, transparent) transparent; }
+.design-v2 *::-webkit-scrollbar { width: 4px; height: 4px; }
+.design-v2 *::-webkit-scrollbar-track { background: transparent; }
+.design-v2 *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--v2-text-3) 32%, transparent); border-radius: 999px; }
+.design-v2 *::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--v2-text-2) 48%, transparent); }
+.design-v2 button, .design-v2 [role="button"], .design-v2 a, .design-v2 label[for] { cursor: pointer; }
+/* the same ring as the rest of the app - see shell-v3.css. This was a lightened accent at a
+   3px offset, which is why the wordmark's ring sat one pixel wider than every other. */
+.design-v2 :focus-visible { outline: 2px solid var(--v2-accent); outline-offset: 2px; }
+.design-v2 ::selection { background: color-mix(in srgb, var(--v2-accent) 28%, transparent); color: var(--v2-text); }
+
+/* --- application shell ---------------------------------------------------- */
+.design-v2.prototype-ui body {
+  background: var(--v2-bg);
+  color: var(--v2-text);
+}
+.design-v2.prototype-ui body::after { opacity: .018; mix-blend-mode: soft-light; }
+.design-v2.prototype-ui .app {
+  --sidebar-w: var(--v2-sidebar-w);
+  background: var(--v2-bg);
+}
+.design-v2.prototype-ui .canvas {
+  position: relative;
+  background:
+    radial-gradient(900px 580px at 12% -18%, color-mix(in srgb, var(--v2-accent) 7%, transparent), transparent 64%),
+    radial-gradient(780px 580px at 104% 18%, color-mix(in srgb, var(--v2-accent-3) 5%, transparent), transparent 62%),
+    var(--v2-bg);
+}
+.design-v2.prototype-ui .canvas::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: .22;
+  background-image: linear-gradient(var(--v2-line) 1px, transparent 1px), linear-gradient(90deg, var(--v2-line) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,.35), transparent 72%);
+}
+.design-v2.prototype-ui .chat-scroll { position: relative; z-index: 1; scroll-behavior: smooth; }
+.design-v2.prototype-ui .chat { width: 100%; max-width: 1320px; padding: 42px 42px 76px; }
+
+/* --- sidebar -------------------------------------------------------------- */
+.design-v2.prototype-ui .sidebar {
+  width: var(--sb-w, var(--v2-sidebar-w));
+  padding: 14px 13px 12px;
+  gap: 12px;
+  border: 0;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--v2-sidebar) 96%, var(--v2-accent) 4%), var(--v2-sidebar));
+  box-shadow: 14px 0 50px rgba(0, 0, 0, .13);
+}
+.design-v2.prototype-ui .sidebar::before {
+  inset: 7px 6px 8px;
+  border: 1px solid var(--v2-line);
+  border-radius: 18px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--v2-panel) 72%, transparent), transparent 30%);
+}
+.design-v2.prototype-ui .sidebar::after { left: 30px; right: 30px; top: 7px; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--v2-accent) 34%, transparent), transparent); }
+.design-v2.prototype-ui .sb-head { min-height: 58px; padding: 9px 9px 8px; }
+.design-v2.prototype-ui .sb-logo {
+  width: 39px; height: 39px;
+  border: 1px solid color-mix(in srgb, var(--v2-accent) 33%, var(--v2-line));
+  border-radius: 12px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--v2-accent) 4%, transparent), 0 10px 26px rgba(0,0,0,.24);
+  filter: saturate(.8) contrast(1.08);
+}
+.design-v2.prototype-ui .sb-title b { font-size: 15px; font-weight: 720; letter-spacing: -.055em; color: var(--v2-text); }
+.design-v2.prototype-ui .sb-title b span { color: inherit; }
+.design-v2.prototype-ui .sb-title b i { background: var(--v2-accent); box-shadow: 0 0 12px color-mix(in srgb, var(--v2-accent) 75%, transparent); }
+.design-v2.prototype-ui .sb-collapse {
+  width: 28px; height: 28px;
+  opacity: .42;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--v2-text-2);
+  transition: opacity var(--v2-fast), color var(--v2-fast), background var(--v2-fast), border-color var(--v2-fast);
+}
+.design-v2.prototype-ui .sb-collapse:hover { opacity: 1; color: var(--v2-text); background: var(--v2-panel-2); border-color: var(--v2-line); }
+.design-v2.prototype-ui .sb-nav { gap: 5px; padding: 0 5px; }
+.design-v2.prototype-ui .sb-nav button {
+  min-height: 46px;
+  padding: 10px 12px;
+  gap: 11px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: var(--v2-text-2);
+  font-size: 13px;
+  font-weight: 640;
+  transition: color var(--v2-fast), background var(--v2-fast), border-color var(--v2-fast), transform var(--v2-normal) var(--v2-ease);
+}
+.design-v2.prototype-ui .sb-nav button:hover { transform: translateX(3px); color: var(--v2-text); background: var(--v2-panel); border-color: var(--v2-line); }
+.design-v2.prototype-ui .sb-nav button.active {
+  color: var(--v2-text);
+  border-color: color-mix(in srgb, var(--v2-accent) 19%, var(--v2-line));
+  background: linear-gradient(100deg, color-mix(in srgb, var(--v2-accent) 12%, transparent), color-mix(in srgb, var(--v2-panel) 80%, transparent));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--v2-accent) 70%, transparent);
+}
+.design-v2.prototype-ui .sb-nav button.active::after { width: 6px; height: 6px; background: var(--v2-accent); }
+.design-v2.prototype-ui .sb-nav .ico, .design-v2.prototype-ui .sb-nav .proto-icon { width: 19px; height: 19px; }
+.design-v2.prototype-ui .sb-section { margin: 0 5px; }
+.design-v2.prototype-ui .sb-section::before { background: linear-gradient(90deg, transparent, var(--v2-line), transparent); }
+.design-v2.prototype-ui .sb-cap {
+  padding: 0 7px;
+  color: var(--v2-text-3);
+  font: 720 9px/1.2 var(--mono);
+  letter-spacing: .14em;
+}
+.design-v2.prototype-ui .sb-projects { gap: 4px; padding-right: 3px; }
+.design-v2.prototype-ui .sb-proj {
+  min-height: 55px;
+  padding: 6px 7px;
+  gap: 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  transition: background var(--v2-fast), border-color var(--v2-fast), transform var(--v2-normal) var(--v2-ease);
+}
+.design-v2.prototype-ui .sb-proj:hover { transform: translateX(3px); background: var(--v2-panel); border-color: var(--v2-line); }
+.design-v2.prototype-ui .sb-proj .th, .design-v2.prototype-ui .sb-proj .pv-wrap.th { width: 36px; height: 44px; border: 1px solid var(--v2-line-strong); border-radius: 9px; }
+.design-v2.prototype-ui .sb-proj .meta b { color: var(--v2-text); font-size: 12px; font-weight: 610; }
+.design-v2.prototype-ui .sb-proj .meta span { color: var(--v2-text-3); font-size: 9px; }
+.design-v2.prototype-ui .sb-proj-row.pinned::after { background: var(--v2-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--v2-accent) 60%, transparent); }
+.design-v2.prototype-ui .sb-project-menu { padding: 6px; border: 1px solid var(--v2-line-strong); border-radius: 12px; background: color-mix(in srgb, var(--v2-panel-2) 94%, transparent); box-shadow: var(--v2-shadow-2); backdrop-filter: blur(20px); }
+.design-v2.prototype-ui .sb-project-menu button { min-height: 40px; border-radius: 8px; }
+.design-v2.prototype-ui .sb-conns-count { color: var(--v2-text-2); background: var(--v2-panel-2); border-color: var(--v2-line); }
+.design-v2.prototype-ui .sb-conn { min-height: 38px; padding: 6px 8px; border-radius: 10px; color: var(--v2-text-2); }
+.design-v2.prototype-ui .sb-conn:hover { background: var(--v2-panel); color: var(--v2-text); }
+.design-v2.prototype-ui .sb-conn button { min-width: 34px; min-height: 30px; gap: 5px; border-color: var(--v2-line); border-radius: 8px; background: var(--v2-panel-2); }
+.design-v2 .v2-inline-icon { width: 16px; height: 16px; }
+.design-v2.prototype-ui .sb-foot { min-height: 48px; margin: 0 5px; padding: 9px 4px 2px; gap: 8px; border-color: var(--v2-line); }
+.design-v2.prototype-ui .sb-proto-switch { display: none !important; }
+.design-v2 .sb-theme-switch { display: inline-flex; min-height: 34px; align-items: center; gap: 7px; margin-left: auto; color: var(--v2-text-2); }
+.design-v2 .sb-theme-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.design-v2 .sb-theme-glyph { display: grid; width: 24px; height: 24px; place-items: center; color: var(--v2-text-2); }
+.design-v2 .sb-theme-track { position: relative; width: 31px; height: 18px; border: 1px solid var(--v2-line-strong); border-radius: 99px; background: var(--v2-panel-3); }
+.design-v2 .sb-theme-track i { position: absolute; width: 12px; height: 12px; left: 2px; top: 2px; border-radius: 50%; background: var(--v2-text-2); transition: transform 220ms var(--v2-ease), background 180ms ease; }
+.design-v2 .sb-theme-switch input:checked + .sb-theme-track i { transform: translateX(13px); background: var(--v2-accent); }
+.design-v2 .sb-theme-label { font: 650 9px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.design-v2 .v2-version-badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 7px; border: 1px solid var(--v2-line); border-radius: 7px; color: var(--v2-text-3); font: 700 8px/1 var(--mono); letter-spacing: .1em; white-space: nowrap; }
+.design-v2.prototype-ui .sb-dev-btn { min-width: 30px; min-height: 30px; border-radius: 8px; }
+.design-v2.prototype-ui .sb-resize { width: 5px; right: -2px; }
+.design-v2.prototype-ui .sb-resize:hover::after { background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--v2-accent) 55%, transparent), transparent); }
+
+/* --- creation launchpad --------------------------------------------------- */
+.design-v2.prototype-ui .app.proto-home .chat { padding-top: 46px; }
+.design-v2.prototype-ui .app.proto-home .chat-scroll { background: transparent; }
+.design-v2 .proto-launchpad { max-width: 1250px; margin: 0 auto; }
+.design-v2 .proto-hero { position: relative; margin: 0 0 42px; padding-right: 300px; }
+.design-v2 .proto-hero-kicker {
+  display: inline-flex; align-items: center; gap: 9px; margin-bottom: 15px;
+  color: var(--v2-accent); font: 760 10px/1 var(--mono); letter-spacing: .17em;
+}
+.design-v2 .proto-hero-kicker::before { content: ""; width: 24px; height: 1px; background: currentColor; box-shadow: 0 0 12px currentColor; }
+.design-v2 .proto-hero h1 { max-width: 760px; color: var(--v2-text); font-size: clamp(44px, 5vw, 68px); font-weight: 520; letter-spacing: -.065em; line-height: .98; }
+.design-v2 .proto-hero h1 em { color: var(--v2-accent); font-weight: 760; text-shadow: 0 0 48px color-mix(in srgb, var(--v2-accent) 12%, transparent); }
+.design-v2 .proto-hero p { max-width: 680px; margin-top: 18px; color: var(--v2-text-2); font-size: 15px; line-height: 1.6; }
+.design-v2 .v2-hero-meta { position: absolute; right: 0; bottom: 2px; display: grid; gap: 8px; padding-left: 24px; border-left: 1px solid var(--v2-line); color: var(--v2-text-3); font: 600 10px/1.3 var(--mono); }
+.design-v2 .v2-hero-meta span { display: flex; align-items: center; gap: 8px; }
+.design-v2 .v2-hero-meta i { width: 6px; height: 6px; border-radius: 50%; background: var(--v2-success); box-shadow: 0 0 10px color-mix(in srgb, var(--v2-success) 65%, transparent); }
+.design-v2 .proto-work-section { margin-bottom: 42px; }
+.design-v2 .proto-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 28px; margin: 0 0 15px; padding: 0 2px; }
+.design-v2 .proto-section-heading > div small { display: block; margin-bottom: 7px; color: var(--v2-accent); font: 720 9px/1 var(--mono); letter-spacing: .15em; }
+.design-v2 .proto-section-heading h2 { margin: 0; color: var(--v2-text); font-size: 23px; font-weight: 620; letter-spacing: -.035em; }
+.design-v2 .proto-section-heading > p { margin: 0 0 2px; color: var(--v2-text-3); font-size: 12px; }
+.design-v2 .proto-primary-tools { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; perspective: 1200px; }
+.design-v2 .proto-primary-tools .proto-tool { grid-column: span 4; min-height: 275px; aspect-ratio: auto; padding: 22px; border: 1px solid var(--v2-line); border-radius: var(--v2-r-lg); background: var(--v2-panel); box-shadow: var(--v2-shadow-1); }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) { grid-column: span 6; min-height: 380px; }
+.design-v2 .proto-tool::after { left: 26px; right: 26px; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--v2-accent) 65%, white), transparent); opacity: .38; }
+.design-v2 .proto-primary-tools .proto-tool:hover { transform: translate(var(--tx), calc(var(--ty) - 8px)) scale(1.018) !important; border-color: color-mix(in srgb, var(--v2-accent) 32%, var(--v2-line)); box-shadow: 0 34px 90px rgba(0,0,0,.34), 0 0 0 1px color-mix(in srgb, var(--v2-accent) 7%, transparent); }
+.design-v2 .proto-creator-card > video { opacity: .82; transition: transform 900ms var(--v2-ease), filter 380ms ease; }
+.design-v2 .proto-creator-card:hover > video { transform: scale(1.045); filter: saturate(1.06) contrast(1.04); }
+.design-v2 .proto-culture-shade, .design-v2 .proto-sketch-shade, .design-v2 .proto-lowpoly-shade {
+  background: linear-gradient(0deg, rgba(4,7,8,.96) 0%, rgba(4,7,8,.76) 35%, rgba(4,7,8,.04) 76%), linear-gradient(90deg, rgba(4,7,8,.46), transparent 62%);
+}
+.design-v2 .proto-tool-copy { margin-top: auto; }
+.design-v2 .proto-tool-copy strong { margin: 0; color: #fff; font-size: 25px; font-weight: 650; letter-spacing: -.04em; text-shadow: 0 2px 18px rgba(0,0,0,.7); }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: 31px; }
+.design-v2 .proto-tool-copy em { max-width: 500px; margin-top: 9px; color: rgba(255,255,255,.76); font-size: 13px; line-height: 1.48; text-shadow: 0 2px 12px rgba(0,0,0,.8); }
+.design-v2 .proto-tool-physics .proto-tool-copy, .design-v2 .proto-tool-lowpoly .proto-tool-copy { position: relative; z-index: 2; }
+.design-v2 .proto-tool-lowpoly { position: relative; isolation: isolate; overflow: hidden; background: radial-gradient(circle at 72% 20%, rgba(117,221,255,.18), transparent 35%), #111822 !important; }
+.design-v2 .proto-lowpoly-preview { position: absolute; inset: 0; z-index: 0; overflow: hidden; background: linear-gradient(155deg,#263e51 0 42%,#d19c62 43% 47%,#244632 48%); }
+.design-v2 .proto-lowpoly-preview::before { content:""; position:absolute; inset:18% -15% -30%; clip-path:polygon(0 52%,12% 36%,25% 48%,39% 18%,54% 44%,67% 12%,84% 45%,100% 28%,100% 100%,0 100%); background:linear-gradient(145deg,#415d4d,#142c24); }
+.design-v2 .proto-lowpoly-preview i { position:absolute; width:82px; height:82px; top:18%; left:14%; clip-path:polygon(50% 0,100% 34%,82% 100%,18% 100%,0 34%); background:#f0c86a; opacity:.78; }
+.design-v2 .proto-lowpoly-preview i:nth-child(2) { width:64px; height:100px; left:64%; top:31%; background:#7798bd; transform:rotate(9deg); }
+.design-v2 .proto-lowpoly-preview i:nth-child(3) { width:110px; height:48px; left:42%; top:57%; background:#bd6e54; transform:skewX(-24deg); }
+.design-v2 .proto-lowpoly-shade { position:absolute; inset:0; z-index:1; }
+.design-v2 .proto-upgrade-section { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 0; }
+.design-v2 .proto-upgrade-section > .proto-section-heading { grid-column: 1 / -1; margin-bottom: -1px; }
+.design-v2 .proto-upgrade-section > .proto-section-heading h2 { font-size: 23px; }
+.design-v2 .proto-enhance-showcase { min-height: 330px; border: 1px solid var(--v2-line); border-radius: var(--v2-r-lg); background: var(--v2-panel); box-shadow: var(--v2-shadow-1); overflow: hidden; transition: transform var(--v2-normal) var(--v2-ease), border-color var(--v2-fast), box-shadow var(--v2-normal) var(--v2-ease); }
+.design-v2 .proto-enhance-showcase:hover { transform: translateY(-6px); border-color: color-mix(in srgb, var(--v2-accent-2) 34%, var(--v2-line)); box-shadow: var(--v2-shadow-2); }
+.design-v2 .proto-enhance-preview { background: linear-gradient(140deg, #171f28, #090d12); }
+.design-v2 .proto-enhance-copy { padding: 24px 26px 26px; background: linear-gradient(0deg, rgba(5,8,11,.98), rgba(5,8,11,.72), transparent); }
+.design-v2 .proto-enhance-copy strong { color: #fff; font-size: 25px; font-weight: 650; letter-spacing: -.04em; }
+.design-v2 .proto-enhance-copy em { color: rgba(255,255,255,.72); font-size: 13px; line-height: 1.48; }
+
+/* --- configuration studio ------------------------------------------------ */
+.design-v2.prototype-ui .app.proto-flow .chat { max-width: 1280px; padding: 38px 42px 70px; }
+.design-v2.prototype-ui .app.proto-flow .proto-step-surface {
+  width: min(1120px, 100%);
+  min-height: 620px;
+  margin: 0 auto;
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-r-xl);
+  background:
+    radial-gradient(600px 280px at 8% -6%, color-mix(in srgb, var(--v2-accent) 7%, transparent), transparent 65%),
+    linear-gradient(155deg, color-mix(in srgb, var(--v2-panel) 97%, var(--v2-accent) 3%), var(--v2-panel));
+  box-shadow: 0 32px 100px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.025);
+  overflow: hidden;
+}
+/* Adjacent-step coverflow made real forms look as though a second, broken screen
+   was bleeding through behind them. It adds no task value in the production UI. */
+.design-v2.prototype-ui .app.proto-flow .proto-ghost { display: none !important; }
+.design-v2 .v2-version-badge { display: none !important; }
+.design-v2.prototype-ui .app.proto-flow .proto-step-surface::before { left: 42px; right: 42px; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--v2-accent) 48%, transparent), transparent); }
+.design-v2.prototype-ui .app.proto-flow .proto-step-surface > :not(.proto-config-head) { margin-left: 42px; margin-right: 42px; }
+.design-v2 .proto-config-head { position: relative; min-height: 170px; margin: 0 !important; padding: 37px 42px 31px; border-bottom: 1px solid var(--v2-line); background: linear-gradient(180deg, color-mix(in srgb, var(--v2-panel-2) 54%, transparent), transparent); }
+.design-v2 .proto-config-title { max-width: 780px; }
+.design-v2 .proto-config-title small { color: var(--v2-accent); font: 760 9px/1 var(--mono); letter-spacing: .18em; }
+.design-v2 .proto-config-count { top: 40px; right: 42px; min-width: 72px; color: var(--v2-text-3); font: 650 10px/1 var(--mono); letter-spacing: .08em; text-align: right; }
+.design-v2 .proto-config-title h1 { margin-top: 13px; color: var(--v2-text); font-size: clamp(31px, 4vw, 45px); font-weight: 560; letter-spacing: -.055em; line-height: 1.05; }
+.design-v2 .proto-config-title p { max-width: 650px; margin-top: 10px; color: var(--v2-text-2); font-size: 14px; line-height: 1.5; }
+.design-v2.prototype-ui .app.proto-flow .card-cap { color: var(--v2-text-3); }
+.design-v2.prototype-ui .app.proto-flow .card-note, .design-v2.prototype-ui .app.proto-flow .hint { color: var(--v2-text-2); border-color: var(--v2-line); background: color-mix(in srgb, var(--v2-panel-2) 72%, transparent); }
+.design-v2.prototype-ui .app.proto-flow .choices, .design-v2.prototype-ui .app.proto-flow .mode-grid { gap: 13px; }
+.design-v2.prototype-ui .app.proto-flow .choice, .design-v2.prototype-ui .app.proto-flow .mode-card {
+  min-height: 82px;
+  padding: 17px 19px;
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-r-md);
+  background: color-mix(in srgb, var(--v2-panel-2) 70%, transparent);
+  color: var(--v2-text);
+  box-shadow: none;
+  transition: transform var(--v2-normal) var(--v2-ease), border-color var(--v2-fast), background var(--v2-fast), box-shadow var(--v2-normal);
+}
+.design-v2.prototype-ui .app.proto-flow .choice:hover, .design-v2.prototype-ui .app.proto-flow .mode-card:hover { transform: translateY(-3px); border-color: var(--v2-line-strong); background: var(--v2-panel-2); box-shadow: var(--v2-shadow-1); }
+.design-v2.prototype-ui .app.proto-flow .choice.sel,
+.design-v2.prototype-ui .app.proto-flow .mode-card.sel {
+  border-color: var(--v2-accent);
+  background: color-mix(in srgb, var(--v2-accent) 22%, var(--v2-panel-2));
+  color: color-mix(in srgb, var(--v2-accent) 82%, white);
+  box-shadow: inset 0 0 0 1px var(--v2-accent),
+              0 6px 22px -10px var(--v2-accent);
+}
+.design-v2.prototype-ui .app.proto-flow .choice.sel small,
+.design-v2.prototype-ui .app.proto-flow .mode-card.sel small { color: var(--v2-text); }
+.design-v2.prototype-ui .app.proto-flow .fld > label, .design-v2.prototype-ui .app.proto-flow .fld > span { color: var(--v2-text-2); font-size: 10px; letter-spacing: .1em; }
+.design-v2.prototype-ui .app.proto-flow input:not([type="checkbox"]):not([type="range"]),
+.design-v2.prototype-ui .app.proto-flow select,
+.design-v2.prototype-ui .app.proto-flow textarea,
+.design-v2.prototype-ui .app.proto-flow .script-box,
+.design-v2.prototype-ui .app.proto-flow .input-card-ta {
+  min-height: 50px;
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-r-sm);
+  background: var(--v2-panel-2);
+  color: var(--v2-text);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.015);
+  transition: border-color var(--v2-fast), box-shadow var(--v2-fast), background var(--v2-fast);
+}
+.design-v2.prototype-ui .app.proto-flow input:focus, .design-v2.prototype-ui .app.proto-flow select:focus, .design-v2.prototype-ui .app.proto-flow textarea:focus { border-color: color-mix(in srgb, var(--v2-accent) 58%, var(--v2-line)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--v2-accent) 7%, transparent); }
+.design-v2.prototype-ui .app.proto-flow .tgl { min-height: 54px; padding: 10px 13px; border: 1px solid var(--v2-line); border-radius: var(--v2-r-sm); background: color-mix(in srgb, var(--v2-panel-2) 72%, transparent); }
+.design-v2.prototype-ui .app.proto-flow .tgl:hover { background: var(--v2-panel-2); }
+.design-v2.prototype-ui .app.proto-flow .tgl input[type="checkbox"] { width: 38px; height: 22px; background: var(--v2-panel-3); }
+.design-v2.prototype-ui .app.proto-flow .tgl input[type="checkbox"]::after { width: 16px; height: 16px; left: 3px; top: 3px; }
+.design-v2.prototype-ui .app.proto-flow .tgl input[type="checkbox"]:checked { background: var(--v2-accent); }
+.design-v2.prototype-ui .app.proto-flow .tgl input[type="checkbox"]:checked::after { transform: translateX(16px); background: var(--v2-accent-ink); }
+.design-v2.prototype-ui .app.proto-flow input[type="range"] { accent-color: var(--v2-accent); }
+.design-v2.prototype-ui .app.proto-flow .card-foot { min-height: 78px; margin: 34px 42px 0 !important; padding: 20px 0 25px; border-top: 1px solid var(--v2-line); gap: 10px; }
+.design-v2.prototype-ui .btn { min-height: 44px; padding: 10px 16px; gap: 8px; border: 1px solid var(--v2-line); border-radius: var(--v2-r-sm); background: var(--v2-panel-2); color: var(--v2-text); font-weight: 650; box-shadow: none; transition: transform var(--v2-normal) var(--v2-ease), background var(--v2-fast), border-color var(--v2-fast), box-shadow var(--v2-normal); }
+.design-v2.prototype-ui .btn:hover { transform: translateY(-2px); border-color: var(--v2-line-strong); background: var(--v2-panel-3); box-shadow: var(--v2-shadow-1); }
+.design-v2.prototype-ui .btn.primary { min-width: 142px; border-color: var(--v2-accent); background: var(--v2-accent); color: var(--v2-accent-ink); box-shadow: 0 12px 32px color-mix(in srgb, var(--v2-accent) 13%, transparent); }
+.design-v2.prototype-ui .btn.primary:hover { transform: translateY(-3px); background: color-mix(in srgb, var(--v2-accent) 90%, white); box-shadow: 0 17px 42px color-mix(in srgb, var(--v2-accent) 18%, transparent); }
+.design-v2.prototype-ui .proto-foot-back { color: var(--v2-text-2); background: transparent; }
+.design-v2.prototype-ui .proto-foot-back svg { transform: rotate(180deg); }
+.design-v2.prototype-ui .proto-ghost { border: 1px solid var(--v2-line); border-radius: var(--v2-r-lg); background: var(--v2-panel); filter: saturate(.6); opacity: .32; }
+.design-v2.prototype-ui .proto-ghost .pg-kicker { color: var(--v2-accent); }
+.design-v2.prototype-ui .proto-ghost .pg-title { color: var(--v2-text); }
+.design-v2.prototype-ui .proto-ghost .pg-sub { color: var(--v2-text-3); }
+
+/* Mode selectors and upload surfaces share the same card anatomy. */
+.design-v2 .ai-short-picker { max-width: 1120px !important; padding: 0 !important; background: transparent !important; }
+.design-v2 .ai-short-choice-grid { gap: 15px; padding: 24px 42px 10px; }
+.design-v2 .ai-short-choice { grid-template-rows: 235px auto; border: 1px solid var(--v2-line); border-radius: var(--v2-r-lg); background: var(--v2-panel-2); box-shadow: var(--v2-shadow-1); }
+.design-v2 .ai-short-choice:hover { transform: translateY(-6px) scale(1.01); border-color: color-mix(in srgb, var(--v2-accent) 34%, var(--v2-line)); box-shadow: var(--v2-shadow-2); }
+.design-v2 .ai-choice-copy { min-height: 170px; padding: 21px 22px 24px; }
+.design-v2 .ai-choice-copy small { color: var(--v2-accent); }
+.design-v2 .ai-choice-copy strong { color: var(--v2-text); font-size: 22px; }
+.design-v2 .ai-choice-copy em { color: var(--v2-text-2); }
+.design-v2.prototype-ui .upl-drop { min-height: 210px; border: 1px dashed color-mix(in srgb, var(--v2-accent) 31%, var(--v2-line)); border-radius: var(--v2-r-md); background: color-mix(in srgb, var(--v2-accent) 3%, var(--v2-panel-2)); }
+.design-v2.prototype-ui .upl-drop:hover, .design-v2.prototype-ui .upl-drop.over { transform: translateY(-2px); border-color: color-mix(in srgb, var(--v2-accent) 58%, var(--v2-line)); background: color-mix(in srgb, var(--v2-accent) 6%, var(--v2-panel-2)); }
+.design-v2.prototype-ui .proto-upload-icon { width: 46px; height: 46px; border-radius: 14px; background: var(--v2-accent); color: var(--v2-accent-ink); }
+
+/* --- assets, modals, menus ------------------------------------------------ */
+.design-v2.prototype-ui .app.proto-assets .chat { max-width: 1280px; padding: 42px; }
+.design-v2.prototype-ui .assets-head { margin-bottom: 24px; }
+.design-v2.prototype-ui .assets-grid { grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 15px; }
+.design-v2.prototype-ui .asset-card2 { border: 1px solid var(--v2-line); border-radius: var(--v2-r-md); background: var(--v2-panel); box-shadow: var(--v2-shadow-1); overflow: hidden; }
+.design-v2.prototype-ui .asset-card2:hover { transform: translateY(-5px); border-color: var(--v2-line-strong); box-shadow: var(--v2-shadow-2); }
+.design-v2.prototype-ui .modal-scrim { background: rgba(2,4,6,.68); backdrop-filter: blur(14px) saturate(.8); }
+.design-v2.prototype-ui .modal { width: min(580px, calc(100vw - 32px)); padding: 28px; border: 1px solid var(--v2-line-strong); border-radius: var(--v2-r-lg); background: color-mix(in srgb, var(--v2-panel) 94%, transparent); box-shadow: 0 38px 130px rgba(0,0,0,.5); backdrop-filter: blur(28px); }
+.design-v2.prototype-ui .modal h3 { color: var(--v2-text); font-size: 24px; letter-spacing: -.035em; }
+
+/* --- processing / live production --------------------------------------- */
+.design-v2.prototype-ui .app.proto-job .chat { max-width: 1280px; padding: 42px 42px 72px; }
+.design-v2.prototype-ui .app.proto-job .prog-card,
+.design-v2.prototype-ui .app.proto-job .term-card,
+.design-v2.prototype-ui .app.proto-job .am-card,
+.design-v2.prototype-ui .app.proto-job .scrape-browser-card,
+.design-v2.prototype-ui .app.proto-job .live-process-timeline {
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-r-lg);
+  background: var(--v2-panel);
+  box-shadow: var(--v2-shadow-1);
+}
+.design-v2.prototype-ui .app.proto-job .prog-card { padding: 26px; }
+.design-v2.prototype-ui .app.proto-job .prog-title { font-size: 18px; color: var(--v2-text); }
+.design-v2.prototype-ui .app.proto-job .prog-rail { height: 5px; border-radius: 99px; background: var(--v2-panel-3); }
+.design-v2.prototype-ui .app.proto-job .prog-step { min-height: 42px; border: 1px solid var(--v2-line); background: var(--v2-panel-2); }
+.design-v2.prototype-ui .tech-log { border: 1px solid var(--v2-line); border-radius: var(--v2-r-sm); background: #05080a; }
+.design-v2.prototype-ui .assigned-grid { gap: 12px; }
+
+/* --- compact top bar / collapsed sidebar -------------------------------- */
+.design-v2.prototype-ui .topbar { min-height: 52px; border-bottom: 1px solid var(--v2-line); background: color-mix(in srgb, var(--v2-bg) 82%, transparent); backdrop-filter: blur(18px); }
+.design-v2.prototype-ui .topbar.empty { min-height: 0; border: 0; }
+/* The menu is only a recovery control once the rail is hidden.  Keep it
+   deliberately quiet instead of promoting it to a second primary action. */
+.design-v2.prototype-ui .tb-menu { width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 0; border: 1px solid var(--v2-line); border-radius: 10px; background: var(--v2-glass); color: var(--v2-text-2); box-shadow: var(--v2-shadow-1); }
+.design-v2.prototype-ui .app.sb-collapsed .tb-menu { top: 16px; left: 16px; }
+
+/* --- responsive ---------------------------------------------------------- */
+@media (max-width: 1180px) {
+  .design-v2.prototype-ui .chat, .design-v2.prototype-ui .app.proto-flow .chat, .design-v2.prototype-ui .app.proto-job .chat { padding-left: 28px; padding-right: 28px; }
+  .design-v2 .proto-hero { padding-right: 0; }
+  .design-v2 .v2-hero-meta { position: static; display: flex; flex-wrap: wrap; margin-top: 22px; padding: 0; border: 0; }
+  .design-v2 .proto-primary-tools .proto-tool { grid-column: span 6; }
+  .design-v2 .proto-primary-tools .proto-tool:last-child { grid-column: 1 / -1; }
+}
+@media (max-width: 900px) {
+  .design-v2 { --v2-sidebar-w: 310px; }
+  .design-v2.prototype-ui .sidebar { box-shadow: 24px 0 70px rgba(0,0,0,.42); }
+  .design-v2.prototype-ui .chat, .design-v2.prototype-ui .app.proto-flow .chat, .design-v2.prototype-ui .app.proto-job .chat, .design-v2.prototype-ui .app.proto-assets .chat { padding: 30px 20px 60px; }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface > :not(.proto-config-head) { margin-left: 24px; margin-right: 24px; }
+  .design-v2 .proto-config-head { padding: 30px 24px 26px; }
+  .design-v2 .proto-config-count { right: 0; }
+  .design-v2.prototype-ui .app.proto-flow .card-foot { margin-left: 24px !important; margin-right: 24px !important; }
+}
+@media (max-width: 720px) {
+  .design-v2 .proto-hero { margin-bottom: 30px; }
+  .design-v2 .proto-hero h1 { font-size: 42px; }
+  .design-v2 .proto-section-heading { display: block; }
+  .design-v2 .proto-section-heading > p { margin-top: 7px; }
+  .design-v2 .proto-primary-tools { grid-template-columns: 1fr; }
+  .design-v2 .proto-primary-tools .proto-tool, .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2), .design-v2 .proto-primary-tools .proto-tool:last-child { grid-column: 1; min-height: 320px; }
+  .design-v2 .proto-upgrade-section { grid-template-columns: 1fr; }
+  .design-v2 .proto-enhance-showcase { min-height: 310px; }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface { min-height: 0; border-radius: 20px; }
+  .design-v2 .proto-config-title h1 { font-size: 33px; }
+  .design-v2 .proto-config-count { position: static; display: block; margin-top: 12px; text-align: left; }
+  .design-v2 .ai-short-choice-grid { grid-template-columns: 1fr; padding: 20px 20px 8px; }
+}
+@media (max-width: 430px) {
+  .design-v2.prototype-ui .chat, .design-v2.prototype-ui .app.proto-flow .chat, .design-v2.prototype-ui .app.proto-job .chat, .design-v2.prototype-ui .app.proto-assets .chat { padding-left: 13px; padding-right: 13px; }
+  .design-v2 .proto-hero h1 { font-size: 36px; }
+  .design-v2 .proto-hero p { font-size: 14px; }
+  .design-v2 .v2-hero-meta { display: grid; }
+  .design-v2 .proto-primary-tools .proto-tool, .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2), .design-v2 .proto-primary-tools .proto-tool:last-child { min-height: 290px; border-radius: 18px; }
+  .design-v2 .proto-tool-copy strong, .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: 24px; }
+  .design-v2 .proto-config-head { padding: 26px 20px 22px; }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface > :not(.proto-config-head) { margin-left: 18px; margin-right: 18px; }
+  .design-v2.prototype-ui .app.proto-flow .card-foot { margin-left: 18px !important; margin-right: 18px !important; flex-wrap: wrap; }
+  .design-v2.prototype-ui .app.proto-flow .card-foot .btn.primary { width: 100%; order: -1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .design-v2 *, .design-v2 *::before, .design-v2 *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}
+
+/* --- Design V2.1: editorial workspace -----------------------------------
+   This pass makes the redesign deliberately different from V1: less copy,
+   asymmetric media, firmer typography and a two-column configuration desk. */
+.design-v2 {
+  --v2-bg: #06080d;
+  --v2-sidebar: #090c13;
+  --v2-panel: #0d111a;
+  --v2-panel-2: #121824;
+  --v2-panel-3: #192132;
+  --v2-line: rgba(233, 240, 255, .075);
+  --v2-line-strong: rgba(233, 240, 255, .17);
+  --v2-r-sm: 8px;
+  --v2-r-md: 12px;
+  --v2-r-lg: 16px;
+  --v2-r-xl: 20px;
+}
+.design-v2[data-theme="light"], .design-v2.chat-light {
+  --v2-bg: #eef0f5;
+  --v2-sidebar: #e4e7ee;
+  --v2-panel: #fafbfe;
+  --v2-panel-2: #ffffff;
+  --v2-panel-3: #e9ecf3;
+}
+.design-v2.prototype-ui .canvas {
+  background:
+    linear-gradient(90deg, transparent 0 49.95%, color-mix(in srgb, var(--v2-line) 54%, transparent) 50%, transparent 50.05%),
+    radial-gradient(900px 520px at 88% -12%, color-mix(in srgb, var(--v2-accent-2) 7%, transparent), transparent 66%),
+    var(--v2-bg);
+}
+.design-v2.prototype-ui .canvas::before { opacity: .12; background-size: 96px 96px; }
+.design-v2.prototype-ui .chat { max-width: 1460px; padding: 36px clamp(28px, 4vw, 68px) 76px; }
+
+/* Sidebar becomes a calm utility rail instead of a second card. */
+.design-v2.prototype-ui .sidebar { padding: 18px 14px 14px; gap: 16px; box-shadow: none; }
+.design-v2.prototype-ui .sidebar::before,
+.design-v2.prototype-ui .sidebar::after { display: none; }
+.design-v2.prototype-ui .sb-head { min-height: 66px; padding: 7px 10px 13px; border-bottom: 1px solid var(--v2-line); }
+.design-v2.prototype-ui .sb-logo-mark { width: 42px; height: 42px; border-radius: 13px; transform: rotate(-2deg); }
+.design-v2.prototype-ui .sb-brand { font-size: 17px; letter-spacing: -.045em; }
+.design-v2.prototype-ui .sb-nav { gap: 4px; }
+.design-v2.prototype-ui .sb-nav-btn { min-height: 46px; padding: 0 13px; border: 0; border-radius: 9px; background: transparent; }
+.design-v2.prototype-ui .sb-nav-btn::before { content: ""; width: 3px; height: 18px; margin-left: -13px; border-radius: 0 4px 4px 0; background: transparent; }
+.design-v2.prototype-ui .sb-nav-btn.active { border: 0; background: color-mix(in srgb, var(--v2-accent) 8%, transparent); box-shadow: none; }
+.design-v2.prototype-ui .sb-nav-btn.active::before { background: var(--v2-accent); box-shadow: 0 0 18px color-mix(in srgb, var(--v2-accent) 65%, transparent); }
+.design-v2.prototype-ui .sb-section-title { padding-inline: 10px; color: var(--v2-text-3); }
+.design-v2.prototype-ui .sb-proj-row { margin: 0 2px; border-radius: 8px; }
+.design-v2.prototype-ui .sb-proj-row:hover { transform: translateX(3px); background: var(--v2-panel); }
+.design-v2.prototype-ui .sb-thumb { border-radius: 7px; }
+.design-v2.prototype-ui .sb-collapse { opacity: .42; border: 0; background: transparent; }
+.design-v2.prototype-ui .sb-collapse:hover { opacity: 1; background: var(--v2-panel-2); }
+.design-v2.prototype-ui .sb-foot { border-top: 1px solid var(--v2-line); }
+
+/* New Creation is an editorial bento, not a settings dashboard. */
+.design-v2.prototype-ui .app.proto-home .chat { padding-top: 28px; }
+.design-v2 .proto-launchpad { max-width: 1380px; }
+.design-v2 .proto-hero { display: flex; min-height: 160px; align-items: end; justify-content: space-between; margin: 0 0 26px; padding: 0; border-bottom: 1px solid var(--v2-line); }
+.design-v2 .proto-hero-kicker { align-self: start; margin: 8px 0 0; font-size: 9px; }
+.design-v2 .proto-hero-kicker::before { width: 8px; height: 8px; border-radius: 50%; }
+.design-v2 .proto-hero h1 { margin: 0 0 24px auto; max-width: none; text-align: right; font-size: clamp(58px, 7vw, 102px); font-weight: 760; letter-spacing: -.085em; line-height: .73; text-transform: uppercase; }
+.design-v2 .proto-hero h1 em { color: var(--v2-accent); font-style: normal; font-weight: 760; }
+.design-v2 .proto-hero p,
+.design-v2 .v2-hero-meta,
+.design-v2 .proto-section-heading > p,
+.design-v2 .proto-section-heading small,
+.design-v2 .proto-tool-copy em,
+.design-v2 .proto-enhance-copy em,
+.design-v2 .proto-config-title > p,
+.design-v2 .ai-choice-copy em { display: none !important; }
+.design-v2 .proto-section-heading { margin: 0 0 11px; padding: 0; }
+.design-v2 .proto-section-heading h2 { font-size: 12px; font-weight: 760; letter-spacing: .13em; text-transform: uppercase; }
+.design-v2 .proto-primary-tools { grid-template-columns: repeat(12, minmax(0, 1fr)); grid-auto-rows: 176px; gap: 10px; }
+.design-v2 .proto-primary-tools .proto-tool,
+.design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) { grid-column: span 4; min-height: 0; aspect-ratio: auto; padding: 20px; border-radius: var(--v2-r-lg); }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(1) { grid-column: span 7; grid-row: span 3; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(2) { grid-column: span 5; grid-row: span 2; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(3) { grid-column: span 5; grid-row: span 2; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(4),
+.design-v2 .proto-primary-tools .proto-tool:nth-child(5) { grid-column: span 6; grid-row: span 2; }
+.design-v2 .proto-primary-tools .proto-tool::before { content: attr(data-card-index); position: absolute; z-index: 5; top: 17px; left: 19px; color: rgba(255,255,255,.72); font: 700 10px/1 var(--mono); letter-spacing: .08em; }
+.design-v2 .proto-primary-tools .proto-tool::after { top: 0; bottom: 0; left: 0; right: auto; width: 3px; height: auto; opacity: .9; background: var(--v2-accent); transform: scaleY(.25); transform-origin: bottom; transition: transform 420ms var(--v2-ease); }
+.design-v2 .proto-primary-tools .proto-tool:hover::after { transform: scaleY(1); }
+.design-v2 .proto-primary-tools .proto-tool:hover { transform: translate(var(--tx), calc(var(--ty) - 7px)) scale(1.012) !important; }
+.design-v2 .proto-tool-copy { inset-inline: 20px; bottom: 19px; }
+.design-v2 .proto-tool-copy strong,
+.design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: clamp(24px, 2.4vw, 38px); font-weight: 720; letter-spacing: -.055em; line-height: .95; }
+.design-v2 .proto-primary-tools .proto-tool:not(:first-child) .proto-tool-copy strong { font-size: clamp(22px, 2vw, 30px); }
+.design-v2 .proto-culture-shade, .design-v2 .proto-sketch-shade, .design-v2 .proto-lowpoly-shade { background: linear-gradient(0deg, rgba(3,5,7,.98), rgba(3,5,7,.35) 62%, rgba(3,5,7,.08)); }
+.design-v2 .proto-creator-card > video { opacity: .92; filter: saturate(.88) contrast(1.08); }
+.design-v2 .proto-upgrade-section { gap: 10px; margin-top: 38px; }
+.design-v2 .proto-upgrade-section > .proto-section-heading { margin-bottom: 0; }
+.design-v2 .proto-enhance-showcase { min-height: 248px; border-radius: var(--v2-r-lg); }
+.design-v2 .proto-enhance-copy { padding: 22px; }
+.design-v2 .proto-enhance-copy strong { font-size: clamp(24px, 2.2vw, 32px); font-weight: 720; letter-spacing: -.055em; }
+
+/* Configuration pages use the same broad editorial header as New Creation.
+   A permanent 29% title rail looked dramatic but left every real setting cramped,
+   especially on a maximised display.  Forms are workspaces, not side-by-side
+   presentation slides. */
+@media (min-width: 951px) {
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface:not(.proto-step-script) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+    min-height: 0;
+    border-radius: var(--v2-r-lg);
+    background: var(--v2-panel);
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface:not(.proto-step-script) > .proto-config-head {
+    grid-column: 1;
+    grid-row: 1;
+    min-height: 0;
+    padding: 28px 34px 24px;
+    border: 0;
+    border-bottom: 1px solid var(--v2-line);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--v2-panel-2) 54%, transparent), transparent);
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface:not(.proto-step-script) > :not(.proto-config-head) {
+    grid-column: 1;
+    margin-left: 34px;
+    margin-right: 34px;
+  }
+  .design-v2 .proto-config-title { position: static; max-width: 760px; }
+  .design-v2 .proto-config-title h1 { margin-top: 12px; font-size: clamp(30px, 2.5vw, 42px); line-height: 1; }
+  .design-v2 .proto-config-count {
+    position: absolute;
+    top: 29px;
+    right: 34px;
+    bottom: auto;
+    left: auto;
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--v2-line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--v2-panel-2) 78%, transparent);
+    font-size: 10px;
+    text-align: right;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface:not(.proto-step-script) .card-foot { grid-column: 1; margin: 28px 34px 0 !important; }
+}
+
+.design-v2.prototype-ui .app.proto-flow .choice,
+.design-v2.prototype-ui .app.proto-flow .mode-card { position: relative; min-height: 74px; padding: 16px 18px 16px 22px; border-radius: 9px; }
+.design-v2.prototype-ui .app.proto-flow .choice::before,
+.design-v2.prototype-ui .app.proto-flow .mode-card::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 2px; border-radius: 4px; background: transparent; }
+.design-v2.prototype-ui .app.proto-flow .choice.sel::before,
+.design-v2.prototype-ui .app.proto-flow .mode-card.sel::before { background: var(--v2-accent); box-shadow: 0 0 12px color-mix(in srgb, var(--v2-accent) 55%, transparent); }
+.design-v2.prototype-ui .app.proto-flow input:not([type="checkbox"]):not([type="range"]),
+.design-v2.prototype-ui .app.proto-flow select,
+.design-v2.prototype-ui .app.proto-flow textarea,
+.design-v2.prototype-ui .app.proto-flow .script-box,
+.design-v2.prototype-ui .app.proto-flow .input-card-ta { border-radius: 8px; background: color-mix(in srgb, var(--v2-panel-2) 88%, transparent); }
+.design-v2.prototype-ui .btn { border-radius: 8px; }
+.design-v2.prototype-ui .btn.primary { border-radius: 8px; }
+
+/* Processing reads like a live control room. */
+.design-v2.prototype-ui .app.proto-job .chat { max-width: 1420px; }
+.design-v2.prototype-ui .app.proto-job .prog-card { position: relative; padding: 30px 30px 26px; border-radius: 14px; background: linear-gradient(135deg, color-mix(in srgb, var(--v2-accent) 5%, var(--v2-panel)), var(--v2-panel)); overflow: hidden; }
+.design-v2.prototype-ui .app.proto-job .prog-card::before { content: "LIVE"; position: absolute; top: 24px; right: 28px; color: var(--v2-accent); font: 760 9px/1 var(--mono); letter-spacing: .16em; }
+.design-v2.prototype-ui .app.proto-job .prog-card::after { content: ""; position: absolute; inset: auto 0 0; height: 2px; background: linear-gradient(90deg, var(--v2-accent), var(--v2-accent-2), transparent 72%); opacity: .7; }
+.design-v2.prototype-ui .app.proto-job .prog-title { font-size: 23px; letter-spacing: -.035em; }
+.design-v2.prototype-ui .app.proto-job .prog-step { border-radius: 8px; background: transparent; }
+.design-v2.prototype-ui .app.proto-job .term-card,
+.design-v2.prototype-ui .app.proto-job .am-card,
+.design-v2.prototype-ui .app.proto-job .scrape-browser-card,
+.design-v2.prototype-ui .app.proto-job .live-process-timeline { border-radius: 14px; }
+
+@media (max-width: 950px) {
+  .design-v2 .proto-primary-tools { grid-template-columns: 1fr 1fr; grid-auto-rows: 250px; }
+  .design-v2 .proto-primary-tools .proto-tool,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(n) { grid-column: span 1; grid-row: span 1; min-height: 250px; }
+  .design-v2 .proto-primary-tools .proto-tool:first-child { grid-column: 1 / -1; min-height: 340px; }
+}
+@media (max-width: 720px) {
+  .design-v2 .proto-hero { min-height: 132px; }
+  .design-v2 .proto-hero h1 { font-size: 58px; }
+  .design-v2 .proto-primary-tools { display: grid; grid-template-columns: 1fr; grid-auto-rows: auto; }
+  .design-v2 .proto-primary-tools .proto-tool,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(n),
+  .design-v2 .proto-primary-tools .proto-tool:first-child { grid-column: 1; min-height: 290px; }
+}
+
+/* --- New Creation: one-screen dashboard ---------------------------------
+   The launchpad must never become a document. Creation and Upgrade share the
+   available viewport and stay visible without a page scrollbar. */
+.design-v2.prototype-ui .app.proto-home .chat-scroll { overflow: hidden !important; }
+.design-v2.prototype-ui .app.proto-home .chat {
+  height: 100%;
+  min-height: 0;
+  padding-top: clamp(18px, 2.4vh, 28px);
+  padding-bottom: clamp(18px, 2.4vh, 28px);
+}
+.design-v2 .proto-launchpad {
+  display: grid;
+  grid-template-columns: minmax(0, 3.2fr) minmax(250px, 1fr);
+  grid-template-rows: clamp(88px, 13vh, 126px) minmax(0, 1fr);
+  gap: clamp(14px, 2vh, 22px) 12px;
+  height: 100%;
+  min-height: 0;
+}
+.design-v2 .proto-hero {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  min-height: 0;
+  height: 100%;
+  margin: 0;
+}
+.design-v2 .proto-hero h1 {
+  margin-bottom: clamp(14px, 2vh, 22px);
+  font-size: clamp(48px, 6.2vh, 78px);
+  line-height: .77;
+}
+.design-v2 .proto-work-section {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+}
+.design-v2 .proto-primary-tools {
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+.design-v2 .proto-primary-tools .proto-tool,
+.design-v2 .proto-primary-tools .proto-tool:nth-child(n) {
+  width: 100%;
+  height: 100% !important;
+  min-height: 0;
+  grid-row: span 1;
+}
+.design-v2 .proto-primary-tools .proto-tool:nth-child(1) { grid-column: span 5; grid-row: span 2; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(2) { grid-column: span 4; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(3) { grid-column: span 3; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(4) { grid-column: span 4; }
+.design-v2 .proto-primary-tools .proto-tool:nth-child(5) { grid-column: span 3; }
+.design-v2 .proto-upgrade-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto repeat(2, minmax(0, 1fr));
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  gap: 10px;
+  margin: 0;
+}
+.design-v2 .proto-upgrade-section > .proto-section-heading { grid-column: 1; }
+.design-v2 .proto-enhance-showcase {
+  min-height: 0;
+  height: 100%;
+}
+.design-v2 .proto-enhance-copy { padding: clamp(14px, 1.8vh, 20px); }
+.design-v2 .proto-enhance-copy strong { font-size: clamp(20px, 2.5vh, 28px); }
+
+@media (max-height: 760px) and (min-width: 901px) {
+  .design-v2 .proto-launchpad { grid-template-rows: 76px minmax(0, 1fr); gap: 11px 10px; }
+  .design-v2 .proto-hero h1 { margin-bottom: 11px; font-size: 45px; }
+  .design-v2 .proto-hero-kicker { margin-top: 2px; }
+  .design-v2 .proto-section-heading { margin-bottom: 7px; }
+  .design-v2 .proto-primary-tools, .design-v2 .proto-upgrade-section { gap: 7px; }
+  .design-v2 .proto-primary-tools .proto-tool { padding: 15px; }
+  .design-v2 .proto-tool-copy { inset-inline: 15px; bottom: 14px; }
+  .design-v2 .proto-tool-copy strong,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: 23px; }
+  .design-v2 .proto-enhance-copy { padding: 13px; }
+  .design-v2 .proto-enhance-copy strong { font-size: 20px; }
+}
+
+/* A narrow desktop still has the persistent project rail.  Treat its remaining
+   workspace as compact rather than squeezing the creation cards into strips.
+   The same one-screen structure is retained: Create gets the main canvas and
+   Upgrade becomes a clear two-card row below it. */
+@media (min-width: 901px) and (max-width: 1500px) {
+  .design-v2.prototype-ui .app.proto-home .chat { padding: 16px 20px; }
+  .design-v2 .proto-launchpad {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 70px minmax(0, 1fr) minmax(116px, .34fr);
+    gap: 10px;
+  }
+  .design-v2 .proto-work-section { grid-column: 1; grid-row: 2; }
+  .design-v2 .proto-primary-tools {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+  .design-v2 .proto-primary-tools .proto-tool,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(n) {
+    grid-column: span 1;
+    grid-row: span 1;
+  }
+  .design-v2 .proto-primary-tools .proto-tool:first-child { grid-column: 1; grid-row: 1 / span 2; }
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(2) { grid-column: 2; grid-row: 1; }
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(3) { grid-column: 3; grid-row: 1; }
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(4) { grid-column: 2; grid-row: 2; }
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(5) { grid-column: 3; grid-row: 2; }
+  .design-v2 .proto-primary-tools .proto-tool .proto-tool-copy { inset-inline: 12px; bottom: 12px; }
+  .design-v2 .proto-primary-tools .proto-tool .proto-tool-copy strong,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: 18px; line-height: .95; }
+  .design-v2 .proto-primary-tools .proto-tool:first-child .proto-tool-copy strong { font-size: 23px; }
+  .design-v2 .proto-upgrade-section {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-column: 1;
+    grid-row: 3;
+  }
+  .design-v2 .proto-upgrade-section > .proto-section-heading { grid-column: 1 / -1; }
+  .design-v2 .proto-hero h1 { font-size: 44px; }
+}
+
+@media (max-width: 900px) {
+  .design-v2.prototype-ui .app.proto-home .chat { padding: 16px; }
+  /* At drawer widths the sidebar is off-canvas by default.  The old recovery
+     control only appeared after a desktop "sb-collapsed" action, leaving no
+     visible way back into navigation on a narrow screen. */
+  .design-v2.prototype-ui .app:not(.sb-open) .tb-menu {
+    display: grid;
+    position: fixed;
+    z-index: 70;
+    top: 14px;
+    left: 14px;
+    width: 32px;
+    height: 32px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid var(--v2-line);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--v2-panel-2) 90%, transparent);
+    color: var(--v2-text-2);
+    box-shadow: 0 10px 28px rgba(0,0,0,.18);
+    backdrop-filter: blur(14px);
+    opacity: .72;
+  }
+  .design-v2.prototype-ui .app:not(.sb-open) .tb-menu:hover { opacity: 1; color: var(--v2-text); }
+  .design-v2 .proto-launchpad {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 76px minmax(0, 1fr) minmax(132px, .42fr);
+    gap: 10px;
+  }
+  .design-v2 .proto-work-section { grid-column: 1; grid-row: 2; }
+  .design-v2 .proto-upgrade-section {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-column: 1;
+    grid-row: 3;
+  }
+  .design-v2 .proto-upgrade-section > .proto-section-heading { grid-column: 1 / -1; }
+  .design-v2 .proto-hero h1 { font-size: 44px; }
+}
+
+@media (max-width: 620px) {
+  .design-v2 .proto-launchpad { grid-template-rows: 64px minmax(0, 1fr) minmax(108px, .35fr); }
+  .design-v2 .proto-hero-kicker { font-size: 8px; }
+  .design-v2 .proto-hero h1 { font-size: 34px; }
+  .design-v2 .proto-primary-tools { gap: 6px; }
+  .design-v2 .proto-primary-tools .proto-tool { padding: 10px; }
+  .design-v2 .proto-primary-tools .proto-tool::before { top: 9px; left: 9px; font-size: 8px; }
+  .design-v2 .proto-tool-copy { inset-inline: 10px; bottom: 9px; }
+  .design-v2 .proto-tool-copy strong,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong,
+  .design-v2 .proto-primary-tools .proto-tool:not(:first-child) .proto-tool-copy strong { font-size: 16px; }
+  .design-v2 .proto-section-heading { margin-bottom: 5px; }
+  .design-v2 .proto-section-heading h2 { font-size: 9px; }
+  .design-v2 .proto-upgrade-section { gap: 6px; }
+  .design-v2 .proto-enhance-preview { opacity: .68; }
+  .design-v2 .proto-enhance-copy { padding: 9px; }
+  .design-v2 .proto-enhance-copy strong { font-size: 16px; }
+}
+
+/* A maximized desktop window must use its actual workspace, not retain the launch
+   width from a small starting window.  The launcher itself already has a fixed
+   height-based grid, so widening the shell enlarges cards without introducing a
+   vertical scroll bar. */
+/* Use the available desktop canvas rather than the physical monitor's pixel
+   count.  On Windows at 200% scaling a 2560px monitor reports roughly 1280
+   CSS pixels to the embedded browser, so a 1600px breakpoint never fired and
+   the launcher remained stuck at its small-window max width. */
+@media (min-width: 1501px) {
+  .design-v2.prototype-ui .app.proto-home .canvas {
+    /* The legacy shell capped the entire canvas at 1420px, which left half of
+       a maximized window empty even after the launchpad itself was widened. */
+    max-width: none;
+  }
+  .design-v2.prototype-ui .app.proto-home .chat {
+    width: 100%;
+    max-width: none;
+    padding-left: clamp(42px, 4.8vw, 112px);
+    padding-right: clamp(42px, 4.8vw, 112px);
+  }
+  .design-v2 .proto-launchpad { width: 100%; max-width: none; }
+  .design-v2 .proto-launchpad { grid-template-columns: minmax(0, 3.45fr) minmax(310px, 1fr); gap: clamp(16px, 1.25vw, 28px); }
+  .design-v2 .proto-primary-tools { gap: clamp(10px, .75vw, 18px); }
+  .design-v2 .proto-upgrade-section { gap: clamp(10px, .75vw, 18px); }
+  .design-v2 .proto-tool-copy strong,
+  .design-v2 .proto-primary-tools .proto-tool:nth-child(-n+2) .proto-tool-copy strong { font-size: clamp(28px, 1.9vw, 42px); }
+  .design-v2 .proto-primary-tools .proto-tool:not(:first-child) .proto-tool-copy strong { font-size: clamp(24px, 1.55vw, 34px); }
+}
+
+/* The script step owns two real working columns.  The generic configuration
+   sidebar rule was also claiming both columns, stacking Script Creator directly
+   over the editor and making the actual script textarea appear to disappear. */
+@media (min-width: 951px) {
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script {
+    display: grid;
+    grid-template-columns: minmax(0, 1.6fr) minmax(300px, .82fr);
+    align-content: start;
+    min-height: 0;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .proto-config-head {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    min-height: 0;
+    padding: 28px 32px 24px;
+    border: 0;
+    border-bottom: 1px solid var(--v2-line);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--v2-panel-2) 54%, transparent), transparent);
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script .proto-config-title {
+    position: static;
+    max-width: 760px;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script .proto-config-title h1 {
+    margin-top: 12px;
+    font-size: clamp(30px, 2.5vw, 42px);
+    line-height: 1;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script .proto-config-count {
+    top: 29px;
+    right: 32px;
+    bottom: auto;
+    left: auto;
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--v2-line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--v2-panel-2) 78%, transparent);
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .script-edit-col {
+    grid-column: 1 !important;
+    grid-row: 2;
+    margin: 22px 0 0 32px !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .script-gen-col {
+    grid-column: 2 !important;
+    grid-row: 2;
+    margin: 22px 32px 0 22px !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .card-foot {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    margin: 24px 32px 0 !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script .script-edit-col .script-box {
+    display: block !important;
+    min-height: clamp(270px, 36vh, 460px) !important;
+    height: clamp(270px, 36vh, 460px) !important;
+    background: var(--v2-panel-2) !important;
+  }
+
+  /* Longform has no Script Creator column. Keep its authoring field and footer in
+     distinct rows instead of inheriting the regular step's left rail. */
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script > .proto-config-head {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script > .lf-existing {
+    grid-column: 1 !important;
+    grid-row: 2;
+    margin: 22px 32px 0 !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script > .script-edit-col,
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script > .script-box {
+    grid-column: 1 !important;
+    grid-row: 3;
+    margin: 22px 32px 0 !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-mode-longform.proto-step-script > .card-foot {
+    grid-column: 1 !important;
+    grid-row: 4;
+  }
+}
+
+/* A window can be technically "desktop" while the persistent project rail has
+   already consumed most of its width. Do not compress a working editor into a
+   sliver just to preserve the side-by-side generator. */
+@media (min-width: 901px) and (max-width: 1280px) {
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script {
+    display: block;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .script-edit-col,
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .script-gen-col {
+    width: auto;
+    margin: 22px 28px 0 !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .script-gen-col {
+    padding: 15px;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script > .card-foot {
+    margin: 24px 28px 0 !important;
+  }
+  .design-v2.prototype-ui .app.proto-flow .proto-step-surface.proto-step-script .script-edit-col .script-box {
+    height: clamp(260px, 34vh, 390px) !important;
+    min-height: 260px !important;
+  }
+}
+
+/* --- legacy and transitional documents ----------------------------------
+   A few diagnostic, approval, developer and empty-state pages are rendered by
+   the server instead of the shell. Re-skin their existing semantics so every
+   reachable screen belongs to the same product without touching their forms. */
+.design-v2 body:not(.page-timeline) {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif !important;
+  background:
+    radial-gradient(900px 580px at 12% -18%, color-mix(in srgb, var(--v2-accent) 7%, transparent), transparent 64%),
+    radial-gradient(760px 520px at 104% 24%, color-mix(in srgb, var(--v2-accent-3) 5%, transparent), transparent 65%),
+    var(--v2-bg) !important;
+  color: var(--v2-text) !important;
+}
+.design-v2 body:not(.page-timeline)::before, .design-v2 body:not(.page-timeline)::after { display: none !important; }
+.design-v2 body:not(.page-timeline) main { max-width: 1420px; padding: 24px clamp(20px, 3.6vw, 58px) 44px; }
+.design-v2 body:not(.page-timeline) h1, .design-v2 body:not(.page-timeline) h2, .design-v2 body:not(.page-timeline) h3 {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+  color: var(--v2-text) !important;
+  text-transform: none !important;
+  text-shadow: none !important;
+  letter-spacing: -.035em !important;
+}
+.design-v2 body:not(.page-timeline) h1 { font-size: clamp(28px, 4vw, 44px) !important; font-weight: 580 !important; }
+.design-v2 body:not(.page-timeline) h2 { font-size: 20px !important; font-weight: 650 !important; }
+.design-v2 body:not(.page-timeline) .top {
+  min-height: 66px;
+  margin-bottom: 22px;
+  padding: 8px 0 16px;
+  border: 0 !important;
+  border-bottom: 1px solid var(--v2-line) !important;
+  box-shadow: none !important;
+}
+.design-v2 body:not(.page-timeline) .brand-mark { width: 42px; height: 42px; border: 1px solid color-mix(in srgb, var(--v2-accent) 28%, var(--v2-line)); border-radius: 12px; image-rendering: auto; box-shadow: var(--v2-shadow-1); }
+.design-v2 body:not(.page-timeline) .sub, .design-v2 body:not(.page-timeline) .hint { color: var(--v2-text-2) !important; }
+.design-v2 body:not(.page-timeline) .panel, .design-v2 body:not(.page-timeline) .card {
+  border: 1px solid var(--v2-line) !important;
+  border-radius: var(--v2-r-lg) !important;
+  background: linear-gradient(155deg, color-mix(in srgb, var(--v2-panel) 97%, var(--v2-accent) 3%), var(--v2-panel)) !important;
+  box-shadow: var(--v2-shadow-1) !important;
+}
+.design-v2 body:not(.page-timeline) button, .design-v2 body:not(.page-timeline) .button {
+  min-height: 44px;
+  border: 1px solid var(--v2-line) !important;
+  border-radius: var(--v2-r-sm) !important;
+  background: var(--v2-panel-2) !important;
+  color: var(--v2-text) !important;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 650 !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  box-shadow: none !important;
+  transition: transform var(--v2-normal) var(--v2-ease), border-color var(--v2-fast), background var(--v2-fast), box-shadow var(--v2-normal) !important;
+}
+.design-v2 body:not(.page-timeline) button:hover, .design-v2 body:not(.page-timeline) .button:hover { transform: translateY(-2px) !important; border-color: var(--v2-line-strong) !important; background: var(--v2-panel-3) !important; box-shadow: var(--v2-shadow-1) !important; }
+.design-v2 body:not(.page-timeline) button.primary, .design-v2 body:not(.page-timeline) .button.primary {
+  border-color: var(--v2-accent) !important;
+  background: var(--v2-accent) !important;
+  color: var(--v2-accent-ink) !important;
+}
+.design-v2 body:not(.page-timeline) input:not([type="checkbox"]):not([type="range"]),
+.design-v2 body:not(.page-timeline) select,
+.design-v2 body:not(.page-timeline) textarea {
+  min-height: 48px;
+  border: 1px solid var(--v2-line) !important;
+  border-radius: var(--v2-r-sm) !important;
+  background: var(--v2-panel-2) !important;
+  color: var(--v2-text) !important;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+  box-shadow: none !important;
+}
+.design-v2 body:not(.page-timeline) input:focus, .design-v2 body:not(.page-timeline) select:focus, .design-v2 body:not(.page-timeline) textarea:focus { outline: none !important; border-color: color-mix(in srgb, var(--v2-accent) 58%, var(--v2-line)) !important; box-shadow: 0 0 0 4px color-mix(in srgb, var(--v2-accent) 7%, transparent) !important; }
+.design-v2 body:not(.page-timeline) code, .design-v2 body:not(.page-timeline) pre { font-family: ui-monospace, "Cascadia Code", Consolas, monospace !important; }
+.design-v2 body:not(.page-timeline) table { border-color: var(--v2-line) !important; border-radius: var(--v2-r-md); overflow: hidden; }
+.design-v2 body:not(.page-timeline) th { background: var(--v2-panel-2) !important; color: var(--v2-text-2) !important; }
+.design-v2 body:not(.page-timeline) td { border-color: var(--v2-line) !important; }
+.design-v2 .page-timeline-blank .tl-blank-wrap { min-height: calc(100vh - 110px); align-items: center; }
+.design-v2 .page-timeline-blank .tl-blank-card { max-width: 720px; padding: 46px !important; }
+.design-v2 .page-timeline-blank .tl-blank-badge { display: none; }
+.design-v2 .page-timeline-blank .tl-blank-card h1 { font-size: 42px !important; }
+.design-v2 .page-timeline-blank .tlb-proj { border-color: var(--v2-line) !important; border-radius: var(--v2-r-sm) !important; background: var(--v2-panel-2) !important; }
+
+
+/* ---- Selected states win over the generic button skin -------------------------------------
+   `.design-v2 body:not(.page-timeline) button` sets a panel background at specificity (0,2,2),
+   which beats `.choice.sel` (0,2,0) in chat-shell.css - so OUTSIDE the flow screens a selected
+   button was painted with the unselected skin and the two were pixel-identical. Measured: bg
+   distance 0, border distance 0. The generic rule declares `background`, `border` and
+   `border-radius` with !important, so specificity alone cannot beat it - matching !important is
+   the only way in without rewriting that block and every skin that depends on it. */
+.design-v2 body:not(.page-timeline) button.choice.sel,
+.design-v2 body:not(.page-timeline) button.mode-card.sel,
+.design-v2 body:not(.page-timeline) button.hook-sentence.on,
+.design-v2 body:not(.page-timeline) button.aicore-option.on,
+.design-v2 body:not(.page-timeline) button.capstyle-seg-btn.on {
+  border-color: var(--v2-accent) !important;
+  background: color-mix(in srgb, var(--v2-accent) 22%, var(--v2-panel-2)) !important;
+  color: color-mix(in srgb, var(--v2-accent) 84%, white) !important;
+  box-shadow: inset 0 0 0 1px var(--v2-accent),
+              0 6px 22px -10px var(--v2-accent) !important;
+}
+.design-v2 body:not(.page-timeline) button.choice.sel:hover,
+.design-v2 body:not(.page-timeline) button.mode-card.sel:hover {
+  background: color-mix(in srgb, var(--v2-accent) 30%, var(--v2-panel-2)) !important;
+  border-color: var(--v2-accent) !important;
+}
+.design-v2 body:not(.page-timeline) button.choice.sel small { color: var(--v2-text) !important; }
+/* The sidebar's active entry is a button too, and lost the same fight. */
+.design-v2 body:not(.page-timeline) #sb-nav button.active {
+  background: color-mix(in srgb, var(--v2-accent) 18%, var(--v2-panel-2)) !important;
+  color: color-mix(in srgb, var(--v2-accent) 84%, white) !important;
+  box-shadow: inset 3px 0 0 var(--v2-accent) !important;
+}
+
+
+/* ---- Wide screens: centre the content column instead of leaving a void -----------------------
+   Measured at 2560x1400: the flow and assets screens cap their column at 1280px and place it
+   flush against the sidebar, leaving 884px of empty canvas on the right. The home screen was
+   already widened for its launchpad grid; every OTHER screen still looked laid out for a
+   1280-wide window and simply hugged one edge when maximised.
+
+   Centring, not stretching: a 2100px text column is unreadable, which is what the home screen's
+   uncap would do to a form. The column grows a little on very wide displays and then sits in
+   the middle of the space it does not use. */
+@media (min-width: 1600px) {
+  /* The cap that actually bites is on .canvas, not .chat - the chat can never exceed the
+     column it lives in, which is why widening .chat alone changed nothing. .canvas is a flex
+     item of .app, so auto margins centre it in the space the sidebar leaves. */
+  .design-v2.prototype-ui .app.proto-flow .canvas,
+  .design-v2.prototype-ui .app.proto-assets .canvas,
+  .design-v2.prototype-ui .app.proto-job .canvas {
+    max-width: min(1640px, 88vw);
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .design-v2.prototype-ui .app.proto-flow .chat,
+  .design-v2.prototype-ui .app.proto-job .chat {
+    max-width: 1520px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+@media (min-width: 2100px) {
+  .design-v2.prototype-ui .app.proto-flow .canvas,
+  .design-v2.prototype-ui .app.proto-job .canvas { max-width: 1760px; }
+  .design-v2.prototype-ui .app.proto-flow .chat,
+  .design-v2.prototype-ui .app.proto-job .chat { max-width: 1640px; }
+  /* Asset and media grids are TILES, not prose - they earn real width. */
+  .design-v2.prototype-ui .app.proto-assets .canvas { max-width: min(2280px, 94vw); }
+  .design-v2.prototype-ui .app.proto-assets .chat { max-width: none; }
+}
+
+
+/* ---- A tall panel must always be scrollable ------------------------------------------------
+   The home and job screens lock `.chat-scroll` to overflow:hidden, because their own layouts
+   are designed to fit exactly. The longform frame editor is appended INTO that same chat: 2165px
+   of content in an 832px window, with "Render video" sitting at y=2097 - unreachable, so the
+   sketch short could not be finished at all. The job screen already carries this exact exception
+   for `.result-wrap`; these extend it to the panels that were missed. */
+.design-v2.prototype-ui .app.proto-home .chat-scroll:has(.lf-frame-editor),
+.design-v2.prototype-ui .app.proto-home .chat-scroll:has(.lf-postrender),
+.design-v2.prototype-ui .app.proto-job .chat-scroll:has(.lf-frame-editor),
+.design-v2.prototype-ui .app.proto-job .chat-scroll:has(.lf-postrender),
+.design-v2.prototype-ui .app.proto-flow .chat-scroll:has(.lf-frame-editor) {
+  overflow-y: auto !important;
+}

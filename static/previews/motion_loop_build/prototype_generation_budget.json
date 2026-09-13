@@ -1,0 +1,69 @@
+{
+  "gpt_image_2_submissions": 1,
+  "gpt_image_note": "The authorized call was submitted earlier; its shell was interrupted before the prediction id was persisted. No retry was made.",
+  "seedance_2_submissions": 1,
+  "seedance_prediction_id": "7beb7dea497e42618d9aa457211c1a75",
+  "limit_each": 1,
+  "payload": {
+    "aspect_ratio": "9:16",
+    "duration": 5,
+    "image": "https://d1q70pf5vjeyhc.cloudfront.net/media/9379fefd06664f42ae458cfb60cb9ae1/images/1785616854045543919_s4cmuENX.jpg",
+    "prompt": "Transform this into an original, premium hypnotic POV journey through a bioluminescent glass forest. Continuous lateral-forward travel, deep layered parallax, liquid chrome trees bending around a clear central path, emerald and electric-violet light, fluid elastic environmental movement. One unbroken shot, stable composition, no cuts, no text, no logos. Return naturally to the opening composition and direction at the end for a seamless loop. Wholesome, tasteful documentary realism: every figure is fully clothed in modest, period-appropriate attire, with respectful, non-graphic framing.",
+    "resolution": "720p",
+    "seed": -1,
+    "enable_web_search": false,
+    "generate_audio": false,
+    "last_image": "https://d1q70pf5vjeyhc.cloudfront.net/media/9379fefd06664f42ae458cfb60cb9ae1/images/1785616854045543919_s4cmuENX.jpg"
+  },
+  "submit": {
+    "code": 200,
+    "message": "success",
+    "data": {
+      "id": "7beb7dea497e42618d9aa457211c1a75",
+      "model": "bytedance/seedance-2.0/image-to-video",
+      "input": {
+        "aspect_ratio": "9:16",
+        "duration": 5,
+        "enable_web_search": false,
+        "generate_audio": false,
+        "image": "https://d1q70pf5vjeyhc.cloudfront.net/media/9379fefd06664f42ae458cfb60cb9ae1/images/1785616854045543919_s4cmuENX.jpg",
+        "last_image": "https://d1q70pf5vjeyhc.cloudfront.net/media/9379fefd06664f42ae458cfb60cb9ae1/images/1785616854045543919_s4cmuENX.jpg",
+        "prompt": "Transform this into an original, premium hypnotic POV journey through a bioluminescent glass forest. Continuous lateral-forward travel, deep layered parallax, liquid chrome trees bending around a clear central path, emerald and electric-violet light, fluid elastic environmental movement. One unbroken shot, stable composition, no cuts, no text, no logos. Return naturally to the opening composition and direction at the end for a seamless loop. Wholesome, tasteful documentary realism: every figure is fully clothed in modest, period-appropriate attire, with respectful, non-graphic framing.",
+        "resolution": "720p"
+      },
+      "outputs": [],
+      "urls": {
+        "get": "https://api.wavespeed.ai/api/v3/predictions/7beb7dea497e42618d9aa457211c1a75/result"
+      },
+      "status": "created",
+      "created_at": "2026-08-01T20:40:55.066Z",
+      "code": 0,
+      "error": "",
+      "timings": {
+        "inference": 0
+      }
+    }
+  },
+  "result": {
+    "code": 200,
+    "message": "success",
+    "data": {
+      "id": "7beb7dea497e42618d9aa457211c1a75",
+      "model": "bytedance/seedance-2.0/image-to-video",
+      "outputs": [
+        "https://d2h7xmz5gqybh9.cloudfront.net/output/055c38a9-7d3b-47e6-89d9-6ccdc9c16b16.mp4"
+      ],
+      "urls": {
+        "get": "https://api.wavespeed.ai/api/v3/predictions/7beb7dea497e42618d9aa457211c1a75/result"
+      },
+      "status": "completed",
+      "created_at": "2026-08-01T20:40:55.065330789Z",
+      "code": 0,
+      "error": "",
+      "timings": {
+        "inference": 334650
+      }
+    }
+  },
+  "final": "D:\\data\\AutoShortsClaude\\static\\previews\\motion_loop_prototype.mp4"
+}

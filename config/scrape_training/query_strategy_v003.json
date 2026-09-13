@@ -1,0 +1,18 @@
+{
+  "version": "v003",
+  "source_run": "train_e2e_144837",
+  "created_at": "2026-07-08 15:30:55",
+  "categories": {
+    "school": {
+      "preferred_query_types": [
+        "subject_action"
+      ],
+      "avoid_query_types": [],
+      "query_type_weights": {
+        "subject_action": 1.03
+      },
+      "n_ratings": 3
+    }
+  },
+  "note": "Derived from manual ratings (ground truth). NOT active until 'activate'. Compare on a holdout before activating."
+}
